@@ -1007,7 +1007,7 @@ class LMCacheConnectorV1Impl:
                 continue
             layerwise_retriever = self.layerwise_retrievers[idx]
             if request.is_sparse_decode:
-                selected_tokens_per_req = torch.arange(request.load_spec.lmcache_cached_tokens) if selected_tokens is None else selected_tokens[idx]
+                selected_tokens_per_req = torch.arange(request.load_spec.lmcache_cached_tokens, dtype=torch.int32) if selected_tokens is None else selected_tokens[idx]
                 token_start_index_per_req = 0 if token_start_index is None else token_start_index[idx]
                 ret_token_mask = layerwise_retriever.send((selected_tokens_per_req, token_start_index_per_req))
             else:
