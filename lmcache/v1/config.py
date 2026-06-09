@@ -97,6 +97,11 @@ _CONFIG_DEFINITIONS: dict[str, dict[str, Any]] = {
         "default": "builtin",
         "env_converter": str,
     },
+    "enable_sparse_attention": {
+        "type": bool,
+        "default": False,
+        "env_converter": _to_bool,
+    },
     # Blending configurations
     "enable_blending": {
         "type": bool,
