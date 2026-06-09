@@ -143,6 +143,8 @@ class RequestTracker:
     cached_keys: list[list] = field(default_factory=list)
     cached_starts: list[int] = field(default_factory=list)
     cached_ends: list[int] = field(default_factory=list)
+    cached_memory_objs: list[list] = field(default_factory=list)
+    cached_tensors: list[list] = field(default_factory=list)
 
     @_lmcache_nvtx_annotate
     @staticmethod
@@ -287,7 +289,8 @@ class ReqMeta:
     cached_keys: list[list] = field(default_factory=list)
     cached_starts: list[int] = field(default_factory=list)
     cached_ends: list[int] = field(default_factory=list)
-
+    cached_memory_objs: list[list] = field(default_factory=list)
+    cached_tensors: list[list] = field(default_factory=list)
 
     # Whether is last prefill or not
     is_last_prefill: bool = False
@@ -441,6 +444,8 @@ class ReqMeta:
             cached_keys=tracker.cached_keys,
             cached_starts=tracker.cached_starts,
             cached_ends=tracker.cached_ends,
+            cached_memory_objs=tracker.cached_memory_objs,
+            cached_tensors=tracker.cached_tensors,
         )
 
 
@@ -853,6 +858,8 @@ class LMCacheConnectorV1Impl:
                         cached_keys=request.cached_keys,
                         cached_starts=request.cached_starts,
                         cached_ends=request.cached_ends,
+                        cached_memory_objs=request.cached_memory_objs,
+                        cached_tensors=request.cached_tensors,
                         req_id=request.req_id,
                     )
                     # NOTE: retrieve layers one by one with cpu prefetch
@@ -1120,6 +1127,10 @@ class LMCacheConnectorV1Impl:
                     sync=is_first,
                     req_id=request.req_id,
                     cached_keys = request.cached_keys,
+                    cached_starts=request.cached_starts,
+                    cached_ends=request.cached_ends,
+                    cached_memory_objs=request.cached_memory_objs,
+                    cached_tensors=request.cached_tensors,
                 )
                 self._layerwise_save_storers[request.req_id] = layerwise_storer
                 if is_first:
