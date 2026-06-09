@@ -990,6 +990,9 @@ class LMCacheConnectorV1Impl:
         if self.layerwise_retrievers:
             logger.debug(f"Waiting for layer {self.current_layer} to be loaded")
 
+        metadata = self._parent._get_connector_metadata()
+        assert isinstance(metadata, LMCacheConnectorMetadata)
+
         # Wait for the layer to be loaded
         idx = 0
         for request in metadata.requests:
