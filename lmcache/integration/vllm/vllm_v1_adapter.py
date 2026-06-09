@@ -141,6 +141,8 @@ class RequestTracker:
 
     # key of cached object
     cached_keys: list[list] = field(default_factory=list)
+    cached_starts: list[int] = field(default_factory=list)
+    cached_ends: list[int] = field(default_factory=list)
 
     @_lmcache_nvtx_annotate
     @staticmethod
@@ -283,6 +285,8 @@ class ReqMeta:
 
     # key of cached object
     cached_keys: list[list] = field(default_factory=list)
+    cached_starts: list[int] = field(default_factory=list)
+    cached_ends: list[int] = field(default_factory=list)
 
 
     # Whether is last prefill or not
@@ -435,6 +439,8 @@ class ReqMeta:
             disagg_spec=tracker.disagg_spec,
             request_configs=tracker.request_configs,
             cached_keys=tracker.cached_keys,
+            cached_starts=tracker.cached_starts,
+            cached_ends=tracker.cached_ends,
         )
 
 
@@ -845,6 +851,8 @@ class LMCacheConnectorV1Impl:
                         vllm_cached_tokens=request.load_spec.vllm_cached_tokens,
                         sync=sync,
                         cached_keys=request.cached_keys,
+                        cached_starts=request.cached_starts,
+                        cached_ends=request.cached_ends,
                         req_id=request.req_id,
                     )
                     # NOTE: retrieve layers one by one with cpu prefetch
