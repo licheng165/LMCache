@@ -837,7 +837,6 @@ class LMCacheConnectorV1Impl:
                         vllm_cached_tokens=request.load_spec.vllm_cached_tokens,
                     )
                 elif request.is_sparse_decode:
-                    self.load_time[idx] = 0
                     layerwise_retriever = self.lmcache_engine.retrieve_layer_head_token_wise(
                         tokens[:lmcache_cached_tokens], # needed for keys of cached kv cache
                         token_mask[:lmcache_cached_tokens], # all true for lmcache chunk size 1
