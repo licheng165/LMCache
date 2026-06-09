@@ -977,7 +977,7 @@ class LMCacheConnectorV1Impl:
         return missing_blocks
 
     @_lmcache_nvtx_annotate
-    def wait_for_layer_load(self, layer_name: str, selected_tokens: list = None, token_start_idx: list = None) -> None:
+    def wait_for_layer_load(self, layer_name: str, selected_tokens: list = None, token_start_index: list = None) -> None:
         """Blocking until the KV for a specific layer is loaded into vLLM's
         paged buffer.
 
