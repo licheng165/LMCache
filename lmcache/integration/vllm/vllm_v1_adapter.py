@@ -1013,7 +1013,7 @@ class LMCacheConnectorV1Impl:
             else:
                 ret_token_mask = next(layerwise_retriever)
 
-            if self.current_layer == self.num_layers - 1:
+            if self.current_layer == self.num_layers - 1 and not request.is_sparse_decode:
                 assert ret_token_mask is not None
                 num_retrieved_tokens = ret_token_mask.sum().item()
                 logger.info(f"Retrieved {num_retrieved_tokens} tokens")
