@@ -36,7 +36,6 @@ from lmcache.integration.vllm.slot_mapping_cache import (
     CpuSlotMappingCache,
     DeviceSlotMappingCache,
     EMPTY_SLOT_MAPPING,
-    SlotMappingBuilder,
     connector_perf_log_enabled,
     log_slot_mapping_cache_summary,
 )
@@ -161,8 +160,8 @@ class RequestTracker:
     slot_mapping_cache: CpuSlotMappingCache = field(
         default_factory=CpuSlotMappingCache, repr=False
     )
-    # Sparse-decode prompt block fingerprint; stable across decode steps.
-    _sparse_slot_fp: Optional[tuple[int, ...]] = field(default=None, repr=False)
+    # Sparse decode: slot_mapping built once on scheduler, then omitted from metadata.
+    _sparse_slot_mapping_built: bool = field(default=False, repr=False)
 
     @_lmcache_nvtx_annotate
     @staticmethod
@@ -269,7 +268,7 @@ class RequestTracker:
                 f"Preempted request {self.req_id} has no all_token_ids"
             )
             self.slot_mapping_cache.invalidate()
-            self._sparse_slot_fp = None
+            self._sparse_slot_mapping_built = False
             # the block ids will change after preemption
             self.allocated_block_ids = new_block_ids
             # reset the number of saved tokens
@@ -442,33 +441,24 @@ class ReqMeta:
             )
 
         slot_mapping_tokens = len(token_ids)
-        if is_sparse_decode and load_spec is not None:
+        if is_sparse_decode and load_spec is not None and skip_save:
             slot_mapping_tokens = sparse_decode_slot_mapping_tokens(
                 load_spec.lmcache_cached_tokens
             )
-            if skip_save:
-                sparse_fp = SlotMappingBuilder.block_fingerprint(
-                    slot_mapping_block_fingerprint, block_size, slot_mapping_tokens
-                )
-                slot_mapping_block_fingerprint = sparse_fp
-                if tracker._sparse_slot_fp == sparse_fp:
-                    slot_mapping = EMPTY_SLOT_MAPPING
-                    reuse_worker_slot_mapping = True
-                    if connector_perf_log_enabled():
-                        logger.info(
-                            "cpu slot_mapping reuse_worker req=%s num_tokens=%d",
-                            tracker.req_id,
-                            slot_mapping_tokens,
-                        )
-                else:
-                    slot_mapping = tracker.slot_mapping_cache.get(
-                        tracker.allocated_block_ids, block_size, slot_mapping_tokens
-                    )
-                    tracker._sparse_slot_fp = sparse_fp
+            if tracker._sparse_slot_mapping_built:
+                slot_mapping = EMPTY_SLOT_MAPPING
+                reuse_worker_slot_mapping = True
+                slot_mapping_block_fingerprint = ()
             else:
                 slot_mapping = tracker.slot_mapping_cache.get(
-                    tracker.allocated_block_ids, block_size, len(token_ids)
+                    tracker.allocated_block_ids, block_size, slot_mapping_tokens
                 )
+                tracker._sparse_slot_mapping_built = True
+                slot_mapping_block_fingerprint = tuple(tracker.allocated_block_ids)
+        elif is_sparse_decode and load_spec is not None:
+            slot_mapping = tracker.slot_mapping_cache.get(
+                tracker.allocated_block_ids, block_size, len(token_ids)
+            )
         else:
             slot_mapping = tracker.slot_mapping_cache.get(
                 tracker.allocated_block_ids, block_size, slot_mapping_tokens
@@ -603,6 +593,7 @@ class LMCacheConnectorV1Impl:
             self.use_layerwise = config.use_layerwise
             self.enable_blending = config.enable_blending
             self._slot_mapping_device = DeviceSlotMappingCache(self.device)
+            self._sparse_device_slot_mappings: dict[str, torch.Tensor] = {}
 
             if self.enable_blending:
                 assert self.lmcache_engine is not None
@@ -835,14 +826,28 @@ class LMCacheConnectorV1Impl:
     def _get_device_slot_mapping(
         self, request: ReqMeta, num_tokens: int
     ) -> torch.Tensor:
+        if request.is_sparse_decode:
+            return self._get_sparse_device_slot_mapping(request, num_tokens)
         return self._slot_mapping_device.get(
             request.req_id,
             request.slot_mapping,
             request.slot_mapping_block_fingerprint,
             self._block_size,
             num_tokens,
-            reuse_worker_cache=request.reuse_worker_slot_mapping,
         )
+
+    def _get_sparse_device_slot_mapping(
+        self, request: ReqMeta, num_tokens: int
+    ) -> torch.Tensor:
+        """Return cached sparse-decode slot_mapping; build once per request."""
+        if request.reuse_worker_slot_mapping:
+            return self._sparse_device_slot_mappings[request.req_id]
+
+        slot_mapping = request.slot_mapping[:num_tokens].to(
+            device=self.device, dtype=torch.long
+        )
+        self._sparse_device_slot_mappings[request.req_id] = slot_mapping
+        return slot_mapping
 
     @staticmethod
     def _load_slot_mapping_token_count(request: ReqMeta) -> int:
@@ -915,8 +920,13 @@ class LMCacheConnectorV1Impl:
             tokens = request.token_ids
             lmcache_cached_tokens = request.load_spec.lmcache_cached_tokens
             load_slot_tokens = self._load_slot_mapping_token_count(request)
-            with perf.section("slot_mapping"):
-                slot_mapping = self._get_device_slot_mapping(request, load_slot_tokens)
+            if request.is_sparse_decode and request.reuse_worker_slot_mapping:
+                slot_mapping = self._sparse_device_slot_mappings[request.req_id]
+            else:
+                with perf.section("slot_mapping"):
+                    slot_mapping = self._get_device_slot_mapping(
+                        request, load_slot_tokens
+                    )
             if not request.is_sparse_decode:
                 assert len(tokens) == len(slot_mapping)
 
@@ -1887,6 +1897,8 @@ class LMCacheConnectorV1Impl:
 
         if hasattr(self, "_slot_mapping_device"):
             self._slot_mapping_device.clear(request.request_id)
+        if hasattr(self, "_sparse_device_slot_mappings"):
+            self._sparse_device_slot_mappings.pop(request.request_id, None)
 
         # Cleanup if request was aborted
         if request.status == RequestStatus.FINISHED_ABORTED and self.async_loading:
