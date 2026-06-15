@@ -30,6 +30,7 @@ from lmcache import utils
 from lmcache.integration.vllm.slot_mapping_cache import (
     CpuSlotMappingCache,
     DeviceSlotMappingCache,
+    connector_perf_log_enabled,
     log_slot_mapping_cache_summary,
 )
 from lmcache.integration.vllm.utils import (
@@ -604,6 +605,12 @@ class LMCacheConnectorV1Impl:
         self.force_skip_save = bool(os.environ.get("LMCACHE_FORCE_SKIP_SAVE", False))
         self._requests_priority: dict[str, int] = {}
         self._invalid_block_ids: set[int] = set()
+
+        if connector_perf_log_enabled():
+            logger.info(
+                "LMCACHE_CONNECTOR_PERF_LOG is enabled (connector role=%s)",
+                role,
+            )
 
     def _check_legacy_register_kv_caches(self) -> None:
         """Check for legacy connector without register_kv_caches implementation."""

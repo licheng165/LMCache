@@ -14,9 +14,20 @@ from lmcache.logging import init_logger
 
 logger = init_logger(__name__)
 
+_PERF_LOG_DISABLED = frozenset({"0", "false", "no", "off", ""})
+
 
 def connector_perf_log_enabled() -> bool:
-    return bool(os.environ.get("LMCACHE_CONNECTOR_PERF_LOG"))
+    value = os.environ.get("LMCACHE_CONNECTOR_PERF_LOG")
+    if value is None:
+        return False
+    return value.strip().lower() not in _PERF_LOG_DISABLED
+
+
+def _perf_log(msg: str, *args) -> None:
+    """Emit connector perf diagnostics at INFO (visible under default log level)."""
+    if connector_perf_log_enabled():
+        logger.info(msg, *args)
 
 
 @dataclass
@@ -47,7 +58,7 @@ def reset_slot_mapping_cache_counters() -> None:
 def log_slot_mapping_cache_summary(context: str) -> None:
     if not connector_perf_log_enabled():
         return
-    logger.debug(
+    _perf_log(
         "slot_mapping_cache %s cpu(hit=%d extend=%d rebuild=%d fp_mismatch=%d) "
         "device(hit=%d extend=%d rebuild=%d fp_mismatch=%d)",
         context,
@@ -141,13 +152,12 @@ class CpuSlotMappingCache:
             and self._tensor.numel() >= num_tokens
         ):
             CPU_SLOT_MAPPING_COUNTERS.hit += 1
-            if connector_perf_log_enabled():
-                logger.debug(
-                    "cpu slot_mapping hit num_tokens=%d num_blocks=%d fp_head=%s",
-                    num_tokens,
-                    num_blocks,
-                    _mapping_fp_head(tuple(block_ids), block_size, num_tokens),
-                )
+            _perf_log(
+                "cpu slot_mapping hit num_tokens=%d num_blocks=%d fp_head=%s",
+                num_tokens,
+                num_blocks,
+                _mapping_fp_head(tuple(block_ids), block_size, num_tokens),
+            )
             return self._tensor[:num_tokens]
 
         if self._tensor is not None and self._num_blocks == num_blocks:
@@ -157,15 +167,14 @@ class CpuSlotMappingCache:
             )
             self._tensor = torch.cat([self._tensor, new_slots])
             CPU_SLOT_MAPPING_COUNTERS.extend += 1
-            if connector_perf_log_enabled():
-                logger.debug(
-                    "cpu slot_mapping extend num_tokens=%d extend_start=%d "
-                    "num_blocks=%d fp_head=%s",
-                    num_tokens,
-                    extend_start,
-                    num_blocks,
-                    _mapping_fp_head(tuple(block_ids), block_size, num_tokens),
-                )
+            _perf_log(
+                "cpu slot_mapping extend num_tokens=%d extend_start=%d "
+                "num_blocks=%d fp_head=%s",
+                num_tokens,
+                extend_start,
+                num_blocks,
+                _mapping_fp_head(tuple(block_ids), block_size, num_tokens),
+            )
             return self._tensor[:num_tokens]
 
         if self._tensor is not None and self._num_blocks < num_blocks:
@@ -176,27 +185,25 @@ class CpuSlotMappingCache:
             self._tensor = torch.cat([self._tensor, new_slots])
             self._num_blocks = num_blocks
             CPU_SLOT_MAPPING_COUNTERS.extend += 1
-            if connector_perf_log_enabled():
-                logger.debug(
-                    "cpu slot_mapping extend_blocks num_tokens=%d num_blocks=%d "
-                    "prev_blocks=%d fp_head=%s",
-                    num_tokens,
-                    num_blocks,
-                    prev_blocks,
-                    _mapping_fp_head(tuple(block_ids), block_size, num_tokens),
-                )
+            _perf_log(
+                "cpu slot_mapping extend_blocks num_tokens=%d num_blocks=%d "
+                "prev_blocks=%d fp_head=%s",
+                num_tokens,
+                num_blocks,
+                prev_blocks,
+                _mapping_fp_head(tuple(block_ids), block_size, num_tokens),
+            )
             return self._tensor[:num_tokens]
 
         self._tensor = SlotMappingBuilder.slots_for_blocks(block_ids, block_size)
         self._num_blocks = num_blocks
         CPU_SLOT_MAPPING_COUNTERS.rebuild += 1
-        if connector_perf_log_enabled():
-            logger.debug(
-                "cpu slot_mapping rebuild num_tokens=%d num_blocks=%d fp_head=%s",
-                num_tokens,
-                num_blocks,
-                _mapping_fp_head(tuple(block_ids), block_size, num_tokens),
-            )
+        _perf_log(
+            "cpu slot_mapping rebuild num_tokens=%d num_blocks=%d fp_head=%s",
+            num_tokens,
+            num_blocks,
+            _mapping_fp_head(tuple(block_ids), block_size, num_tokens),
+        )
         return self._tensor[:num_tokens]
 
 
@@ -248,13 +255,12 @@ class DeviceSlotMappingCache:
             cached_fp, cached_tensor = entry
             if cached_fp == fp and cached_tensor.numel() >= num_tokens:
                 DEVICE_SLOT_MAPPING_COUNTERS.hit += 1
-                if connector_perf_log_enabled():
-                    logger.debug(
-                        "device slot_mapping hit req=%s num_tokens=%d fp_head=%s",
-                        req_id,
-                        num_tokens,
-                        _mapping_fp_head(block_fingerprint, block_size, num_tokens),
-                    )
+                _perf_log(
+                    "device slot_mapping hit req=%s num_tokens=%d fp_head=%s",
+                    req_id,
+                    num_tokens,
+                    _mapping_fp_head(block_fingerprint, block_size, num_tokens),
+                )
                 return cached_tensor[:num_tokens]
 
             if (
@@ -267,42 +273,39 @@ class DeviceSlotMappingCache:
                     )
                 self._entries[req_id] = (fp, cached_tensor)
                 DEVICE_SLOT_MAPPING_COUNTERS.extend += 1
-                if connector_perf_log_enabled():
-                    logger.debug(
-                        "device slot_mapping extend req=%s num_tokens=%d "
-                        "cached_fp_head=%s fp_head=%s",
-                        req_id,
-                        num_tokens,
-                        cached_fp[:4],
-                        fp[:4],
-                    )
+                _perf_log(
+                    "device slot_mapping extend req=%s num_tokens=%d "
+                    "cached_fp_head=%s fp_head=%s",
+                    req_id,
+                    num_tokens,
+                    cached_fp[:4],
+                    fp[:4],
+                )
                 return cached_tensor[:num_tokens]
 
             if not SlotMappingBuilder.fingerprint_compatible(cached_fp, fp):
                 self._entries.pop(req_id, None)
                 DEVICE_SLOT_MAPPING_COUNTERS.fp_mismatch += 1
-                if connector_perf_log_enabled():
-                    logger.debug(
-                        "device slot_mapping fp_mismatch req=%s num_tokens=%d "
-                        "cached_fp_head=%s fp_head=%s",
-                        req_id,
-                        num_tokens,
-                        cached_fp[:4],
-                        fp[:4],
-                    )
+                _perf_log(
+                    "device slot_mapping fp_mismatch req=%s num_tokens=%d "
+                    "cached_fp_head=%s fp_head=%s",
+                    req_id,
+                    num_tokens,
+                    cached_fp[:4],
+                    fp[:4],
+                )
 
         device_mapping = cpu_mapping[:num_tokens].to(
             device=self.device, dtype=torch.long
         )
         self._entries[req_id] = (fp, device_mapping)
         DEVICE_SLOT_MAPPING_COUNTERS.rebuild += 1
-        if connector_perf_log_enabled():
-            logger.debug(
-                "device slot_mapping rebuild req=%s num_tokens=%d fp_head=%s",
-                req_id,
-                num_tokens,
-                _mapping_fp_head(block_fingerprint, block_size, num_tokens),
-            )
+        _perf_log(
+            "device slot_mapping rebuild req=%s num_tokens=%d fp_head=%s",
+            req_id,
+            num_tokens,
+            _mapping_fp_head(block_fingerprint, block_size, num_tokens),
+        )
         return device_mapping
 
     def _extend_cached(
