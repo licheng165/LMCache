@@ -39,6 +39,14 @@ class SlotMappingBuilder:
     ) -> bool:
         return len(new_fp) > len(cached_fp) and new_fp[: len(cached_fp)] == cached_fp
 
+    @staticmethod
+    def fingerprint_compatible(
+        cached_fp: tuple[int, ...], new_fp: tuple[int, ...]
+    ) -> bool:
+        return cached_fp == new_fp or SlotMappingBuilder.is_prefix_extension(
+            cached_fp, new_fp
+        )
+
 
 @dataclass
 class CpuSlotMappingCache:
@@ -108,16 +116,17 @@ class DeviceSlotMappingCache:
                 return cached_tensor[:num_tokens]
 
             if (
-                SlotMappingBuilder.is_prefix_extension(cached_fp, fp)
+                SlotMappingBuilder.fingerprint_compatible(cached_fp, fp)
                 and cpu_mapping.numel() >= num_tokens
             ):
-                cached_tensor = self._extend_cached(
-                    cached_tensor, cpu_mapping, num_tokens
-                )
+                if cached_tensor.numel() < num_tokens:
+                    cached_tensor = self._extend_cached(
+                        cached_tensor, cpu_mapping, num_tokens
+                    )
                 self._entries[req_id] = (fp, cached_tensor)
                 return cached_tensor[:num_tokens]
 
-            if cached_fp != fp:
+            if not SlotMappingBuilder.fingerprint_compatible(cached_fp, fp):
                 self._entries.pop(req_id, None)
 
         device_mapping = cpu_mapping[:num_tokens].to(

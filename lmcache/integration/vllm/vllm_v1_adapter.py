@@ -781,6 +781,13 @@ class LMCacheConnectorV1Impl:
             num_tokens,
         )
 
+    @staticmethod
+    def _load_slot_mapping_token_count(request: ReqMeta) -> int:
+        """Tokens whose slot_mapping is needed for KV load in start_load_kv."""
+        if request.is_sparse_decode and request.load_spec is not None:
+            return request.load_spec.lmcache_cached_tokens
+        return len(request.token_ids)
+
     @_lmcache_nvtx_annotate
     def start_load_kv(self, forward_context: "ForwardContext", **kwargs) -> None:
         """Start loading the KV cache from the connector buffer to vLLM's
@@ -837,8 +844,11 @@ class LMCacheConnectorV1Impl:
                 continue
 
             tokens = request.token_ids
-            slot_mapping = self._get_device_slot_mapping(request, len(tokens))
-            assert len(tokens) == len(slot_mapping)
+            lmcache_cached_tokens = request.load_spec.lmcache_cached_tokens
+            load_slot_tokens = self._load_slot_mapping_token_count(request)
+            slot_mapping = self._get_device_slot_mapping(request, load_slot_tokens)
+            if not request.is_sparse_decode:
+                assert len(tokens) == len(slot_mapping)
 
             token_mask = torch.ones(len(tokens), dtype=torch.bool)
             masked_token_count = (
@@ -848,7 +858,6 @@ class LMCacheConnectorV1Impl:
             )
             token_mask[:masked_token_count] = False
 
-            lmcache_cached_tokens = request.load_spec.lmcache_cached_tokens
             if self.use_layerwise:
                 if idx == last_idx:
                     sync = True
