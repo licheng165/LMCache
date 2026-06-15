@@ -98,6 +98,9 @@ class SlotMappingCacheCounters:
 CPU_SLOT_MAPPING_COUNTERS = SlotMappingCacheCounters()
 DEVICE_SLOT_MAPPING_COUNTERS = SlotMappingCacheCounters()
 
+# Sentinel CPU tensor: metadata omits slot_mapping payload on sparse-decode reuse.
+EMPTY_SLOT_MAPPING = torch.empty(0, dtype=torch.long)
+
 
 def reset_slot_mapping_cache_counters() -> None:
     CPU_SLOT_MAPPING_COUNTERS.reset()
@@ -291,10 +294,9 @@ class DeviceSlotMappingCache:
         block_fingerprint: tuple[int, ...],
         block_size: int,
         num_tokens: int,
+        *,
+        reuse_worker_cache: bool = False,
     ) -> torch.Tensor:
-        cpu_mapping = self._resolve_cpu_mapping(
-            cpu_mapping, block_fingerprint, block_size, num_tokens
-        )
         fp = SlotMappingBuilder.block_fingerprint(
             block_fingerprint, block_size, num_tokens
         )
@@ -305,12 +307,20 @@ class DeviceSlotMappingCache:
             if cached_fp == fp and cached_tensor.numel() >= num_tokens:
                 DEVICE_SLOT_MAPPING_COUNTERS.hit += 1
                 _perf_log(
-                    "device slot_mapping hit req=%s num_tokens=%d fp_head=%s",
+                    "device slot_mapping hit req=%s num_tokens=%d fp_head=%s "
+                    "reuse_worker_cache=%s",
                     req_id,
                     num_tokens,
                     _mapping_fp_head(block_fingerprint, block_size, num_tokens),
+                    reuse_worker_cache,
                 )
                 return cached_tensor[:num_tokens]
+
+            if reuse_worker_cache:
+                raise RuntimeError(
+                    f"Sparse decode slot_mapping worker cache miss for {req_id}: "
+                    f"cached_fp_head={cached_fp[:4]} fp_head={fp[:4]}"
+                )
 
             if (
                 SlotMappingBuilder.fingerprint_compatible(cached_fp, fp)
@@ -344,6 +354,14 @@ class DeviceSlotMappingCache:
                     fp[:4],
                 )
 
+        elif reuse_worker_cache:
+            raise RuntimeError(
+                f"Sparse decode slot_mapping worker cache empty for {req_id}"
+            )
+
+        cpu_mapping = self._resolve_cpu_mapping(
+            cpu_mapping, block_fingerprint, block_size, num_tokens
+        )
         device_mapping = cpu_mapping[:num_tokens].to(
             device=self.device, dtype=torch.long
         )

@@ -35,6 +35,8 @@ from lmcache.integration.vllm.slot_mapping_cache import (
     ConnectorPerfTimer,
     CpuSlotMappingCache,
     DeviceSlotMappingCache,
+    EMPTY_SLOT_MAPPING,
+    SlotMappingBuilder,
     connector_perf_log_enabled,
     log_slot_mapping_cache_summary,
 )
@@ -159,6 +161,8 @@ class RequestTracker:
     slot_mapping_cache: CpuSlotMappingCache = field(
         default_factory=CpuSlotMappingCache, repr=False
     )
+    # Sparse-decode prompt block fingerprint; stable across decode steps.
+    _sparse_slot_fp: Optional[tuple[int, ...]] = field(default=None, repr=False)
 
     @_lmcache_nvtx_annotate
     @staticmethod
@@ -265,6 +269,7 @@ class RequestTracker:
                 f"Preempted request {self.req_id} has no all_token_ids"
             )
             self.slot_mapping_cache.invalidate()
+            self._sparse_slot_fp = None
             # the block ids will change after preemption
             self.allocated_block_ids = new_block_ids
             # reset the number of saved tokens
@@ -301,6 +306,8 @@ class ReqMeta:
     slot_mapping: torch.Tensor
     # vLLM block ids used to build slot_mapping; worker cache invalidates on change.
     slot_mapping_block_fingerprint: tuple[int, ...] = field(default_factory=tuple)
+    # Sparse decode: omit slot_mapping in metadata; worker uses cached device tensor.
+    reuse_worker_slot_mapping: bool = False
 
     # key of cached object
     cached_keys: list[list] = field(default_factory=list)
@@ -397,8 +404,14 @@ class ReqMeta:
             tracker.num_saved_tokens = num_tokens_to_save
         save_spec = SaveSpec(skip_leading_tokens, not skip_save)
 
+        reuse_worker_slot_mapping = False
+        slot_mapping_block_fingerprint = tuple(tracker.allocated_block_ids)
+
         # Calculate the token ids and slot mappings for load and save
-        token_ids = input_token_ids[:num_tokens_to_save]
+        if is_sparse_decode and load_spec is not None and skip_save:
+            token_ids = input_token_ids[: load_spec.lmcache_cached_tokens]
+        else:
+            token_ids = input_token_ids[:num_tokens_to_save]
 
         # If the request has multimodal hashes, apply them to the token ids
         if tracker.mm_hashes:
@@ -433,10 +446,33 @@ class ReqMeta:
             slot_mapping_tokens = sparse_decode_slot_mapping_tokens(
                 load_spec.lmcache_cached_tokens
             )
-
-        slot_mapping = tracker.slot_mapping_cache.get(
-            tracker.allocated_block_ids, block_size, slot_mapping_tokens
-        )
+            if skip_save:
+                sparse_fp = SlotMappingBuilder.block_fingerprint(
+                    slot_mapping_block_fingerprint, block_size, slot_mapping_tokens
+                )
+                slot_mapping_block_fingerprint = sparse_fp
+                if tracker._sparse_slot_fp == sparse_fp:
+                    slot_mapping = EMPTY_SLOT_MAPPING
+                    reuse_worker_slot_mapping = True
+                    if connector_perf_log_enabled():
+                        logger.info(
+                            "cpu slot_mapping reuse_worker req=%s num_tokens=%d",
+                            tracker.req_id,
+                            slot_mapping_tokens,
+                        )
+                else:
+                    slot_mapping = tracker.slot_mapping_cache.get(
+                        tracker.allocated_block_ids, block_size, slot_mapping_tokens
+                    )
+                    tracker._sparse_slot_fp = sparse_fp
+            else:
+                slot_mapping = tracker.slot_mapping_cache.get(
+                    tracker.allocated_block_ids, block_size, len(token_ids)
+                )
+        else:
+            slot_mapping = tracker.slot_mapping_cache.get(
+                tracker.allocated_block_ids, block_size, slot_mapping_tokens
+            )
         assert slot_mapping.dtype == torch.long  # TODO: this could be removed
 
         # For load operation: log if the request is scheduled to load
@@ -453,7 +489,8 @@ class ReqMeta:
             req_id=tracker.req_id,
             token_ids=token_ids,
             slot_mapping=slot_mapping,
-            slot_mapping_block_fingerprint=tuple(tracker.allocated_block_ids),
+            slot_mapping_block_fingerprint=slot_mapping_block_fingerprint,
+            reuse_worker_slot_mapping=reuse_worker_slot_mapping,
             is_last_prefill=is_last_prefill,
             is_sparse_decode=is_sparse_decode,
             save_spec=save_spec,
@@ -804,6 +841,7 @@ class LMCacheConnectorV1Impl:
             request.slot_mapping_block_fingerprint,
             self._block_size,
             num_tokens,
+            reuse_worker_cache=request.reuse_worker_slot_mapping,
         )
 
     @staticmethod
