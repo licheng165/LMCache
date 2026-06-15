@@ -27,6 +27,10 @@ import torch
 # Use LMCache's own math utilities instead of vllm's
 # (avoids dependency on vllm internal changes like https://github.com/vllm-project/vllm/pull/27188)
 from lmcache import utils
+from lmcache.integration.vllm.sparse_decode_config import (
+    SPARSE_DECODE_RETRIEVE_TOKENS,
+    sparse_decode_slot_mapping_tokens,
+)
 from lmcache.integration.vllm.slot_mapping_cache import (
     ConnectorPerfTimer,
     CpuSlotMappingCache,
@@ -426,8 +430,8 @@ class ReqMeta:
 
         slot_mapping_tokens = len(token_ids)
         if is_sparse_decode and load_spec is not None:
-            slot_mapping_tokens = min(
-                load_spec.lmcache_cached_tokens, len(token_ids)
+            slot_mapping_tokens = sparse_decode_slot_mapping_tokens(
+                load_spec.lmcache_cached_tokens
             )
 
         slot_mapping = tracker.slot_mapping_cache.get(
@@ -611,6 +615,12 @@ class LMCacheConnectorV1Impl:
             logger.info(
                 "LMCACHE_CONNECTOR_PERF_LOG is enabled (connector role=%s)",
                 role,
+            )
+        if self.enable_sparse_attention:
+            logger.info(
+                "Sparse decode retrieve window: %d tokens "
+                "(LMCACHE_SPARSE_DECODE_RETRIEVE_TOKENS)",
+                SPARSE_DECODE_RETRIEVE_TOKENS,
             )
 
     def _check_legacy_register_kv_caches(self) -> None:
@@ -800,7 +810,9 @@ class LMCacheConnectorV1Impl:
     def _load_slot_mapping_token_count(request: ReqMeta) -> int:
         """Tokens whose slot_mapping is needed for KV load in start_load_kv."""
         if request.is_sparse_decode and request.load_spec is not None:
-            return request.load_spec.lmcache_cached_tokens
+            return sparse_decode_slot_mapping_tokens(
+                request.load_spec.lmcache_cached_tokens
+            )
         return len(request.token_ids)
 
     @_lmcache_nvtx_annotate
@@ -891,7 +903,7 @@ class LMCacheConnectorV1Impl:
                             tokens[:lmcache_cached_tokens],
                             token_mask[:lmcache_cached_tokens],
                             kvcaches=kvcaches,
-                            slot_mapping=slot_mapping[:2048],
+                            slot_mapping=slot_mapping,
                             vllm_cached_tokens=request.load_spec.vllm_cached_tokens,
                         )
                 elif request.is_sparse_decode:
@@ -901,7 +913,7 @@ class LMCacheConnectorV1Impl:
                                 tokens[:lmcache_cached_tokens], # needed for keys of cached kv cache
                                 token_mask[:lmcache_cached_tokens], # all true for lmcache chunk size 1
                                 kvcaches=kvcaches, # needed to allocate gpu buffer of the same size
-                                slot_mapping=slot_mapping[:2048], # same attention blocks for all layers
+                                slot_mapping=slot_mapping,
                                 vllm_cached_tokens=request.load_spec.vllm_cached_tokens,
                                 sync=sync,
                                 cached_keys=request.cached_keys,
