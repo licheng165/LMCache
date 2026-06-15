@@ -30,6 +30,7 @@ from lmcache import utils
 from lmcache.integration.vllm.slot_mapping_cache import (
     CpuSlotMappingCache,
     DeviceSlotMappingCache,
+    log_slot_mapping_cache_summary,
 )
 from lmcache.integration.vllm.utils import (
     ENGINE_NAME,
@@ -421,8 +422,14 @@ class ReqMeta:
                 block_size,
             )
 
+        slot_mapping_tokens = len(token_ids)
+        if is_sparse_decode and load_spec is not None:
+            slot_mapping_tokens = min(
+                load_spec.lmcache_cached_tokens, len(token_ids)
+            )
+
         slot_mapping = tracker.slot_mapping_cache.get(
-            tracker.allocated_block_ids, block_size, len(token_ids)
+            tracker.allocated_block_ids, block_size, slot_mapping_tokens
         )
         assert slot_mapping.dtype == torch.long  # TODO: this could be removed
 
@@ -943,6 +950,8 @@ class LMCacheConnectorV1Impl:
                     )
                     self._invalid_block_ids.update(missing_blocks)
 
+        log_slot_mapping_cache_summary("start_load_kv")
+
     def record_failed_blocks(
         self,
         request_id: str,
@@ -1138,7 +1147,8 @@ class LMCacheConnectorV1Impl:
 
                 slot_mapping = request.slot_mapping
                 assert isinstance(slot_mapping, torch.Tensor)
-                assert len(slot_mapping) == len(token_ids)
+                if not request.is_sparse_decode:
+                    assert len(slot_mapping) == len(token_ids)
 
                 slot_mapping = self._get_device_slot_mapping(request, len(token_ids))
 
@@ -1240,7 +1250,8 @@ class LMCacheConnectorV1Impl:
 
             slot_mapping = request.slot_mapping
             assert isinstance(slot_mapping, torch.Tensor)
-            assert len(slot_mapping) == len(token_ids)
+            if not request.is_sparse_decode:
+                assert len(slot_mapping) == len(token_ids)
 
             slot_mapping = self._get_device_slot_mapping(request, len(token_ids))
 
@@ -1647,6 +1658,7 @@ class LMCacheConnectorV1Impl:
                 )
                 if req_meta is not None:
                     meta.add_request(req_meta)
+            log_slot_mapping_cache_summary("build_connector_meta")
             return meta
 
         for i, req_id in enumerate(cached_reqs.req_ids):
@@ -1776,6 +1788,7 @@ class LMCacheConnectorV1Impl:
             if req_meta is not None:
                 meta.add_request(req_meta)
 
+        log_slot_mapping_cache_summary("build_connector_meta")
         return meta
 
     @_lmcache_nvtx_annotate

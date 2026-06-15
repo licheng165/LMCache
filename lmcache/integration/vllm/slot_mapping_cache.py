@@ -3,12 +3,70 @@
 
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass, field
 from typing import Optional
 
 import torch
 
 from lmcache import utils
+from lmcache.logging import init_logger
+
+logger = init_logger(__name__)
+
+
+def connector_perf_log_enabled() -> bool:
+    return bool(os.environ.get("LMCACHE_CONNECTOR_PERF_LOG"))
+
+
+@dataclass
+class SlotMappingCacheCounters:
+    """Aggregate hit/miss counters for connector perf diagnostics."""
+
+    hit: int = 0
+    extend: int = 0
+    rebuild: int = 0
+    fp_mismatch: int = 0
+
+    def reset(self) -> None:
+        self.hit = 0
+        self.extend = 0
+        self.rebuild = 0
+        self.fp_mismatch = 0
+
+
+CPU_SLOT_MAPPING_COUNTERS = SlotMappingCacheCounters()
+DEVICE_SLOT_MAPPING_COUNTERS = SlotMappingCacheCounters()
+
+
+def reset_slot_mapping_cache_counters() -> None:
+    CPU_SLOT_MAPPING_COUNTERS.reset()
+    DEVICE_SLOT_MAPPING_COUNTERS.reset()
+
+
+def log_slot_mapping_cache_summary(context: str) -> None:
+    if not connector_perf_log_enabled():
+        return
+    logger.debug(
+        "slot_mapping_cache %s cpu(hit=%d extend=%d rebuild=%d fp_mismatch=%d) "
+        "device(hit=%d extend=%d rebuild=%d fp_mismatch=%d)",
+        context,
+        CPU_SLOT_MAPPING_COUNTERS.hit,
+        CPU_SLOT_MAPPING_COUNTERS.extend,
+        CPU_SLOT_MAPPING_COUNTERS.rebuild,
+        CPU_SLOT_MAPPING_COUNTERS.fp_mismatch,
+        DEVICE_SLOT_MAPPING_COUNTERS.hit,
+        DEVICE_SLOT_MAPPING_COUNTERS.extend,
+        DEVICE_SLOT_MAPPING_COUNTERS.rebuild,
+        DEVICE_SLOT_MAPPING_COUNTERS.fp_mismatch,
+    )
+    reset_slot_mapping_cache_counters()
+
+
+def _mapping_fp_head(
+    block_ids: tuple[int, ...], block_size: int, num_tokens: int, n: int = 4
+) -> tuple[int, ...]:
+    return SlotMappingBuilder.block_fingerprint(block_ids, block_size, num_tokens)[:n]
 
 
 class SlotMappingBuilder:
@@ -25,6 +83,18 @@ class SlotMappingBuilder:
             block_offsets.reshape((1, block_size))
             + block_ids_t.reshape((num_blocks, 1)) * block_size
         ).flatten()
+
+    @staticmethod
+    def slots_for_token_range(
+        block_ids: list[int], block_size: int, start_token: int, end_token: int
+    ) -> torch.Tensor:
+        """Slot indices for token indices ``[start_token, end_token)``."""
+        if start_token >= end_token or not block_ids:
+            return torch.empty(0, dtype=torch.long)
+        tokens = torch.arange(start_token, end_token, dtype=torch.long)
+        block_ids_t = torch.tensor(block_ids, dtype=torch.long)
+        block_indices = tokens // block_size
+        return block_ids_t[block_indices] * block_size + (tokens % block_size)
 
     @staticmethod
     def block_fingerprint(
@@ -70,18 +140,63 @@ class CpuSlotMappingCache:
             and self._num_blocks == num_blocks
             and self._tensor.numel() >= num_tokens
         ):
+            CPU_SLOT_MAPPING_COUNTERS.hit += 1
+            if connector_perf_log_enabled():
+                logger.debug(
+                    "cpu slot_mapping hit num_tokens=%d num_blocks=%d fp_head=%s",
+                    num_tokens,
+                    num_blocks,
+                    _mapping_fp_head(tuple(block_ids), block_size, num_tokens),
+                )
+            return self._tensor[:num_tokens]
+
+        if self._tensor is not None and self._num_blocks == num_blocks:
+            extend_start = self._tensor.numel()
+            new_slots = SlotMappingBuilder.slots_for_token_range(
+                block_ids, block_size, extend_start, num_tokens
+            )
+            self._tensor = torch.cat([self._tensor, new_slots])
+            CPU_SLOT_MAPPING_COUNTERS.extend += 1
+            if connector_perf_log_enabled():
+                logger.debug(
+                    "cpu slot_mapping extend num_tokens=%d extend_start=%d "
+                    "num_blocks=%d fp_head=%s",
+                    num_tokens,
+                    extend_start,
+                    num_blocks,
+                    _mapping_fp_head(tuple(block_ids), block_size, num_tokens),
+                )
             return self._tensor[:num_tokens]
 
         if self._tensor is not None and self._num_blocks < num_blocks:
+            prev_blocks = self._num_blocks
             new_slots = SlotMappingBuilder.slots_for_blocks(
                 block_ids[self._num_blocks :], block_size
             )
             self._tensor = torch.cat([self._tensor, new_slots])
             self._num_blocks = num_blocks
+            CPU_SLOT_MAPPING_COUNTERS.extend += 1
+            if connector_perf_log_enabled():
+                logger.debug(
+                    "cpu slot_mapping extend_blocks num_tokens=%d num_blocks=%d "
+                    "prev_blocks=%d fp_head=%s",
+                    num_tokens,
+                    num_blocks,
+                    prev_blocks,
+                    _mapping_fp_head(tuple(block_ids), block_size, num_tokens),
+                )
             return self._tensor[:num_tokens]
 
         self._tensor = SlotMappingBuilder.slots_for_blocks(block_ids, block_size)
         self._num_blocks = num_blocks
+        CPU_SLOT_MAPPING_COUNTERS.rebuild += 1
+        if connector_perf_log_enabled():
+            logger.debug(
+                "cpu slot_mapping rebuild num_tokens=%d num_blocks=%d fp_head=%s",
+                num_tokens,
+                num_blocks,
+                _mapping_fp_head(tuple(block_ids), block_size, num_tokens),
+            )
         return self._tensor[:num_tokens]
 
 
@@ -97,6 +212,22 @@ class DeviceSlotMappingCache:
     def clear(self, req_id: str) -> None:
         self._entries.pop(req_id, None)
 
+    @staticmethod
+    def _resolve_cpu_mapping(
+        cpu_mapping: torch.Tensor,
+        block_fingerprint: tuple[int, ...],
+        block_size: int,
+        num_tokens: int,
+    ) -> torch.Tensor:
+        if cpu_mapping.numel() >= num_tokens:
+            return cpu_mapping[:num_tokens]
+        if not block_fingerprint:
+            return cpu_mapping[:num_tokens]
+        built = SlotMappingBuilder.slots_for_blocks(
+            list(block_fingerprint), block_size
+        )
+        return built[:num_tokens]
+
     def get(
         self,
         req_id: str,
@@ -105,6 +236,9 @@ class DeviceSlotMappingCache:
         block_size: int,
         num_tokens: int,
     ) -> torch.Tensor:
+        cpu_mapping = self._resolve_cpu_mapping(
+            cpu_mapping, block_fingerprint, block_size, num_tokens
+        )
         fp = SlotMappingBuilder.block_fingerprint(
             block_fingerprint, block_size, num_tokens
         )
@@ -113,6 +247,14 @@ class DeviceSlotMappingCache:
         if entry is not None:
             cached_fp, cached_tensor = entry
             if cached_fp == fp and cached_tensor.numel() >= num_tokens:
+                DEVICE_SLOT_MAPPING_COUNTERS.hit += 1
+                if connector_perf_log_enabled():
+                    logger.debug(
+                        "device slot_mapping hit req=%s num_tokens=%d fp_head=%s",
+                        req_id,
+                        num_tokens,
+                        _mapping_fp_head(block_fingerprint, block_size, num_tokens),
+                    )
                 return cached_tensor[:num_tokens]
 
             if (
@@ -124,15 +266,43 @@ class DeviceSlotMappingCache:
                         cached_tensor, cpu_mapping, num_tokens
                     )
                 self._entries[req_id] = (fp, cached_tensor)
+                DEVICE_SLOT_MAPPING_COUNTERS.extend += 1
+                if connector_perf_log_enabled():
+                    logger.debug(
+                        "device slot_mapping extend req=%s num_tokens=%d "
+                        "cached_fp_head=%s fp_head=%s",
+                        req_id,
+                        num_tokens,
+                        cached_fp[:4],
+                        fp[:4],
+                    )
                 return cached_tensor[:num_tokens]
 
             if not SlotMappingBuilder.fingerprint_compatible(cached_fp, fp):
                 self._entries.pop(req_id, None)
+                DEVICE_SLOT_MAPPING_COUNTERS.fp_mismatch += 1
+                if connector_perf_log_enabled():
+                    logger.debug(
+                        "device slot_mapping fp_mismatch req=%s num_tokens=%d "
+                        "cached_fp_head=%s fp_head=%s",
+                        req_id,
+                        num_tokens,
+                        cached_fp[:4],
+                        fp[:4],
+                    )
 
         device_mapping = cpu_mapping[:num_tokens].to(
             device=self.device, dtype=torch.long
         )
         self._entries[req_id] = (fp, device_mapping)
+        DEVICE_SLOT_MAPPING_COUNTERS.rebuild += 1
+        if connector_perf_log_enabled():
+            logger.debug(
+                "device slot_mapping rebuild req=%s num_tokens=%d fp_head=%s",
+                req_id,
+                num_tokens,
+                _mapping_fp_head(block_fingerprint, block_size, num_tokens),
+            )
         return device_mapping
 
     def _extend_cached(
