@@ -27,6 +27,10 @@ import torch
 # Use LMCache's own math utilities instead of vllm's
 # (avoids dependency on vllm internal changes like https://github.com/vllm-project/vllm/pull/27188)
 from lmcache import utils
+from lmcache.integration.vllm.slot_mapping_cache import (
+    CpuSlotMappingCache,
+    DeviceSlotMappingCache,
+)
 from lmcache.integration.vllm.utils import (
     ENGINE_NAME,
     apply_mm_hashes_to_token_ids,
@@ -145,59 +149,9 @@ class RequestTracker:
     cached_ends: list[int] = field(default_factory=list)
     cached_memory_objs: list[list] = field(default_factory=list)
     cached_tensors: list[list] = field(default_factory=list)
-    _slot_mapping_cpu_cache: Optional[torch.Tensor] = field(default=None, repr=False)
-    _slot_mapping_cached_num_blocks: int = field(default=0, repr=False)
-
-    @staticmethod
-    def _build_slot_mapping_for_blocks(
-        block_ids: list[int], block_size: int
-    ) -> torch.Tensor:
-        num_blocks = len(block_ids)
-        if num_blocks == 0:
-            return torch.empty(0, dtype=torch.long)
-        block_ids_t = torch.tensor(block_ids, dtype=torch.long)
-        block_offsets = torch.arange(0, block_size, dtype=torch.long)
-        return (
-            block_offsets.reshape((1, block_size))
-            + block_ids_t.reshape((num_blocks, 1)) * block_size
-        ).flatten()
-
-    def invalidate_slot_mapping_cache(self) -> None:
-        self._slot_mapping_cpu_cache = None
-        self._slot_mapping_cached_num_blocks = 0
-
-    def get_slot_mapping_cpu(self, block_size: int, num_tokens: int) -> torch.Tensor:
-        """Return CPU slot_mapping, reusing or extending the tracker cache."""
-        num_blocks = len(self.allocated_block_ids)
-        cache = self._slot_mapping_cpu_cache
-        cached_blocks = self._slot_mapping_cached_num_blocks
-
-        if cache is not None and cached_blocks > num_blocks:
-            self.invalidate_slot_mapping_cache()
-            cache = None
-            cached_blocks = 0
-
-        if (
-            cache is not None
-            and cached_blocks == num_blocks
-            and cache.numel() >= num_tokens
-        ):
-            return cache[:num_tokens]
-
-        if cache is not None and cached_blocks < num_blocks:
-            new_block_ids = self.allocated_block_ids[cached_blocks:]
-            new_slots = self._build_slot_mapping_for_blocks(new_block_ids, block_size)
-            cache = torch.cat([cache, new_slots])
-            self._slot_mapping_cpu_cache = cache
-            self._slot_mapping_cached_num_blocks = num_blocks
-            return cache[:num_tokens]
-
-        cache = self._build_slot_mapping_for_blocks(
-            self.allocated_block_ids, block_size
-        )
-        self._slot_mapping_cpu_cache = cache
-        self._slot_mapping_cached_num_blocks = num_blocks
-        return cache[:num_tokens]
+    slot_mapping_cache: CpuSlotMappingCache = field(
+        default_factory=CpuSlotMappingCache, repr=False
+    )
 
     @_lmcache_nvtx_annotate
     @staticmethod
@@ -303,7 +257,7 @@ class RequestTracker:
             assert all_token_ids is not None, (
                 f"Preempted request {self.req_id} has no all_token_ids"
             )
-            self.invalidate_slot_mapping_cache()
+            self.slot_mapping_cache.invalidate()
             # the block ids will change after preemption
             self.allocated_block_ids = new_block_ids
             # reset the number of saved tokens
@@ -467,7 +421,9 @@ class ReqMeta:
                 block_size,
             )
 
-        slot_mapping = tracker.get_slot_mapping_cpu(block_size, len(token_ids))
+        slot_mapping = tracker.slot_mapping_cache.get(
+            tracker.allocated_block_ids, block_size, len(token_ids)
+        )
         assert slot_mapping.dtype == torch.long  # TODO: this could be removed
 
         # For load operation: log if the request is scheduled to load
@@ -596,9 +552,7 @@ class LMCacheConnectorV1Impl:
         else:
             self.use_layerwise = config.use_layerwise
             self.enable_blending = config.enable_blending
-            self._device_slot_mapping_cache: dict[
-                str, tuple[tuple[int, ...], torch.Tensor]
-            ] = {}
+            self._slot_mapping_device = DeviceSlotMappingCache(self.device)
 
             if self.enable_blending:
                 assert self.lmcache_engine is not None
@@ -816,57 +770,16 @@ class LMCacheConnectorV1Impl:
         self._build_kv_layer_groups()
         self._manager.post_init()
 
-    @staticmethod
-    def _slot_mapping_block_fingerprint(
-        block_fingerprint: tuple[int, ...], block_size: int, num_tokens: int
-    ) -> tuple[int, ...]:
-        num_blocks = utils.cdiv(num_tokens, block_size)
-        return block_fingerprint[:num_blocks]
-
     def _get_device_slot_mapping(
         self, request: ReqMeta, num_tokens: int
     ) -> torch.Tensor:
-        """Return device slot_mapping, reusing cache when vLLM blocks are unchanged."""
-        fp = self._slot_mapping_block_fingerprint(
+        return self._slot_mapping_device.get(
+            request.req_id,
+            request.slot_mapping,
             request.slot_mapping_block_fingerprint,
             self._block_size,
             num_tokens,
         )
-        cache = self._device_slot_mapping_cache.get(request.req_id)
-
-        if cache is not None:
-            cached_fp, cached_tensor = cache
-            if cached_fp == fp and cached_tensor.numel() >= num_tokens:
-                return cached_tensor[:num_tokens]
-
-            if (
-                len(fp) > len(cached_fp)
-                and fp[: len(cached_fp)] == cached_fp
-                and request.slot_mapping.numel() >= num_tokens
-            ):
-                extend_start = cached_tensor.numel()
-                if num_tokens > extend_start:
-                    new_slice = request.slot_mapping[extend_start:num_tokens].to(
-                        device=self.device, dtype=torch.long
-                    )
-                    cached_tensor = torch.cat([cached_tensor, new_slice])
-                else:
-                    cached_tensor = cached_tensor[:num_tokens]
-                self._device_slot_mapping_cache[request.req_id] = (fp, cached_tensor)
-                return cached_tensor[:num_tokens]
-
-            if cached_fp != fp:
-                self._device_slot_mapping_cache.pop(request.req_id, None)
-
-        dev_mapping = request.slot_mapping[:num_tokens].to(
-            device=self.device, dtype=torch.long
-        )
-        self._device_slot_mapping_cache[request.req_id] = (fp, dev_mapping)
-        return dev_mapping
-
-    def _clear_device_slot_mapping_cache(self, req_id: str) -> None:
-        if hasattr(self, "_device_slot_mapping_cache"):
-            self._device_slot_mapping_cache.pop(req_id, None)
 
     @_lmcache_nvtx_annotate
     def start_load_kv(self, forward_context: "ForwardContext", **kwargs) -> None:
@@ -948,7 +861,7 @@ class LMCacheConnectorV1Impl:
                         tokens[:lmcache_cached_tokens],
                         token_mask[:lmcache_cached_tokens],
                         kvcaches=kvcaches,
-                        slot_mapping=slot_mapping[:lmcache_cached_tokens],
+                        slot_mapping=slot_mapping[:2048],
                         vllm_cached_tokens=request.load_spec.vllm_cached_tokens,
                     )
                 elif request.is_sparse_decode:
@@ -956,7 +869,7 @@ class LMCacheConnectorV1Impl:
                         tokens[:lmcache_cached_tokens], # needed for keys of cached kv cache
                         token_mask[:lmcache_cached_tokens], # all true for lmcache chunk size 1
                         kvcaches=kvcaches, # needed to allocate gpu buffer of the same size
-                        slot_mapping=slot_mapping[:lmcache_cached_tokens], # same attention blocks for all layers
+                        slot_mapping=slot_mapping[:2048], # same attention blocks for all layers
                         vllm_cached_tokens=request.load_spec.vllm_cached_tokens,
                         sync=sync,
                         cached_keys=request.cached_keys,
@@ -1096,7 +1009,13 @@ class LMCacheConnectorV1Impl:
         return missing_blocks
 
     @_lmcache_nvtx_annotate
-    def wait_for_layer_load(self, layer_name: str, selected_tokens: list = None, token_start_index: list = None) -> None:
+    def wait_for_layer_load(
+        self,
+        layer_name: str,
+        selected_tokens: list = None,
+        token_start_index: list = None,
+        request_ids: list = None,
+    ) -> None:
         """Blocking until the KV for a specific layer is loaded into vLLM's
         paged buffer.
 
@@ -1104,23 +1023,45 @@ class LMCacheConnectorV1Impl:
 
         Args:
             layer_name: the name of that layer
+            selected_tokens: batched sparse token indices per decode request.
+            token_start_index: per-request start offset into slot_mapping.
+            request_ids: req_id for each selected_tokens row (input_batch order).
         """
         if self.layerwise_retrievers:
             logger.debug(f"Waiting for layer {self.current_layer} to be loaded")
 
         metadata = self._parent._get_connector_metadata()
         assert isinstance(metadata, LMCacheConnectorMetadata)
+        row_of_req = (
+            {rid: row for row, rid in enumerate(request_ids)}
+            if request_ids is not None
+            else None
+        )
 
-        # Wait for the layer to be loaded
         idx = 0
+        decode_row = 0
         for request in metadata.requests:
             if request.load_spec is None or not request.load_spec.can_load:
                 continue
             layerwise_retriever = self.layerwise_retrievers[idx]
             if request.is_sparse_decode:
-                selected_tokens_per_req = None if selected_tokens is None else selected_tokens[idx]
-                token_start_index_per_req = 0 if token_start_index is None else token_start_index[idx]
-                ret_token_mask = layerwise_retriever.send((selected_tokens_per_req, token_start_index_per_req))
+                if selected_tokens is None:
+                    selected_tokens_per_req = None
+                    token_start_index_per_req = 0
+                else:
+                    row = (
+                        row_of_req[request.req_id]
+                        if row_of_req is not None
+                        else decode_row
+                    )
+                    selected_tokens_per_req = selected_tokens[row]
+                    token_start_index_per_req = (
+                        0 if token_start_index is None else token_start_index[row]
+                    )
+                ret_token_mask = layerwise_retriever.send(
+                    (selected_tokens_per_req, token_start_index_per_req)
+                )
+                decode_row += 1
             else:
                 ret_token_mask = next(layerwise_retriever)
 
@@ -1476,7 +1417,7 @@ class LMCacheConnectorV1Impl:
         below_min_retrieve = min_retrieve > 0 and need_to_allocate < min_retrieve
 
         if below_min_retrieve:
-            logger.info(
+            logger.debug(
                 "Reqid: %s, Total tokens %d, Inference Engine computed tokens: %d, "
                 "LMCache hit tokens: %d, but need to load: %d < min_retrieve %d, "
                 "skip retrieve but record for save skip",
@@ -1488,7 +1429,7 @@ class LMCacheConnectorV1Impl:
                 min_retrieve,
             )
         else:
-            logger.info(
+            logger.debug(
                 "Reqid: %s, Total tokens %d, Inference Engine computed tokens: %d, "
                 "LMCache hit tokens: %d, need to load: %d",
                 req_id,
@@ -1842,7 +1783,8 @@ class LMCacheConnectorV1Impl:
         ):
             self._layerwise_save_storers.pop(request.request_id, None)
 
-        self._clear_device_slot_mapping_cache(request.request_id)
+        if hasattr(self, "_slot_mapping_device"):
+            self._slot_mapping_device.clear(request.request_id)
 
         # Cleanup if request was aborted
         if request.status == RequestStatus.FINISHED_ABORTED and self.async_loading:

@@ -74,7 +74,13 @@ class LMCacheConnectorV1Dynamic(KVConnectorBase_V1):
         """
         self._lmcache_engine.start_load_kv(forward_context, **kwargs)
 
-    def wait_for_layer_load(self, layer_name: str) -> None:
+    def wait_for_layer_load(
+        self,
+        layer_name: str,
+        selected_tokens: list = None,
+        token_start_index: list = None,
+        request_ids=None,
+    ) -> None:
         """
         Block until the KV for a specific layer is loaded into vLLM's
         paged buffer. This is called from within attention layer to ensure
@@ -84,8 +90,14 @@ class LMCacheConnectorV1Dynamic(KVConnectorBase_V1):
 
         Args:
             layer_name: the name of that layer
+            selected_tokens: batched per-request DSA selected token indices.
+            token_start_index: per-request start offset into slot_mapping.
+            request_ids: req_id for each selected_tokens row (input_batch order),
+                used to pair rows to requests by identity instead of by position.
         """
-        self._lmcache_engine.wait_for_layer_load(layer_name)
+        self._lmcache_engine.wait_for_layer_load(
+            layer_name, selected_tokens, token_start_index, request_ids
+        )
 
     def save_kv_layer(
         self,
