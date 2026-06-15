@@ -145,6 +145,59 @@ class RequestTracker:
     cached_ends: list[int] = field(default_factory=list)
     cached_memory_objs: list[list] = field(default_factory=list)
     cached_tensors: list[list] = field(default_factory=list)
+    _slot_mapping_cpu_cache: Optional[torch.Tensor] = field(default=None, repr=False)
+    _slot_mapping_cached_num_blocks: int = field(default=0, repr=False)
+
+    @staticmethod
+    def _build_slot_mapping_for_blocks(
+        block_ids: list[int], block_size: int
+    ) -> torch.Tensor:
+        num_blocks = len(block_ids)
+        if num_blocks == 0:
+            return torch.empty(0, dtype=torch.long)
+        block_ids_t = torch.tensor(block_ids, dtype=torch.long)
+        block_offsets = torch.arange(0, block_size, dtype=torch.long)
+        return (
+            block_offsets.reshape((1, block_size))
+            + block_ids_t.reshape((num_blocks, 1)) * block_size
+        ).flatten()
+
+    def invalidate_slot_mapping_cache(self) -> None:
+        self._slot_mapping_cpu_cache = None
+        self._slot_mapping_cached_num_blocks = 0
+
+    def get_slot_mapping_cpu(self, block_size: int, num_tokens: int) -> torch.Tensor:
+        """Return CPU slot_mapping, reusing or extending the tracker cache."""
+        num_blocks = len(self.allocated_block_ids)
+        cache = self._slot_mapping_cpu_cache
+        cached_blocks = self._slot_mapping_cached_num_blocks
+
+        if cache is not None and cached_blocks > num_blocks:
+            self.invalidate_slot_mapping_cache()
+            cache = None
+            cached_blocks = 0
+
+        if (
+            cache is not None
+            and cached_blocks == num_blocks
+            and cache.numel() >= num_tokens
+        ):
+            return cache[:num_tokens]
+
+        if cache is not None and cached_blocks < num_blocks:
+            new_block_ids = self.allocated_block_ids[cached_blocks:]
+            new_slots = self._build_slot_mapping_for_blocks(new_block_ids, block_size)
+            cache = torch.cat([cache, new_slots])
+            self._slot_mapping_cpu_cache = cache
+            self._slot_mapping_cached_num_blocks = num_blocks
+            return cache[:num_tokens]
+
+        cache = self._build_slot_mapping_for_blocks(
+            self.allocated_block_ids, block_size
+        )
+        self._slot_mapping_cpu_cache = cache
+        self._slot_mapping_cached_num_blocks = num_blocks
+        return cache[:num_tokens]
 
     @_lmcache_nvtx_annotate
     @staticmethod
@@ -250,6 +303,7 @@ class RequestTracker:
             assert all_token_ids is not None, (
                 f"Preempted request {self.req_id} has no all_token_ids"
             )
+            self.invalidate_slot_mapping_cache()
             # the block ids will change after preemption
             self.allocated_block_ids = new_block_ids
             # reset the number of saved tokens
@@ -284,6 +338,8 @@ class ReqMeta:
     token_ids: list[int]  # torch.Tensor
     # Slot mapping
     slot_mapping: torch.Tensor
+    # vLLM block ids used to build slot_mapping; worker cache invalidates on change.
+    slot_mapping_block_fingerprint: tuple[int, ...] = field(default_factory=tuple)
 
     # key of cached object
     cached_keys: list[list] = field(default_factory=list)
@@ -411,14 +467,7 @@ class ReqMeta:
                 block_size,
             )
 
-        block_ids = torch.tensor(tracker.allocated_block_ids, dtype=torch.long)
-        block_offsets = torch.arange(0, block_size, dtype=torch.long)
-        slot_mapping = (
-            block_offsets.reshape((1, block_size))
-            + block_ids.reshape((num_blocks, 1)) * block_size
-        )
-
-        slot_mapping = slot_mapping.flatten()[: len(token_ids)]
+        slot_mapping = tracker.get_slot_mapping_cpu(block_size, len(token_ids))
         assert slot_mapping.dtype == torch.long  # TODO: this could be removed
 
         # For load operation: log if the request is scheduled to load
@@ -435,6 +484,7 @@ class ReqMeta:
             req_id=tracker.req_id,
             token_ids=token_ids,
             slot_mapping=slot_mapping,
+            slot_mapping_block_fingerprint=tuple(tracker.allocated_block_ids),
             is_last_prefill=is_last_prefill,
             is_sparse_decode=is_sparse_decode,
             save_spec=save_spec,
@@ -546,6 +596,9 @@ class LMCacheConnectorV1Impl:
         else:
             self.use_layerwise = config.use_layerwise
             self.enable_blending = config.enable_blending
+            self._device_slot_mapping_cache: dict[
+                str, tuple[tuple[int, ...], torch.Tensor]
+            ] = {}
 
             if self.enable_blending:
                 assert self.lmcache_engine is not None
@@ -763,6 +816,58 @@ class LMCacheConnectorV1Impl:
         self._build_kv_layer_groups()
         self._manager.post_init()
 
+    @staticmethod
+    def _slot_mapping_block_fingerprint(
+        block_fingerprint: tuple[int, ...], block_size: int, num_tokens: int
+    ) -> tuple[int, ...]:
+        num_blocks = utils.cdiv(num_tokens, block_size)
+        return block_fingerprint[:num_blocks]
+
+    def _get_device_slot_mapping(
+        self, request: ReqMeta, num_tokens: int
+    ) -> torch.Tensor:
+        """Return device slot_mapping, reusing cache when vLLM blocks are unchanged."""
+        fp = self._slot_mapping_block_fingerprint(
+            request.slot_mapping_block_fingerprint,
+            self._block_size,
+            num_tokens,
+        )
+        cache = self._device_slot_mapping_cache.get(request.req_id)
+
+        if cache is not None:
+            cached_fp, cached_tensor = cache
+            if cached_fp == fp and cached_tensor.numel() >= num_tokens:
+                return cached_tensor[:num_tokens]
+
+            if (
+                len(fp) > len(cached_fp)
+                and fp[: len(cached_fp)] == cached_fp
+                and request.slot_mapping.numel() >= num_tokens
+            ):
+                extend_start = cached_tensor.numel()
+                if num_tokens > extend_start:
+                    new_slice = request.slot_mapping[extend_start:num_tokens].to(
+                        device=self.device, dtype=torch.long
+                    )
+                    cached_tensor = torch.cat([cached_tensor, new_slice])
+                else:
+                    cached_tensor = cached_tensor[:num_tokens]
+                self._device_slot_mapping_cache[request.req_id] = (fp, cached_tensor)
+                return cached_tensor[:num_tokens]
+
+            if cached_fp != fp:
+                self._device_slot_mapping_cache.pop(request.req_id, None)
+
+        dev_mapping = request.slot_mapping[:num_tokens].to(
+            device=self.device, dtype=torch.long
+        )
+        self._device_slot_mapping_cache[request.req_id] = (fp, dev_mapping)
+        return dev_mapping
+
+    def _clear_device_slot_mapping_cache(self, req_id: str) -> None:
+        if hasattr(self, "_device_slot_mapping_cache"):
+            self._device_slot_mapping_cache.pop(req_id, None)
+
     @_lmcache_nvtx_annotate
     def start_load_kv(self, forward_context: "ForwardContext", **kwargs) -> None:
         """Start loading the KV cache from the connector buffer to vLLM's
@@ -819,8 +924,7 @@ class LMCacheConnectorV1Impl:
                 continue
 
             tokens = request.token_ids
-            # TODO: have a pre-allocated buffer to hold the slot_mappings
-            slot_mapping = request.slot_mapping.to(self.device)
+            slot_mapping = self._get_device_slot_mapping(request, len(tokens))
             assert len(tokens) == len(slot_mapping)
 
             token_mask = torch.ones(len(tokens), dtype=torch.bool)
@@ -1086,8 +1190,7 @@ class LMCacheConnectorV1Impl:
                 assert isinstance(slot_mapping, torch.Tensor)
                 assert len(slot_mapping) == len(token_ids)
 
-                # TODO: have a pre-allocated buffer to hold the slot_mappings
-                slot_mapping = slot_mapping.to(self.device)
+                slot_mapping = self._get_device_slot_mapping(request, len(token_ids))
 
                 if self.kv_role == "kv_producer":
                     skip_leading_tokens = 0
@@ -1189,8 +1292,7 @@ class LMCacheConnectorV1Impl:
             assert isinstance(slot_mapping, torch.Tensor)
             assert len(slot_mapping) == len(token_ids)
 
-            # TODO: have a pre-allocated buffer to hold the slot_mappings
-            slot_mapping = slot_mapping.to(self.device)
+            slot_mapping = self._get_device_slot_mapping(request, len(token_ids))
 
             skip_leading_tokens = save_spec.skip_leading_tokens
             # shared storage disaggregation will not have a disagg_spec passed in
@@ -1739,6 +1841,8 @@ class LMCacheConnectorV1Impl:
             self, "_layerwise_save_storers"
         ):
             self._layerwise_save_storers.pop(request.request_id, None)
+
+        self._clear_device_slot_mapping_cache(request.request_id)
 
         # Cleanup if request was aborted
         if request.status == RequestStatus.FINISHED_ABORTED and self.async_loading:
