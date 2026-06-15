@@ -28,6 +28,7 @@ import torch
 # (avoids dependency on vllm internal changes like https://github.com/vllm-project/vllm/pull/27188)
 from lmcache import utils
 from lmcache.integration.vllm.slot_mapping_cache import (
+    ConnectorPerfTimer,
     CpuSlotMappingCache,
     DeviceSlotMappingCache,
     connector_perf_log_enabled,
@@ -837,6 +838,9 @@ class LMCacheConnectorV1Impl:
 
         assert self.lmcache_engine is not None
 
+        perf = ConnectorPerfTimer.create()
+        num_load_requests = 0
+
         self.layerwise_retrievers = []
 
         for idx, request in enumerate(metadata.requests):
@@ -857,10 +861,12 @@ class LMCacheConnectorV1Impl:
             if request.load_spec is None or not request.load_spec.can_load:
                 continue
 
+            num_load_requests += 1
             tokens = request.token_ids
             lmcache_cached_tokens = request.load_spec.lmcache_cached_tokens
             load_slot_tokens = self._load_slot_mapping_token_count(request)
-            slot_mapping = self._get_device_slot_mapping(request, load_slot_tokens)
+            with perf.section("slot_mapping"):
+                slot_mapping = self._get_device_slot_mapping(request, load_slot_tokens)
             if not request.is_sparse_decode:
                 assert len(tokens) == len(slot_mapping)
 
@@ -880,54 +886,62 @@ class LMCacheConnectorV1Impl:
                 # NOTE(Jiayi): Perform blending before layerwise prefix caching
                 if self.enable_blending:
                     # TODO(Jiayi): Need to make prefix caching and blending compatible
-                    self.blender.blend(
-                        tokens[:lmcache_cached_tokens],
-                        token_mask[:lmcache_cached_tokens],
-                        kvcaches=kvcaches,
-                        slot_mapping=slot_mapping[:2048],
-                        vllm_cached_tokens=request.load_spec.vllm_cached_tokens,
-                    )
+                    with perf.section("blend"):
+                        self.blender.blend(
+                            tokens[:lmcache_cached_tokens],
+                            token_mask[:lmcache_cached_tokens],
+                            kvcaches=kvcaches,
+                            slot_mapping=slot_mapping[:2048],
+                            vllm_cached_tokens=request.load_spec.vllm_cached_tokens,
+                        )
                 elif request.is_sparse_decode:
-                    layerwise_retriever = self.lmcache_engine.retrieve_layer_head_token_wise(
-                        tokens[:lmcache_cached_tokens], # needed for keys of cached kv cache
-                        token_mask[:lmcache_cached_tokens], # all true for lmcache chunk size 1
-                        kvcaches=kvcaches, # needed to allocate gpu buffer of the same size
-                        slot_mapping=slot_mapping[:2048], # same attention blocks for all layers
-                        vllm_cached_tokens=request.load_spec.vllm_cached_tokens,
-                        sync=sync,
-                        cached_keys=request.cached_keys,
-                        cached_starts=request.cached_starts,
-                        cached_ends=request.cached_ends,
-                        cached_memory_objs=request.cached_memory_objs,
-                        cached_tensors=request.cached_tensors,
-                        req_id=request.req_id,
-                    )
+                    with perf.section("retrieve_create"):
+                        layerwise_retriever = (
+                            self.lmcache_engine.retrieve_layer_head_token_wise(
+                                tokens[:lmcache_cached_tokens], # needed for keys of cached kv cache
+                                token_mask[:lmcache_cached_tokens], # all true for lmcache chunk size 1
+                                kvcaches=kvcaches, # needed to allocate gpu buffer of the same size
+                                slot_mapping=slot_mapping[:2048], # same attention blocks for all layers
+                                vllm_cached_tokens=request.load_spec.vllm_cached_tokens,
+                                sync=sync,
+                                cached_keys=request.cached_keys,
+                                cached_starts=request.cached_starts,
+                                cached_ends=request.cached_ends,
+                                cached_memory_objs=request.cached_memory_objs,
+                                cached_tensors=request.cached_tensors,
+                                req_id=request.req_id,
+                            )
+                        )
                     # NOTE: retrieve layers one by one with cpu prefetch
-                    next(layerwise_retriever) 
+                    with perf.section("retrieve_next"):
+                        next(layerwise_retriever)
                     self.layerwise_retrievers.append(layerwise_retriever)
                 else:
-                    layerwise_retriever = self.lmcache_engine.retrieve_layer(
+                    with perf.section("retrieve_create"):
+                        layerwise_retriever = self.lmcache_engine.retrieve_layer(
+                            tokens[:lmcache_cached_tokens],
+                            token_mask[:lmcache_cached_tokens],
+                            kvcaches=kvcaches,
+                            slot_mapping=slot_mapping[:lmcache_cached_tokens],
+                            vllm_cached_tokens=request.load_spec.vllm_cached_tokens,
+                            sync=sync,
+                        )
+                    # NOTE: retrieve for two layers at the first layer
+                    with perf.section("retrieve_next"):
+                        next(layerwise_retriever)
+                        next(layerwise_retriever)
+                    self.layerwise_retrievers.append(layerwise_retriever)
+            else:
+                with perf.section("retrieve"):
+                    ret_token_mask = self.lmcache_engine.retrieve(
                         tokens[:lmcache_cached_tokens],
                         token_mask[:lmcache_cached_tokens],
                         kvcaches=kvcaches,
                         slot_mapping=slot_mapping[:lmcache_cached_tokens],
                         vllm_cached_tokens=request.load_spec.vllm_cached_tokens,
-                        sync=sync,
+                        request_configs=request.request_configs,
+                        req_id=request.req_id,
                     )
-                    # NOTE: retrieve for two layers at the first layer
-                    next(layerwise_retriever)
-                    next(layerwise_retriever)
-                    self.layerwise_retrievers.append(layerwise_retriever)
-            else:
-                ret_token_mask = self.lmcache_engine.retrieve(
-                    tokens[:lmcache_cached_tokens],
-                    token_mask[:lmcache_cached_tokens],
-                    kvcaches=kvcaches,
-                    slot_mapping=slot_mapping[:lmcache_cached_tokens],
-                    vllm_cached_tokens=request.load_spec.vllm_cached_tokens,
-                    request_configs=request.request_configs,
-                    req_id=request.req_id,
-                )
 
                 # Check the result
                 num_retrieved_tokens = ret_token_mask.sum().item()
@@ -957,6 +971,7 @@ class LMCacheConnectorV1Impl:
                     )
                     self._invalid_block_ids.update(missing_blocks)
 
+        perf.log("start_load_kv", num_load=num_load_requests)
         log_slot_mapping_cache_summary("start_load_kv")
 
     def record_failed_blocks(
@@ -1570,6 +1585,7 @@ class LMCacheConnectorV1Impl:
 
         force_skip_save = self.kv_role == "kv_consumer" or self.force_skip_save
 
+        perf = ConnectorPerfTimer.create()
         meta = LMCacheConnectorMetadata()
 
         for finished_req_id in scheduler_output.finished_req_ids:
@@ -1609,14 +1625,15 @@ class LMCacheConnectorV1Impl:
             )
             self._request_trackers[request.req_id] = request_tracker
 
-            req_meta = ReqMeta.from_request_tracker(
-                request_tracker,
-                self._block_size,
-                self._lmcache_chunk_size,
-                load_spec=load_spec,
-                discard_partial_chunks=self._discard_partial_chunks,
-                save_decode_cache=self.config.save_decode_cache,
-            )
+            with perf.section("req_meta"):
+                req_meta = ReqMeta.from_request_tracker(
+                    request_tracker,
+                    self._block_size,
+                    self._lmcache_chunk_size,
+                    load_spec=load_spec,
+                    discard_partial_chunks=self._discard_partial_chunks,
+                    save_decode_cache=self.config.save_decode_cache,
+                )
             if req_meta is not None:
                 meta.add_request(req_meta)
 
@@ -1646,25 +1663,28 @@ class LMCacheConnectorV1Impl:
                     )
                     all_token_ids = list(vllm_request.all_token_ids)
 
-                request_tracker.update(
-                    req.new_token_ids,
-                    req.new_block_ids,
-                    req.resumed_from_preemption,
-                    lmcache_cached_tokens=lmcache_cached_tokens,
-                    vllm_cached_tokens=vllm_cached_tokens,
-                    all_token_ids=all_token_ids,
-                )
+                with perf.section("tracker_update"):
+                    request_tracker.update(
+                        req.new_token_ids,
+                        req.new_block_ids,
+                        req.resumed_from_preemption,
+                        lmcache_cached_tokens=lmcache_cached_tokens,
+                        vllm_cached_tokens=vllm_cached_tokens,
+                        all_token_ids=all_token_ids,
+                    )
 
-                req_meta = ReqMeta.from_request_tracker(
-                    request_tracker,
-                    self._block_size,
-                    self._lmcache_chunk_size,
-                    load_spec=load_spec,
-                    discard_partial_chunks=self._discard_partial_chunks,
-                    save_decode_cache=self.config.save_decode_cache,
-                )
+                with perf.section("req_meta"):
+                    req_meta = ReqMeta.from_request_tracker(
+                        request_tracker,
+                        self._block_size,
+                        self._lmcache_chunk_size,
+                        load_spec=load_spec,
+                        discard_partial_chunks=self._discard_partial_chunks,
+                        save_decode_cache=self.config.save_decode_cache,
+                    )
                 if req_meta is not None:
                     meta.add_request(req_meta)
+            perf.log("build_connector_meta", num_requests=len(meta.requests))
             log_slot_mapping_cache_summary("build_connector_meta")
             return meta
 
@@ -1770,31 +1790,34 @@ class LMCacheConnectorV1Impl:
             # token_ids correctly for chunk key computation
             all_token_ids = list(request.all_token_ids) if preempted else None
 
-            request_tracker.update(
-                new_token_ids,
-                new_block_ids,
-                preempted=preempted,
-                lmcache_cached_tokens=lmcache_cached_tokens,
-                vllm_cached_tokens=vllm_cached_tokens,
-                all_token_ids=all_token_ids,
-            )
+            with perf.section("tracker_update"):
+                request_tracker.update(
+                    new_token_ids,
+                    new_block_ids,
+                    preempted=preempted,
+                    lmcache_cached_tokens=lmcache_cached_tokens,
+                    vllm_cached_tokens=vllm_cached_tokens,
+                    all_token_ids=all_token_ids,
+                )
 
             is_sparse_decode = self.enable_sparse_attention and (request.num_computed_tokens > request.num_prompt_tokens)
             if is_sparse_decode:
                 load_spec = LoadSpec(vllm_cached_tokens=0, lmcache_cached_tokens=len(request.prompt_token_ids), can_load=True)
 
-            req_meta = ReqMeta.from_request_tracker(
-                request_tracker,
-                self._block_size,
-                self._lmcache_chunk_size,
-                load_spec=load_spec,
-                discard_partial_chunks=self._discard_partial_chunks,
-                save_decode_cache=self.config.save_decode_cache,
-                is_sparse_decode=is_sparse_decode
-            )
+            with perf.section("req_meta"):
+                req_meta = ReqMeta.from_request_tracker(
+                    request_tracker,
+                    self._block_size,
+                    self._lmcache_chunk_size,
+                    load_spec=load_spec,
+                    discard_partial_chunks=self._discard_partial_chunks,
+                    save_decode_cache=self.config.save_decode_cache,
+                    is_sparse_decode=is_sparse_decode
+                )
             if req_meta is not None:
                 meta.add_request(req_meta)
 
+        perf.log("build_connector_meta", num_requests=len(meta.requests))
         log_slot_mapping_cache_summary("build_connector_meta")
         return meta
 

@@ -4,8 +4,10 @@
 from __future__ import annotations
 
 import os
+import time
+from contextlib import contextmanager
 from dataclasses import dataclass, field
-from typing import Optional
+from typing import Generator, Optional
 
 import torch
 
@@ -28,6 +30,53 @@ def _perf_log(msg: str, *args) -> None:
     """Emit connector perf diagnostics at INFO (visible under default log level)."""
     if connector_perf_log_enabled():
         logger.info(msg, *args)
+
+
+@dataclass
+class ConnectorPerfTimer:
+    """Accumulate section timings for connector perf logging."""
+
+    enabled: bool = field(default=False, repr=False)
+    _start: float = field(default=0.0, repr=False)
+    _parts: dict[str, float] = field(default_factory=dict, repr=False)
+
+    def __post_init__(self) -> None:
+        if self.enabled:
+            self._start = time.perf_counter()
+
+    @classmethod
+    def create(cls) -> "ConnectorPerfTimer":
+        return cls(enabled=connector_perf_log_enabled())
+
+    def record(self, name: str, elapsed_ms: float) -> None:
+        if self.enabled:
+            self._parts[name] = self._parts.get(name, 0.0) + elapsed_ms
+
+    @contextmanager
+    def section(self, name: str) -> Generator[None, None, None]:
+        if not self.enabled:
+            yield
+            return
+        t0 = time.perf_counter()
+        try:
+            yield
+        finally:
+            self.record(name, (time.perf_counter() - t0) * 1000)
+
+    def log(self, context: str, **kwargs: object) -> None:
+        if not self.enabled:
+            return
+        total_ms = (time.perf_counter() - self._start) * 1000
+        parts = " ".join(
+            f"{name}={elapsed_ms:.3f}ms"
+            for name, elapsed_ms in sorted(self._parts.items())
+        )
+        extras = " ".join(f"{name}={value}" for name, value in kwargs.items())
+        detail = " ".join(part for part in (parts, extras) if part)
+        if detail:
+            _perf_log("connector_perf %s total=%.3fms %s", context, total_ms, detail)
+        else:
+            _perf_log("connector_perf %s total=%.3fms", context, total_ms)
 
 
 @dataclass
