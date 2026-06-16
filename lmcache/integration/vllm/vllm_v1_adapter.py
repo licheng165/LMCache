@@ -168,9 +168,8 @@ class RequestTracker:
     cached_ends: list[int] = field(default_factory=list)
     cached_memory_objs: list[list] = field(default_factory=list)
     cached_tensors: list[list] = field(default_factory=list)
-    # Sparse decode only: scheduler keeps CPU mapping; worker keeps NPU mapping.
+    # Sparse decode only: built once on scheduler, NPU-uploaded once on worker.
     sparse_slot_mapping: Optional[torch.Tensor] = field(default=None, repr=False)
-    sparse_slot_mapping_uploaded: bool = field(default=False, repr=False)
 
     @_lmcache_nvtx_annotate
     @staticmethod
@@ -277,7 +276,6 @@ class RequestTracker:
                 f"Preempted request {self.req_id} has no all_token_ids"
             )
             self.sparse_slot_mapping = None
-            self.sparse_slot_mapping_uploaded = False
             # the block ids will change after preemption
             self.allocated_block_ids = new_block_ids
             # reset the number of saved tokens
@@ -310,7 +308,7 @@ class ReqMeta:
     req_id: str
     # Request tokens
     token_ids: list[int]  # torch.Tensor
-    # Slot mapping (None = reuse worker-side cached tensor for sparse decode)
+    # Slot mapping; sparse decode reuses tracker.sparse_slot_mapping by reference.
     slot_mapping: Optional[torch.Tensor] = None
 
     # key of cached object
@@ -439,21 +437,16 @@ class ReqMeta:
                 block_size,
             )
 
-        slot_mapping: Optional[torch.Tensor] = None
         if is_sparse_decode and load_spec is not None:
-            # Sparse decode window is fixed; build once and omit from later metadata.
-            num_slots = _sparse_slot_mapping_len(load_spec.lmcache_cached_tokens)
             if tracker.sparse_slot_mapping is None:
+                num_slots = _sparse_slot_mapping_len(load_spec.lmcache_cached_tokens)
                 tracker.sparse_slot_mapping = _build_slot_mapping(
                     tracker.allocated_block_ids, block_size, num_slots
                 )
-            if not tracker.sparse_slot_mapping_uploaded:
-                slot_mapping = tracker.sparse_slot_mapping
-                tracker.sparse_slot_mapping_uploaded = True
+            slot_mapping = tracker.sparse_slot_mapping
             if skip_save:
                 token_ids = input_token_ids[: load_spec.lmcache_cached_tokens]
         else:
-            # Prefill / non-sparse: mapping changes as blocks are allocated.
             slot_mapping = _build_slot_mapping(
                 tracker.allocated_block_ids, block_size, len(token_ids)
             )
@@ -800,44 +793,6 @@ class LMCacheConnectorV1Impl:
         self._build_kv_layer_groups()
         self._manager.post_init()
 
-    def _worker_tracker(self, req_id: str) -> RequestTracker:
-        tracker = self._request_trackers.get(req_id)
-        if tracker is None:
-            tracker = RequestTracker(
-                req_id=req_id,
-                prompt_len=0,
-                token_ids=[],
-                allocated_block_ids=[],
-            )
-            self._request_trackers[req_id] = tracker
-        return tracker
-
-    def _resolve_slot_mapping(
-        self, request: ReqMeta, num_tokens: int
-    ) -> torch.Tensor:
-        # Prefill / non-sparse: mapping grows with blocks; always take from metadata.
-        if not request.is_sparse_decode:
-            assert request.slot_mapping is not None
-            return request.slot_mapping[:num_tokens].to(
-                device=self.device, dtype=torch.long
-            )
-
-        # Sparse decode: build NPU mapping once, then reuse via RequestTracker.
-        tracker = self._worker_tracker(request.req_id)
-        if request.slot_mapping is not None:
-            tracker.sparse_slot_mapping = request.slot_mapping[:num_tokens].to(
-                device=self.device, dtype=torch.long
-            )
-            return tracker.sparse_slot_mapping
-        assert tracker.sparse_slot_mapping is not None
-        return tracker.sparse_slot_mapping
-
-    @staticmethod
-    def _load_slot_mapping_token_count(request: ReqMeta) -> int:
-        if request.is_sparse_decode and request.load_spec is not None:
-            return _sparse_slot_mapping_len(request.load_spec.lmcache_cached_tokens)
-        return len(request.token_ids)
-
     @_lmcache_nvtx_annotate
     def start_load_kv(self, forward_context: "ForwardContext", **kwargs) -> None:
         """Start loading the KV cache from the connector buffer to vLLM's
@@ -895,8 +850,20 @@ class LMCacheConnectorV1Impl:
 
             tokens = request.token_ids
             lmcache_cached_tokens = request.load_spec.lmcache_cached_tokens
-            load_slot_tokens = self._load_slot_mapping_token_count(request)
-            slot_mapping = self._resolve_slot_mapping(request, load_slot_tokens)
+            assert request.slot_mapping is not None
+            if request.is_sparse_decode:
+                tracker = self._request_trackers[request.req_id]
+                if tracker.sparse_slot_mapping.device.type != torch.device(
+                    self.device
+                ).type:
+                    tracker.sparse_slot_mapping = request.slot_mapping.to(
+                        device=self.device, dtype=torch.long
+                    )
+                slot_mapping = tracker.sparse_slot_mapping
+            else:
+                slot_mapping = request.slot_mapping.to(
+                    device=self.device, dtype=torch.long
+                )
             if not request.is_sparse_decode:
                 assert len(tokens) == len(slot_mapping)
 
@@ -1185,8 +1152,20 @@ class LMCacheConnectorV1Impl:
             if layerwise_storer is None:
                 token_ids = request.token_ids
                 assert isinstance(token_ids, list)
-
-                slot_mapping = self._resolve_slot_mapping(request, len(token_ids))
+                assert request.slot_mapping is not None
+                if request.is_sparse_decode:
+                    tracker = self._request_trackers[request.req_id]
+                    if tracker.sparse_slot_mapping.device.type != torch.device(
+                        self.device
+                    ).type:
+                        tracker.sparse_slot_mapping = request.slot_mapping.to(
+                            device=self.device, dtype=torch.long
+                        )
+                    slot_mapping = tracker.sparse_slot_mapping
+                else:
+                    slot_mapping = request.slot_mapping.to(
+                        device=self.device, dtype=torch.long
+                    )
 
                 if self.kv_role == "kv_producer":
                     skip_leading_tokens = 0
@@ -1284,7 +1263,20 @@ class LMCacheConnectorV1Impl:
 
             token_ids = request.token_ids
 
-            slot_mapping = self._resolve_slot_mapping(request, len(token_ids))
+            assert request.slot_mapping is not None
+            if request.is_sparse_decode:
+                tracker = self._request_trackers[request.req_id]
+                if tracker.sparse_slot_mapping.device.type != torch.device(
+                    self.device
+                ).type:
+                    tracker.sparse_slot_mapping = request.slot_mapping.to(
+                        device=self.device, dtype=torch.long
+                    )
+                slot_mapping = tracker.sparse_slot_mapping
+            else:
+                slot_mapping = request.slot_mapping.to(
+                    device=self.device, dtype=torch.long
+                )
 
             skip_leading_tokens = save_spec.skip_leading_tokens
             # shared storage disaggregation will not have a disagg_spec passed in
@@ -1833,10 +1825,6 @@ class LMCacheConnectorV1Impl:
             self, "_layerwise_save_storers"
         ):
             self._layerwise_save_storers.pop(request.request_id, None)
-
-        tracker = self._request_trackers.get(request.request_id)
-        if tracker is not None and not tracker.allocated_block_ids:
-            self._request_trackers.pop(request.request_id, None)
 
         # Cleanup if request was aborted
         if request.status == RequestStatus.FINISHED_ABORTED and self.async_loading:
