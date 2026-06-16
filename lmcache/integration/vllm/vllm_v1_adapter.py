@@ -168,8 +168,8 @@ class RequestTracker:
     cached_ends: list[int] = field(default_factory=list)
     cached_memory_objs: list[list] = field(default_factory=list)
     cached_tensors: list[list] = field(default_factory=list)
-    # Sparse decode only: built once on scheduler, NPU-uploaded once on worker.
-    sparse_slot_mapping: Optional[torch.Tensor] = field(default=None, repr=False)
+    # Sparse decode only: single-element list holding CPU then NPU slot_mapping.
+    sparse_slot_mapping: list[torch.Tensor] = field(default_factory=list, repr=False)
 
     @_lmcache_nvtx_annotate
     @staticmethod
@@ -275,7 +275,7 @@ class RequestTracker:
             assert all_token_ids is not None, (
                 f"Preempted request {self.req_id} has no all_token_ids"
             )
-            self.sparse_slot_mapping = None
+            self.sparse_slot_mapping.clear()
             # the block ids will change after preemption
             self.allocated_block_ids = new_block_ids
             # reset the number of saved tokens
@@ -308,8 +308,8 @@ class ReqMeta:
     req_id: str
     # Request tokens
     token_ids: list[int]  # torch.Tensor
-    # Slot mapping; sparse decode reuses tracker.sparse_slot_mapping by reference.
-    slot_mapping: Optional[torch.Tensor] = None
+    # Single-element list; sparse decode reuses tracker.sparse_slot_mapping by reference.
+    slot_mapping: list[torch.Tensor] = field(default_factory=list)
 
     # key of cached object
     cached_keys: list[list] = field(default_factory=list)
@@ -438,18 +438,22 @@ class ReqMeta:
             )
 
         if is_sparse_decode and load_spec is not None:
-            if tracker.sparse_slot_mapping is None:
+            if not tracker.sparse_slot_mapping:
                 num_slots = _sparse_slot_mapping_len(load_spec.lmcache_cached_tokens)
-                tracker.sparse_slot_mapping = _build_slot_mapping(
-                    tracker.allocated_block_ids, block_size, num_slots
+                tracker.sparse_slot_mapping.append(
+                    _build_slot_mapping(
+                        tracker.allocated_block_ids, block_size, num_slots
+                    )
                 )
             slot_mapping = tracker.sparse_slot_mapping
             if skip_save:
                 token_ids = input_token_ids[: load_spec.lmcache_cached_tokens]
         else:
-            slot_mapping = _build_slot_mapping(
-                tracker.allocated_block_ids, block_size, len(token_ids)
-            )
+            slot_mapping = [
+                _build_slot_mapping(
+                    tracker.allocated_block_ids, block_size, len(token_ids)
+                )
+            ]
 
         # For load operation: log if the request is scheduled to load
         if load_spec is not None and load_spec.can_load:
@@ -850,18 +854,17 @@ class LMCacheConnectorV1Impl:
 
             tokens = request.token_ids
             lmcache_cached_tokens = request.load_spec.lmcache_cached_tokens
-            assert request.slot_mapping is not None
+            assert request.slot_mapping
             if request.is_sparse_decode:
-                tracker = self._request_trackers[request.req_id]
-                if tracker.sparse_slot_mapping.device.type != torch.device(
+                if request.slot_mapping[0].device.type != torch.device(
                     self.device
                 ).type:
-                    tracker.sparse_slot_mapping = request.slot_mapping.to(
+                    request.slot_mapping[0] = request.slot_mapping[0].to(
                         device=self.device, dtype=torch.long
                     )
-                slot_mapping = tracker.sparse_slot_mapping
+                slot_mapping = request.slot_mapping[0]
             else:
-                slot_mapping = request.slot_mapping.to(
+                slot_mapping = request.slot_mapping[0].to(
                     device=self.device, dtype=torch.long
                 )
             if not request.is_sparse_decode:
@@ -1152,18 +1155,17 @@ class LMCacheConnectorV1Impl:
             if layerwise_storer is None:
                 token_ids = request.token_ids
                 assert isinstance(token_ids, list)
-                assert request.slot_mapping is not None
+                assert request.slot_mapping
                 if request.is_sparse_decode:
-                    tracker = self._request_trackers[request.req_id]
-                    if tracker.sparse_slot_mapping.device.type != torch.device(
+                    if request.slot_mapping[0].device.type != torch.device(
                         self.device
                     ).type:
-                        tracker.sparse_slot_mapping = request.slot_mapping.to(
+                        request.slot_mapping[0] = request.slot_mapping[0].to(
                             device=self.device, dtype=torch.long
                         )
-                    slot_mapping = tracker.sparse_slot_mapping
+                    slot_mapping = request.slot_mapping[0]
                 else:
-                    slot_mapping = request.slot_mapping.to(
+                    slot_mapping = request.slot_mapping[0].to(
                         device=self.device, dtype=torch.long
                     )
 
@@ -1263,18 +1265,17 @@ class LMCacheConnectorV1Impl:
 
             token_ids = request.token_ids
 
-            assert request.slot_mapping is not None
+            assert request.slot_mapping
             if request.is_sparse_decode:
-                tracker = self._request_trackers[request.req_id]
-                if tracker.sparse_slot_mapping.device.type != torch.device(
+                if request.slot_mapping[0].device.type != torch.device(
                     self.device
                 ).type:
-                    tracker.sparse_slot_mapping = request.slot_mapping.to(
+                    request.slot_mapping[0] = request.slot_mapping[0].to(
                         device=self.device, dtype=torch.long
                     )
-                slot_mapping = tracker.sparse_slot_mapping
+                slot_mapping = request.slot_mapping[0]
             else:
-                slot_mapping = request.slot_mapping.to(
+                slot_mapping = request.slot_mapping[0].to(
                     device=self.device, dtype=torch.long
                 )
 
