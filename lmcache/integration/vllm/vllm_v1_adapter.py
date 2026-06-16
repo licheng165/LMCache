@@ -168,6 +168,8 @@ class RequestTracker:
     cached_ends: list[int] = field(default_factory=list)
     cached_memory_objs: list[list] = field(default_factory=list)
     cached_tensors: list[list] = field(default_factory=list)
+    # Sparse decode only: prompt token ids for retrieve keys, built once.
+    sparse_token_ids: list[int] = field(default_factory=list, repr=False)
     # Sparse decode only: single-element list holding CPU then NPU slot_mapping.
     sparse_slot_mapping: list[torch.Tensor] = field(default_factory=list, repr=False)
 
@@ -275,6 +277,7 @@ class RequestTracker:
             assert all_token_ids is not None, (
                 f"Preempted request {self.req_id} has no all_token_ids"
             )
+            self.sparse_token_ids.clear()
             self.sparse_slot_mapping.clear()
             # the block ids will change after preemption
             self.allocated_block_ids = new_block_ids
@@ -407,19 +410,35 @@ class ReqMeta:
         save_spec = SaveSpec(skip_leading_tokens, not skip_save)
 
         # Calculate the token ids and slot mappings for load and save
-        token_ids = input_token_ids[:num_tokens_to_save]
+        if is_sparse_decode and load_spec is not None and skip_save:
+            if not tracker.sparse_token_ids:
+                tracker.sparse_token_ids = input_token_ids[
+                    : load_spec.lmcache_cached_tokens
+                ]
+                if tracker.mm_hashes:
+                    token_ids_tensor = torch.tensor(tracker.sparse_token_ids)
+                    assert tracker.mm_positions is not None, (
+                        "tracker got mm_hashes but no mm_positions"
+                    )
+                    apply_mm_hashes_to_token_ids(
+                        token_ids_tensor, tracker.mm_hashes, tracker.mm_positions
+                    )
+                    tracker.sparse_token_ids = token_ids_tensor.tolist()
+            token_ids = tracker.sparse_token_ids
+        else:
+            token_ids = input_token_ids[:num_tokens_to_save]
 
-        # If the request has multimodal hashes, apply them to the token ids
-        if tracker.mm_hashes:
-            # TODO: Optimize this
-            token_ids = torch.tensor(token_ids)
-            assert tracker.mm_positions is not None, (
-                "tracker got mm_hashes but no mm_positions"
-            )
-            apply_mm_hashes_to_token_ids(
-                token_ids, tracker.mm_hashes, tracker.mm_positions
-            )
-            token_ids = token_ids.tolist()
+            # If the request has multimodal hashes, apply them to the token ids
+            if tracker.mm_hashes:
+                # TODO: Optimize this
+                token_ids = torch.tensor(token_ids)
+                assert tracker.mm_positions is not None, (
+                    "tracker got mm_hashes but no mm_positions"
+                )
+                apply_mm_hashes_to_token_ids(
+                    token_ids, tracker.mm_hashes, tracker.mm_positions
+                )
+                token_ids = token_ids.tolist()
 
         num_blocks = len(tracker.allocated_block_ids)
 
@@ -446,8 +465,6 @@ class ReqMeta:
                     )
                 )
             slot_mapping = tracker.sparse_slot_mapping
-            if skip_save:
-                token_ids = input_token_ids[: load_spec.lmcache_cached_tokens]
         else:
             slot_mapping = [
                 _build_slot_mapping(
