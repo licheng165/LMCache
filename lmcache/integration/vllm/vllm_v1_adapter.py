@@ -4,6 +4,7 @@ from collections.abc import Iterable
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Generator, Optional, Union
 import os
+import time
 
 # Third Party
 from vllm.config import (
@@ -60,6 +61,9 @@ logger = init_logger(__name__)
 SPARSE_DECODE_RETRIEVE_TOKENS = int(
     os.environ.get("LMCACHE_SPARSE_DECODE_RETRIEVE_TOKENS", "2048")
 )
+
+# Per-request timing breakdown for start_load_kv (set to 1 to enable).
+_PERF_LOG_START_LOAD_KV = os.environ.get("LMCACHE_PERF_LOG_START_LOAD_KV", "0") == "1"
 
 
 def _sparse_slot_mapping_len(prompt_tokens: int) -> int:
@@ -172,6 +176,9 @@ class RequestTracker:
     sparse_token_ids: list[int] = field(default_factory=list, repr=False)
     # Sparse decode only: single-element list holding CPU then NPU slot_mapping.
     sparse_slot_mapping: list[torch.Tensor] = field(default_factory=list, repr=False)
+    # Sparse decode only: reused across decode steps to avoid per-step allocation.
+    sparse_decode_token_mask: Optional[torch.Tensor] = field(default=None, repr=False)
+    sparse_decode_ret_mask: Optional[torch.Tensor] = field(default=None, repr=False)
 
     @_lmcache_nvtx_annotate
     @staticmethod
@@ -279,6 +286,8 @@ class RequestTracker:
             )
             self.sparse_token_ids.clear()
             self.sparse_slot_mapping.clear()
+            self.sparse_decode_token_mask = None
+            self.sparse_decode_ret_mask = None
             # the block ids will change after preemption
             self.allocated_block_ids = new_block_ids
             # reset the number of saved tokens
@@ -320,6 +329,9 @@ class ReqMeta:
     cached_ends: list[int] = field(default_factory=list)
     cached_memory_objs: list[list] = field(default_factory=list)
     cached_tensors: list[list] = field(default_factory=list)
+    # Sparse decode only: shared with RequestTracker, reused across decode steps.
+    decode_token_mask: Optional[torch.Tensor] = field(default=None, repr=False)
+    decode_ret_mask: Optional[torch.Tensor] = field(default=None, repr=False)
 
     # Whether is last prefill or not
     is_last_prefill: bool = False
@@ -472,7 +484,6 @@ class ReqMeta:
                 )
             ]
 
-        # For load operation: log if the request is scheduled to load
         if load_spec is not None and load_spec.can_load:
             logger.debug(
                 "Scheduled to load %d tokens (%d cached in vLLM) for request %s",
@@ -480,6 +491,27 @@ class ReqMeta:
                 load_spec.vllm_cached_tokens,
                 tracker.req_id,
             )
+
+        decode_token_mask: Optional[torch.Tensor] = None
+        decode_ret_mask: Optional[torch.Tensor] = None
+        if is_sparse_decode and load_spec is not None:
+            num_retrieve_tokens = len(token_ids)
+            if (
+                tracker.sparse_decode_token_mask is None
+                or tracker.sparse_decode_token_mask.numel() != num_retrieve_tokens
+            ):
+                tracker.sparse_decode_token_mask = torch.ones(
+                    num_retrieve_tokens, dtype=torch.bool
+                )
+            if (
+                tracker.sparse_decode_ret_mask is None
+                or tracker.sparse_decode_ret_mask.numel() != num_retrieve_tokens
+            ):
+                tracker.sparse_decode_ret_mask = torch.zeros(
+                    num_retrieve_tokens, dtype=torch.bool, device="cpu"
+                )
+            decode_token_mask = tracker.sparse_decode_token_mask
+            decode_ret_mask = tracker.sparse_decode_ret_mask
 
         # Note: We keep load_spec even when can_load=False to pass metrics to worker
         return ReqMeta(
@@ -497,6 +529,8 @@ class ReqMeta:
             cached_ends=tracker.cached_ends,
             cached_memory_objs=tracker.cached_memory_objs,
             cached_tensors=tracker.cached_tensors,
+            decode_token_mask=decode_token_mask,
+            decode_ret_mask=decode_ret_mask,
         )
 
 
@@ -641,6 +675,8 @@ class LMCacheConnectorV1Impl:
         self.force_skip_save = bool(os.environ.get("LMCACHE_FORCE_SKIP_SAVE", False))
         self._requests_priority: dict[str, int] = {}
         self._invalid_block_ids: set[int] = set()
+        self._decode_retrieve_locations: dict[str, str] = {}
+        self._decode_metadata_warm: set[str] = set()
 
     def _check_legacy_register_kv_caches(self) -> None:
         """Check for legacy connector without register_kv_caches implementation."""
@@ -804,6 +840,50 @@ class LMCacheConnectorV1Impl:
     ####################
     # Worker side APIs
     ####################
+    @staticmethod
+    def _load_tokens_for_retrieve(
+        tokens: list[int], lmcache_cached_tokens: int, *, is_sparse_decode: bool
+    ) -> list[int]:
+        """Return token ids for retrieve without redundant list copy on decode."""
+        if is_sparse_decode or lmcache_cached_tokens >= len(tokens):
+            return tokens
+        return tokens[:lmcache_cached_tokens]
+
+    @staticmethod
+    def _load_token_mask_for_retrieve(
+        request: "ReqMeta",
+        token_count: int,
+        lmcache_chunk_size: int,
+    ) -> torch.Tensor:
+        """Build or reuse the token mask for a retrieve call."""
+        if request.is_sparse_decode and request.decode_token_mask is not None:
+            mask = request.decode_token_mask
+            if mask.numel() == token_count:
+                return mask
+
+        token_mask = torch.ones(token_count, dtype=torch.bool)
+        if request.load_spec is not None:
+            masked_token_count = (
+                request.load_spec.vllm_cached_tokens
+                // lmcache_chunk_size
+                * lmcache_chunk_size
+            )
+            if masked_token_count:
+                token_mask[:masked_token_count] = False
+
+        if request.is_sparse_decode:
+            request.decode_token_mask = token_mask
+        return token_mask
+
+    def _drain_layerwise_retrievers(self) -> None:
+        """Finish suspended layerwise generators to avoid GC cost on reset."""
+        for retriever in self.layerwise_retrievers:
+            try:
+                next(retriever)
+            except StopIteration:
+                pass
+        self.layerwise_retrievers.clear()
+
     @_lmcache_nvtx_annotate
     def register_kv_caches(self, kv_caches: dict[str, torch.Tensor]):
         logger.info("Registering KV caches")
@@ -827,6 +907,7 @@ class LMCacheConnectorV1Impl:
             The number of elements in kv_caches and layer_names should be
             the same.
         """
+        t_total = time.perf_counter()
         self.current_layer = 0
 
         if len(self.kv_caches) == 0:
@@ -839,6 +920,14 @@ class LMCacheConnectorV1Impl:
         metadata = self._parent._get_connector_metadata()
         assert isinstance(metadata, LMCacheConnectorMetadata)
 
+        active_req_ids = {req.req_id for req in metadata.requests}
+        self._decode_retrieve_locations = {
+            req_id: loc
+            for req_id, loc in self._decode_retrieve_locations.items()
+            if req_id in active_req_ids
+        }
+        self._decode_metadata_warm &= active_req_ids
+
         assert len(self.kv_caches) > 0
         kvcaches = list(self.kv_caches.values())
 
@@ -849,7 +938,9 @@ class LMCacheConnectorV1Impl:
 
         assert self.lmcache_engine is not None
 
-        self.layerwise_retrievers = []
+        t_drain = time.perf_counter()
+        self._drain_layerwise_retrievers()
+        t_drain_ms = (time.perf_counter() - t_drain) * 1000
 
         for idx, request in enumerate(metadata.requests):
             if request.load_spec is None or not request.load_spec.can_load:
@@ -857,6 +948,9 @@ class LMCacheConnectorV1Impl:
             last_idx = idx
 
         for idx, request in enumerate(metadata.requests):
+            t_req = time.perf_counter()
+            req_perf: dict[str, float] = {}
+
             # Update metrics for all requests that have a load_spec
             if request.load_spec is not None:
                 self._stats_monitor.update_interval_vllm_hit_tokens(
@@ -872,6 +966,8 @@ class LMCacheConnectorV1Impl:
             tokens = request.token_ids
             lmcache_cached_tokens = request.load_spec.lmcache_cached_tokens
             assert request.slot_mapping
+
+            t_slot = time.perf_counter()
             if request.is_sparse_decode:
                 if request.slot_mapping[0].device.type != torch.device(
                     self.device
@@ -884,16 +980,22 @@ class LMCacheConnectorV1Impl:
                 slot_mapping = request.slot_mapping[0].to(
                     device=self.device, dtype=torch.long
                 )
+            req_perf["slot_mapping_ms"] = (time.perf_counter() - t_slot) * 1000
+
             if not request.is_sparse_decode:
                 assert len(tokens) == len(slot_mapping)
 
-            token_mask = torch.ones(len(tokens), dtype=torch.bool)
-            masked_token_count = (
-                request.load_spec.vllm_cached_tokens
-                // self._lmcache_chunk_size
-                * self._lmcache_chunk_size
+            t_tokens = time.perf_counter()
+            retrieve_tokens = self._load_tokens_for_retrieve(
+                tokens,
+                lmcache_cached_tokens,
+                is_sparse_decode=request.is_sparse_decode,
             )
-            token_mask[:masked_token_count] = False
+            token_count = len(retrieve_tokens)
+            token_mask = self._load_token_mask_for_retrieve(
+                request, token_count, self._lmcache_chunk_size
+            )
+            req_perf["tokens_mask_ms"] = (time.perf_counter() - t_tokens) * 1000
 
             if self.use_layerwise:
                 if idx == last_idx:
@@ -904,53 +1006,106 @@ class LMCacheConnectorV1Impl:
                 if self.enable_blending:
                     # TODO(Jiayi): Need to make prefix caching and blending compatible
                     self.blender.blend(
-                        tokens[:lmcache_cached_tokens],
-                        token_mask[:lmcache_cached_tokens],
+                        retrieve_tokens,
+                        token_mask,
                         kvcaches=kvcaches,
                         slot_mapping=slot_mapping,
                         vllm_cached_tokens=request.load_spec.vllm_cached_tokens,
                     )
                 elif request.is_sparse_decode:
-                    layerwise_retriever = self.lmcache_engine.retrieve_layer_head_token_wise(
-                        tokens[:lmcache_cached_tokens], # needed for keys of cached kv cache
-                        token_mask[:lmcache_cached_tokens], # all true for lmcache chunk size 1
-                        kvcaches=kvcaches, # needed to allocate gpu buffer of the same size
-                        slot_mapping=slot_mapping,
-                        vllm_cached_tokens=request.load_spec.vllm_cached_tokens,
-                        sync=sync,
-                        cached_keys=request.cached_keys,
-                        cached_starts=request.cached_starts,
-                        cached_ends=request.cached_ends,
-                        cached_memory_objs=request.cached_memory_objs,
-                        cached_tensors=request.cached_tensors,
-                        req_id=request.req_id,
+                    retrieve_kwargs: dict[str, Any] = {
+                        "kvcaches": kvcaches,
+                        "slot_mapping": slot_mapping,
+                        "vllm_cached_tokens": request.load_spec.vllm_cached_tokens,
+                        "sync": sync,
+                        "cached_keys": request.cached_keys,
+                        "cached_starts": request.cached_starts,
+                        "cached_ends": request.cached_ends,
+                        "cached_memory_objs": request.cached_memory_objs,
+                        "cached_tensors": request.cached_tensors,
+                        "req_id": request.req_id,
+                    }
+                    if request.decode_ret_mask is not None:
+                        retrieve_kwargs["ret_mask"] = request.decode_ret_mask
+                    cached_location = self._decode_retrieve_locations.get(
+                        request.req_id
                     )
+                    if cached_location is not None:
+                        retrieve_kwargs["cached_retrieve_location"] = cached_location
+                    if (
+                        request.cached_ends
+                        and token_count > request.cached_ends[-1]
+                    ):
+                        self._decode_metadata_warm.discard(request.req_id)
+                    elif request.req_id in self._decode_metadata_warm:
+                        retrieve_kwargs["_retrieve_metadata_warm"] = True
+
+                    t_create = time.perf_counter()
+                    layerwise_retriever = (
+                        self.lmcache_engine.retrieve_layer_head_token_wise(
+                            retrieve_tokens,
+                            token_mask,
+                            **retrieve_kwargs,
+                        )
+                    )
+                    req_perf["retrieve_create_ms"] = (
+                        time.perf_counter() - t_create
+                    ) * 1000
+
                     # NOTE: retrieve layers one by one with cpu prefetch
-                    next(layerwise_retriever) 
+                    t_next = time.perf_counter()
+                    next(layerwise_retriever)
+                    req_perf["retrieve_next_ms"] = (
+                        time.perf_counter() - t_next
+                    ) * 1000
+                    if loc := retrieve_kwargs.get("cached_retrieve_location"):
+                        self._decode_retrieve_locations[request.req_id] = loc
+                    if request.cached_keys:
+                        self._decode_metadata_warm.add(request.req_id)
                     self.layerwise_retrievers.append(layerwise_retriever)
                 else:
+                    retrieve_slot_mapping = (
+                        slot_mapping
+                        if lmcache_cached_tokens >= len(slot_mapping)
+                        else slot_mapping[:lmcache_cached_tokens]
+                    )
+                    t_create = time.perf_counter()
                     layerwise_retriever = self.lmcache_engine.retrieve_layer(
-                        tokens[:lmcache_cached_tokens],
-                        token_mask[:lmcache_cached_tokens],
+                        retrieve_tokens,
+                        token_mask,
                         kvcaches=kvcaches,
-                        slot_mapping=slot_mapping[:lmcache_cached_tokens],
+                        slot_mapping=retrieve_slot_mapping,
                         vllm_cached_tokens=request.load_spec.vllm_cached_tokens,
                         sync=sync,
                     )
+                    req_perf["retrieve_create_ms"] = (
+                        time.perf_counter() - t_create
+                    ) * 1000
                     # NOTE: retrieve for two layers at the first layer
+                    t_next = time.perf_counter()
                     next(layerwise_retriever)
                     next(layerwise_retriever)
+                    req_perf["retrieve_next_ms"] = (
+                        time.perf_counter() - t_next
+                    ) * 1000
                     self.layerwise_retrievers.append(layerwise_retriever)
             else:
+                retrieve_slot_mapping = (
+                    slot_mapping
+                    if lmcache_cached_tokens >= len(slot_mapping)
+                    else slot_mapping[:lmcache_cached_tokens]
+                )
+                t_create = time.perf_counter()
                 ret_token_mask = self.lmcache_engine.retrieve(
-                    tokens[:lmcache_cached_tokens],
-                    token_mask[:lmcache_cached_tokens],
+                    retrieve_tokens,
+                    token_mask,
                     kvcaches=kvcaches,
-                    slot_mapping=slot_mapping[:lmcache_cached_tokens],
+                    slot_mapping=retrieve_slot_mapping,
                     vllm_cached_tokens=request.load_spec.vllm_cached_tokens,
                     request_configs=request.request_configs,
                     req_id=request.req_id,
                 )
+                req_perf["retrieve_ms"] = (time.perf_counter() - t_create) * 1000
 
                 # Check the result
                 num_retrieved_tokens = ret_token_mask.sum().item()
@@ -974,11 +1129,39 @@ class LMCacheConnectorV1Impl:
                     """
                     missing_blocks = self.record_failed_blocks(
                         request.req_id,
-                        token_mask[:lmcache_cached_tokens],
+                        token_mask,
                         ret_token_mask,
-                        slot_mapping[:lmcache_cached_tokens],
+                        retrieve_slot_mapping,
                     )
                     self._invalid_block_ids.update(missing_blocks)
+
+            req_perf["total_ms"] = (time.perf_counter() - t_req) * 1000
+            if _PERF_LOG_START_LOAD_KV:
+                logger.info(
+                    "start_load_kv perf req=%s sparse=%s tokens=%d "
+                    "drain_clear_ms=%.3f slot_mapping_ms=%.3f tokens_mask_ms=%.3f "
+                    "retrieve_create_ms=%.3f retrieve_next_ms=%.3f retrieve_ms=%.3f "
+                    "total_ms=%.3f",
+                    request.req_id,
+                    request.is_sparse_decode,
+                    token_count,
+                    t_drain_ms,
+                    req_perf.get("slot_mapping_ms", 0.0),
+                    req_perf.get("tokens_mask_ms", 0.0),
+                    req_perf.get("retrieve_create_ms", 0.0),
+                    req_perf.get("retrieve_next_ms", 0.0),
+                    req_perf.get("retrieve_ms", 0.0),
+                    req_perf["total_ms"],
+                )
+
+        if _PERF_LOG_START_LOAD_KV:
+            logger.info(
+                "start_load_kv perf summary drain_clear_ms=%.3f total_ms=%.3f "
+                "num_retrievers=%d",
+                t_drain_ms,
+                (time.perf_counter() - t_total) * 1000,
+                len(self.layerwise_retrievers),
+            )
 
     def record_failed_blocks(
         self,
@@ -1119,6 +1302,8 @@ class LMCacheConnectorV1Impl:
 
         if self.layerwise_retrievers:
             self.current_layer += 1
+            if self.current_layer >= self.num_layers:
+                self._drain_layerwise_retrievers()
 
         return
 
