@@ -4,7 +4,6 @@ from collections.abc import Iterable
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Generator, Optional, Union
 import os
-import time
 
 # Third Party
 from vllm.config import (
@@ -61,9 +60,6 @@ logger = init_logger(__name__)
 SPARSE_DECODE_RETRIEVE_TOKENS = int(
     os.environ.get("LMCACHE_SPARSE_DECODE_RETRIEVE_TOKENS", "2048")
 )
-
-# Per-request timing breakdown for start_load_kv (set to 1 to enable).
-_PERF_LOG_START_LOAD_KV = os.environ.get("LMCACHE_PERF_LOG_START_LOAD_KV", "0") == "1"
 
 
 def _sparse_slot_mapping_len(prompt_tokens: int) -> int:
@@ -913,14 +909,6 @@ class LMCacheConnectorV1Impl:
             The number of elements in kv_caches and layer_names should be
             the same.
         """
-        t_total = time.perf_counter()
-        perf: dict[str, float] = {
-            "metadata_ms": 0.0,
-            "state_cleanup_ms": 0.0,
-            "drain_ms": 0.0,
-            "stats_ms": 0.0,
-            "requests_load_ms": 0.0,
-        }
         self.current_layer = 0
 
         if len(self.kv_caches) == 0:
@@ -930,12 +918,9 @@ class LMCacheConnectorV1Impl:
             )
             self._init_kv_caches_from_forward_context(forward_context)
 
-        t0 = time.perf_counter()
         metadata = self._parent._get_connector_metadata()
-        perf["metadata_ms"] = (time.perf_counter() - t0) * 1000
         assert isinstance(metadata, LMCacheConnectorMetadata)
 
-        t0 = time.perf_counter()
         active_req_ids = {req.req_id for req in metadata.requests}
         self._decode_retrieve_locations = {
             req_id: loc
@@ -943,7 +928,6 @@ class LMCacheConnectorV1Impl:
             if req_id in active_req_ids
         }
         self._decode_metadata_warm &= active_req_ids
-        perf["state_cleanup_ms"] = (time.perf_counter() - t0) * 1000
 
         assert len(self.kv_caches) > 0
         if not self._kvcaches_list:
@@ -957,18 +941,14 @@ class LMCacheConnectorV1Impl:
 
         assert self.lmcache_engine is not None
 
-        t0 = time.perf_counter()
         self._drain_layerwise_retrievers()
-        perf["drain_ms"] = (time.perf_counter() - t0) * 1000
 
         last_idx = -1
         for idx, request in enumerate(metadata.requests):
             if request.load_spec is not None and request.load_spec.can_load:
                 last_idx = idx
 
-        num_load_requests = 0
         for idx, request in enumerate(metadata.requests):
-            t_stats = time.perf_counter()
             # Update metrics for all requests that have a load_spec
             if request.load_spec is not None:
                 self._stats_monitor.update_interval_vllm_hit_tokens(
@@ -977,20 +957,14 @@ class LMCacheConnectorV1Impl:
                 self._stats_monitor.update_interval_prompt_tokens(
                     len(request.token_ids)
                 )
-            perf["stats_ms"] += (time.perf_counter() - t_stats) * 1000
 
             if request.load_spec is None or not request.load_spec.can_load:
                 continue
-
-            t_req = time.perf_counter()
-            req_perf: dict[str, float] = {}
-            num_load_requests += 1
 
             tokens = request.token_ids
             lmcache_cached_tokens = request.load_spec.lmcache_cached_tokens
             assert request.slot_mapping
 
-            t_slot = time.perf_counter()
             if request.is_sparse_decode:
                 if request.slot_mapping[0].device.type != torch.device(
                     self.device
@@ -1003,12 +977,10 @@ class LMCacheConnectorV1Impl:
                 slot_mapping = request.slot_mapping[0].to(
                     device=self.device, dtype=torch.long
                 )
-            req_perf["slot_mapping_ms"] = (time.perf_counter() - t_slot) * 1000
 
             if not request.is_sparse_decode:
                 assert len(tokens) == len(slot_mapping)
 
-            t_tokens = time.perf_counter()
             retrieve_tokens = self._load_tokens_for_retrieve(
                 tokens,
                 lmcache_cached_tokens,
@@ -1018,7 +990,6 @@ class LMCacheConnectorV1Impl:
             token_mask = self._load_token_mask_for_retrieve(
                 request, token_count, self._lmcache_chunk_size
             )
-            req_perf["tokens_mask_ms"] = (time.perf_counter() - t_tokens) * 1000
 
             if self.use_layerwise:
                 if idx == last_idx:
@@ -1063,7 +1034,6 @@ class LMCacheConnectorV1Impl:
                     elif request.req_id in self._decode_metadata_warm:
                         retrieve_kwargs["_retrieve_metadata_warm"] = True
 
-                    t_create = time.perf_counter()
                     layerwise_retriever = (
                         self.lmcache_engine.retrieve_layer_head_token_wise(
                             retrieve_tokens,
@@ -1071,16 +1041,8 @@ class LMCacheConnectorV1Impl:
                             **retrieve_kwargs,
                         )
                     )
-                    req_perf["retrieve_create_ms"] = (
-                        time.perf_counter() - t_create
-                    ) * 1000
-
                     # NOTE: retrieve layers one by one with cpu prefetch
-                    t_next = time.perf_counter()
                     next(layerwise_retriever)
-                    req_perf["retrieve_next_ms"] = (
-                        time.perf_counter() - t_next
-                    ) * 1000
                     if loc := retrieve_kwargs.get("cached_retrieve_location"):
                         self._decode_retrieve_locations[request.req_id] = loc
                     if request.cached_keys:
@@ -1092,7 +1054,6 @@ class LMCacheConnectorV1Impl:
                         if lmcache_cached_tokens >= len(slot_mapping)
                         else slot_mapping[:lmcache_cached_tokens]
                     )
-                    t_create = time.perf_counter()
                     layerwise_retriever = self.lmcache_engine.retrieve_layer(
                         retrieve_tokens,
                         token_mask,
@@ -1101,16 +1062,9 @@ class LMCacheConnectorV1Impl:
                         vllm_cached_tokens=request.load_spec.vllm_cached_tokens,
                         sync=sync,
                     )
-                    req_perf["retrieve_create_ms"] = (
-                        time.perf_counter() - t_create
-                    ) * 1000
                     # NOTE: retrieve for two layers at the first layer
-                    t_next = time.perf_counter()
                     next(layerwise_retriever)
                     next(layerwise_retriever)
-                    req_perf["retrieve_next_ms"] = (
-                        time.perf_counter() - t_next
-                    ) * 1000
                     self.layerwise_retrievers.append(layerwise_retriever)
             else:
                 retrieve_slot_mapping = (
@@ -1118,7 +1072,6 @@ class LMCacheConnectorV1Impl:
                     if lmcache_cached_tokens >= len(slot_mapping)
                     else slot_mapping[:lmcache_cached_tokens]
                 )
-                t_create = time.perf_counter()
                 ret_token_mask = self.lmcache_engine.retrieve(
                     retrieve_tokens,
                     token_mask,
@@ -1128,7 +1081,6 @@ class LMCacheConnectorV1Impl:
                     request_configs=request.request_configs,
                     req_id=request.req_id,
                 )
-                req_perf["retrieve_ms"] = (time.perf_counter() - t_create) * 1000
 
                 # Check the result
                 num_retrieved_tokens = ret_token_mask.sum().item()
@@ -1157,51 +1109,6 @@ class LMCacheConnectorV1Impl:
                         retrieve_slot_mapping,
                     )
                     self._invalid_block_ids.update(missing_blocks)
-
-            request_load_ms = (time.perf_counter() - t_req) * 1000
-            perf["requests_load_ms"] += request_load_ms
-            if _PERF_LOG_START_LOAD_KV:
-                logger.info(
-                    "start_load_kv perf req=%s sparse=%s tokens=%d "
-                    "request_load_ms=%.3f slot_mapping_ms=%.3f tokens_mask_ms=%.3f "
-                    "retrieve_create_ms=%.3f retrieve_next_ms=%.3f retrieve_ms=%.3f",
-                    request.req_id,
-                    request.is_sparse_decode,
-                    token_count,
-                    request_load_ms,
-                    req_perf.get("slot_mapping_ms", 0.0),
-                    req_perf.get("tokens_mask_ms", 0.0),
-                    req_perf.get("retrieve_create_ms", 0.0),
-                    req_perf.get("retrieve_next_ms", 0.0),
-                    req_perf.get("retrieve_ms", 0.0),
-                )
-
-        if _PERF_LOG_START_LOAD_KV:
-            total_ms = (time.perf_counter() - t_total) * 1000
-            setup_ms = (
-                perf["metadata_ms"]
-                + perf["state_cleanup_ms"]
-                + perf["drain_ms"]
-            )
-            overhead_ms = (
-                total_ms - setup_ms - perf["stats_ms"] - perf["requests_load_ms"]
-            )
-            logger.info(
-                "start_load_kv perf summary total_ms=%.3f setup_ms=%.3f "
-                "(metadata_ms=%.3f state_cleanup_ms=%.3f drain_ms=%.3f) "
-                "stats_ms=%.3f requests_load_ms=%.3f overhead_ms=%.3f "
-                "num_load_requests=%d num_retrievers=%d",
-                total_ms,
-                setup_ms,
-                perf["metadata_ms"],
-                perf["state_cleanup_ms"],
-                perf["drain_ms"],
-                perf["stats_ms"],
-                perf["requests_load_ms"],
-                overhead_ms,
-                num_load_requests,
-                len(self.layerwise_retrievers),
-            )
 
     def record_failed_blocks(
         self,
