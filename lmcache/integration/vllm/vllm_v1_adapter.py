@@ -923,6 +923,7 @@ class LMCacheConnectorV1Impl:
                         cached_ends=request.cached_ends,
                         cached_memory_objs=request.cached_memory_objs,
                         cached_tensors=request.cached_tensors,
+                        request_configs=request.request_configs,
                         req_id=request.req_id,
                     )
                     # NOTE: retrieve layers one by one with cpu prefetch
@@ -1228,6 +1229,7 @@ class LMCacheConnectorV1Impl:
                     cached_ends=request.cached_ends,
                     cached_memory_objs=request.cached_memory_objs,
                     cached_tensors=request.cached_tensors,
+                    request_configs=request.request_configs,
                 )
                 self._layerwise_save_storers[request.req_id] = layerwise_storer
                 if is_first:
