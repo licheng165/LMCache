@@ -648,6 +648,7 @@ class LMCacheConnectorV1Impl:
         self._check_legacy_register_kv_caches()
 
         self.kv_caches: dict[str, torch.Tensor] = {}
+        self._kvcaches_list: list[torch.Tensor] = []
         self._block_size = vllm_config.cache_config.block_size
         self.load_specs: dict[str, LoadSpec] = {}
         self.kv_cache_manager: Optional["KVCacheManager"] = None
@@ -819,6 +820,9 @@ class LMCacheConnectorV1Impl:
             )
             kv_layer_groups_manager.build_kv_layer_groups(self.kv_caches)
 
+    def _refresh_kvcaches_list(self) -> None:
+        self._kvcaches_list = list(self.kv_caches.values())
+
     # TODO(chunxiaozheng): in the latest lmcache_connector, we use `register_kv_caches`
     #  to init self.kv_caches, we keep it in order to be compatible with old versions
     #  and will be removed in the future.
@@ -836,6 +840,7 @@ class LMCacheConnectorV1Impl:
                 ]
 
         self._build_kv_layer_groups()
+        self._refresh_kvcaches_list()
 
     ####################
     # Worker side APIs
@@ -892,6 +897,7 @@ class LMCacheConnectorV1Impl:
         assert len(self.kv_caches) == 0 and len(kv_caches) > 0
         self.kv_caches = kv_caches
         self._build_kv_layer_groups()
+        self._refresh_kvcaches_list()
         self._manager.post_init()
 
     @_lmcache_nvtx_annotate
@@ -908,6 +914,13 @@ class LMCacheConnectorV1Impl:
             the same.
         """
         t_total = time.perf_counter()
+        perf: dict[str, float] = {
+            "metadata_ms": 0.0,
+            "state_cleanup_ms": 0.0,
+            "drain_ms": 0.0,
+            "stats_ms": 0.0,
+            "requests_load_ms": 0.0,
+        }
         self.current_layer = 0
 
         if len(self.kv_caches) == 0:
@@ -917,9 +930,12 @@ class LMCacheConnectorV1Impl:
             )
             self._init_kv_caches_from_forward_context(forward_context)
 
+        t0 = time.perf_counter()
         metadata = self._parent._get_connector_metadata()
+        perf["metadata_ms"] = (time.perf_counter() - t0) * 1000
         assert isinstance(metadata, LMCacheConnectorMetadata)
 
+        t0 = time.perf_counter()
         active_req_ids = {req.req_id for req in metadata.requests}
         self._decode_retrieve_locations = {
             req_id: loc
@@ -927,9 +943,12 @@ class LMCacheConnectorV1Impl:
             if req_id in active_req_ids
         }
         self._decode_metadata_warm &= active_req_ids
+        perf["state_cleanup_ms"] = (time.perf_counter() - t0) * 1000
 
         assert len(self.kv_caches) > 0
-        kvcaches = list(self.kv_caches.values())
+        if not self._kvcaches_list:
+            self._refresh_kvcaches_list()
+        kvcaches = self._kvcaches_list
 
         attn_metadata = forward_context.attn_metadata
         if attn_metadata is None:
@@ -938,19 +957,18 @@ class LMCacheConnectorV1Impl:
 
         assert self.lmcache_engine is not None
 
-        t_drain = time.perf_counter()
+        t0 = time.perf_counter()
         self._drain_layerwise_retrievers()
-        t_drain_ms = (time.perf_counter() - t_drain) * 1000
+        perf["drain_ms"] = (time.perf_counter() - t0) * 1000
 
+        last_idx = -1
         for idx, request in enumerate(metadata.requests):
-            if request.load_spec is None or not request.load_spec.can_load:
-                continue
-            last_idx = idx
+            if request.load_spec is not None and request.load_spec.can_load:
+                last_idx = idx
 
+        num_load_requests = 0
         for idx, request in enumerate(metadata.requests):
-            t_req = time.perf_counter()
-            req_perf: dict[str, float] = {}
-
+            t_stats = time.perf_counter()
             # Update metrics for all requests that have a load_spec
             if request.load_spec is not None:
                 self._stats_monitor.update_interval_vllm_hit_tokens(
@@ -959,9 +977,14 @@ class LMCacheConnectorV1Impl:
                 self._stats_monitor.update_interval_prompt_tokens(
                     len(request.token_ids)
                 )
+            perf["stats_ms"] += (time.perf_counter() - t_stats) * 1000
 
             if request.load_spec is None or not request.load_spec.can_load:
                 continue
+
+            t_req = time.perf_counter()
+            req_perf: dict[str, float] = {}
+            num_load_requests += 1
 
             tokens = request.token_ids
             lmcache_cached_tokens = request.load_spec.lmcache_cached_tokens
@@ -1135,31 +1158,48 @@ class LMCacheConnectorV1Impl:
                     )
                     self._invalid_block_ids.update(missing_blocks)
 
-            req_perf["total_ms"] = (time.perf_counter() - t_req) * 1000
+            request_load_ms = (time.perf_counter() - t_req) * 1000
+            perf["requests_load_ms"] += request_load_ms
             if _PERF_LOG_START_LOAD_KV:
                 logger.info(
                     "start_load_kv perf req=%s sparse=%s tokens=%d "
-                    "drain_clear_ms=%.3f slot_mapping_ms=%.3f tokens_mask_ms=%.3f "
-                    "retrieve_create_ms=%.3f retrieve_next_ms=%.3f retrieve_ms=%.3f "
-                    "total_ms=%.3f",
+                    "request_load_ms=%.3f slot_mapping_ms=%.3f tokens_mask_ms=%.3f "
+                    "retrieve_create_ms=%.3f retrieve_next_ms=%.3f retrieve_ms=%.3f",
                     request.req_id,
                     request.is_sparse_decode,
                     token_count,
-                    t_drain_ms,
+                    request_load_ms,
                     req_perf.get("slot_mapping_ms", 0.0),
                     req_perf.get("tokens_mask_ms", 0.0),
                     req_perf.get("retrieve_create_ms", 0.0),
                     req_perf.get("retrieve_next_ms", 0.0),
                     req_perf.get("retrieve_ms", 0.0),
-                    req_perf["total_ms"],
                 )
 
         if _PERF_LOG_START_LOAD_KV:
+            total_ms = (time.perf_counter() - t_total) * 1000
+            setup_ms = (
+                perf["metadata_ms"]
+                + perf["state_cleanup_ms"]
+                + perf["drain_ms"]
+            )
+            overhead_ms = (
+                total_ms - setup_ms - perf["stats_ms"] - perf["requests_load_ms"]
+            )
             logger.info(
-                "start_load_kv perf summary drain_clear_ms=%.3f total_ms=%.3f "
-                "num_retrievers=%d",
-                t_drain_ms,
-                (time.perf_counter() - t_total) * 1000,
+                "start_load_kv perf summary total_ms=%.3f setup_ms=%.3f "
+                "(metadata_ms=%.3f state_cleanup_ms=%.3f drain_ms=%.3f) "
+                "stats_ms=%.3f requests_load_ms=%.3f overhead_ms=%.3f "
+                "num_load_requests=%d num_retrievers=%d",
+                total_ms,
+                setup_ms,
+                perf["metadata_ms"],
+                perf["state_cleanup_ms"],
+                perf["drain_ms"],
+                perf["stats_ms"],
+                perf["requests_load_ms"],
+                overhead_ms,
+                num_load_requests,
                 len(self.layerwise_retrievers),
             )
 
