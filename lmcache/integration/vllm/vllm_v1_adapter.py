@@ -168,6 +168,10 @@ class RequestTracker:
     cached_ends: list[int] = field(default_factory=list)
     cached_memory_objs: list[list] = field(default_factory=list)
     cached_tensors: list[list] = field(default_factory=list)
+    # Sparse decode only: NPU device ptr per cached chunk, parallel to cached_tensors.
+    cached_chunk_dev_ptrs: list[list[int]] = field(default_factory=list)
+    # Sparse decode only: prebuilt NPU tensor of chunk device ptrs, one entry per layer.
+    cached_chunk_ptrs_npu: list[Optional[torch.Tensor]] = field(default_factory=list)
     # Sparse decode only: prompt token ids for retrieve keys, built once.
     sparse_token_ids: list[int] = field(default_factory=list, repr=False)
     # Sparse decode only: single-element list holding CPU then NPU slot_mapping.
@@ -325,6 +329,8 @@ class ReqMeta:
     cached_ends: list[int] = field(default_factory=list)
     cached_memory_objs: list[list] = field(default_factory=list)
     cached_tensors: list[list] = field(default_factory=list)
+    cached_chunk_dev_ptrs: list[list[int]] = field(default_factory=list)
+    cached_chunk_ptrs_npu: list[Optional[torch.Tensor]] = field(default_factory=list)
     # Sparse decode only: shared with RequestTracker, reused across decode steps.
     decode_token_mask: Optional[torch.Tensor] = field(default=None, repr=False)
     decode_ret_mask: Optional[torch.Tensor] = field(default=None, repr=False)
@@ -525,6 +531,8 @@ class ReqMeta:
             cached_ends=tracker.cached_ends,
             cached_memory_objs=tracker.cached_memory_objs,
             cached_tensors=tracker.cached_tensors,
+            cached_chunk_dev_ptrs=tracker.cached_chunk_dev_ptrs,
+            cached_chunk_ptrs_npu=tracker.cached_chunk_ptrs_npu,
             decode_token_mask=decode_token_mask,
             decode_ret_mask=decode_ret_mask,
         )
@@ -1017,6 +1025,8 @@ class LMCacheConnectorV1Impl:
                         "cached_ends": request.cached_ends,
                         "cached_memory_objs": request.cached_memory_objs,
                         "cached_tensors": request.cached_tensors,
+                        "cached_chunk_dev_ptrs": request.cached_chunk_dev_ptrs,
+                        "cached_chunk_ptrs_npu": request.cached_chunk_ptrs_npu,
                         "req_id": request.req_id,
                     }
                     if request.decode_ret_mask is not None:
