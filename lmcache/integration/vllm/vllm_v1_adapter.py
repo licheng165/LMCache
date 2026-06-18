@@ -1019,6 +1019,7 @@ class LMCacheConnectorV1Impl:
                         "kvcaches": kvcaches,
                         "slot_mapping": slot_mapping,
                         "vllm_cached_tokens": request.load_spec.vllm_cached_tokens,
+                        "lmcache_cached_tokens": request.load_spec.lmcache_cached_tokens,
                         "sync": sync,
                         "cached_keys": request.cached_keys,
                         "cached_starts": request.cached_starts,
