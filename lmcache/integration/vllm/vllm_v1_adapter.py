@@ -315,6 +315,22 @@ class RequestTracker:
 
 
 @dataclass
+class WorkerRetrieveState:
+    """Worker-local retrieve cache; survives scheduler/worker IPC each decode step."""
+
+    cached_keys: list[list] = field(default_factory=list)
+    cached_starts: list[int] = field(default_factory=list)
+    cached_ends: list[int] = field(default_factory=list)
+    cached_memory_objs: list[list] = field(default_factory=list)
+    cached_tensors: list[list] = field(default_factory=list)
+    cached_chunk_dev_ptrs: list[list[int]] = field(default_factory=list)
+    cached_chunk_ptrs_npu: list[Optional[torch.Tensor]] = field(default_factory=list)
+    location: Optional[str] = None
+    metadata_warm: bool = False
+    token_count: int = 0
+
+
+@dataclass
 class ReqMeta:
     # Request id
     req_id: str
@@ -334,6 +350,9 @@ class ReqMeta:
     # Sparse decode only: shared with RequestTracker, reused across decode steps.
     decode_token_mask: Optional[torch.Tensor] = field(default=None, repr=False)
     decode_ret_mask: Optional[torch.Tensor] = field(default=None, repr=False)
+
+    # Set by scheduler when a cached request resumes after preemption.
+    resumed_from_preemption: bool = False
 
     # Whether is last prefill or not
     is_last_prefill: bool = False
@@ -680,8 +699,8 @@ class LMCacheConnectorV1Impl:
         self.force_skip_save = bool(os.environ.get("LMCACHE_FORCE_SKIP_SAVE", False))
         self._requests_priority: dict[str, int] = {}
         self._invalid_block_ids: set[int] = set()
-        self._decode_retrieve_locations: dict[str, str] = {}
-        self._decode_metadata_warm: set[str] = set()
+        if role != KVConnectorRole.SCHEDULER:
+            self._worker_retrieve_state: dict[str, WorkerRetrieveState] = {}
 
     def _check_legacy_register_kv_caches(self) -> None:
         """Check for legacy connector without register_kv_caches implementation."""
@@ -893,6 +912,115 @@ class LMCacheConnectorV1Impl:
                 pass
         self.layerwise_retrievers.clear()
 
+    def _prune_worker_retrieve_state(self, active_req_ids: set[str]) -> None:
+        if not hasattr(self, "_worker_retrieve_state"):
+            return
+        self._worker_retrieve_state = {
+            req_id: state
+            for req_id, state in self._worker_retrieve_state.items()
+            if req_id in active_req_ids
+        }
+
+    def _drop_worker_retrieve_state(self, req_id: str) -> None:
+        if hasattr(self, "_worker_retrieve_state"):
+            self._worker_retrieve_state.pop(req_id, None)
+
+    def _should_invalidate_worker_retrieve_state(
+        self, request: ReqMeta, token_count: int
+    ) -> bool:
+        if request.resumed_from_preemption:
+            return True
+        state = self._worker_retrieve_state.get(request.req_id)
+        if state is None:
+            return False
+        if state.cached_ends and token_count < state.cached_ends[-1]:
+            return True
+        return False
+
+    def _bind_worker_retrieve_state_to_request(
+        self, request: ReqMeta
+    ) -> Optional[WorkerRetrieveState]:
+        state = self._worker_retrieve_state.get(request.req_id)
+        if state is None or not (state.metadata_warm or state.cached_keys):
+            return None
+        request.cached_keys = state.cached_keys
+        request.cached_starts = state.cached_starts
+        request.cached_ends = state.cached_ends
+        request.cached_memory_objs = state.cached_memory_objs
+        request.cached_tensors = state.cached_tensors
+        request.cached_chunk_dev_ptrs = state.cached_chunk_dev_ptrs
+        request.cached_chunk_ptrs_npu = state.cached_chunk_ptrs_npu
+        return state
+
+    def _save_worker_retrieve_state_from_request(
+        self,
+        request: ReqMeta,
+        *,
+        location: Optional[str],
+        metadata_warm: bool,
+        token_count: int,
+    ) -> None:
+        if not hasattr(self, "_worker_retrieve_state"):
+            return
+        if not metadata_warm and not request.cached_keys:
+            return
+        self._worker_retrieve_state[request.req_id] = WorkerRetrieveState(
+            cached_keys=request.cached_keys,
+            cached_starts=request.cached_starts,
+            cached_ends=request.cached_ends,
+            cached_memory_objs=request.cached_memory_objs,
+            cached_tensors=request.cached_tensors,
+            cached_chunk_dev_ptrs=request.cached_chunk_dev_ptrs,
+            cached_chunk_ptrs_npu=request.cached_chunk_ptrs_npu,
+            location=location,
+            metadata_warm=metadata_warm,
+            token_count=token_count,
+        )
+
+    def _finalize_worker_retrieve_state_from_metadata(
+        self, metadata: LMCacheConnectorMetadata
+    ) -> None:
+        if not hasattr(self, "_worker_retrieve_state"):
+            return
+        for request in metadata.requests:
+            if not request.is_sparse_decode:
+                continue
+            if request.load_spec is None or not request.load_spec.can_load:
+                continue
+            if not request.cached_keys:
+                continue
+            existing = self._worker_retrieve_state.get(request.req_id)
+            location = existing.location if existing is not None else None
+            metadata_warm = (
+                existing.metadata_warm if existing is not None else True
+            )
+            self._save_worker_retrieve_state_from_request(
+                request,
+                location=location,
+                metadata_warm=metadata_warm or bool(request.cached_keys),
+                token_count=len(request.token_ids),
+            )
+
+    def _sparse_decode_retrieve_warm_kwargs(
+        self,
+        request: ReqMeta,
+        token_count: int,
+        bound_state: Optional[WorkerRetrieveState],
+    ) -> dict[str, Any]:
+        warm_kwargs: dict[str, Any] = {}
+        if bound_state is None:
+            return warm_kwargs
+        if bound_state.location is not None:
+            warm_kwargs["cached_retrieve_location"] = bound_state.location
+        if (
+            bound_state.metadata_warm
+            and bound_state.cached_keys
+            and bound_state.cached_ends
+            and token_count <= bound_state.cached_ends[-1]
+        ):
+            warm_kwargs["_retrieve_metadata_warm"] = True
+        return warm_kwargs
+
     @_lmcache_nvtx_annotate
     def register_kv_caches(self, kv_caches: dict[str, torch.Tensor]):
         logger.info("Registering KV caches")
@@ -930,12 +1058,7 @@ class LMCacheConnectorV1Impl:
         assert isinstance(metadata, LMCacheConnectorMetadata)
 
         active_req_ids = {req.req_id for req in metadata.requests}
-        self._decode_retrieve_locations = {
-            req_id: loc
-            for req_id, loc in self._decode_retrieve_locations.items()
-            if req_id in active_req_ids
-        }
-        self._decode_metadata_warm &= active_req_ids
+        self._prune_worker_retrieve_state(active_req_ids)
 
         assert len(self.kv_caches) > 0
         if not self._kvcaches_list:
@@ -1015,6 +1138,17 @@ class LMCacheConnectorV1Impl:
                         vllm_cached_tokens=request.load_spec.vllm_cached_tokens,
                     )
                 elif request.is_sparse_decode:
+                    if hasattr(self, "_worker_retrieve_state"):
+                        if self._should_invalidate_worker_retrieve_state(
+                            request, token_count
+                        ):
+                            self._drop_worker_retrieve_state(request.req_id)
+                        bound_state = self._bind_worker_retrieve_state_to_request(
+                            request
+                        )
+                    else:
+                        bound_state = None
+
                     retrieve_kwargs: dict[str, Any] = {
                         "kvcaches": kvcaches,
                         "slot_mapping": slot_mapping,
@@ -1030,20 +1164,13 @@ class LMCacheConnectorV1Impl:
                         "cached_chunk_ptrs_npu": request.cached_chunk_ptrs_npu,
                         "req_id": request.req_id,
                     }
+                    retrieve_kwargs.update(
+                        self._sparse_decode_retrieve_warm_kwargs(
+                            request, token_count, bound_state
+                        )
+                    )
                     if request.decode_ret_mask is not None:
                         retrieve_kwargs["ret_mask"] = request.decode_ret_mask
-                    cached_location = self._decode_retrieve_locations.get(
-                        request.req_id
-                    )
-                    if cached_location is not None:
-                        retrieve_kwargs["cached_retrieve_location"] = cached_location
-                    if (
-                        request.cached_ends
-                        and token_count > request.cached_ends[-1]
-                    ):
-                        self._decode_metadata_warm.discard(request.req_id)
-                    elif request.req_id in self._decode_metadata_warm:
-                        retrieve_kwargs["_retrieve_metadata_warm"] = True
 
                     layerwise_retriever = (
                         self.lmcache_engine.retrieve_layer_head_token_wise(
@@ -1054,10 +1181,17 @@ class LMCacheConnectorV1Impl:
                     )
                     # NOTE: retrieve layers one by one with cpu prefetch
                     next(layerwise_retriever)
-                    if loc := retrieve_kwargs.get("cached_retrieve_location"):
-                        self._decode_retrieve_locations[request.req_id] = loc
-                    if request.cached_keys:
-                        self._decode_metadata_warm.add(request.req_id)
+                    location = retrieve_kwargs.get("cached_retrieve_location")
+                    metadata_warm = bool(
+                        retrieve_kwargs.get("_retrieve_metadata_warm")
+                        or request.cached_keys
+                    )
+                    self._save_worker_retrieve_state_from_request(
+                        request,
+                        location=location,
+                        metadata_warm=metadata_warm,
+                        token_count=token_count,
+                    )
                     self.layerwise_retrievers.append(layerwise_retriever)
                 else:
                     retrieve_slot_mapping = (
@@ -1261,6 +1395,7 @@ class LMCacheConnectorV1Impl:
         if self.layerwise_retrievers:
             self.current_layer += 1
             if self.current_layer >= self.num_layers:
+                self._finalize_worker_retrieve_state_from_metadata(metadata)
                 self._drain_layerwise_retrievers()
 
         return
@@ -1841,6 +1976,7 @@ class LMCacheConnectorV1Impl:
                     save_decode_cache=self.config.save_decode_cache,
                 )
                 if req_meta is not None:
+                    req_meta.resumed_from_preemption = req.resumed_from_preemption
                     meta.add_request(req_meta)
             return meta
 
@@ -1969,6 +2105,7 @@ class LMCacheConnectorV1Impl:
                 is_sparse_decode=is_sparse_decode
             )
             if req_meta is not None:
+                req_meta.resumed_from_preemption = preempted
                 meta.add_request(req_meta)
 
         return meta
@@ -1986,6 +2123,8 @@ class LMCacheConnectorV1Impl:
             self, "_layerwise_save_storers"
         ):
             self._layerwise_save_storers.pop(request.request_id, None)
+
+        self._drop_worker_retrieve_state(request.request_id)
 
         # Cleanup if request was aborted
         if request.status == RequestStatus.FINISHED_ABORTED and self.async_loading:
