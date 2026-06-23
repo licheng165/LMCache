@@ -48,6 +48,31 @@ class MockMooncakeConnection:
         return False
 
 
+class MockLocalCPUBackend:
+    """LocalCPUBackend stand-in tracking hot cache and API usage."""
+
+    def __init__(self):
+        self.hot_cache: dict[CacheEngineKey, MockMemoryObj] = {}
+        self.batched_submit_put_task_calls: list[
+            tuple[list[CacheEngineKey], list[MockMemoryObj]]
+        ] = []
+        self.batched_get_non_blocking_calls: list[list[CacheEngineKey]] = []
+
+    def batched_submit_put_task(self, keys, memory_objs, transfer_spec=None):
+        self.batched_submit_put_task_calls.append((list(keys), list(memory_objs)))
+        for key, obj in zip(keys, memory_objs, strict=False):
+            self.hot_cache[key] = obj
+
+    async def batched_get_non_blocking(
+        self,
+        lookup_id: str,
+        keys: list[CacheEngineKey],
+        transfer_spec=None,
+    ) -> list[MockMemoryObj]:
+        self.batched_get_non_blocking_calls.append(list(keys))
+        return [self.hot_cache[k] for k in keys if k in self.hot_cache]
+
+
 class MockRemoteBackend:
     """RemoteBackend stand-in for layerwise blocking get tests."""
 
@@ -78,31 +103,6 @@ class MockRemoteBackend:
         result = self._blocking_results[self._call_idx]
         self._call_idx += 1
         return result
-
-
-class MockLocalCPUBackend:
-    """LocalCPUBackend stand-in tracking hot cache and API usage."""
-
-    def __init__(self):
-        self.hot_cache: dict[CacheEngineKey, MockMemoryObj] = {}
-        self.batched_submit_put_task_calls: list[
-            tuple[list[CacheEngineKey], list[MockMemoryObj]]
-        ] = []
-        self.batched_get_non_blocking_calls: list[list[CacheEngineKey]] = []
-
-    def batched_submit_put_task(self, keys, memory_objs, transfer_spec=None):
-        self.batched_submit_put_task_calls.append((list(keys), list(memory_objs)))
-        for key, obj in zip(keys, memory_objs, strict=False):
-            self.hot_cache[key] = obj
-
-    async def batched_get_non_blocking(
-        self,
-        lookup_id: str,
-        keys: list[CacheEngineKey],
-        transfer_spec=None,
-    ) -> list[MockMemoryObj]:
-        self.batched_get_non_blocking_calls.append(list(keys))
-        return [self.hot_cache[k] for k in keys if k in self.hot_cache]
 
 
 def _make_layer_key(layer_id: int, chunk_hash: int = 0xabc) -> LayerCacheEngineKey:
