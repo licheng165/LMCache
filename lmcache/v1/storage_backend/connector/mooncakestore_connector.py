@@ -103,6 +103,11 @@ class MooncakestoreConnector(RemoteConnector):
     ):
         # initialize base class, which includes some common attributes
         super().__init__(local_cpu_backend.config, local_cpu_backend.metadata)
+        logger.info(
+            "Mooncake connector save_chunk_meta=%s, meta_shapes=%s",
+            self.save_chunk_meta,
+            self.meta_shapes,
+        )
 
         try:
             # Third Party

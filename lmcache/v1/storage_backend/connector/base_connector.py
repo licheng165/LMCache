@@ -19,6 +19,37 @@ from lmcache.v1.protocol import get_remote_metadata_bytes, init_remote_metadata_
 logger = init_logger(__name__)
 
 
+def resolve_save_chunk_meta(config: LMCacheEngineConfig) -> bool:
+    """
+    Whether remote connectors embed per-chunk metadata alongside KV bytes.
+
+    Explicit ``save_chunk_meta`` in extra_config always wins. Otherwise layerwise
+    mode defaults to True for legacy remote backends that cannot rely on fixed
+    connector-side metadata.
+    """
+    extra = config.extra_config
+    if extra is not None and "save_chunk_meta" in extra:
+        return bool(extra["save_chunk_meta"])
+    if extra is None:
+        return True
+    if config.use_layerwise:
+        return True
+    return bool(extra.get("save_chunk_meta", True))
+
+
+def layerwise_connector_meta_shapes(
+    shapes: list[torch.Size],
+) -> list[torch.Size]:
+    """Per-layer keys store one layer per chunk; shrink the layer dimension."""
+    adjusted: list[torch.Size] = []
+    for shape in shapes:
+        if len(shape) == 4 and shape[1] > 1:
+            adjusted.append(torch.Size([shape[0], 1, shape[2], shape[3]]))
+        else:
+            adjusted.append(shape)
+    return adjusted
+
+
 def NotAudit(func):
     """
     Decorator to mark methods that should not be audited.
@@ -52,12 +83,10 @@ class RemoteConnector(metaclass=abc.ABCMeta):
         """
         # TODO(chunxiaozheng): support layerwise here
         assert metadata is not None
-        self.save_chunk_meta: bool = (
-            config.extra_config is None
-            or config.extra_config.get("save_chunk_meta", True)
-            or config.use_layerwise
-        )
+        self.save_chunk_meta: bool = resolve_save_chunk_meta(config)
         self.meta_shapes: list[torch.Size] = metadata.get_shapes()
+        if config.use_layerwise and not self.save_chunk_meta:
+            self.meta_shapes = layerwise_connector_meta_shapes(self.meta_shapes)
         self.meta_dtypes: list[torch.dtype] = metadata.get_dtypes()
         self.meta_fmt: MemoryFormat = (
             MemoryFormat.KV_MLA_FMT if metadata.use_mla else MemoryFormat.KV_2LTD
