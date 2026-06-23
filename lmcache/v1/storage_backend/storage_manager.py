@@ -597,6 +597,15 @@ class StorageManager:
         """
         if location is None:
             location = "LocalCPUBackend"
+        elif (
+            location != "LocalCPUBackend"
+            and "LocalCPUBackend" in self.storage_backends
+            and keys
+            and keys[0]
+        ):
+            local_backend = self.storage_backends["LocalCPUBackend"]
+            if local_backend.contains(keys[0][0]):
+                location = "LocalCPUBackend"
         backend = self.storage_backends[location]
         use_blocking = self._layerwise_get_prefers_blocking(location, backend)
         for keys_multi_chunk in keys:
