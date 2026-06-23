@@ -489,28 +489,94 @@ class StorageManager:
         for backend_name, storage_backend in self.get_active_storage_backends(location):
             memory_objs = storage_backend.batched_get_blocking(keys)
             if memory_objs:
-                # Align with single-key `get()` logic:
-                # auto-write remote data to local CPU cache
-                if (
-                    backend_name not in ["LocalCPUBackend", "PDBackend", "MaruBackend"]
-                    and "LocalCPUBackend" in self.storage_backends
-                    and None not in memory_objs
-                ):
-                    logger.debug(
-                        "Storing %s objects from %s to LocalCPUBackend",
-                        len(keys),
+                if None not in memory_objs:
+                    self._write_back_to_local_cpu(
                         backend_name,
+                        keys,
+                        cast(List[MemoryObj], memory_objs),
                     )
-                    local_cpu_backend = self.storage_backends["LocalCPUBackend"]
-                    assert isinstance(local_cpu_backend, LocalCPUBackend)
-                    # Type cast: Safe (we verified no Nones above)
-                    # `batched_submit_put_task` expects list[MemoryObj]
-                    # TODO (lisiG9): Refactor this write-back logic into caching
-                    #  policy module
-                    memory_objs_no_none = cast(List[MemoryObj], memory_objs)
-                    local_cpu_backend.batched_submit_put_task(keys, memory_objs_no_none)
                 return memory_objs
         return [None] * len(keys)
+
+    def _write_back_to_local_cpu(
+        self,
+        backend_name: str,
+        keys: Sequence[CacheEngineKey],
+        memory_objs: List[MemoryObj],
+    ) -> None:
+        """Write remote-tier hits into LocalCPUBackend hot cache."""
+        if (
+            backend_name in ["LocalCPUBackend", "PDBackend", "MaruBackend"]
+            or "LocalCPUBackend" not in self.storage_backends
+            or not self.config.local_cpu
+            or not memory_objs
+        ):
+            return
+
+        logger.debug(
+            "Storing %s objects from %s to LocalCPUBackend",
+            len(memory_objs),
+            backend_name,
+        )
+        local_cpu_backend = self.storage_backends["LocalCPUBackend"]
+        assert isinstance(local_cpu_backend, LocalCPUBackend)
+        local_cpu_backend.batched_submit_put_task(
+            list(keys[: len(memory_objs)]),
+            memory_objs,
+        )
+
+    def _normalize_layerwise_prefix(
+        self,
+        objs: List[Optional[MemoryObj]],
+    ) -> List[MemoryObj]:
+        """
+        Return the consecutive prefix of valid memory objects.
+        Release objects after the first None to match remote prefix semantics.
+        """
+        memory_objs: List[MemoryObj] = []
+        found_failure = False
+        for obj in objs:
+            if found_failure:
+                if obj is not None:
+                    obj.ref_count_down()
+                continue
+            if obj is None:
+                found_failure = True
+                continue
+            memory_objs.append(obj)
+        return memory_objs
+
+    def _layerwise_get_prefers_blocking(
+        self,
+        backend_name: str,
+        backend: StorageBackendInterface,
+    ) -> bool:
+        if backend_name != "RemoteBackend":
+            return False
+
+        if self.config.get_extra_config_value("layerwise_use_blocking_get", False):
+            return True
+
+        connection = getattr(backend, "connection", None)
+        if connection is None:
+            return False
+
+        if connection.support_batched_get() and not connection.support_batched_get_non_blocking():
+            return True
+        return False
+
+    async def _layerwise_batched_get_blocking(
+        self,
+        backend: StorageBackendInterface,
+        backend_name: str,
+        keys_multi_chunk: List[CacheEngineKey],
+    ) -> List[MemoryObj]:
+        objs_optional = await asyncio.to_thread(
+            backend.batched_get_blocking, keys_multi_chunk
+        )
+        objs = self._normalize_layerwise_prefix(objs_optional)
+        self._write_back_to_local_cpu(backend_name, keys_multi_chunk, objs)
+        return objs
 
     def layerwise_batched_get(
         self,
@@ -531,11 +597,17 @@ class StorageManager:
         """
         if location is None:
             location = "LocalCPUBackend"
+        backend = self.storage_backends[location]
+        use_blocking = self._layerwise_get_prefers_blocking(location, backend)
         for keys_multi_chunk in keys:
-            # Retrieve all chunks for one layer
-            backend = self.storage_backends[location]
-            # TODO(Jiayi): need to make async loading and layerwise compatible
-            coro = backend.batched_get_non_blocking("fake_lookup_id", keys_multi_chunk)
+            if use_blocking:
+                coro = self._layerwise_batched_get_blocking(
+                    backend, location, keys_multi_chunk
+                )
+            else:
+                coro = backend.batched_get_non_blocking(
+                    "fake_lookup_id", keys_multi_chunk
+                )
             task = asyncio.run_coroutine_threadsafe(coro, self.loop)
             yield task
 

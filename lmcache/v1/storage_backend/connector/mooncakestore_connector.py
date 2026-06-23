@@ -271,6 +271,39 @@ class MooncakestoreConnector(RemoteConnector):
         """
         return True
 
+    def support_batched_get_non_blocking(self) -> bool:
+        """
+        Mooncake only supports batched_get / batch_get_into, not per-key get().
+        Layerwise retrieval uses StorageManager's blocking batched_get path.
+        """
+        return False
+
+    async def batched_get_non_blocking(
+        self,
+        lookup_id: str,
+        keys: List[CacheEngineKey],
+    ) -> List[MemoryObj]:
+        """
+        Fallback for callers that still invoke non-blocking get on Mooncake.
+        Delegates to batched_get and applies prefix semantics.
+        """
+        if not keys:
+            return []
+
+        results = await self.batched_get(keys)
+        memory_objs: list[MemoryObj] = []
+        found_failure = False
+        for result in results:
+            if found_failure:
+                if result is not None:
+                    result.ref_count_down()
+                continue
+            if result is None:
+                found_failure = True
+                continue
+            memory_objs.append(result)
+        return memory_objs
+
     async def exists(self, key: CacheEngineKey) -> bool:
         return self.store.is_exist(key.to_string())
 
