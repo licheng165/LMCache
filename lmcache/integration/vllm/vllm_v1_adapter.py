@@ -61,6 +61,29 @@ SPARSE_DECODE_RETRIEVE_TOKENS = int(
     os.environ.get("LMCACHE_SPARSE_DECODE_RETRIEVE_TOKENS", "2048")
 )
 
+_DECODE_DIAG_LOG_PREFIX = "[LMCacheDecodeDiag]"
+
+
+def _decode_diag_enabled() -> bool:
+    return os.environ.get("LMCACHE_DECODE_DIAG", "").lower() in (
+        "1",
+        "true",
+        "yes",
+    )
+
+
+def _tensor_cache_chunk_counts(cached_tensors: Optional[list]) -> list[int]:
+    if not cached_tensors:
+        return []
+    return [len(layer) for layer in cached_tensors]
+
+
+def _get_decode_diag_pending_stores(lmcache_engine: Any) -> tuple[int, int]:
+    getter = getattr(lmcache_engine, "get_decode_diag_pending_stores", None)
+    if getter is None:
+        return 0, 0
+    return getter()
+
 
 def _sparse_slot_mapping_len(prompt_tokens: int) -> int:
     return min(SPARSE_DECODE_RETRIEVE_TOKENS, prompt_tokens)
@@ -701,6 +724,7 @@ class LMCacheConnectorV1Impl:
         self._invalid_block_ids: set[int] = set()
         if role != KVConnectorRole.SCHEDULER:
             self._worker_retrieve_state: dict[str, WorkerRetrieveState] = {}
+            self._sparse_decode_diag_steps: dict[str, int] = {}
 
     def _check_legacy_register_kv_caches(self) -> None:
         """Check for legacy connector without register_kv_caches implementation."""
@@ -1021,6 +1045,52 @@ class LMCacheConnectorV1Impl:
             warm_kwargs["_retrieve_metadata_warm"] = True
         return warm_kwargs
 
+    def _log_sparse_decode_step_diag(
+        self,
+        request: ReqMeta,
+        *,
+        phase: str,
+        decode_step: int,
+        bound_state: Optional[WorkerRetrieveState],
+        retrieve_kwargs: Optional[dict[str, Any]] = None,
+    ) -> None:
+        if not _decode_diag_enabled():
+            return
+        assert self.lmcache_engine is not None
+        pending_reqs, pending_ops = _get_decode_diag_pending_stores(
+            self.lmcache_engine
+        )
+        worker_bind = (
+            "miss"
+            if bound_state is None
+            else ("warm" if bound_state.metadata_warm else "hit")
+        )
+        save_can_save = (
+            request.save_spec.can_save if request.save_spec is not None else False
+        )
+        parts = [
+            f"phase={phase}",
+            f"req={request.req_id}",
+            f"step={decode_step}",
+            f"worker_bind={worker_bind}",
+            f"lmcache_cached_tokens={request.load_spec.lmcache_cached_tokens if request.load_spec else 0}",
+            f"save_can_save={save_can_save}",
+            f"pending_async_stores={pending_reqs}/{pending_ops}",
+            f"cached_keys_layers={len(request.cached_keys)}",
+            f"cached_tensor_chunks={_tensor_cache_chunk_counts(request.cached_tensors)}",
+        ]
+        if retrieve_kwargs is not None:
+            parts.extend(
+                [
+                    f"retrieve_warm={bool(retrieve_kwargs.get('_retrieve_metadata_warm'))}",
+                    f"meta_path={retrieve_kwargs.get('_decode_diag_meta_path', '?')}",
+                    f"meta_ms={retrieve_kwargs.get('_decode_diag_meta_ms', 0.0):.3f}",
+                    f"use_cached_retrieve={retrieve_kwargs.get('_decode_diag_use_cached_retrieve')}",
+                    f"storage_get={retrieve_kwargs.get('_decode_diag_storage_get')}",
+                ]
+            )
+        logger.info("%s %s", _DECODE_DIAG_LOG_PREFIX, " ".join(parts))
+
     @_lmcache_nvtx_annotate
     def register_kv_caches(self, kv_caches: dict[str, torch.Tensor]):
         logger.info("Registering KV caches")
@@ -1059,6 +1129,12 @@ class LMCacheConnectorV1Impl:
 
         active_req_ids = {req.req_id for req in metadata.requests}
         self._prune_worker_retrieve_state(active_req_ids)
+        if _decode_diag_enabled() and hasattr(self, "_sparse_decode_diag_steps"):
+            self._sparse_decode_diag_steps = {
+                req_id: step
+                for req_id, step in self._sparse_decode_diag_steps.items()
+                if req_id in active_req_ids
+            }
 
         assert len(self.kv_caches) > 0
         if not self._kvcaches_list:
@@ -1138,6 +1214,13 @@ class LMCacheConnectorV1Impl:
                         vllm_cached_tokens=request.load_spec.vllm_cached_tokens,
                     )
                 elif request.is_sparse_decode:
+                    decode_step = 0
+                    if hasattr(self, "_sparse_decode_diag_steps"):
+                        decode_step = self._sparse_decode_diag_steps.get(
+                            request.req_id, 0
+                        ) + 1
+                        self._sparse_decode_diag_steps[request.req_id] = decode_step
+
                     if hasattr(self, "_worker_retrieve_state"):
                         if self._should_invalidate_worker_retrieve_state(
                             request, token_count
@@ -1148,6 +1231,13 @@ class LMCacheConnectorV1Impl:
                         )
                     else:
                         bound_state = None
+
+                    self._log_sparse_decode_step_diag(
+                        request,
+                        phase="pre_retrieve",
+                        decode_step=decode_step,
+                        bound_state=bound_state,
+                    )
 
                     retrieve_kwargs: dict[str, Any] = {
                         "kvcaches": kvcaches,
@@ -1191,6 +1281,13 @@ class LMCacheConnectorV1Impl:
                         location=location,
                         metadata_warm=metadata_warm,
                         token_count=token_count,
+                    )
+                    self._log_sparse_decode_step_diag(
+                        request,
+                        phase="post_retrieve",
+                        decode_step=decode_step,
+                        bound_state=bound_state,
+                        retrieve_kwargs=retrieve_kwargs,
                     )
                     self.layerwise_retrievers.append(layerwise_retriever)
                 else:
@@ -1534,6 +1631,17 @@ class LMCacheConnectorV1Impl:
 
         if self.use_layerwise:
             for request in connector_metadata.requests:
+                if _decode_diag_enabled() and request.is_sparse_decode:
+                    save_spec = request.save_spec
+                    if save_spec is not None and save_spec.can_save:
+                        logger.info(
+                            "%s phase=wait_for_save req=%s save_can_save=True "
+                            "skip_leading_tokens=%d token_ids=%d",
+                            _DECODE_DIAG_LOG_PREFIX,
+                            request.req_id,
+                            save_spec.skip_leading_tokens,
+                            len(request.token_ids),
+                        )
                 layerwise_storer = self._layerwise_save_storers.pop(
                     request.req_id, None
                 )
@@ -2125,6 +2233,8 @@ class LMCacheConnectorV1Impl:
             self._layerwise_save_storers.pop(request.request_id, None)
 
         self._drop_worker_retrieve_state(request.request_id)
+        if hasattr(self, "_sparse_decode_diag_steps"):
+            self._sparse_decode_diag_steps.pop(request.request_id, None)
 
         # Cleanup if request was aborted
         if request.status == RequestStatus.FINISHED_ABORTED and self.async_loading:
