@@ -19,6 +19,7 @@ from lmcache.utils import CacheEngineKey, LayerCacheEngineKey
 from lmcache.v1.config import LMCacheEngineConfig
 from lmcache.v1.event_manager import EventManager
 from lmcache.v1.metadata import LMCacheMetadata
+from lmcache.v1.storage_backend.local_cpu_backend import LocalCPUBackend
 from lmcache.v1.storage_backend.storage_manager import StorageManager
 
 
@@ -34,6 +35,9 @@ class MockMemoryObj:
         self.ref_count -= 1
         self.ref_count_down_calls += 1
 
+    def ref_count_up(self):
+        self.ref_count += 1
+
     def get_size(self) -> int:
         return 1024
 
@@ -48,15 +52,19 @@ class MockMooncakeConnection:
         return False
 
 
-class MockLocalCPUBackend:
+class MockLocalCPUBackend(LocalCPUBackend):
     """LocalCPUBackend stand-in tracking hot cache and API usage."""
 
     def __init__(self):
+        # Skip LocalCPUBackend.__init__ — tests only need isinstance() + duck typing.
         self.hot_cache: dict[CacheEngineKey, MockMemoryObj] = {}
         self.batched_submit_put_task_calls: list[
             tuple[list[CacheEngineKey], list[MockMemoryObj]]
         ] = []
         self.batched_get_non_blocking_calls: list[list[CacheEngineKey]] = []
+
+    def get_allocator_backend(self):
+        return self
 
     def batched_submit_put_task(self, keys, memory_objs, transfer_spec=None):
         self.batched_submit_put_task_calls.append((list(keys), list(memory_objs)))
@@ -200,7 +208,7 @@ class TestMooncakeConnectorCapabilities:
             def __init__(self):
                 pass
 
-        conn = _Conn.__new__(MooncakestoreConnector)
+        conn = object.__new__(_Conn)
         assert conn.support_batched_get() is True
         assert conn.support_batched_get_non_blocking() is False
 
@@ -428,9 +436,6 @@ class TestMooncakeConnectorBatchedGetNonBlockingFallback:
         )
 
         class _Conn(MooncakestoreConnector):
-            def __init__(self):
-                pass
-
             async def batched_get(self, keys):
                 return [
                     MockMemoryObj(1),
@@ -439,7 +444,7 @@ class TestMooncakeConnectorBatchedGetNonBlockingFallback:
                     MockMemoryObj(3),
                 ]
 
-        conn = _Conn.__new__(MooncakestoreConnector)
+        conn = object.__new__(_Conn)
         loop = asyncio.new_event_loop()
         try:
             result = loop.run_until_complete(
