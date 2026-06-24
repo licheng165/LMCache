@@ -915,14 +915,18 @@ class LMCacheConnectorV1Impl:
     def _should_defer_lookup_unpin_for_sparse_decode(self, request: ReqMeta) -> bool:
         """Keep lookup pins across decode steps while sparse retrieve is active."""
         return (
-            request.is_sparse_decode
+            getattr(request, "is_sparse_decode", False)
             and request.load_spec is not None
             and request.load_spec.can_load
         )
 
     def _release_request_lookup_pins(self, req_id: str) -> None:
-        if self.lmcache_engine is not None:
-            self.lmcache_engine.lookup_unpin(req_id)
+        manager = getattr(self, "_manager", None)
+        if manager is None:
+            return
+        engine = manager.lmcache_engine
+        if engine is not None:
+            engine.lookup_unpin(req_id)
 
     def _maybe_lookup_unpin_for_request(self, request: ReqMeta) -> None:
         if self._should_defer_lookup_unpin_for_sparse_decode(request):
@@ -1471,7 +1475,7 @@ class LMCacheConnectorV1Impl:
             if layerwise_storer is None:
                 token_ids = request.token_ids
                 assert isinstance(token_ids, list)
-                assert request.slot_mapping
+                assert request.slot_mapping is not None and len(request.slot_mapping) > 0
                 if request.is_sparse_decode:
                     if request.slot_mapping[0].device.type != torch.device(
                         self.device

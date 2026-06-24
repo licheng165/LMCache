@@ -56,8 +56,10 @@ def _make_req(req_id: str, can_save: bool = True):
     return SimpleNamespace(
         req_id=req_id,
         token_ids=[1, 2, 3, 4],
-        slot_mapping=torch.arange(4, dtype=torch.long),
+        slot_mapping=[torch.arange(4, dtype=torch.long)],
         save_spec=SaveSpec(skip_leading_tokens=0, can_save=can_save),
+        is_sparse_decode=False,
+        load_spec=None,
     )
 
 
