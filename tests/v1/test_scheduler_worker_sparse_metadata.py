@@ -64,6 +64,7 @@ def _make_vllm_request(
     return SimpleNamespace(
         request_id=req_id,
         num_prompt_tokens=prompt_len,
+        prompt_token_ids=prompt,
         num_computed_tokens=num_computed,
         all_token_ids=prompt + [decode_token],
     )
