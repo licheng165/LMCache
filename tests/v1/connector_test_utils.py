@@ -4,6 +4,7 @@
 # Standard
 from types import SimpleNamespace
 from typing import Any, Optional
+from unittest.mock import MagicMock
 
 # Third Party
 import torch
@@ -91,6 +92,9 @@ def make_worker_connector(
     connector._layerwise_save_storers = {}
     connector._worker_retrieve_state = {}
     connector.kv_caches = {"layer0": torch.zeros(1)}
+    connector.config = MagicMock()
+    connector.config.get_extra_config_value = lambda key, default=False: default
+    connector.async_loading = False
     return connector, metadata, fake_engine
 
 

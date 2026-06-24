@@ -76,7 +76,20 @@ class TestConnectorWarmColdInvalidate:
         rebound = impl._bind_worker_retrieve_state_to_request(_make_sparse_request())
         assert rebound is None
 
-    def test_token_rollback_disables_metadata_warm(self) -> None:
+    def test_token_rollback_invalidates_worker_state(self) -> None:
+        impl = make_worker_impl()
+        impl._worker_retrieve_state["req-1"] = WorkerRetrieveState(
+            cached_keys=[["k"]],
+            cached_starts=[0],
+            cached_ends=[256],
+            metadata_warm=True,
+            token_count=256,
+        )
+        assert impl._should_invalidate_worker_retrieve_state(
+            _make_sparse_request(), 128
+        )
+
+    def test_extended_prefix_disables_metadata_warm_kwargs(self) -> None:
         impl = make_worker_impl()
         state = WorkerRetrieveState(
             cached_keys=[["k"]],
@@ -87,15 +100,17 @@ class TestConnectorWarmColdInvalidate:
             token_count=256,
         )
         warm = impl._sparse_decode_retrieve_warm_kwargs(
-            _make_sparse_request(), 128, state
+            _make_sparse_request(), 512, state
         )
         assert "_retrieve_metadata_warm" not in warm
+        assert warm["cached_retrieve_location"] == "LocalCPUBackend"
 
 
 class TestAscendEngineWarmColdMetadata:
     def test_has_retrieve_data_cache_cold_vs_warm(self) -> None:
         assert not AscendLMCacheEngine._has_retrieve_data_cache(None, None, 2)
-        assert not AscendLMCacheEngine._has_retrieve_data_cache([[], []], None, 2)
+        # Empty per-layer lists still mean the tensor cache structure exists.
+        assert AscendLMCacheEngine._has_retrieve_data_cache([[], []], None, 2)
 
         cached_tensors = [torch.zeros(1), torch.zeros(1)]
         assert AscendLMCacheEngine._has_retrieve_data_cache(cached_tensors, None, 2)

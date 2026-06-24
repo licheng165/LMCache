@@ -83,8 +83,8 @@ class TestBuildConnectorMetaSparseSyntheticLoadSpec:
             token_ids=list(range(prompt_len)),
             allocated_block_ids=list(range(8)),
             num_saved_tokens=prompt_len,
-            is_decode_phase=True,
         )
+        tracker.is_decode_phase = True
         tracker.sparse_token_ids = list(range(prompt_len))
         impl._request_trackers[req_id] = tracker
 
@@ -124,8 +124,8 @@ class TestBuildConnectorMetaSparseSyntheticLoadSpec:
             token_ids=list(range(prompt_len)) + [1000],
             allocated_block_ids=list(range(10)),
             num_saved_tokens=prompt_len,
-            is_decode_phase=True,
         )
+        tracker.is_decode_phase = True
         tracker.sparse_token_ids = sparse_tokens.copy()
         impl._request_trackers[req_id] = tracker
 

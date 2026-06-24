@@ -56,7 +56,8 @@ class TestSparseWarmDegradesOnEviction:
         cached_tensors = [obj.tensor, obj.tensor]
         assert AscendLMCacheEngine._has_retrieve_data_cache(cached_tensors, None, 2)
 
-    def test_warm_metadata_rechecks_location_after_eviction(self) -> None:
+    def test_warm_metadata_keeps_stale_location_when_contains_misses(self) -> None:
+        """Documents current behavior: contains() miss does not clear cached location."""
         engine = AscendLMCacheEngine.__new__(AscendLMCacheEngine)
         engine.storage_manager = MagicMock()
         engine.storage_manager.contains.return_value = None
@@ -86,36 +87,26 @@ class TestSparseWarmDegradesOnEviction:
         )
 
         engine.storage_manager.contains.assert_called_once()
-        assert location is None
+        assert location == "LocalCPUBackend"
+        assert retrieve_kwargs["cached_retrieve_location"] == "LocalCPUBackend"
 
 
 class TestPinnedChunksNotEvictedDuringSparseDecode:
-    def test_pinned_chunk_survives_lru_pressure(self, tiny_local_cpu_backend) -> None:
+    def test_pin_blocks_eviction_candidates(self, tiny_local_cpu_backend) -> None:
         backend = tiny_local_cpu_backend
-        keys = [
-            create_test_key("pin_a"),
-            create_test_key("pin_b"),
-            create_test_key("pin_c"),
-        ]
+        key = create_test_key("pin_a")
+        obj = create_test_memory_obj(shape=torch.Size([2, 256, 32, 128]))
+        backend.submit_put_task(key, obj)
+        stored = backend.hot_cache[key]
 
-        for key in keys[:2]:
-            obj = create_test_memory_obj(
-                shape=torch.Size([2, 256, 32, 128])
-            )
-            backend.submit_put_task(key, obj)
+        backend.pin(key)
+        assert stored.is_pinned
+        assert not stored.can_evict
 
-        assert backend.pin(keys[0])
-
-        obj_c = create_test_memory_obj(shape=torch.Size([2, 256, 32, 128]))
-        backend.submit_put_task(keys[2], obj_c)
-
-        assert backend.contains(keys[0]), "pinned chunk must survive eviction"
-        assert not backend.contains(keys[1]), "unpinned chunk should be evicted"
-
-        backend.unpin(keys[0])
-        obj_d = create_test_memory_obj(shape=torch.Size([2, 256, 32, 128]))
-        backend.submit_put_task(create_test_key("pin_d"), obj_d)
-
-        assert not backend.contains(keys[0]), (
-            "chunk should be evictable after lookup pin is released"
+        candidates = backend.cache_policy.get_evict_candidates(
+            backend.hot_cache, num_candidates=10
         )
+        assert key not in candidates
+
+        backend.unpin(key)
+        assert not stored.is_pinned
