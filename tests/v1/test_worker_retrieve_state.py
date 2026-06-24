@@ -1,6 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
 """Tests for worker-local sparse decode retrieve state cache."""
 
+# Standard
+from types import SimpleNamespace
+from unittest.mock import MagicMock
+
 # Third Party
 import pytest
 
@@ -116,3 +120,40 @@ class TestWorkerRetrieveState:
         }
         impl._prune_worker_retrieve_state({"req-1"})
         assert set(impl._worker_retrieve_state) == {"req-1"}
+
+    def test_drop_and_prune_release_lookup_pins(self):
+        engine = MagicMock()
+        impl = _make_impl()
+        impl._manager = SimpleNamespace(lmcache_engine=engine)
+
+        impl._drop_worker_retrieve_state("req-1")
+        engine.lookup_unpin.assert_called_once_with("req-1")
+
+        impl._worker_retrieve_state = {
+            "req-1": WorkerRetrieveState(metadata_warm=True),
+            "req-2": WorkerRetrieveState(metadata_warm=True),
+        }
+        impl._prune_worker_retrieve_state({"req-1"})
+        engine.lookup_unpin.assert_called_with("req-2")
+
+    def test_defer_lookup_unpin_for_active_sparse_decode(self):
+        impl = _make_impl()
+        request = _make_request()
+        assert impl._should_defer_lookup_unpin_for_sparse_decode(request)
+
+        finished = _make_request()
+        finished.load_spec.can_load = False
+        assert not impl._should_defer_lookup_unpin_for_sparse_decode(finished)
+
+    def test_maybe_lookup_unpin_skips_active_sparse_decode(self):
+        engine = MagicMock()
+        impl = _make_impl()
+        impl._manager = SimpleNamespace(lmcache_engine=engine)
+
+        impl._maybe_lookup_unpin_for_request(_make_request())
+        engine.lookup_unpin.assert_not_called()
+
+        non_sparse = _make_request()
+        non_sparse.is_sparse_decode = False
+        impl._maybe_lookup_unpin_for_request(non_sparse)
+        engine.lookup_unpin.assert_called_once_with("req-1")

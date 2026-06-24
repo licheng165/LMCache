@@ -912,9 +912,29 @@ class LMCacheConnectorV1Impl:
                 pass
         self.layerwise_retrievers.clear()
 
+    def _should_defer_lookup_unpin_for_sparse_decode(self, request: ReqMeta) -> bool:
+        """Keep lookup pins across decode steps while sparse retrieve is active."""
+        return (
+            request.is_sparse_decode
+            and request.load_spec is not None
+            and request.load_spec.can_load
+        )
+
+    def _release_request_lookup_pins(self, req_id: str) -> None:
+        if self.lmcache_engine is not None:
+            self.lmcache_engine.lookup_unpin(req_id)
+
+    def _maybe_lookup_unpin_for_request(self, request: ReqMeta) -> None:
+        if self._should_defer_lookup_unpin_for_sparse_decode(request):
+            return
+        self._release_request_lookup_pins(request.req_id)
+
     def _prune_worker_retrieve_state(self, active_req_ids: set[str]) -> None:
         if not hasattr(self, "_worker_retrieve_state"):
             return
+        dropped_req_ids = set(self._worker_retrieve_state) - active_req_ids
+        for req_id in dropped_req_ids:
+            self._release_request_lookup_pins(req_id)
         self._worker_retrieve_state = {
             req_id: state
             for req_id, state in self._worker_retrieve_state.items()
@@ -924,6 +944,7 @@ class LMCacheConnectorV1Impl:
     def _drop_worker_retrieve_state(self, req_id: str) -> None:
         if hasattr(self, "_worker_retrieve_state"):
             self._worker_retrieve_state.pop(req_id, None)
+        self._release_request_lookup_pins(req_id)
 
     def _should_invalidate_worker_retrieve_state(
         self, request: ReqMeta, token_count: int
@@ -1528,7 +1549,7 @@ class LMCacheConnectorV1Impl:
                 "LMCacheEngine must be initialized to unpin requests."
             )
             for request in connector_metadata.requests:
-                self.lmcache_engine.lookup_unpin(request.req_id)
+                self._maybe_lookup_unpin_for_request(request)
 
             return
 
@@ -1539,8 +1560,7 @@ class LMCacheConnectorV1Impl:
                 )
                 if layerwise_storer is not None:
                     next(layerwise_storer)
-                # unpin the kv caches according to req_id
-                self.lmcache_engine.lookup_unpin(request.req_id)
+                self._maybe_lookup_unpin_for_request(request)
             return
 
         assert len(self.kv_caches) > 0
@@ -1549,8 +1569,7 @@ class LMCacheConnectorV1Impl:
         assert self.lmcache_engine is not None
 
         for request in connector_metadata.requests:
-            # unpin the kv caches according to req_id
-            self.lmcache_engine.lookup_unpin(request.req_id)
+            self._maybe_lookup_unpin_for_request(request)
 
             save_spec = request.save_spec
             if (
