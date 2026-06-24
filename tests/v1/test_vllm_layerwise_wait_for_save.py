@@ -60,6 +60,11 @@ def _make_req(req_id: str, can_save: bool = True):
         save_spec=SaveSpec(skip_leading_tokens=0, can_save=can_save),
         is_sparse_decode=False,
         load_spec=None,
+        cached_keys=[],
+        cached_starts=[],
+        cached_ends=[],
+        cached_memory_objs=[],
+        cached_tensors=[],
     )
 
 
