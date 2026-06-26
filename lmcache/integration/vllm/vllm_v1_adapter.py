@@ -42,6 +42,7 @@ from lmcache.v1.compute.blend import LMCBlenderBuilder
 from lmcache.v1.config import LMCacheEngineConfig
 from lmcache.v1.config_base import validate_and_set_config_value
 from lmcache.v1.manager import LMCacheManager
+from lmcache.v1.sparse_tp_diag import log_sparse_tp_diag
 
 if TYPE_CHECKING:
     # Third Party
@@ -702,6 +703,16 @@ class LMCacheConnectorV1Impl:
         if role != KVConnectorRole.SCHEDULER:
             self._worker_retrieve_state: dict[str, WorkerRetrieveState] = {}
 
+    def _sparse_tp_diag_rank_label(self) -> str:
+        metadata = self.lmcache_engine_metadata
+        if metadata is None:
+            return "role=unknown"
+        return (
+            f"worker_id={metadata.worker_id} "
+            f"world_size={metadata.world_size} "
+            f"save_only_first_rank={getattr(self.lmcache_engine, 'save_only_first_rank', None)}"
+        )
+
     def _check_legacy_register_kv_caches(self) -> None:
         """Check for legacy connector without register_kv_caches implementation."""
         if self.lmcache_engine is None:
@@ -1117,6 +1128,21 @@ class LMCacheConnectorV1Impl:
             if request.load_spec is None or not request.load_spec.can_load:
                 continue
 
+            log_sparse_tp_diag(
+                "start_load_kv req=%s %s sparse_decode=%s can_load=%s "
+                "vllm_cached=%d lmcache_cached=%d token_count=%d slot_len=%d",
+                request.req_id,
+                self._sparse_tp_diag_rank_label(),
+                request.is_sparse_decode,
+                request.load_spec.can_load,
+                request.load_spec.vllm_cached_tokens,
+                request.load_spec.lmcache_cached_tokens,
+                len(request.token_ids),
+                len(request.slot_mapping[0])
+                if request.slot_mapping
+                else 0,
+            )
+
             tokens = request.token_ids
             lmcache_cached_tokens = request.load_spec.lmcache_cached_tokens
             assert request.slot_mapping
@@ -1217,6 +1243,17 @@ class LMCacheConnectorV1Impl:
                         metadata_warm=metadata_warm,
                         token_count=token_count,
                     )
+                    log_sparse_tp_diag(
+                        "sparse_decode retrieve init req=%s %s "
+                        "metadata_warm=%s cached_key_layers=%d cached_chunks=%d "
+                        "location=%s",
+                        request.req_id,
+                        self._sparse_tp_diag_rank_label(),
+                        metadata_warm,
+                        len(request.cached_keys),
+                        len(request.cached_starts),
+                        location,
+                    )
                     self.layerwise_retrievers.append(layerwise_retriever)
                 else:
                     retrieve_slot_mapping = (
@@ -1235,6 +1272,15 @@ class LMCacheConnectorV1Impl:
                     # NOTE: retrieve for two layers at the first layer
                     next(layerwise_retriever)
                     next(layerwise_retriever)
+                    log_sparse_tp_diag(
+                        "prefill retrieve_layer init req=%s %s "
+                        "retrieve_tokens=%d lmcache_cached=%d slot_len=%d",
+                        request.req_id,
+                        self._sparse_tp_diag_rank_label(),
+                        len(retrieve_tokens),
+                        lmcache_cached_tokens,
+                        len(retrieve_slot_mapping),
+                    )
                     self.layerwise_retrievers.append(layerwise_retriever)
             else:
                 retrieve_slot_mapping = (
@@ -1802,6 +1848,18 @@ class LMCacheConnectorV1Impl:
                 max(need_to_allocate, 0),
                 min_retrieve,
             )
+            log_sparse_tp_diag(
+                "scheduler lookup req=%s tp=%d sparse=%s "
+                "lmcache_hit=%d vllm_computed=%d need_alloc=%d "
+                "below_min_retrieve=%d (returns 0 to vLLM)",
+                req_id,
+                self.worker_count,
+                self.enable_sparse_attention,
+                num_external_hit_tokens,
+                num_computed_tokens,
+                max(need_to_allocate, 0),
+                min_retrieve,
+            )
         else:
             logger.debug(
                 "Reqid: %s, Total tokens %d, Inference Engine computed tokens: %d, "
@@ -1811,6 +1869,19 @@ class LMCacheConnectorV1Impl:
                 num_computed_tokens,
                 num_external_hit_tokens,
                 max(need_to_allocate, 0),
+            )
+            log_sparse_tp_diag(
+                "scheduler lookup req=%s tp=%d sparse=%s "
+                "lmcache_hit=%d vllm_computed=%d need_alloc=%d returns=%d",
+                req_id,
+                self.worker_count,
+                self.enable_sparse_attention,
+                num_external_hit_tokens,
+                num_computed_tokens,
+                max(need_to_allocate, 0),
+                0
+                if below_min_retrieve or need_to_allocate <= 0
+                else need_to_allocate,
             )
 
         self.load_specs[req_id] = LoadSpec(
@@ -2128,7 +2199,16 @@ class LMCacheConnectorV1Impl:
 
             is_sparse_decode = self.enable_sparse_attention and (request.num_computed_tokens > request.num_prompt_tokens)
             if is_sparse_decode:
+                prior_load = load_spec
                 load_spec = LoadSpec(vllm_cached_tokens=0, lmcache_cached_tokens=len(request.prompt_token_ids), can_load=True)
+                log_sparse_tp_diag(
+                    "build_connector_meta decode req=%s tp=%d "
+                    "synthetic_load_spec prompt_len=%d prior_load=%s",
+                    req_id,
+                    self.worker_count,
+                    len(request.prompt_token_ids),
+                    prior_load,
+                )
 
             req_meta = ReqMeta.from_request_tracker(
                 request_tracker,

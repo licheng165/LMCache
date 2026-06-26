@@ -61,6 +61,7 @@ from lmcache.v1.token_database import (
     SegmentTokenDatabase,
     TokenDatabase,
 )
+from lmcache.v1.sparse_tp_diag import log_sparse_tp_diag
 
 logger = init_logger(__name__)
 
@@ -645,6 +646,7 @@ class LMCacheEngine:
             assert isinstance(request_configs, dict)
 
         prev_key = 0
+        skipped_existing = 0
         for start, end, key in self.token_database.process_tokens(
             tokens=tokens, mask=mask, request_configs=request_configs
         ):
@@ -655,6 +657,7 @@ class LMCacheEngine:
             if self.storage_manager.contains(
                 keys_multi_layer[0], self.retrieve_locations
             ):
+                skipped_existing += 1
                 continue
 
             # Allocate the memory object
@@ -706,6 +709,17 @@ class LMCacheEngine:
                 )
                 self.kv_events.append(stored_event)
                 prev_key = key.chunk_hash
+
+        log_sparse_tp_diag(
+            "store_layer req=%s rank=%d new_chunks=%d stored_tokens=%d "
+            "skipped_existing=%d total_tokens=%d",
+            req_id,
+            self.metadata.worker_id,
+            len(keys),
+            tot_token_num,
+            skipped_existing,
+            len(tokens),
+        )
 
         if keys:
             # Transpose the keys and memory objects into layer major format
@@ -985,6 +999,15 @@ class LMCacheEngine:
                         "Please support multi-location retrieval in the future."
                     )
             else:
+                log_sparse_tp_diag(
+                    "retrieve_layer contains_miss req=%s rank=%d at_start=%d "
+                    "chunk_hash=%s keys_found=%d",
+                    req_id,
+                    self.metadata.worker_id,
+                    start,
+                    key.chunk_hash,
+                    len(keys),
+                )
                 break
 
             starts.append(start)
@@ -992,6 +1015,16 @@ class LMCacheEngine:
             keys.append(keys_multi_layer)
 
             ret_mask[start:end] = True
+
+        if not keys:
+            log_sparse_tp_diag(
+                "retrieve_layer no_keys req=%s rank=%d num_tokens=%d "
+                "num_required=%d",
+                req_id,
+                self.metadata.worker_id,
+                len(tokens),
+                num_required_tokens,
+            )
 
         if keys:
             # Transpose the keys into layer major format
