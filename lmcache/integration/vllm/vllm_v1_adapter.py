@@ -1147,7 +1147,7 @@ class LMCacheConnectorV1Impl:
                 request, token_count, self._lmcache_chunk_size
             )
 
-            if self.use_layerwise:
+            if self.use_layerwise or request.is_sparse_decode:
                 if idx == last_idx:
                     sync = True
                 else:
@@ -1378,6 +1378,9 @@ class LMCacheConnectorV1Impl:
 
         metadata = self._parent._get_connector_metadata()
         assert isinstance(metadata, LMCacheConnectorMetadata)
+        if not self.layerwise_retrievers:
+            return
+
         row_of_req = (
             {rid: row for row, rid in enumerate(request_ids)}
             if request_ids is not None
@@ -1389,6 +1392,15 @@ class LMCacheConnectorV1Impl:
         for request in metadata.requests:
             if request.load_spec is None or not request.load_spec.can_load:
                 continue
+            if idx >= len(self.layerwise_retrievers):
+                logger.warning(
+                    "wait_for_layer_load: missing retriever for request %s "
+                    "(idx=%d, retrievers=%d)",
+                    request.req_id,
+                    idx,
+                    len(self.layerwise_retrievers),
+                )
+                break
             layerwise_retriever = self.layerwise_retrievers[idx]
             if request.is_sparse_decode:
                 if selected_tokens is None:
