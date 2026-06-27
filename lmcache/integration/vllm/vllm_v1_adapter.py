@@ -2219,7 +2219,7 @@ class LMCacheConnectorV1Impl:
                 "scheduler build_connector_meta new_req=%s prompt=%d "
                 "can_load=%s lookup_hit=%d vllm_cached=%d scheduled_tokens=%d",
                 request.req_id,
-                request.num_prompt_tokens,
+                len(request.prompt_token_ids),
                 load_spec.can_load if load_spec is not None else False,
                 lmcache_cached_tokens,
                 load_spec.vllm_cached_tokens if load_spec is not None else 0,
@@ -2411,16 +2411,22 @@ class LMCacheConnectorV1Impl:
                 all_token_ids=all_token_ids,
             )
 
-            is_sparse_decode = self.enable_sparse_attention and (request.num_computed_tokens > request.num_prompt_tokens)
+            is_sparse_decode = self.enable_sparse_attention and (
+                request.num_computed_tokens > request_tracker.prompt_len
+            )
             if is_sparse_decode:
                 prior_load = load_spec
-                load_spec = LoadSpec(vllm_cached_tokens=0, lmcache_cached_tokens=len(request.prompt_token_ids), can_load=True)
+                load_spec = LoadSpec(
+                    vllm_cached_tokens=0,
+                    lmcache_cached_tokens=request_tracker.prompt_len,
+                    can_load=True,
+                )
                 log_sparse_tp_diag(
                     "build_connector_meta decode req=%s tp=%d "
                     "synthetic_load_spec prompt_len=%d prior_load=%s",
                     req_id,
                     self.worker_count,
-                    len(request.prompt_token_ids),
+                    request_tracker.prompt_len,
                     prior_load,
                 )
 
