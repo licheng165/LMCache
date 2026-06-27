@@ -648,6 +648,7 @@ class LMCacheConnectorV1Impl:
         self.layerwise_retrievers: list[
             Generator[Optional[torch.Tensor], None, None]
         ] = []
+        self._layerwise_retriever_is_sparse: list[bool] = []
         self._layerwise_save_storers: dict[
             str, Generator[Optional[torch.Tensor], None, None]
         ] = {}
@@ -981,12 +982,29 @@ class LMCacheConnectorV1Impl:
 
     def _drain_layerwise_retrievers(self) -> None:
         """Finish suspended layerwise generators to avoid GC cost on reset."""
-        for retriever in self.layerwise_retrievers:
+        for idx, retriever in enumerate(self.layerwise_retrievers):
+            is_sparse = (
+                idx < len(self._layerwise_retriever_is_sparse)
+                and self._layerwise_retriever_is_sparse[idx]
+            )
             try:
-                next(retriever)
+                if is_sparse:
+                    self._drain_sparse_layerwise_retriever(retriever)
+                else:
+                    next(retriever)
             except StopIteration:
                 pass
         self.layerwise_retrievers.clear()
+        self._layerwise_retriever_is_sparse.clear()
+
+    def _drain_sparse_layerwise_retriever(
+        self, retriever: Generator[Any, Any, Any]
+    ) -> None:
+        """Close sparse head-token-wise retrievers waiting on send()."""
+        try:
+            retriever.close()
+        except (GeneratorExit, RuntimeError, ValueError):
+            pass
 
     def _should_defer_lookup_unpin_for_sparse_decode(self, request: ReqMeta) -> bool:
         """Keep lookup pins across decode steps while sparse retrieve is active."""
@@ -1343,6 +1361,7 @@ class LMCacheConnectorV1Impl:
                         location,
                     )
                     self.layerwise_retrievers.append(layerwise_retriever)
+                    self._layerwise_retriever_is_sparse.append(True)
                 else:
                     retrieve_slot_mapping = (
                         slot_mapping
@@ -1370,6 +1389,7 @@ class LMCacheConnectorV1Impl:
                         len(retrieve_slot_mapping),
                     )
                     self.layerwise_retrievers.append(layerwise_retriever)
+                    self._layerwise_retriever_is_sparse.append(False)
             else:
                 retrieve_slot_mapping = (
                     slot_mapping
