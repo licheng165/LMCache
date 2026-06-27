@@ -62,6 +62,7 @@ from lmcache.v1.token_database import (
     TokenDatabase,
 )
 from lmcache.v1.sparse_tp_diag import log_sparse_tp_diag
+from lmcache.v1.ext_prefix_hit_diag import record_store_layer_if_enabled
 
 logger = init_logger(__name__)
 
@@ -719,6 +720,15 @@ class LMCacheEngine:
             tot_token_num,
             skipped_existing,
             len(tokens),
+        )
+        record_store_layer_if_enabled(
+            req_id=req_id,
+            token_ids=tokens,
+            worker_id=self.metadata.worker_id,
+            new_chunks=len(keys),
+            stored_tokens=tot_token_num,
+            skipped_existing=skipped_existing,
+            total_tokens=len(tokens),
         )
 
         if keys:

@@ -43,6 +43,11 @@ from lmcache.v1.config import LMCacheEngineConfig
 from lmcache.v1.config_base import validate_and_set_config_value
 from lmcache.v1.manager import LMCacheManager
 from lmcache.v1.sparse_tp_diag import log_sparse_tp_diag
+from lmcache.v1.ext_prefix_hit_diag import (
+    get_run_tracker,
+    log_ext_prefix_hit_diag,
+    pct,
+)
 
 if TYPE_CHECKING:
     # Third Party
@@ -703,6 +708,20 @@ class LMCacheConnectorV1Impl:
         if role != KVConnectorRole.SCHEDULER:
             self._worker_retrieve_state: dict[str, WorkerRetrieveState] = {}
 
+    def _lookup_token_ids_for_request(self, request: "Request") -> list[int]:
+        """Token ids used for lookup / prompt fingerprint (matches lookup path)."""
+        token_ids = list(request.all_token_ids)
+        mm_hashes, mm_positions = extract_mm_features(request)
+        if mm_hashes and mm_positions:
+            token_ids_tensor = torch.tensor(request.prompt_token_ids)
+            apply_mm_hashes_to_token_ids(
+                token_ids_tensor, mm_hashes, mm_positions
+            )
+            token_ids = token_ids_tensor.tolist()
+        if self.skip_last_n_tokens > 0:
+            token_ids = token_ids[: -self.skip_last_n_tokens]
+        return token_ids
+
     def _sparse_tp_diag_rank_label(self) -> str:
         metadata = self.lmcache_engine_metadata
         if metadata is None:
@@ -711,6 +730,52 @@ class LMCacheConnectorV1Impl:
             f"worker_id={metadata.worker_id} "
             f"world_size={metadata.world_size} "
             f"save_only_first_rank={getattr(self.lmcache_engine, 'save_only_first_rank', None)}"
+        )
+
+    def _log_ext_prefix_worker_load(
+        self,
+        request: "ReqMeta",
+        *,
+        num_retrieved: int,
+        num_expected: int,
+        prompt_len: int,
+        phase: str,
+    ) -> None:
+        vllm_cached = (
+            request.load_spec.vllm_cached_tokens if request.load_spec else 0
+        )
+        lmcache_cached = (
+            request.load_spec.lmcache_cached_tokens if request.load_spec else 0
+        )
+        total_loaded = vllm_cached + num_retrieved
+        metadata = self.lmcache_engine_metadata
+        worker_id = metadata.worker_id if metadata is not None else -1
+        log_ext_prefix_hit_diag(
+            "worker load_done req=%s %s phase=%s prompt=%d "
+            "lookup_hit=%d vllm_cached=%d expected_load=%d retrieved=%d "
+            "total_external_loaded=%d (total/prompt=%.1f%%) "
+            "missing=%d",
+            request.req_id,
+            self._sparse_tp_diag_rank_label(),
+            phase,
+            prompt_len,
+            lmcache_cached,
+            vllm_cached,
+            num_expected,
+            num_retrieved,
+            total_loaded,
+            pct(total_loaded, prompt_len),
+            max(num_expected - num_retrieved, 0),
+        )
+        get_run_tracker().record_worker_load(
+            request.req_id,
+            request.token_ids,
+            worker_id=worker_id,
+            prompt_len=prompt_len,
+            lookup_hit=lmcache_cached,
+            retrieved=num_retrieved,
+            expected=num_expected,
+            total_loaded=total_loaded,
         )
 
     def _check_legacy_register_kv_caches(self) -> None:
@@ -1172,6 +1237,29 @@ class LMCacheConnectorV1Impl:
             token_mask = self._load_token_mask_for_retrieve(
                 request, token_count, self._lmcache_chunk_size
             )
+            num_expected_load = (
+                request.load_spec.lmcache_cached_tokens
+                - request.load_spec.vllm_cached_tokens
+            )
+            if (
+                request.load_spec.lmcache_cached_tokens == len(request.token_ids)
+                and request.load_spec.lmcache_cached_tokens
+                > request.load_spec.vllm_cached_tokens
+            ):
+                num_expected_load -= 1
+            log_ext_prefix_hit_diag(
+                "worker start_load_kv req=%s %s sparse_decode=%s prompt=%d "
+                "lookup_hit=%d vllm_cached=%d expected_load=%d retrieve_len=%d "
+                "(vLLM external hit ~ loaded/prompt per rank; TP>1 check all ranks)",
+                request.req_id,
+                self._sparse_tp_diag_rank_label(),
+                request.is_sparse_decode,
+                len(request.token_ids),
+                request.load_spec.lmcache_cached_tokens,
+                request.load_spec.vllm_cached_tokens,
+                num_expected_load,
+                token_count,
+            )
 
             if self.use_layerwise or request.is_sparse_decode:
                 if idx == last_idx:
@@ -1304,6 +1392,13 @@ class LMCacheConnectorV1Impl:
                     lmcache_cached_tokens - request.load_spec.vllm_cached_tokens
                 )
                 if num_retrieved_tokens < num_expected_tokens:
+                    self._log_ext_prefix_worker_load(
+                        request,
+                        num_retrieved=num_retrieved_tokens,
+                        num_expected=num_expected_tokens,
+                        prompt_len=len(request.token_ids),
+                        phase="prefill_non_layerwise_partial",
+                    )
                     logger.error(
                         "Request %s"
                         "The number of retrieved tokens is less than the "
@@ -1325,6 +1420,14 @@ class LMCacheConnectorV1Impl:
                         retrieve_slot_mapping,
                     )
                     self._invalid_block_ids.update(missing_blocks)
+                else:
+                    self._log_ext_prefix_worker_load(
+                        request,
+                        num_retrieved=num_retrieved_tokens,
+                        num_expected=num_expected_tokens,
+                        prompt_len=len(request.token_ids),
+                        phase="prefill_non_layerwise",
+                    )
 
     def record_failed_blocks(
         self,
@@ -1392,6 +1495,13 @@ class LMCacheConnectorV1Impl:
         if not missing_blocks:
             return set()
 
+        log_ext_prefix_hit_diag(
+            "worker load_partial_fail req=%s missing_tokens=%d missing_blocks=%d "
+            "(reduces vLLM external prefix hit rate)",
+            request_id,
+            missing_indices.numel(),
+            len(missing_blocks),
+        )
         logger.warning(
             "Request %s failed to load %d tokens across %d blocks",
             request_id,
@@ -1473,6 +1583,33 @@ class LMCacheConnectorV1Impl:
                 assert ret_token_mask is not None
                 num_retrieved_tokens = ret_token_mask.sum().item()
                 logger.info(f"Retrieved {num_retrieved_tokens} tokens")
+                num_expected_tokens = (
+                    request.load_spec.lmcache_cached_tokens
+                    - request.load_spec.vllm_cached_tokens
+                )
+                if (
+                    request.load_spec.lmcache_cached_tokens == len(request.token_ids)
+                    and request.load_spec.lmcache_cached_tokens
+                    > request.load_spec.vllm_cached_tokens
+                ):
+                    num_expected_tokens -= 1
+                self._log_ext_prefix_worker_load(
+                    request,
+                    num_retrieved=num_retrieved_tokens,
+                    num_expected=num_expected_tokens,
+                    prompt_len=len(request.token_ids),
+                    phase="prefill_layerwise",
+                )
+                if num_retrieved_tokens < num_expected_tokens:
+                    log_ext_prefix_hit_diag(
+                        "worker layerwise retrieve shortfall req=%s %s "
+                        "retrieved=%d expected=%d "
+                        "(likely cause of <100%% external prefix hit on this rank)",
+                        request.req_id,
+                        self._sparse_tp_diag_rank_label(),
+                        num_retrieved_tokens,
+                        num_expected_tokens,
+                    )
             idx += 1
 
         if self.layerwise_retrievers:
@@ -1818,6 +1955,13 @@ class LMCacheConnectorV1Impl:
                 request.num_tokens,
                 num_computed_tokens,
             )
+            log_ext_prefix_hit_diag(
+                "scheduler get_num_new_matched_tokens req=%s lookup_pending "
+                "prompt=%d vllm_computed=%d (returns None; vLLM may skip scheduling)",
+                req_id,
+                request.num_tokens,
+                num_computed_tokens,
+            )
             return None
 
         # When prompt length is divisible by the block size and all
@@ -1827,8 +1971,10 @@ class LMCacheConnectorV1Impl:
         need_to_allocate = num_external_hit_tokens - num_computed_tokens
 
         # In, full-prompt-hit case, we need to recompute the last token
+        recalc_last = 0
         if num_external_hit_tokens == request.num_tokens:
             need_to_allocate -= 1
+            recalc_last = 1
 
         # Check if hit tokens meet the minimum for retrieve
         # If below minimum, skip retrieve but still record hit tokens
@@ -1883,6 +2029,37 @@ class LMCacheConnectorV1Impl:
                 if below_min_retrieve or need_to_allocate <= 0
                 else need_to_allocate,
             )
+
+        returns_to_vllm = (
+            0 if below_min_retrieve or need_to_allocate <= 0 else need_to_allocate
+        )
+        log_ext_prefix_hit_diag(
+            "scheduler get_num_new_matched_tokens req=%s tp=%d sparse=%s "
+            "prompt=%d vllm_computed=%d lookup_hit=%d (lookup_hit/prompt=%.1f%%) "
+            "need_alloc=%d recalc_last=%d min_retrieve=%d below_min=%s "
+            "returns_to_vllm=%d "
+            "(vLLM external stat uses lookup+load; returns is this step's load)",
+            req_id,
+            self.worker_count,
+            self.enable_sparse_attention,
+            request.num_tokens,
+            num_computed_tokens,
+            num_external_hit_tokens,
+            pct(num_external_hit_tokens, request.num_tokens),
+            max(need_to_allocate, 0),
+            recalc_last,
+            min_retrieve,
+            below_min_retrieve,
+            returns_to_vllm,
+        )
+        get_run_tracker().record_scheduler_lookup(
+            req_id,
+            self._lookup_token_ids_for_request(request),
+            prompt_len=request.num_tokens,
+            lookup_hit=num_external_hit_tokens,
+            returns_to_vllm=returns_to_vllm,
+            vllm_computed=num_computed_tokens,
+        )
 
         self.load_specs[req_id] = LoadSpec(
             vllm_cached_tokens=num_computed_tokens,
@@ -1944,6 +2121,14 @@ class LMCacheConnectorV1Impl:
         if num_external_tokens == 0:
             # No need to load anything
             self.load_specs[request.request_id].can_load = False
+            log_ext_prefix_hit_diag(
+                "scheduler update_state_after_alloc req=%s external_allocated=0 "
+                "lookup_hit=%d vllm_computed=%d can_load=False "
+                "(vLLM external hit may show 0%% for this request)",
+                request.request_id,
+                self.load_specs[request.request_id].lmcache_cached_tokens,
+                self.load_specs[request.request_id].vllm_cached_tokens,
+            )
             return
 
         recalc_last = (
@@ -1954,11 +2139,30 @@ class LMCacheConnectorV1Impl:
             )
             else 0
         )
-        assert (
-            num_external_tokens
-            == self.load_specs[request.request_id].lmcache_cached_tokens
+        expected_external = (
+            self.load_specs[request.request_id].lmcache_cached_tokens
             - self.load_specs[request.request_id].vllm_cached_tokens
             - recalc_last
+        )
+        log_ext_prefix_hit_diag(
+            "scheduler update_state_after_alloc req=%s prompt=%d "
+            "lookup_hit=%d vllm_computed=%d recalc_last=%d "
+            "external_allocated=%d expected_external=%d can_load=True "
+            "(after load vLLM computed ~= vllm_computed + external_allocated)",
+            request.request_id,
+            request.num_tokens,
+            self.load_specs[request.request_id].lmcache_cached_tokens,
+            self.load_specs[request.request_id].vllm_cached_tokens,
+            recalc_last,
+            num_external_tokens,
+            expected_external,
+        )
+        get_run_tracker().record_scheduler_alloc(
+            request.request_id,
+            external_allocated=num_external_tokens,
+        )
+        assert (
+            num_external_tokens == expected_external
         ), (
             f"Mismatch in tokens to load: {num_external_tokens} vs "
             f"{self.load_specs[request.request_id].lmcache_cached_tokens} "
@@ -2011,6 +2215,16 @@ class LMCacheConnectorV1Impl:
             lmcache_cached_tokens = 0
             if load_spec is not None:
                 lmcache_cached_tokens = load_spec.lmcache_cached_tokens
+            log_ext_prefix_hit_diag(
+                "scheduler build_connector_meta new_req=%s prompt=%d "
+                "can_load=%s lookup_hit=%d vllm_cached=%d scheduled_tokens=%d",
+                request.req_id,
+                request.num_prompt_tokens,
+                load_spec.can_load if load_spec is not None else False,
+                lmcache_cached_tokens,
+                load_spec.vllm_cached_tokens if load_spec is not None else 0,
+                scheduler_output.num_scheduled_tokens[request.req_id],
+            )
             request_priority = self._requests_priority.pop(request.req_id, 0)
 
             skip_save = force_skip_save or (
