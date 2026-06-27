@@ -62,6 +62,91 @@ SPARSE_DECODE_RETRIEVE_TOKENS = int(
 )
 
 
+def _dsa_debug_enabled() -> bool:
+    return os.environ.get("VLLM_ASCEND_DSA_SHRINK_DEBUG", "0").lower() in (
+        "1",
+        "true",
+        "yes",
+        "on",
+    )
+
+
+def _dsa_debug_summary_enabled() -> bool:
+    return os.environ.get(
+        "VLLM_ASCEND_DSA_SHRINK_DEBUG_MODE", "fail_only"
+    ).lower() in ("summary", "trace", "verbose", "all")
+
+
+def _dsa_debug_limit() -> int:
+    try:
+        return max(1, int(os.environ.get("VLLM_ASCEND_DSA_SHRINK_DEBUG_LIMIT", "8")))
+    except ValueError:
+        return 8
+
+
+def _dsa_debug_should_log(owner: Any, site: str) -> bool:
+    if not _dsa_debug_enabled():
+        return False
+    if not _dsa_debug_summary_enabled():
+        return False
+    counts = getattr(owner, "_dsa_shrink_debug_counts", None)
+    if counts is None:
+        counts = {}
+        setattr(owner, "_dsa_shrink_debug_counts", counts)
+    count = counts.get(site, 0)
+    if count >= _dsa_debug_limit():
+        return False
+    counts[site] = count + 1
+    return True
+
+
+def _dsa_debug_shape(value: Any) -> Any:
+    if value is None:
+        return None
+    shape = getattr(value, "shape", None)
+    if shape is not None:
+        return tuple(shape)
+    try:
+        return len(value)
+    except TypeError:
+        return type(value).__name__
+
+
+def _dsa_debug_sample(value: Any, limit: Optional[int] = None) -> Any:
+    if value is None:
+        return None
+    limit = _dsa_debug_limit() if limit is None else limit
+    try:
+        if isinstance(value, torch.Tensor):
+            if value.numel() == 0:
+                return []
+            return value.detach().reshape(-1)[:limit].to(device="cpu").tolist()
+        return list(value[:limit])
+    except Exception as exc:
+        return f"{type(value).__name__}:sample_failed:{exc}"
+
+
+def _dsa_debug_minmax_count(value: Any) -> Any:
+    if value is None:
+        return None
+    try:
+        if isinstance(value, torch.Tensor):
+            if value.numel() == 0:
+                return None
+            flat = value.detach().reshape(-1)
+            return (
+                flat.min().to(device="cpu").item(),
+                flat.max().to(device="cpu").item(),
+                int(flat.numel()),
+            )
+        seq = list(value)
+        if not seq:
+            return None
+        return (min(seq), max(seq), len(seq))
+    except Exception as exc:
+        return f"{type(value).__name__}:minmax_failed:{exc}"
+
+
 def _sparse_slot_mapping_len(prompt_tokens: int) -> int:
     return min(SPARSE_DECODE_RETRIEVE_TOKENS, prompt_tokens)
 
@@ -533,6 +618,32 @@ class ReqMeta:
                 )
             decode_token_mask = tracker.sparse_decode_token_mask
             decode_ret_mask = tracker.sparse_decode_ret_mask
+
+        if is_sparse_decode and load_spec is not None and _dsa_debug_should_log(
+            tracker, "reqmeta_sparse"
+        ):
+            logger.warning(
+                "[DSA_SHRINK_CHECK] lmcache_reqmeta_sparse req=%s "
+                "input_token_len=%s token_ids_len=%s skip_save=%s "
+                "num_blocks=%s block_size=%s vllm_cached=%s "
+                "lmcache_cached=%s can_load=%s slot_mapping_shape=%s "
+                "slot_mapping_sample=%s slot_mapping_minmax_count=%s "
+                "decode_token_mask_shape=%s decode_ret_mask_shape=%s",
+                tracker.req_id,
+                input_token_len,
+                len(token_ids),
+                skip_save,
+                num_blocks,
+                block_size,
+                load_spec.vllm_cached_tokens,
+                load_spec.lmcache_cached_tokens,
+                load_spec.can_load,
+                _dsa_debug_shape(slot_mapping[0] if slot_mapping else None),
+                _dsa_debug_sample(slot_mapping[0] if slot_mapping else None),
+                _dsa_debug_minmax_count(slot_mapping[0] if slot_mapping else None),
+                _dsa_debug_shape(decode_token_mask),
+                _dsa_debug_shape(decode_ret_mask),
+            )
 
         # Note: We keep load_spec even when can_load=False to pass metrics to worker
         return ReqMeta(
@@ -1197,6 +1308,46 @@ class LMCacheConnectorV1Impl:
                     if request.decode_ret_mask is not None:
                         retrieve_kwargs["ret_mask"] = request.decode_ret_mask
 
+                    if _dsa_debug_should_log(self, "start_sparse_decode"):
+                        logger.warning(
+                            "[DSA_SHRINK_CHECK] lmcache_start_sparse_decode "
+                            "req=%s idx=%s last_idx=%s sync=%s "
+                            "tokens_len=%s retrieve_token_count=%s "
+                            "token_mask_shape=%s token_mask_minmax_count=%s "
+                            "slot_mapping_shape=%s slot_mapping_sample=%s "
+                            "slot_mapping_minmax_count=%s vllm_cached=%s "
+                            "lmcache_cached=%s cached_keys=%s cached_starts=%s "
+                            "cached_ends=%s cached_tensors_layers=%s "
+                            "cached_chunk_ptr_layers=%s metadata_warm=%s "
+                            "bound_state=%s ret_mask_shape=%s",
+                            request.req_id,
+                            idx,
+                            last_idx,
+                            sync,
+                            len(tokens),
+                            token_count,
+                            _dsa_debug_shape(token_mask),
+                            _dsa_debug_minmax_count(token_mask),
+                            _dsa_debug_shape(slot_mapping),
+                            _dsa_debug_sample(slot_mapping),
+                            _dsa_debug_minmax_count(slot_mapping),
+                            request.load_spec.vllm_cached_tokens,
+                            request.load_spec.lmcache_cached_tokens,
+                            len(request.cached_keys)
+                            if request.cached_keys is not None else None,
+                            len(request.cached_starts)
+                            if request.cached_starts is not None else None,
+                            len(request.cached_ends)
+                            if request.cached_ends is not None else None,
+                            len(request.cached_tensors)
+                            if request.cached_tensors is not None else None,
+                            len(request.cached_chunk_ptrs_npu)
+                            if request.cached_chunk_ptrs_npu is not None else None,
+                            bool(retrieve_kwargs.get("_retrieve_metadata_warm")),
+                            bound_state is not None,
+                            _dsa_debug_shape(request.decode_ret_mask),
+                        )
+
                     layerwise_retriever = (
                         self.lmcache_engine.retrieve_layer_head_token_wise(
                             retrieve_tokens,
@@ -1386,6 +1537,31 @@ class LMCacheConnectorV1Impl:
             if request_ids is not None
             else None
         )
+        trace_wait = _dsa_debug_should_log(self, "wait_sparse_decode")
+        if trace_wait:
+            sparse_reqs = [
+                request.req_id for request in metadata.requests
+                if request.is_sparse_decode
+            ]
+            logger.warning(
+                "[DSA_SHRINK_CHECK] lmcache_wait_selected layer=%s "
+                "current_layer=%s retrievers=%s metadata_reqs=%s "
+                "sparse_reqs=%s selected_shape=%s selected_sample=%s "
+                "selected_minmax_count=%s token_start_index=%s "
+                "request_ids=%s row_of_req=%s",
+                layer_name,
+                self.current_layer,
+                len(self.layerwise_retrievers),
+                len(metadata.requests),
+                sparse_reqs[:_dsa_debug_limit()],
+                _dsa_debug_shape(selected_tokens),
+                _dsa_debug_sample(selected_tokens),
+                _dsa_debug_minmax_count(selected_tokens),
+                _dsa_debug_sample(token_start_index),
+                _dsa_debug_sample(request_ids),
+                dict(list(row_of_req.items())[:_dsa_debug_limit()])
+                if row_of_req is not None else None,
+            )
 
         idx = 0
         decode_row = 0
@@ -1407,14 +1583,64 @@ class LMCacheConnectorV1Impl:
                     selected_tokens_per_req = None
                     token_start_index_per_req = 0
                 else:
+                    if row_of_req is not None and request.req_id not in row_of_req:
+                        raise RuntimeError(
+                            "[DSA_SHRINK_CHECK] lmcache_wait_row_missing "
+                            f"layer={layer_name} req={request.req_id} "
+                            f"request_ids={_dsa_debug_sample(request_ids)} "
+                            f"sparse_decode_row={decode_row}"
+                        )
                     row = (
                         row_of_req[request.req_id]
                         if row_of_req is not None
                         else decode_row
                     )
+                    selected_rows = (
+                        int(selected_tokens.shape[0])
+                        if hasattr(selected_tokens, "shape")
+                        and len(selected_tokens.shape) > 0
+                        else len(selected_tokens)
+                    )
+                    if row >= selected_rows:
+                        raise RuntimeError(
+                            "[DSA_SHRINK_CHECK] lmcache_wait_row_oob "
+                            f"layer={layer_name} req={request.req_id} "
+                            f"row={row} selected_rows={selected_rows} "
+                            f"request_ids={_dsa_debug_sample(request_ids)}"
+                        )
                     selected_tokens_per_req = selected_tokens[row]
                     token_start_index_per_req = (
                         0 if token_start_index is None else token_start_index[row]
+                    )
+                if trace_wait:
+                    logger.warning(
+                        "[DSA_SHRINK_CHECK] lmcache_wait_send_sparse "
+                        "layer=%s req=%s idx=%s decode_row=%s row=%s "
+                        "selected_shape=%s selected_sample=%s "
+                        "selected_minmax_count=%s token_start_index=%s "
+                        "slot_mapping_shape=%s slot_mapping_sample=%s "
+                        "slot_mapping_minmax_count=%s vllm_cached=%s "
+                        "lmcache_cached=%s",
+                        layer_name,
+                        request.req_id,
+                        idx,
+                        decode_row,
+                        None if selected_tokens is None else row,
+                        _dsa_debug_shape(selected_tokens_per_req),
+                        _dsa_debug_sample(selected_tokens_per_req),
+                        _dsa_debug_minmax_count(selected_tokens_per_req),
+                        token_start_index_per_req,
+                        _dsa_debug_shape(
+                            request.slot_mapping[0] if request.slot_mapping else None
+                        ),
+                        _dsa_debug_sample(
+                            request.slot_mapping[0] if request.slot_mapping else None
+                        ),
+                        _dsa_debug_minmax_count(
+                            request.slot_mapping[0] if request.slot_mapping else None
+                        ),
+                        request.load_spec.vllm_cached_tokens,
+                        request.load_spec.lmcache_cached_tokens,
                     )
                 ret_token_mask = layerwise_retriever.send(
                     (selected_tokens_per_req, token_start_index_per_req)
