@@ -67,6 +67,12 @@ SPARSE_DECODE_RETRIEVE_TOKENS = int(
     os.environ.get("LMCACHE_SPARSE_DECODE_RETRIEVE_TOKENS", "2048")
 )
 
+# A/B test: scheduler lookup/allocation unchanged; worker skips prefill retrieve_layer
+# so vLLM computes scheduled tokens instead (isolates prefill scatter vs sparse decode).
+SKIP_PREFILL_RETRIEVE_LAYER = os.environ.get(
+    "LMCACHE_SKIP_PREFILL_RETRIEVE_LAYER", "0"
+).lower() in ("1", "true", "yes")
+
 
 def _sparse_slot_mapping_len(prompt_tokens: int) -> int:
     return min(SPARSE_DECODE_RETRIEVE_TOKENS, prompt_tokens)
@@ -1011,6 +1017,57 @@ class LMCacheConnectorV1Impl:
             request.decode_token_mask = token_mask
         return token_mask
 
+    @staticmethod
+    def _full_hit_recalc_last_token(
+        load_spec: Optional[LoadSpec],
+        prompt_len: int,
+        *,
+        is_sparse_decode: bool,
+    ) -> bool:
+        """True when vLLM expects the last prompt token to be recomputed, not loaded."""
+        if is_sparse_decode or load_spec is None:
+            return False
+        return (
+            load_spec.lmcache_cached_tokens >= prompt_len
+            and load_spec.lmcache_cached_tokens > load_spec.vllm_cached_tokens
+        )
+
+    @staticmethod
+    def _apply_full_hit_recalc_last_prefill(
+        request: "ReqMeta",
+        token_mask: torch.Tensor,
+        slot_mapping: torch.Tensor,
+    ) -> torch.Tensor:
+        """Apply scheduler recalc_last=1 to prefill retrieve (mask + slot mapping)."""
+        if not LMCacheConnectorV1Impl._full_hit_recalc_last_token(
+            request.load_spec,
+            len(request.token_ids),
+            is_sparse_decode=request.is_sparse_decode,
+        ):
+            return slot_mapping
+
+        if token_mask.numel() > 0:
+            token_mask[-1] = False
+        trimmed = slot_mapping
+        if slot_mapping.numel() > 0:
+            trimmed = slot_mapping[:-1]
+
+        log_ext_prefix_hit_diag(
+            "prefill recalc_last applied req=%s prompt_len=%d "
+            "mask_true=%d slot_len=%d (last prompt token left for vLLM recompute)",
+            request.req_id,
+            len(request.token_ids),
+            int(token_mask.sum().item()),
+            trimmed.numel(),
+        )
+        log_prefix_load_diag(
+            "recalc_last prefill req=%s mask_true=%d slot_len=%d",
+            request.req_id,
+            int(token_mask.sum().item()),
+            trimmed.numel(),
+        )
+        return trimmed
+
     def _drain_layerwise_retrievers(self) -> None:
         """Finish suspended layerwise generators to avoid GC cost on reset."""
         for idx, retriever in enumerate(self.layerwise_retrievers):
@@ -1286,15 +1343,20 @@ class LMCacheConnectorV1Impl:
             token_mask = self._load_token_mask_for_retrieve(
                 request, token_count, self._lmcache_chunk_size
             )
+            recalc_last_applied = self._full_hit_recalc_last_token(
+                request.load_spec,
+                len(request.token_ids),
+                is_sparse_decode=request.is_sparse_decode,
+            )
+            if recalc_last_applied:
+                slot_mapping = self._apply_full_hit_recalc_last_prefill(
+                    request, token_mask, slot_mapping
+                )
             num_expected_load = (
                 request.load_spec.lmcache_cached_tokens
                 - request.load_spec.vllm_cached_tokens
             )
-            if (
-                request.load_spec.lmcache_cached_tokens == len(request.token_ids)
-                and request.load_spec.lmcache_cached_tokens
-                > request.load_spec.vllm_cached_tokens
-            ):
+            if recalc_last_applied:
                 num_expected_load -= 1
             log_ext_prefix_hit_diag(
                 "worker start_load_kv req=%s %s sparse_decode=%s prompt=%d "
@@ -1336,6 +1398,26 @@ class LMCacheConnectorV1Impl:
                     token_count,
                     len(slot_mapping),
                 )
+
+            if (
+                not request.is_sparse_decode
+                and SKIP_PREFILL_RETRIEVE_LAYER
+            ):
+                log_ext_prefix_hit_diag(
+                    "SKIP_PREFILL_RETRIEVE_LAYER req=%s %s expected_load=%d "
+                    "lookup_hit=%d (worker skips retrieve_layer; vLLM should "
+                    "compute scheduled tokens — A/B test for prefill scatter)",
+                    request.req_id,
+                    self._sparse_tp_diag_rank_label(),
+                    num_expected_load,
+                    request.load_spec.lmcache_cached_tokens,
+                )
+                log_prefix_load_diag(
+                    "skip prefill retrieve_layer req=%s %s",
+                    request.req_id,
+                    self._sparse_tp_diag_rank_label(),
+                )
+                continue
 
             if self.use_layerwise or request.is_sparse_decode:
                 if idx == last_idx:
@@ -1397,15 +1479,18 @@ class LMCacheConnectorV1Impl:
                     # NOTE: retrieve layers one by one with cpu prefetch
                     next(layerwise_retriever)
                     location = retrieve_kwargs.get("cached_retrieve_location")
-                    metadata_warm = bool(
+                    kwargs_metadata_warm = bool(
                         retrieve_kwargs.get("_retrieve_metadata_warm")
-                        or request.cached_keys
                     )
+                    metadata_warm = bool(kwargs_metadata_warm or request.cached_keys)
                     self._save_worker_retrieve_state_from_request(
                         request,
                         location=location,
                         metadata_warm=metadata_warm,
                         token_count=token_count,
+                    )
+                    bound_has_keys = bound_state is not None and bool(
+                        bound_state.cached_keys
                     )
                     log_sparse_tp_diag(
                         "sparse_decode retrieve init req=%s %s "
@@ -1418,14 +1503,32 @@ class LMCacheConnectorV1Impl:
                         len(request.cached_starts),
                         location,
                     )
+                    log_ext_prefix_hit_diag(
+                        "sparse_decode retrieve init req=%s %s "
+                        "metadata_warm=%s kwargs_metadata_warm=%s "
+                        "bound_state=%s bound_has_keys=%s cached_key_layers=%d "
+                        "cached_chunks=%d ret_mask_sum=%d location=%s "
+                        "(Run2 cold if metadata_warm=False on early decode steps; "
+                        "Run1 same-request often warms after first decode step)",
+                        request.req_id,
+                        self._sparse_tp_diag_rank_label(),
+                        metadata_warm,
+                        kwargs_metadata_warm,
+                        bound_state is not None,
+                        bound_has_keys,
+                        len(request.cached_keys),
+                        len(request.cached_starts),
+                        int(request.decode_ret_mask.sum().item())
+                        if request.decode_ret_mask is not None
+                        else -1,
+                        location,
+                    )
                     self.layerwise_retrievers.append(layerwise_retriever)
                     self._layerwise_retriever_is_sparse.append(True)
                 else:
-                    retrieve_slot_mapping = (
-                        slot_mapping
-                        if lmcache_cached_tokens >= len(slot_mapping)
-                        else slot_mapping[:lmcache_cached_tokens]
-                    )
+                    retrieve_slot_mapping = slot_mapping
+                    if lmcache_cached_tokens < len(slot_mapping):
+                        retrieve_slot_mapping = slot_mapping[:lmcache_cached_tokens]
                     layerwise_retriever = self.lmcache_engine.retrieve_layer(
                         retrieve_tokens,
                         token_mask,
@@ -1449,11 +1552,9 @@ class LMCacheConnectorV1Impl:
                     self.layerwise_retrievers.append(layerwise_retriever)
                     self._layerwise_retriever_is_sparse.append(False)
             else:
-                retrieve_slot_mapping = (
-                    slot_mapping
-                    if lmcache_cached_tokens >= len(slot_mapping)
-                    else slot_mapping[:lmcache_cached_tokens]
-                )
+                retrieve_slot_mapping = slot_mapping
+                if lmcache_cached_tokens < len(slot_mapping):
+                    retrieve_slot_mapping = slot_mapping[:lmcache_cached_tokens]
                 ret_token_mask = self.lmcache_engine.retrieve(
                     retrieve_tokens,
                     token_mask,
@@ -1469,6 +1570,8 @@ class LMCacheConnectorV1Impl:
                 num_expected_tokens = (
                     lmcache_cached_tokens - request.load_spec.vllm_cached_tokens
                 )
+                if recalc_last_applied:
+                    num_expected_tokens -= 1
                 if num_retrieved_tokens < num_expected_tokens:
                     self._log_ext_prefix_worker_load(
                         request,
@@ -1665,10 +1768,10 @@ class LMCacheConnectorV1Impl:
                     request.load_spec.lmcache_cached_tokens
                     - request.load_spec.vllm_cached_tokens
                 )
-                if (
-                    request.load_spec.lmcache_cached_tokens == len(request.token_ids)
-                    and request.load_spec.lmcache_cached_tokens
-                    > request.load_spec.vllm_cached_tokens
+                if self._full_hit_recalc_last_token(
+                    request.load_spec,
+                    len(request.token_ids),
+                    is_sparse_decode=False,
                 ):
                     num_expected_tokens -= 1
                 self._log_ext_prefix_worker_load(
@@ -1702,6 +1805,23 @@ class LMCacheConnectorV1Impl:
                         "worker layerwise retrieve shortfall req=%s %s "
                         "retrieved=%d expected=%d "
                         "(likely cause of <100%% external prefix hit on this rank)",
+                        request.req_id,
+                        self._sparse_tp_diag_rank_label(),
+                        num_retrieved_tokens,
+                        num_expected_tokens,
+                    )
+                elif num_retrieved_tokens > num_expected_tokens:
+                    logger.warning(
+                        "Request %s %s prefill layerwise over-retrieve: "
+                        "retrieved=%d expected=%d (recalc_last mask may be missing)",
+                        request.req_id,
+                        self._sparse_tp_diag_rank_label(),
+                        num_retrieved_tokens,
+                        num_expected_tokens,
+                    )
+                    log_ext_prefix_hit_diag(
+                        "worker layerwise over-retrieve req=%s %s "
+                        "retrieved=%d expected=%d",
                         request.req_id,
                         self._sparse_tp_diag_rank_label(),
                         num_retrieved_tokens,
