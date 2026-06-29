@@ -50,6 +50,21 @@ def _clone_kvcaches(
     return [(k.clone(), v.clone()) for k, v in kvcaches]
 
 
+def _corrupt_sampled_k_slot(
+    kvcaches: List[Tuple[torch.Tensor, torch.Tensor]],
+    slot_mapping: torch.Tensor,
+    prompt_len: int,
+    *,
+    layer_id: int = 0,
+    delta: float = 1.0,
+) -> int:
+    """Corrupt K at a token index that sample_token_indices() always checks."""
+    token_idx = sample_token_indices(prompt_len)[0]
+    slot = int(slot_mapping[token_idx].item())
+    kvcaches[layer_id][0][slot] += delta
+    return token_idx
+
+
 @pytest.fixture(autouse=True)
 def _enable_kv_checksum_diag(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("LMCACHE_DIAG_KV_CHECKSUM", "1")
@@ -149,7 +164,7 @@ class TestExperimentBStoreRetrieveRoundtrip:
         )
 
         bad_retrieve_kv = _clone_kvcaches(compute_kv)
-        bad_retrieve_kv[0][0][slot_mapping[10].item()] += 1.0
+        _corrupt_sampled_k_slot(bad_retrieve_kv, slot_mapping, prompt_len)
 
         on_prefill_retrieve_complete(
             req_id="run1-bad-retrieve",
@@ -233,7 +248,7 @@ class TestExperimentBDecodeScatterVsCompute:
         )
 
         scattered_kv = _clone_kvcaches(compute_kv)
-        scattered_kv[1][1][slot_mapping[50].item()] += 0.5
+        _corrupt_sampled_k_slot(scattered_kv, slot_mapping, prompt_len, layer_id=1)
 
         on_decode_scatter_complete(
             req_id="run1",
@@ -343,7 +358,7 @@ class TestExperimentCRun1VsRun2DecodeScatter:
         )
 
         run2_kv = _clone_kvcaches(run1_kv)
-        run2_kv[0][0][slot_mapping[20].item()] += 2.0
+        _corrupt_sampled_k_slot(run2_kv, slot_mapping, prompt_len)
         on_decode_scatter_complete(
             req_id="run2",
             token_ids=token_ids,
