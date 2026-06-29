@@ -1035,6 +1035,12 @@ class LMCacheConnectorV1Impl:
         """True when vLLM expects the last prompt token to be recomputed, not loaded."""
         if is_sparse_decode or load_spec is None:
             return False
+        if os.environ.get("LMCACHE_DISABLE_RECALC_LAST", "").lower() in (
+            "1",
+            "true",
+            "yes",
+        ):
+            return False
         return (
             load_spec.lmcache_cached_tokens >= prompt_len
             and load_spec.lmcache_cached_tokens > load_spec.vllm_cached_tokens
@@ -2409,9 +2415,18 @@ class LMCacheConnectorV1Impl:
         # a better support for this case.
         need_to_allocate = num_external_hit_tokens - num_computed_tokens
 
-        # In, full-prompt-hit case, we need to recompute the last token
+        # In, full-prompt-hit case, we need to recompute the last token.
+        # LMCACHE_DISABLE_RECALC_LAST=1 skips this so the scheduler reports a
+        # full hit (allocates prompt_len external slots) -- test knob to
+        # isolate whether recalc_last is the root cause of Run2 garbage.
+        # WARNING: with recalc_last disabled vLLM may try to compute 0 tokens
+        # (all external) and error; that itself confirms recalc_last is needed.
         recalc_last = 0
-        if num_external_hit_tokens == request.num_tokens:
+        if (
+            num_external_hit_tokens == request.num_tokens
+            and os.environ.get("LMCACHE_DISABLE_RECALC_LAST", "").lower()
+            not in ("1", "true", "yes")
+        ):
             need_to_allocate -= 1
             recalc_last = 1
 
@@ -2575,6 +2590,8 @@ class LMCacheConnectorV1Impl:
             if (
                 self.load_specs[request.request_id].lmcache_cached_tokens
                 == request.num_tokens
+                and os.environ.get("LMCACHE_DISABLE_RECALC_LAST", "").lower()
+                not in ("1", "true", "yes")
             )
             else 0
         )
