@@ -1899,14 +1899,31 @@ class LMCacheConnectorV1Impl:
                         num_expected_tokens,
                     )
                 elif num_retrieved_tokens > num_expected_tokens:
-                    logger.warning(
-                        "Request %s %s prefill layerwise over-retrieve: "
-                        "retrieved=%d expected=%d (recalc_last mask may be missing)",
-                        request.req_id,
-                        self._sparse_tp_diag_rank_label(),
-                        num_retrieved_tokens,
-                        num_expected_tokens,
+                    # On a full-cache-hit with recalc_last=1, we intentionally
+                    # load the full prompt (prompt_len tokens) so the partial
+                    # chunk key matches the store; vLLM recomputes the last
+                    # token and overwrites that slot. So retrieved == expected+1
+                    # is the expected recalc_last shape, not an error.
+                    recalc_last_full_hit = (
+                        self._full_hit_recalc_last_token(
+                            request.load_spec,
+                            len(request.token_ids),
+                            is_sparse_decode=False,
+                        )
                     )
+                    if not (
+                        recalc_last_full_hit
+                        and num_retrieved_tokens == num_expected_tokens + 1
+                    ):
+                        logger.warning(
+                            "Request %s %s prefill layerwise over-retrieve: "
+                            "retrieved=%d expected=%d (recalc_last mask may be "
+                            "missing)",
+                            request.req_id,
+                            self._sparse_tp_diag_rank_label(),
+                            num_retrieved_tokens,
+                            num_expected_tokens,
+                        )
                     log_ext_prefix_hit_diag(
                         "worker layerwise over-retrieve req=%s %s "
                         "retrieved=%d expected=%d",
