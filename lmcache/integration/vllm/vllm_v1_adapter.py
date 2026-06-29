@@ -2024,6 +2024,39 @@ class LMCacheConnectorV1Impl:
                 store_mask = torch.ones(len(token_ids), dtype=torch.bool)
                 store_mask[:skip_leading_tokens] = False
 
+                # vLLM recomputes the last prompt token on a full-cache hit
+                # (recalc_last), and the retrieve path correspondingly drops
+                # the last token before chunk-key generation. Chunk keys hash
+                # the chunk's tokens, so a partial chunk stored with N tokens
+                # will NOT match a retrieve that queries N-1 tokens -- the
+                # last partial chunk would silently miss (e.g. missing 190
+                # tokens for a 18879-prompt with chunk_size=256). Store
+                # symmetrically drops the last prompt token so the stored
+                # partial chunk has the same token count the future full-hit
+                # retrieve will query. vLLM recomputes that last token on
+                # every run (cold and full-hit), so not storing its KV is
+                # safe and does not affect decode (the KV is in GPU memory).
+                if (
+                    request.is_last_prefill
+                    and not request.is_sparse_decode
+                    and not self.enable_blending
+                    and len(token_ids) > skip_leading_tokens
+                ):
+                    token_ids = token_ids[:-1]
+                    store_mask = store_mask[:-1]
+                    slot_mapping = slot_mapping[:-1]
+                    logger.info(
+                        "store recalc_last symmetric trim req=%s %s "
+                        "prompt=%d stored=%d skip_leading=%d "
+                        "(drop last prompt token so partial chunk key "
+                        "matches future full-hit retrieve)",
+                        request.req_id,
+                        self._sparse_tp_diag_rank_label(),
+                        len(request.token_ids),
+                        len(token_ids),
+                        skip_leading_tokens,
+                    )
+
                 logger.debug(
                     "Storing KV cache for %d out of %d tokens "
                     "(skip_leading_tokens=%d) for request %s",
