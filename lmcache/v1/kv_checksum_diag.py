@@ -51,9 +51,20 @@ def sample_token_indices(
     sparse_window: int = 2048,
     num_samples: int = 8,
 ) -> List[int]:
-    """Sample prompt token indices: head, tail, and evenly across sparse window."""
+    """Sample prompt token indices: head, tail, and evenly across sparse window.
+
+    If LMCACHE_DIAG_KV_FULL_SCAN=1, sample every 64th token across the FULL
+    prompt (not just the sparse window) to catch V/K corruption at any position.
+    """
     if prompt_len <= 0:
         return []
+    if os.environ.get("LMCACHE_DIAG_KV_FULL_SCAN", "").lower() in (
+        "1",
+        "true",
+        "yes",
+    ):
+        step = max(1, prompt_len // 256)  # ~256 samples across full prompt
+        return list(range(0, prompt_len, step))
     indices: set[int] = {0, prompt_len - 1}
     start = max(0, prompt_len - sparse_window)
     if num_samples <= 1:
