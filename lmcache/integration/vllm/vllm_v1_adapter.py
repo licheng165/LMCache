@@ -1033,40 +1033,45 @@ class LMCacheConnectorV1Impl:
         )
 
     @staticmethod
-    def _apply_full_hit_recalc_last_prefill(
+    def _trim_prefill_for_recalc_last(
         request: "ReqMeta",
-        token_mask: torch.Tensor,
+        retrieve_tokens: list[int],
         slot_mapping: torch.Tensor,
-    ) -> torch.Tensor:
-        """Apply scheduler recalc_last=1 to prefill retrieve (mask + slot mapping)."""
+    ) -> tuple[list[int], torch.Tensor]:
+        """Drop the last prompt token from prefill retrieve (vLLM recalc_last=1).
+
+        LMCache masks only allow Falses as a prefix (chunk-aligned), so we trim
+        token/slot lists instead of setting mask[-1]=False.
+        """
         if not LMCacheConnectorV1Impl._full_hit_recalc_last_token(
             request.load_spec,
             len(request.token_ids),
             is_sparse_decode=request.is_sparse_decode,
         ):
-            return slot_mapping
+            return retrieve_tokens, slot_mapping
 
-        if token_mask.numel() > 0:
-            token_mask[-1] = False
-        trimmed = slot_mapping
-        if slot_mapping.numel() > 0:
-            trimmed = slot_mapping[:-1]
+        if len(retrieve_tokens) <= 1:
+            return retrieve_tokens, slot_mapping
 
+        trimmed_tokens = retrieve_tokens[:-1]
+        trimmed_slots = (
+            slot_mapping[:-1] if slot_mapping.numel() > 0 else slot_mapping
+        )
         log_ext_prefix_hit_diag(
-            "prefill recalc_last applied req=%s prompt_len=%d "
-            "mask_true=%d slot_len=%d (last prompt token left for vLLM recompute)",
+            "prefill recalc_last trim req=%s prompt_len=%d "
+            "retrieve_len=%d slot_len=%d (last prompt token for vLLM recompute)",
             request.req_id,
             len(request.token_ids),
-            int(token_mask.sum().item()),
-            trimmed.numel(),
+            len(trimmed_tokens),
+            trimmed_slots.numel(),
         )
         log_prefix_load_diag(
-            "recalc_last prefill req=%s mask_true=%d slot_len=%d",
+            "recalc_last prefill req=%s retrieve_len=%d slot_len=%d",
             request.req_id,
-            int(token_mask.sum().item()),
-            trimmed.numel(),
+            len(trimmed_tokens),
+            trimmed_slots.numel(),
         )
-        return trimmed
+        return trimmed_tokens, trimmed_slots
 
     def _drain_layerwise_retrievers(self) -> None:
         """Finish suspended layerwise generators to avoid GC cost on reset."""
@@ -1339,19 +1344,19 @@ class LMCacheConnectorV1Impl:
                 lmcache_cached_tokens,
                 is_sparse_decode=request.is_sparse_decode,
             )
-            token_count = len(retrieve_tokens)
-            token_mask = self._load_token_mask_for_retrieve(
-                request, token_count, self._lmcache_chunk_size
-            )
             recalc_last_applied = self._full_hit_recalc_last_token(
                 request.load_spec,
                 len(request.token_ids),
                 is_sparse_decode=request.is_sparse_decode,
             )
             if recalc_last_applied:
-                slot_mapping = self._apply_full_hit_recalc_last_prefill(
-                    request, token_mask, slot_mapping
+                retrieve_tokens, slot_mapping = self._trim_prefill_for_recalc_last(
+                    request, retrieve_tokens, slot_mapping
                 )
+            token_count = len(retrieve_tokens)
+            token_mask = self._load_token_mask_for_retrieve(
+                request, token_count, self._lmcache_chunk_size
+            )
             num_expected_load = (
                 request.load_spec.lmcache_cached_tokens
                 - request.load_spec.vllm_cached_tokens
