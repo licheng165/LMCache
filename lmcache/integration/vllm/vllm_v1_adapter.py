@@ -48,6 +48,12 @@ from lmcache.v1.ext_prefix_hit_diag import (
     log_ext_prefix_hit_diag,
     pct,
 )
+from lmcache.v1.kv_checksum_diag import (
+    kv_checksum_diag_enabled,
+    on_compute_before_decode_scatter,
+    on_decode_scatter_complete,
+    on_prefill_retrieve_complete,
+)
 
 if TYPE_CHECKING:
     # Third Party
@@ -714,6 +720,7 @@ class LMCacheConnectorV1Impl:
         self._invalid_block_ids: set[int] = set()
         if role != KVConnectorRole.SCHEDULER:
             self._worker_retrieve_state: dict[str, WorkerRetrieveState] = {}
+            self._kv_diag_active_decode_step: dict[str, int] = {}
             self._warn_mla_per_rank_lookup_config(config)
 
     def _warn_mla_per_rank_lookup_config(self, config: LMCacheEngineConfig) -> None:
@@ -1135,6 +1142,8 @@ class LMCacheConnectorV1Impl:
     def _drop_worker_retrieve_state(self, req_id: str) -> None:
         if hasattr(self, "_worker_retrieve_state"):
             self._worker_retrieve_state.pop(req_id, None)
+        if hasattr(self, "_kv_diag_active_decode_step"):
+            self._kv_diag_active_decode_step.pop(req_id, None)
         self._release_request_lookup_pins(req_id)
 
     def _should_invalidate_worker_retrieve_state(
@@ -1212,6 +1221,84 @@ class LMCacheConnectorV1Impl:
                 metadata_warm=metadata_warm or bool(request.cached_keys),
                 token_count=len(request.token_ids),
             )
+
+    def _kv_checksum_worker_id(self) -> int:
+        metadata = self.lmcache_engine_metadata
+        if metadata is None:
+            return 0
+        return metadata.worker_id
+
+    def _kv_checksum_slot_mapping(
+        self, request: ReqMeta
+    ) -> Optional[torch.Tensor]:
+        if not request.slot_mapping:
+            return None
+        slot_mapping = request.slot_mapping[0]
+        if request.is_sparse_decode:
+            return slot_mapping
+        lmcache_cached = 0
+        if request.load_spec is not None:
+            lmcache_cached = request.load_spec.lmcache_cached_tokens
+        if lmcache_cached > 0 and lmcache_cached < slot_mapping.numel():
+            return slot_mapping[:lmcache_cached]
+        return slot_mapping
+
+    def _maybe_record_compute_before_decode_scatter(
+        self, request: ReqMeta, kvcaches: list
+    ) -> None:
+        if not kv_checksum_diag_enabled():
+            return
+        if not request.is_sparse_decode:
+            return
+        decode_step = self._kv_diag_active_decode_step.get(request.req_id, 0)
+        if decode_step != 0:
+            return
+        slot_mapping = self._kv_checksum_slot_mapping(request)
+        if slot_mapping is None:
+            return
+        on_compute_before_decode_scatter(
+            req_id=request.req_id,
+            token_ids=request.token_ids,
+            kvcaches=kvcaches,
+            slot_mapping=slot_mapping,
+            num_layers=self.num_layers,
+            prompt_len=len(request.token_ids),
+            worker_id=self._kv_checksum_worker_id(),
+        )
+
+    def _maybe_record_after_layer_load_checksum(
+        self, request: ReqMeta, kvcaches: list
+    ) -> None:
+        if not kv_checksum_diag_enabled():
+            return
+        slot_mapping = self._kv_checksum_slot_mapping(request)
+        if slot_mapping is None:
+            return
+        worker_id = self._kv_checksum_worker_id()
+        if request.is_sparse_decode:
+            decode_step = self._kv_diag_active_decode_step.get(request.req_id, 0)
+            on_decode_scatter_complete(
+                req_id=request.req_id,
+                token_ids=request.token_ids,
+                kvcaches=kvcaches,
+                slot_mapping=slot_mapping,
+                num_layers=self.num_layers,
+                prompt_len=len(request.token_ids),
+                worker_id=worker_id,
+                decode_step=decode_step,
+            )
+            return
+        if request.load_spec is None or not request.load_spec.can_load:
+            return
+        on_prefill_retrieve_complete(
+            req_id=request.req_id,
+            token_ids=request.token_ids,
+            kvcaches=kvcaches,
+            slot_mapping=slot_mapping,
+            num_layers=self.num_layers,
+            prompt_len=len(request.token_ids),
+            worker_id=worker_id,
+        )
 
     def _sparse_decode_retrieve_warm_kwargs(
         self,
@@ -1440,6 +1527,9 @@ class LMCacheConnectorV1Impl:
                         vllm_cached_tokens=request.load_spec.vllm_cached_tokens,
                     )
                 elif request.is_sparse_decode:
+                    self._maybe_record_compute_before_decode_scatter(
+                        request, kvcaches
+                    )
                     if hasattr(self, "_worker_retrieve_state"):
                         if self._should_invalidate_worker_retrieve_state(
                             request, token_count
@@ -1832,6 +1922,16 @@ class LMCacheConnectorV1Impl:
                         num_retrieved_tokens,
                         num_expected_tokens,
                     )
+            if self.current_layer == self.num_layers - 1:
+                if not self._kvcaches_list:
+                    self._refresh_kvcaches_list()
+                self._maybe_record_after_layer_load_checksum(
+                    request, self._kvcaches_list
+                )
+                if request.is_sparse_decode:
+                    step = self._kv_diag_active_decode_step.get(request.req_id, 0)
+                    if step == 0:
+                        self._kv_diag_active_decode_step[request.req_id] = 1
             idx += 1
 
         if self.layerwise_retrievers:
