@@ -11,6 +11,7 @@ import zmq
 
 # First Party
 from lmcache.logging import init_logger
+from lmcache.v1.prefix_load_diag import log_prefix_load_diag
 from lmcache.v1.cache_engine import LMCacheEngine
 from lmcache.v1.config import LMCacheEngineConfig
 from lmcache.v1.lookup_client.abstract_client import LookupClientInterface
@@ -239,11 +240,32 @@ class LMCacheAsyncLookupClient(LookupClientInterface):
                     if len(all_res) == self.world_size:
                         self.res_for_each_worker.pop(lookup_id)
 
+                        min_hit = min(all_res)
+                        max_hit = max(all_res)
+                        if min_hit != max_hit:
+                            logger.warning(
+                                "Lookup hit count differs across TP ranks for "
+                                "req=%s: per_rank=%s min=%d max=%d. "
+                                "Scheduler uses min; ranks above min may still "
+                                "retrieve less than rank0 reported (garbage risk).",
+                                lookup_id,
+                                all_res,
+                                min_hit,
+                                max_hit,
+                            )
+                        log_prefix_load_diag(
+                            "async_lookup aggregated req=%s per_rank=%s min=%d max=%d",
+                            lookup_id,
+                            all_res,
+                            min_hit,
+                            max_hit,
+                        )
+
                         # NOTE: it is possible that the number of hit
                         # tokens is different across (TP and PP) ranks, so we
                         # can use the minimum value as the number of
                         # hit tokens.
-                        self.reqs_status[lookup_id] = min(all_res)
+                        self.reqs_status[lookup_id] = min_hit
 
             except Exception as e:
                 logger.error("Error processing response from worker: %s", e)

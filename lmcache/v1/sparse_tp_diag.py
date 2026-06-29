@@ -19,6 +19,23 @@ def sparse_tp_diag_enabled() -> bool:
     )
 
 
+def prefix_load_diag_enabled() -> bool:
+    """Also enabled when LMCACHE_DIAG_SPARSE_TP=1."""
+    if sparse_tp_diag_enabled():
+        return True
+    return os.environ.get("LMCACHE_DIAG_PREFIX_LOAD", "").lower() in (
+        "1",
+        "true",
+        "yes",
+    )
+
+
 def log_sparse_tp_diag(fmt: str, *args) -> None:
     if sparse_tp_diag_enabled():
         logger.info("[LMCache-Diag-SparseTP] " + fmt, *args)
+
+
+def log_prefix_load_diag(fmt: str, *args) -> None:
+    # Re-export for callers that already import from sparse_tp_diag.
+    if prefix_load_diag_enabled():
+        logger.info("[LMCache-Diag-PrefixLoad] " + fmt, *args)

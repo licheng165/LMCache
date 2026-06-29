@@ -42,7 +42,7 @@ from lmcache.v1.compute.blend import LMCBlenderBuilder
 from lmcache.v1.config import LMCacheEngineConfig
 from lmcache.v1.config_base import validate_and_set_config_value
 from lmcache.v1.manager import LMCacheManager
-from lmcache.v1.sparse_tp_diag import log_sparse_tp_diag
+from lmcache.v1.sparse_tp_diag import log_prefix_load_diag, log_sparse_tp_diag
 from lmcache.v1.ext_prefix_hit_diag import (
     get_run_tracker,
     log_ext_prefix_hit_diag,
@@ -708,6 +708,37 @@ class LMCacheConnectorV1Impl:
         self._invalid_block_ids: set[int] = set()
         if role != KVConnectorRole.SCHEDULER:
             self._worker_retrieve_state: dict[str, WorkerRetrieveState] = {}
+            self._warn_mla_per_rank_lookup_config(config)
+
+    def _warn_mla_per_rank_lookup_config(self, config: LMCacheEngineConfig) -> None:
+        metadata = self.lmcache_engine_metadata
+        if metadata is None or not metadata.use_mla:
+            return
+        save_only_first_rank = (
+            config.get_extra_config_value("save_only_first_rank", metadata.use_mla)
+            and metadata.use_mla
+        )
+        if save_only_first_rank:
+            return
+        lookup_ids = config.get_lookup_server_worker_ids(
+            metadata.use_mla, metadata.world_size
+        )
+        if len(lookup_ids) < metadata.world_size:
+            logger.warning(
+                "MLA per-rank store (save_only_first_rank=false) but lookup "
+                "server runs on ranks %s only (world_size=%d). The scheduler "
+                "may trust rank0 hit count while other TP ranks miss KV on "
+                "retrieve_layer → garbled generation. Remove "
+                "lookup_server_worker_ids override or list all TP ranks.",
+                lookup_ids,
+                metadata.world_size,
+            )
+        else:
+            log_prefix_load_diag(
+                "MLA per-rank store: lookup_server ranks=%s world_size=%d",
+                lookup_ids,
+                metadata.world_size,
+            )
 
     def _lookup_token_ids_for_request(self, request: "Request") -> list[int]:
         """Token ids used for lookup / prompt fingerprint (matches lookup path)."""
@@ -1278,6 +1309,33 @@ class LMCacheConnectorV1Impl:
                 num_expected_load,
                 token_count,
             )
+            log_prefix_load_diag(
+                "start_load_kv req=%s %s token_ids=%d retrieve_len=%d "
+                "slot_len=%d lookup_hit=%d vllm_cached=%d expected_load=%d "
+                "mask_true=%d",
+                request.req_id,
+                self._sparse_tp_diag_rank_label(),
+                len(request.token_ids),
+                token_count,
+                len(slot_mapping),
+                request.load_spec.lmcache_cached_tokens,
+                request.load_spec.vllm_cached_tokens,
+                num_expected_load,
+                int(token_mask.sum()),
+            )
+            if (
+                not request.is_sparse_decode
+                and token_count > len(slot_mapping)
+            ):
+                logger.warning(
+                    "Request %s %s: retrieve_len=%d exceeds slot_mapping len=%d "
+                    "(KV scatter will be incomplete → garbage). "
+                    "Often chunked-prefill metadata out of sync with lookup_hit.",
+                    request.req_id,
+                    self._sparse_tp_diag_rank_label(),
+                    token_count,
+                    len(slot_mapping),
+                )
 
             if self.use_layerwise or request.is_sparse_decode:
                 if idx == last_idx:
@@ -1620,7 +1678,26 @@ class LMCacheConnectorV1Impl:
                     prompt_len=len(request.token_ids),
                     phase="prefill_layerwise",
                 )
+                log_prefix_load_diag(
+                    "wait_for_layer_load last_layer req=%s %s retrieved=%d "
+                    "expected=%d prompt_token_ids=%d",
+                    request.req_id,
+                    self._sparse_tp_diag_rank_label(),
+                    num_retrieved_tokens,
+                    num_expected_tokens,
+                    len(request.token_ids),
+                )
                 if num_retrieved_tokens < num_expected_tokens:
+                    logger.warning(
+                        "Request %s %s layerwise retrieve shortfall: "
+                        "retrieved=%d expected=%d (TP ranks disagree → garbage). "
+                        "Check store_layer logs on all ranks and async_lookup "
+                        "per_rank hit counts.",
+                        request.req_id,
+                        self._sparse_tp_diag_rank_label(),
+                        num_retrieved_tokens,
+                        num_expected_tokens,
+                    )
                     log_ext_prefix_hit_diag(
                         "worker layerwise retrieve shortfall req=%s %s "
                         "retrieved=%d expected=%d "

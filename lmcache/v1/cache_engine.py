@@ -61,6 +61,7 @@ from lmcache.v1.token_database import (
     SegmentTokenDatabase,
     TokenDatabase,
 )
+from lmcache.v1.prefix_load_diag import cache_key_label, log_prefix_load_diag
 from lmcache.v1.sparse_tp_diag import log_sparse_tp_diag
 from lmcache.v1.ext_prefix_hit_diag import record_store_layer_if_enabled
 
@@ -721,6 +722,19 @@ class LMCacheEngine:
             skipped_existing,
             len(tokens),
         )
+        log_prefix_load_diag(
+            "store_layer req=%s worker_id=%d world_size=%d "
+            "save_only_first_rank=%s new_chunks=%d stored_tokens=%d "
+            "skipped_existing=%d total_tokens=%d",
+            req_id,
+            self.metadata.worker_id,
+            self.metadata.world_size,
+            self.save_only_first_rank,
+            len(keys),
+            tot_token_num,
+            skipped_existing,
+            len(tokens),
+        )
         record_store_layer_if_enabled(
             req_id=req_id,
             token_ids=tokens,
@@ -1009,6 +1023,16 @@ class LMCacheEngine:
                         "Please support multi-location retrieval in the future."
                     )
             else:
+                log_prefix_load_diag(
+                    "retrieve_layer contains_miss req=%s rank=%d at_start=%d "
+                    "key=%s keys_found=%d required=%d",
+                    req_id,
+                    self.metadata.worker_id,
+                    start,
+                    cache_key_label(key),
+                    len(keys),
+                    num_required_tokens,
+                )
                 log_sparse_tp_diag(
                     "retrieve_layer contains_miss req=%s rank=%d at_start=%d "
                     "chunk_hash=%s keys_found=%d",
@@ -1027,6 +1051,18 @@ class LMCacheEngine:
             ret_mask[start:end] = True
 
         if not keys:
+            log_prefix_load_diag(
+                "retrieve_layer no_keys req=%s rank=%d worker_id=%d "
+                "world_size=%d save_only_first_rank=%s num_tokens=%d "
+                "num_required=%d",
+                req_id,
+                self.metadata.worker_id,
+                self.metadata.worker_id,
+                self.metadata.world_size,
+                self.save_only_first_rank,
+                len(tokens),
+                num_required_tokens,
+            )
             log_sparse_tp_diag(
                 "retrieve_layer no_keys req=%s rank=%d num_tokens=%d "
                 "num_required=%d",
@@ -1069,6 +1105,11 @@ class LMCacheEngine:
 
             for mem_obj in to_count_down:
                 mem_obj.ref_count_down()
+
+            next(mem_obj_consumer)
+
+            # Unpin disk-loaded staging objects after device-side sync is enqueued.
+            self._maybe_unpin_retrieved_objs(to_count_down, location)
         else:
             # If no cache are found, we still need to yield to avoid
             # `StopIteration`
@@ -1077,19 +1118,35 @@ class LMCacheEngine:
 
         yield None
 
-        # synchronize the last layer
-        next(mem_obj_consumer)
-
-        # Unpin any disk-loaded staging objects now that the device-side sync
-        # has been enqueued (mem_obj_consumer advanced past its sync point).
-        # Without this, pin_count stays at 1 forever and the CPU staging pool
-        # fills up, causing the next retrieve to deadlock inside allocate().
-        for mem_obj in to_count_down:
-            if mem_obj.is_pinned:
-                mem_obj.unpin()
-
         retrieved_tokens = torch.sum(ret_mask)
         self.stats_monitor.on_retrieve_finished(monitor_req_id, retrieved_tokens)
+        log_prefix_load_diag(
+            "retrieve_layer done req=%s rank=%d worker_id=%d "
+            "save_only_first_rank=%s chunks=%d retrieved=%d required=%d "
+            "total=%d location=%s",
+            req_id,
+            self.metadata.worker_id,
+            self.metadata.worker_id,
+            self.save_only_first_rank,
+            len(keys),
+            int(retrieved_tokens),
+            num_required_tokens,
+            len(tokens),
+            location,
+        )
+        if retrieved_tokens < num_required_tokens and num_required_tokens > 0:
+            logger.warning(
+                "[req_id=%s] retrieve_layer rank=%d loaded %d/%d prefix tokens "
+                "(missing %d). Under MLA+TP with save_only_first_rank=false, "
+                "this often means this rank did not store those chunks on run 1 "
+                "or lookup only queried rank0 (expect garbage on TP>1). "
+                "Enable LMCACHE_DIAG_PREFIX_LOAD=1 for key-level logs.",
+                req_id,
+                self.metadata.worker_id,
+                int(retrieved_tokens),
+                num_required_tokens,
+                num_required_tokens - int(retrieved_tokens),
+            )
         if not self._is_passive():
             logger.info(
                 "[req_id=%s] Retrieved %d out of %d out of total %d tokens",
@@ -1818,6 +1875,15 @@ class LMCacheEngine:
         the data directly, but from the "active" worker (i.e., rank 0 in MLA)
         """
         return self.save_only_first_rank and not self.metadata.is_first_rank()
+
+    def _maybe_unpin_retrieved_objs(
+        self,
+        mem_objs: List[MemoryObj],
+        location: Optional[str],
+    ) -> None:
+        for mem_obj in mem_objs:
+            if mem_obj.is_pinned:
+                mem_obj.unpin()
 
     def _get_slot_mapping_list(
         self,
