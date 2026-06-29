@@ -1045,40 +1045,33 @@ class LMCacheConnectorV1Impl:
         retrieve_tokens: list[int],
         slot_mapping: torch.Tensor,
     ) -> tuple[list[int], torch.Tensor]:
-        """Drop the last prompt token from prefill retrieve (vLLM recalc_last=1).
+        """Handle vLLM recalc_last=1 on a full-cache-hit prefill retrieve.
 
-        LMCache masks only allow Falses as a prefix (chunk-aligned), so we trim
-        token/slot lists instead of setting mask[-1]=False.
+        We intentionally do NOT trim retrieve_tokens or slot_mapping. Rationale:
+
+        Chunk keys hash the chunk's tokens (token_database._prefix_hash yields
+        the hash AFTER each chunk), so the last partial chunk's key depends on
+        its token count. The store saved the full prompt (partial =
+        prompt_len % chunk_size tokens, e.g. 191 for a 18879-prompt with
+        chunk_size=256). If we trimmed retrieve_tokens to prompt_len-1 here,
+        the queried partial chunk would be 190 tokens and its key
+        H(tokens[0:prompt_len-1]) would NOT match the stored key
+        H(tokens[0:prompt_len]) -- the last partial chunk silently misses
+        (the "missing 190" / "loaded 18688/18878" shortfall).
+
+        By keeping retrieve_tokens and slot_mapping at prompt_len, the retrieve
+        queries the same partial chunk the store saved (191 tokens, matching
+        key) and scatters KV to all prompt_len slots. vLLM, on a full-hit with
+        recalc_last=1, still recomputes the last prompt token's logits (and KV)
+        -- overwriting whatever we scattered into that slot -- so loading it is
+        harmless. This also keeps token_count == len(slot_mapping) so the dense
+        prefill retrieve copies exactly match chunk sizes (no OOB).
+
+        Note: this means num_retrieved_tokens (18879) will be 1 more than
+        num_expected_load (18878 = lmcache_cached - recalc_last); the shortfall
+        guard uses a strict `<`, so no false warning is emitted.
         """
-        if not LMCacheConnectorV1Impl._full_hit_recalc_last_token(
-            request.load_spec,
-            len(request.token_ids),
-            is_sparse_decode=request.is_sparse_decode,
-        ):
-            return retrieve_tokens, slot_mapping
-
-        if len(retrieve_tokens) <= 1:
-            return retrieve_tokens, slot_mapping
-
-        trimmed_tokens = retrieve_tokens[:-1]
-        trimmed_slots = (
-            slot_mapping[:-1] if slot_mapping.numel() > 0 else slot_mapping
-        )
-        log_ext_prefix_hit_diag(
-            "prefill recalc_last trim req=%s prompt_len=%d "
-            "retrieve_len=%d slot_len=%d (last prompt token for vLLM recompute)",
-            request.req_id,
-            len(request.token_ids),
-            len(trimmed_tokens),
-            trimmed_slots.numel(),
-        )
-        log_prefix_load_diag(
-            "recalc_last prefill req=%s retrieve_len=%d slot_len=%d",
-            request.req_id,
-            len(trimmed_tokens),
-            trimmed_slots.numel(),
-        )
-        return trimmed_tokens, trimmed_slots
+        return retrieve_tokens, slot_mapping
 
     def _drain_layerwise_retrievers(self) -> None:
         """Finish suspended layerwise generators to avoid GC cost on reset."""
@@ -2024,39 +2017,6 @@ class LMCacheConnectorV1Impl:
                 store_mask = torch.ones(len(token_ids), dtype=torch.bool)
                 store_mask[:skip_leading_tokens] = False
 
-                # vLLM recomputes the last prompt token on a full-cache hit
-                # (recalc_last), and the retrieve path correspondingly drops
-                # the last token before chunk-key generation. Chunk keys hash
-                # the chunk's tokens, so a partial chunk stored with N tokens
-                # will NOT match a retrieve that queries N-1 tokens -- the
-                # last partial chunk would silently miss (e.g. missing 190
-                # tokens for a 18879-prompt with chunk_size=256). Store
-                # symmetrically drops the last prompt token so the stored
-                # partial chunk has the same token count the future full-hit
-                # retrieve will query. vLLM recomputes that last token on
-                # every run (cold and full-hit), so not storing its KV is
-                # safe and does not affect decode (the KV is in GPU memory).
-                if (
-                    request.is_last_prefill
-                    and not request.is_sparse_decode
-                    and not self.enable_blending
-                    and len(token_ids) > skip_leading_tokens
-                ):
-                    token_ids = token_ids[:-1]
-                    store_mask = store_mask[:-1]
-                    slot_mapping = slot_mapping[:-1]
-                    logger.info(
-                        "store recalc_last symmetric trim req=%s %s "
-                        "prompt=%d stored=%d skip_leading=%d "
-                        "(drop last prompt token so partial chunk key "
-                        "matches future full-hit retrieve)",
-                        request.req_id,
-                        self._sparse_tp_diag_rank_label(),
-                        len(request.token_ids),
-                        len(token_ids),
-                        skip_leading_tokens,
-                    )
-
                 logger.debug(
                     "Storing KV cache for %d out of %d tokens "
                     "(skip_leading_tokens=%d) for request %s",
@@ -2179,35 +2139,6 @@ class LMCacheConnectorV1Impl:
             if is_last_prefill:
                 if request.disagg_spec:
                     request.disagg_spec.is_last_prefill = True
-                # vLLM recomputes the last prompt token on a full-cache hit
-                # (recalc_last), and the retrieve path correspondingly drops
-                # the last token before chunk-key generation. Chunk keys hash
-                # the chunk's tokens, so a partial chunk stored with N tokens
-                # will NOT match a retrieve that queries N-1 tokens -- the
-                # last partial chunk would silently miss (e.g. missing 190
-                # tokens for a 18879-prompt with chunk_size=256). Store
-                # symmetrically drops the last prompt token so the stored
-                # partial chunk has the same token count the future full-hit
-                # retrieve will query. vLLM recomputes that last token on
-                # every run (cold and full-hit), so not storing its KV is
-                # safe and does not affect decode (the KV is in GPU memory).
-                if (
-                    not request.is_sparse_decode
-                    and len(token_ids) > skip_leading_tokens
-                    and not self.enable_blending
-                ):
-                    token_ids = token_ids[:-1]
-                    store_mask = store_mask[:-1]
-                    slot_mapping = slot_mapping[:-1]
-                    log_ext_prefix_hit_diag(
-                        "store recalc_last symmetric trim req=%s %s "
-                        "prompt=%d stored=%d (drop last prompt token so "
-                        "partial chunk key matches future full-hit retrieve)",
-                        request.req_id,
-                        self._sparse_tp_diag_rank_label(),
-                        len(request.token_ids),
-                        len(token_ids),
-                    )
             else:
                 if not self.enable_blending:
                     token_len = len(token_ids)
