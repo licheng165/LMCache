@@ -2018,6 +2018,19 @@ class LMCacheConnectorV1Impl:
         kvcaches = list(self.kv_caches.values())
         is_first = True
 
+        # Track the per-call layer index to detect the last layer of a prefill
+        # step. save_kv_layer is called once per layer (layer 0 .. num_layers-1).
+        # vLLM's layerwise store may finish entirely inside save_kv_layer (the
+        # "Stored X" log and final per-layer put happen during the last layer's
+        # next() call), and wait_for_save may not be invoked separately -- so we
+        # record the prefill compute baseline here, at the last layer of the
+        # last prefill step, where the GPU KV for ALL layers is already computed.
+        layer_idx = getattr(self, "_save_kv_layer_counter", 0)
+        is_last_layer = layer_idx == self.num_layers - 1
+        self._save_kv_layer_counter = layer_idx + 1
+        if self._save_kv_layer_counter >= self.num_layers:
+            self._save_kv_layer_counter = 0
+
         for request in connector_metadata.requests:
             save_spec = request.save_spec
             if (
@@ -2091,6 +2104,28 @@ class LMCacheConnectorV1Impl:
                     is_first = False
 
             next(layerwise_storer)
+
+            # Record Run1 prefill compute KV baseline at the LAST layer of the
+            # LAST prefill step (GPU KV for all layers is computed by now).
+            # This is the reliable place: vLLM's layerwise store may finish
+            # entirely inside save_kv_layer, so we cannot depend on
+            # wait_for_save being called separately.
+            if (
+                is_last_layer
+                and request.is_last_prefill
+                and not request.is_sparse_decode
+                and kv_checksum_diag_enabled()
+            ):
+                logger.info(
+                    "[LMCache-Diag-KVChecksum] save_kv_layer last_layer "
+                    "req=%s is_last_prefill=%s counter=%d kv_caches=%d "
+                    "(recording prefill_compute baseline)",
+                    request.req_id,
+                    request.is_last_prefill,
+                    self._save_kv_layer_counter,
+                    len(self.kv_caches),
+                )
+                self._maybe_record_prefill_compute_baseline(request)
 
     @_lmcache_nvtx_annotate
     def wait_for_save(self):

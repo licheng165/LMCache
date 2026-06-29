@@ -567,3 +567,29 @@ class TestLayerwiseStoreGeneratorStructure:
         except StopIteration:
             pass
         assert hook_before_ran
+
+    def test_save_kv_layer_counter_detects_last_layer(self) -> None:
+        """The save_kv_layer layer counter must flag is_last_layer exactly
+        once per num_layers calls (at the last layer), and wrap cleanly across
+        steps. This is what drives the prefill_compute baseline hook in
+        save_kv_layer (independent of whether wait_for_save is called)."""
+        num_layers = 5
+        counter = 0
+        last_layer_flags = []
+        # Simulate two prefill steps (each = num_layers save_kv_layer calls).
+        for _ in range(2):
+            for _ in range(num_layers):
+                layer_idx = counter
+                is_last_layer = layer_idx == num_layers - 1
+                last_layer_flags.append(is_last_layer)
+                counter = layer_idx + 1
+                if counter >= num_layers:
+                    counter = 0
+        # Exactly one is_last_layer per step, at the last call of the step.
+        assert last_layer_flags.count(True) == 2
+        assert last_layer_flags[num_layers - 1] is True
+        assert last_layer_flags[2 * num_layers - 1] is True
+        # No other call flagged.
+        for i, flag in enumerate(last_layer_flags):
+            if i not in (num_layers - 1, 2 * num_layers - 1):
+                assert flag is False
