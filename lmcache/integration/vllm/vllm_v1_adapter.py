@@ -52,6 +52,7 @@ from lmcache.v1.kv_checksum_diag import (
     kv_checksum_diag_enabled,
     on_compute_before_decode_scatter,
     on_decode_scatter_complete,
+    on_prefill_compute_complete,
     on_prefill_retrieve_complete,
 )
 
@@ -1259,6 +1260,31 @@ class LMCacheConnectorV1Impl:
             worker_id=self._kv_checksum_worker_id(),
         )
 
+    def _maybe_record_prefill_compute_baseline(self, request: ReqMeta) -> None:
+        """Record Run1 prefill compute KV at full prompt positions.
+
+        Called from wait_for_save on the last prefill step (after all layers
+        stored). Uses request.slot_mapping[0] (full prompt slot_mapping) so
+        the baseline covers all sampled prompt tokens (0, 16831, ..., 18878),
+        not just the decode-window overlap.
+        """
+        if not kv_checksum_diag_enabled():
+            return
+        if not self._kvcaches_list:
+            self._refresh_kvcaches_list()
+        slot_mapping = request.slot_mapping[0]
+        if slot_mapping is None or slot_mapping.numel() == 0:
+            return
+        on_prefill_compute_complete(
+            req_id=request.req_id,
+            token_ids=request.token_ids,
+            kvcaches=self._kvcaches_list,
+            slot_mapping=slot_mapping,
+            num_layers=self.num_layers,
+            prompt_len=len(request.token_ids),
+            worker_id=self._kv_checksum_worker_id(),
+        )
+
     def _maybe_record_after_layer_load_checksum(
         self, request: ReqMeta, kvcaches: list
     ) -> None:
@@ -2092,6 +2118,16 @@ class LMCacheConnectorV1Impl:
                 if layerwise_storer is not None:
                     next(layerwise_storer)
                 self._maybe_lookup_unpin_for_request(request)
+                # Record Run1 prefill compute KV baseline at full prompt
+                # positions (only on the last prefill step, when the whole
+                # prompt has been computed). This lets on_prefill_retrieve_complete
+                # (Run2) compare at ALL sampled prompt tokens, not just token 0.
+                if (
+                    request.is_last_prefill
+                    and not request.is_sparse_decode
+                    and kv_checksum_diag_enabled()
+                ):
+                    self._maybe_record_prefill_compute_baseline(request)
             return
 
         assert len(self.kv_caches) > 0

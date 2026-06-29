@@ -25,6 +25,8 @@ KV_FORMAT_DSA = 4
 _KV_SAMPLES: Dict[str, Dict[int, Dict[str, List["KvChecksumSample"]]]] = {}
 # prompt_fp -> compute baseline from run 1 decode step 0 (before scatter)
 _COMPUTE_BASELINE_BY_FP: Dict[str, List["KvChecksumSample"]] = {}
+# prompt_fp -> compute baseline from run 1 prefill (full prompt positions)
+_PREFILL_COMPUTE_BASELINE_BY_FP: Dict[str, List["KvChecksumSample"]] = {}
 _REQ_TO_RUN: Dict[str, Tuple[str, int]] = {}
 _FP_RUN_COUNT: Dict[str, int] = {}
 
@@ -482,6 +484,51 @@ def on_decode_scatter_complete(
         )
 
 
+def on_prefill_compute_complete(
+    *,
+    req_id: str,
+    token_ids: Optional[Union[torch.Tensor, List[int]]],
+    kvcaches: Sequence[Any],
+    slot_mapping: Union[torch.Tensor, Sequence[int]],
+    num_layers: int,
+    prompt_len: int,
+    worker_id: int,
+    kv_format: int = KV_FORMAT_MLA,
+) -> None:
+    """Record Run1 prefill compute KV at full prompt positions.
+
+    Unlike ``on_compute_before_decode_scatter`` (which samples the 2048-token
+    decode window and is misaligned with prefill-retrieve prompt positions),
+    this baseline samples the FULL prompt slot_mapping so that
+    ``on_prefill_retrieve_complete`` can compare at all sampled prompt tokens
+    (0, 16831, ..., 18878), not just the overlapping token 0.
+    """
+    if not kv_checksum_diag_enabled():
+        return
+    prompt_fp, run_number, _ = record_phase_samples(
+        req_id=req_id,
+        token_ids=token_ids,
+        phase="prefill_compute",
+        kvcaches=kvcaches,
+        slot_mapping=slot_mapping,
+        num_layers=num_layers,
+        prompt_len=prompt_len,
+        worker_id=worker_id,
+        kv_format=kv_format,
+    )
+    if run_number == 1:
+        samples = _KV_SAMPLES[prompt_fp][run_number]["prefill_compute"]
+        _PREFILL_COMPUTE_BASELINE_BY_FP[prompt_fp] = list(samples)
+        log_kv_checksum_diag(
+            "experiment B prefill_compute baseline stored fp=%s run=1 "
+            "req=%s worker_id=%d n_samples=%d (full prompt positions)",
+            prompt_fp,
+            req_id,
+            worker_id,
+            len(samples),
+        )
+
+
 def on_prefill_retrieve_complete(
     *,
     req_id: str,
@@ -493,7 +540,7 @@ def on_prefill_retrieve_complete(
     worker_id: int,
     kv_format: int = KV_FORMAT_MLA,
 ) -> None:
-    """Experiment B: prefill retrieve scatter vs run1 compute baseline."""
+    """Experiment B: prefill retrieve scatter vs run1 prefill compute baseline."""
     if not kv_checksum_diag_enabled():
         return
     prompt_fp, run_number, _ = record_phase_samples(
@@ -507,7 +554,14 @@ def on_prefill_retrieve_complete(
         worker_id=worker_id,
         kv_format=kv_format,
     )
-    baseline = _COMPUTE_BASELINE_BY_FP.get(prompt_fp)
+    # Prefer the prefill_compute baseline (full prompt positions) so the
+    # comparison covers ALL sampled tokens, not just the token-0 overlap with
+    # the decode-window baseline.
+    baseline = _PREFILL_COMPUTE_BASELINE_BY_FP.get(prompt_fp)
+    baseline_label = "prefill_compute"
+    if baseline is None:
+        baseline = _COMPUTE_BASELINE_BY_FP.get(prompt_fp)
+        baseline_label = "compute_before_decode_scatter"
     if baseline is None:
         log_kv_checksum_diag(
             "prefill_retrieve complete fp=%s run=%d req=%s (no run1 compute baseline yet)",
@@ -519,8 +573,9 @@ def on_prefill_retrieve_complete(
     scatter = _KV_SAMPLES[prompt_fp][run_number]["prefill_retrieve_scatter"]
     compared, n_mismatch, mismatches = _count_mismatches(baseline, scatter)
     log_kv_checksum_diag(
-        "experiment B prefill_retrieve vs run1 compute fp=%s run=%d req=%s "
+        "experiment B prefill_retrieve vs run1 %s fp=%s run=%d req=%s "
         "worker_id=%d compared=%d mismatches=%d",
+        baseline_label,
         prompt_fp,
         run_number,
         req_id,
@@ -564,5 +619,6 @@ def reset_kv_checksum_diag_state() -> None:
     """Clear module state (for unit tests)."""
     _KV_SAMPLES.clear()
     _COMPUTE_BASELINE_BY_FP.clear()
+    _PREFILL_COMPUTE_BASELINE_BY_FP.clear()
     _REQ_TO_RUN.clear()
     _FP_RUN_COUNT.clear()
