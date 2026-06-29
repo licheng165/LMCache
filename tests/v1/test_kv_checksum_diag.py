@@ -491,40 +491,59 @@ class TestLayerwiseStoreGeneratorStructure:
 
         storer = mock_store_layer()
 
-        # save_kv_layer calls next() num_layers times -- none raise.
-        for i in range(num_layers):
-            next(storer)  # consumes per-layer yields
+        # save_kv_layer calls next() num_layers times -- none raise. After
+        # these, the generator is paused right before the final yield (the
+        # last per-layer put + "Stored X" log have NOT run yet).
+        for _ in range(num_layers):
+            next(storer)
 
-        # The store has completed (log fired during the num_layers-th next()).
-        # The generator is now paused at the final yield.
-        hook_ran = True  # a hook here (before the final next()) WOULD run
-        assert hook_ran
+        # A hook here (before the final next()) runs -- this is where the
+        # prefill_compute baseline is recorded. GPU KV is already computed
+        # during prefill forward, so it is available now.
+        hook_ran_before_final_next = True
+        assert hook_ran_before_final_next
 
-        # wait_for_save's next() consumes the final yield and raises
-        # StopIteration -- any code AFTER this next() would NOT run.
+        # wait_for_save's next() consumes the final yield: it runs the last
+        # per-layer put + "Stored X" log + the final yield. It does NOT raise
+        # StopIteration (the "Stored X" log fires HERE, inside this next()).
+        next(storer)  # does not raise
+
+        # Only a FURTHER next() raises StopIteration (generator exhausted).
         with pytest.raises(StopIteration):
             next(storer)
 
     def test_hook_after_next_does_not_run_on_stopiteration(self) -> None:
-        """Confirm a hook placed AFTER the final next() is unreachable."""
+        """A hook placed AFTER the final next() runs (that next() does not
+        raise); only a subsequent next() raises StopIteration. So the real
+        unreachability is one next() further than the final yield."""
         num_layers = 2
 
         def gen():
             for _ in range(num_layers):
                 yield
-            yield
+            yield  # final yield
 
         storer = gen()
         for _ in range(num_layers):
             next(storer)
 
-        hook_after_ran = False
+        # The final-yield next() does NOT raise -- a hook after it WOULD run.
+        hook_after_final_yield_ran = False
         try:
-            next(storer)
-            hook_after_ran = True  # unreachable
+            next(storer)  # consumes final yield, runs "Stored X" log
+            hook_after_final_yield_ran = True
         except StopIteration:
             pass
-        assert not hook_after_ran
+        assert hook_after_final_yield_ran
+
+        # The NEXT next() raises StopIteration -- a hook after IT would not.
+        hook_after_exhaustion_ran = False
+        try:
+            next(storer)
+            hook_after_exhaustion_ran = True
+        except StopIteration:
+            pass
+        assert not hook_after_exhaustion_ran
 
     def test_hook_before_next_runs(self) -> None:
         """Confirm a hook placed BEFORE the final next() runs (the fix)."""
