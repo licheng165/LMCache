@@ -244,7 +244,16 @@ def record_phase_samples(
 ) -> Tuple[str, int, str]:
     """Collect and store checksum samples; returns (prompt_fp, run_number, agg_fp)."""
     prompt_fp, run_number = register_worker_run(req_id, token_ids)
-    token_indices = sample_token_indices(prompt_len)
+    # Sample positions within the slot_mapping range, NOT prompt_len. For
+    # prefill retrieve slot_mapping covers the full prompt (18879); for sparse
+    # decode slot_mapping is the packed 2048-token window. Sampling prompt
+    # positions against a 2048-length decode slot_mapping would skip almost
+    # all tokens (the original n_samples=3 bug).
+    if isinstance(slot_mapping, torch.Tensor):
+        slot_count = int(slot_mapping.numel())
+    else:
+        slot_count = len(slot_mapping)
+    token_indices = sample_token_indices(slot_count)
     layer_ids = sample_layer_ids(num_layers)
     samples = collect_kv_checksum_samples(
         kvcaches,
