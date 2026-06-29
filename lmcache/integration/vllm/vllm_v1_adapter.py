@@ -1293,6 +1293,17 @@ class LMCacheConnectorV1Impl:
         slot_mapping = self._kv_checksum_slot_mapping(request)
         if slot_mapping is None:
             return
+        # Force a full device sync before reading GPU KV so the diag sees the
+        # scattered KV (the scatter runs on a load_stream; without an explicit
+        # sync the .cpu() read in tensor_fingerprint may race the scatter and
+        # produce false mismatches).
+        try:
+            if hasattr(torch, "npu") and torch.npu.is_available():
+                torch.npu.synchronize()
+            elif hasattr(torch, "cuda") and torch.cuda.is_available():
+                torch.cuda.synchronize()
+        except Exception:  # noqa: BLE001
+            pass
         worker_id = self._kv_checksum_worker_id()
         if request.is_sparse_decode:
             decode_step = self._kv_diag_active_decode_step.get(request.req_id, 0)
