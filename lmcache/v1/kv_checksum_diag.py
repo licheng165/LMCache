@@ -427,16 +427,23 @@ def on_decode_scatter_complete(
     decode_step: int,
     kv_format: int = KV_FORMAT_MLA,
 ) -> None:
-    """After decode step scatter: experiment B (vs compute) and C (run1 vs runN)."""
+    """After decode step scatter: per-step Run1 vs RunN comparison (experiment C).
+
+    Records EVERY decode step (not just step 0) so we can see at which step
+    Run2's scattered KV starts to diverge from Run1's. At a given decode step
+    both runs have the same sequence length (prompt_len + step), so the 2048
+    window covers the same prompt tokens -- a real mismatch means the scatter
+    wrote different KV for the same token, not a window-shift artifact.
+    """
     if not kv_checksum_diag_enabled():
         return
-    if decode_step != 0:
-        return
+
+    phase = f"decode_step{decode_step}_scatter"
 
     prompt_fp, run_number, _ = record_phase_samples(
         req_id=req_id,
         token_ids=token_ids,
-        phase="decode_step1_scatter",
+        phase=phase,
         kvcaches=kvcaches,
         slot_mapping=slot_mapping,
         num_layers=num_layers,
@@ -445,40 +452,28 @@ def on_decode_scatter_complete(
         kv_format=kv_format,
     )
 
-    compare_phases(
-        prompt_fp=prompt_fp,
-        run_number=run_number,
-        phase_left="compute_before_decode_scatter",
-        phase_right="decode_step1_scatter",
-        experiment="B_compute_vs_decode_scatter",
-        req_id=req_id,
-        worker_id=worker_id,
-    )
-
-    baseline = _COMPUTE_BASELINE_BY_FP.get(prompt_fp)
-    if baseline and run_number > 1:
-        scatter = _KV_SAMPLES[prompt_fp][run_number]["decode_step1_scatter"]
-        compared, n_mismatch, mismatches = _count_mismatches(baseline, scatter)
-        log_kv_checksum_diag(
-            "experiment B run%d scatter vs run1 compute baseline fp=%s req=%s "
-            "worker_id=%d compared=%d mismatches=%d",
-            run_number,
-            prompt_fp,
-            req_id,
-            worker_id,
-            compared,
-            n_mismatch,
+    # Experiment B: vs compute baseline (only meaningful for step 0; later
+    # steps' "compute_before" was the uninit decode window, so skip).
+    if decode_step == 0:
+        compare_phases(
+            prompt_fp=prompt_fp,
+            run_number=run_number,
+            phase_left="compute_before_decode_scatter",
+            phase_right=phase,
+            experiment="B_compute_vs_decode_scatter",
+            req_id=req_id,
+            worker_id=worker_id,
         )
-        for line in mismatches[:5]:
-            log_kv_checksum_diag("  mismatch %s", line)
 
+    # Experiment C: Run1 vs RunN at the SAME decode step. This is the key
+    # per-step divergence check. Run1 is the reference (correct output).
     if run_number > 1:
         compare_runs_same_phase(
             prompt_fp=prompt_fp,
             run_left=1,
             run_right=run_number,
-            phase="decode_step1_scatter",
-            experiment="C_run1_vs_runN_decode_scatter",
+            phase=phase,
+            experiment=f"C_run1_vs_runN_step{decode_step}",
             req_id=req_id,
             worker_id=worker_id,
         )

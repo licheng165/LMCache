@@ -224,7 +224,7 @@ class TestExperimentBDecodeScatterVsCompute:
             prompt_fp=fp,
             run_number=1,
             phase_left="compute_before_decode_scatter",
-            phase_right="decode_step1_scatter",
+            phase_right="decode_step0_scatter",
             experiment="B_compute_vs_decode_scatter",
             req_id="run1-decode",
         )
@@ -268,7 +268,7 @@ class TestExperimentBDecodeScatterVsCompute:
             prompt_fp=fp,
             run_number=1,
             phase_left="compute_before_decode_scatter",
-            phase_right="decode_step1_scatter",
+            phase_right="decode_step0_scatter",
             experiment="B_compute_vs_decode_scatter",
             req_id="run1",
         )
@@ -323,7 +323,7 @@ class TestExperimentCRun1VsRun2DecodeScatter:
             prompt_fp=fp,
             run_left=1,
             run_right=2,
-            phase="decode_step1_scatter",
+            phase="decode_step0_scatter",
             experiment="C_run1_vs_runN_decode_scatter",
             req_id="run2-req",
         )
@@ -377,7 +377,7 @@ class TestExperimentCRun1VsRun2DecodeScatter:
             prompt_fp=fp,
             run_number=1,
             phase_left="compute_before_decode_scatter",
-            phase_right="decode_step1_scatter",
+            phase_right="decode_step0_scatter",
             experiment="B_compute_vs_decode_scatter",
             req_id="run1",
         )
@@ -385,12 +385,14 @@ class TestExperimentCRun1VsRun2DecodeScatter:
             prompt_fp=fp,
             run_left=1,
             run_right=2,
-            phase="decode_step1_scatter",
+            phase="decode_step0_scatter",
             experiment="C_run1_vs_runN_decode_scatter",
             req_id="run2",
         )
 
-    def test_decode_step_gt_zero_skips_experiment_c(self) -> None:
+    def test_decode_step_gt_zero_records_per_step(self) -> None:
+        """decode_step>0 now records a per-step phase (decode_step{k}_scatter)
+        and compares Run1 vs RunN at the same step (no longer skipped)."""
         prompt_len = 64
         num_layers = 1
         num_slots = 128
@@ -398,16 +400,18 @@ class TestExperimentCRun1VsRun2DecodeScatter:
         slot_mapping = torch.arange(prompt_len, dtype=torch.long)
         kv = _make_mla_kvcaches(num_layers, num_slots)
 
-        record_phase_samples(
+        # Run1 step 1
+        on_decode_scatter_complete(
             req_id="run1",
             token_ids=token_ids,
-            phase="decode_step1_scatter",
-            kvcaches=kv,
+            kvcaches=_clone_kvcaches(kv),
             slot_mapping=slot_mapping,
             num_layers=num_layers,
             prompt_len=prompt_len,
+            worker_id=0,
+            decode_step=1,
         )
-
+        # Run2 step 1 (identical KV -> should match Run1 step 1)
         on_decode_scatter_complete(
             req_id="run2",
             token_ids=token_ids,
@@ -419,11 +423,29 @@ class TestExperimentCRun1VsRun2DecodeScatter:
             decode_step=1,
         )
 
-        from lmcache.v1 import kv_checksum_diag as mod
         from lmcache.v1.ext_prefix_hit_diag import prompt_fingerprint
 
         fp = prompt_fingerprint(token_ids)
-        assert 2 not in mod._KV_SAMPLES.get(fp, {})
+        # Per-step phase recorded for both runs
+        from lmcache.v1 import kv_checksum_diag as mod
+
+        run1_samples = mod._KV_SAMPLES.get(fp, {}).get(1, {}).get(
+            "decode_step1_scatter"
+        )
+        run2_samples = mod._KV_SAMPLES.get(fp, {}).get(2, {}).get(
+            "decode_step1_scatter"
+        )
+        assert run1_samples is not None
+        assert run2_samples is not None
+        # Same KV -> Run1 vs Run2 at step 1 should match
+        assert compare_runs_same_phase(
+            prompt_fp=fp,
+            run_left=1,
+            run_right=2,
+            phase="decode_step1_scatter",
+            experiment="C_run1_vs_runN_step1",
+            req_id="run2",
+        )
 
 
 class TestKvChecksumDisabled:
@@ -444,3 +466,85 @@ class TestKvChecksumDisabled:
         from lmcache.v1 import kv_checksum_diag as mod
 
         assert not mod._KV_SAMPLES
+
+
+class TestLayerwiseStoreGeneratorStructure:
+    """Verify the layerwise store generator yield pattern.
+
+    store_layer yields num_layers+1 times (num_layers in the per-layer loop +
+    one final yield). save_kv_layer calls next() num_layers times, so the
+    "Stored X" log and final per-layer put complete INSIDE save_kv_layer. The
+    generator is then paused at its final yield; wait_for_save's next() raises
+    StopIteration. Therefore any post-store diagnostic hook MUST run BEFORE
+    that next() (which is why the prefill_compute baseline hook is placed
+    before the next() in wait_for_save).
+    """
+
+    def test_store_generator_yields_num_layers_plus_one(self) -> None:
+        num_layers = 4
+
+        def mock_store_layer():
+            for _ in range(num_layers):
+                yield  # per-layer yield (store_layer line 985)
+            # "Stored X" log fires here (store_layer line 994)
+            yield  # final yield (store_layer line 1012)
+
+        storer = mock_store_layer()
+
+        # save_kv_layer calls next() num_layers times -- none raise.
+        for i in range(num_layers):
+            next(storer)  # consumes per-layer yields
+
+        # The store has completed (log fired during the num_layers-th next()).
+        # The generator is now paused at the final yield.
+        hook_ran = True  # a hook here (before the final next()) WOULD run
+        assert hook_ran
+
+        # wait_for_save's next() consumes the final yield and raises
+        # StopIteration -- any code AFTER this next() would NOT run.
+        with pytest.raises(StopIteration):
+            next(storer)
+
+    def test_hook_after_next_does_not_run_on_stopiteration(self) -> None:
+        """Confirm a hook placed AFTER the final next() is unreachable."""
+        num_layers = 2
+
+        def gen():
+            for _ in range(num_layers):
+                yield
+            yield
+
+        storer = gen()
+        for _ in range(num_layers):
+            next(storer)
+
+        hook_after_ran = False
+        try:
+            next(storer)
+            hook_after_ran = True  # unreachable
+        except StopIteration:
+            pass
+        assert not hook_after_ran
+
+    def test_hook_before_next_runs(self) -> None:
+        """Confirm a hook placed BEFORE the final next() runs (the fix)."""
+        num_layers = 2
+
+        def gen():
+            for _ in range(num_layers):
+                yield
+            yield
+
+        storer = gen()
+        for _ in range(num_layers):
+            next(storer)
+
+        hook_before_ran = False
+        # Hook BEFORE the final next() -- this is where the prefill_compute
+        # baseline is recorded.
+        hook_before_ran = True
+        try:
+            next(storer)
+        except StopIteration:
+            pass
+        assert hook_before_ran

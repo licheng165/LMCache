@@ -1965,9 +1965,10 @@ class LMCacheConnectorV1Impl:
                     request, self._kvcaches_list
                 )
                 if request.is_sparse_decode:
+                    # Increment per decode step so on_decode_scatter_complete
+                    # records every step (per-step Run1 vs RunN divergence).
                     step = self._kv_diag_active_decode_step.get(request.req_id, 0)
-                    if step == 0:
-                        self._kv_diag_active_decode_step[request.req_id] = 1
+                    self._kv_diag_active_decode_step[request.req_id] = step + 1
             idx += 1
 
         if self.layerwise_retrievers:
@@ -2098,6 +2099,15 @@ class LMCacheConnectorV1Impl:
         connector_metadata = self._parent._get_connector_metadata()
         assert isinstance(connector_metadata, LMCacheConnectorMetadata)
 
+        if kv_checksum_diag_enabled():
+            logger.info(
+                "[LMCache-Diag-KVChecksum] wait_for_save ENTER kv_role=%s "
+                "use_layerwise=%s n_requests=%d",
+                self.kv_role,
+                self.use_layerwise,
+                len(connector_metadata.requests),
+            )
+
         if self.kv_role == "kv_consumer":
             # Don't do save if the role is kv_consumer
             # But still need to unpin the kv caches according to req_id
@@ -2115,19 +2125,34 @@ class LMCacheConnectorV1Impl:
                 layerwise_storer = self._layerwise_save_storers.pop(
                     request.req_id, None
                 )
-                if layerwise_storer is not None:
-                    next(layerwise_storer)
-                self._maybe_lookup_unpin_for_request(request)
-                # Record Run1 prefill compute KV baseline at full prompt
-                # positions (only on the last prefill step, when the whole
-                # prompt has been computed). This lets on_prefill_retrieve_complete
-                # (Run2) compare at ALL sampled prompt tokens, not just token 0.
+                # NOTE: store_layer yields num_layers+1 times. save_kv_layer
+                # calls next() num_layers times, so the "Stored X" log and the
+                # final per-layer put complete INSIDE save_kv_layer. By the
+                # time we reach here the generator is paused at its final
+                # yield, and the next() below will raise StopIteration (caught
+                # by vLLM). So any post-store logic must run BEFORE this
+                # next(), not after.
                 if (
                     request.is_last_prefill
                     and not request.is_sparse_decode
                     and kv_checksum_diag_enabled()
                 ):
+                    logger.info(
+                        "[LMCache-Diag-KVChecksum] wait_for_save layerwise "
+                        "req=%s is_last_prefill=%s is_sparse_decode=%s "
+                        "kv_caches=%d (recording prefill_compute baseline)",
+                        request.req_id,
+                        request.is_last_prefill,
+                        request.is_sparse_decode,
+                        len(self.kv_caches),
+                    )
                     self._maybe_record_prefill_compute_baseline(request)
+                if layerwise_storer is not None:
+                    try:
+                        next(layerwise_storer)
+                    except StopIteration:
+                        pass
+                self._maybe_lookup_unpin_for_request(request)
             return
 
         assert len(self.kv_caches) > 0
