@@ -303,6 +303,9 @@ class TestMemoryFormat:
         assert hasattr(MemoryFormat, "KV_MLA_LATENT_FMT")
         assert hasattr(MemoryFormat, "KV_DSA_INDEX_FMT")
 
+    def test_mla_latent_is_alias_of_mla_fmt(self):
+        assert MemoryFormat.KV_MLA_LATENT_FMT is MemoryFormat.KV_MLA_FMT
+
     def test_new_formats_have_token_dim(self):
         assert MemoryFormat.KV_MLA_LATENT_FMT.token_dim() == 2
         assert MemoryFormat.KV_DSA_INDEX_FMT.token_dim() == 2

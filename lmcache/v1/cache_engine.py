@@ -197,13 +197,13 @@ class LMCacheEngine:
         self.fmt = None
         if self.use_layerwise:
             if metadata.use_mla:
-                self.fmt = MemoryFormat.KV_MLA_FMT
+                self.fmt = MemoryFormat.KV_MLA_LATENT_FMT
             elif config.enable_blending:
                 self.fmt = MemoryFormat.KV_2TD
             else:
                 self.fmt = MemoryFormat.KV_T2D
         if metadata.use_mla:
-            self.fmt = MemoryFormat.KV_MLA_FMT
+            self.fmt = MemoryFormat.KV_MLA_LATENT_FMT
 
         # NOTE(ApostaC): we haven't support lookup-cache yet
         self.lookup_cache: dict[CacheEngineKey, Any] = {}
@@ -669,6 +669,7 @@ class LMCacheEngine:
 
         prev_key = 0
         kv_group = kwargs.get("kv_group", 0)
+        store_fmt = self._memory_format_for_kv_group(kv_group)
         for start, end, key in self.token_database.process_tokens(
             tokens=tokens, mask=mask, request_configs=request_configs,
             kv_group=kv_group,
@@ -690,7 +691,7 @@ class LMCacheEngine:
                 kv_shape_single_layer,
                 kv_dtype,
                 batch_size=self.num_layers,
-                fmt=self.fmt,
+                fmt=store_fmt,
                 busy_loop=self.config.get_extra_config_value("force_store_wait", False),
             )
 
@@ -1789,6 +1790,15 @@ class LMCacheEngine:
                     raw_data=raw_tensor, metadata=metadata, parent_allocator=None
                 )
                 reordered_chunks.append((None, memory_obj, start, end))
+
+    def _memory_format_for_kv_group(self, kv_group: int = 0) -> MemoryFormat:
+        """Return the CPU chunk format tag for a KV cache group."""
+        if kv_group == 1 and getattr(self.config, "dsa_two_groups", False):
+            return MemoryFormat.KV_DSA_INDEX_FMT
+        if self.metadata.use_mla:
+            return MemoryFormat.KV_MLA_LATENT_FMT
+        assert self.fmt is not None, "Memory format is not initialized"
+        return self.fmt
 
     def _is_passive(self):
         """

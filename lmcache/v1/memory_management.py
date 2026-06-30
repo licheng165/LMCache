@@ -74,12 +74,14 @@ class MemoryFormat(Enum):
     BINARY_BUFFER = auto()
 
     KV_MLA_FMT = auto()
-    """[1, num_layers, num_tokens, aligned_head_size]
+    """MLA plane-major layout: 1D stacked planes
+    [k_nope plane: N*kH | k_pe plane: N*vH] per layer-chunk.
+
+    Deprecated name — use :attr:`KV_MLA_LATENT_FMT` (same enum value).
     """
 
-    KV_MLA_LATENT_FMT = auto()
-    """MLA latent-only (two-group DSA path): 1D stacked planes
-    [k_nope plane: N*kH | k_pe plane: N*vH] per layer-chunk.
+    KV_MLA_LATENT_FMT = KV_MLA_FMT
+    """Canonical tag for MLA latent plane-major storage (identical to ``KV_MLA_FMT``).
     """
 
     KV_DSA_INDEX_FMT = auto()
@@ -99,8 +101,6 @@ class MemoryFormat(Enum):
         elif self == MemoryFormat.BINARY_BUFFER:
             return 0
         elif self == MemoryFormat.KV_MLA_FMT:
-            return 2
-        elif self == MemoryFormat.KV_MLA_LATENT_FMT:
             return 2
         elif self == MemoryFormat.KV_DSA_INDEX_FMT:
             return 2
