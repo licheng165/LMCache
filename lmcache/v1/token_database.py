@@ -396,16 +396,16 @@ class ChunkedTokenDatabase(TokenDatabase):
                 if start_idx < num_falses:
                     continue
                 else:
-                if make_key:
-                    yield (
-                        start_idx,
-                        end_idx,
-                        self._make_key_by_hash(
-                            hash_val, request_configs, kv_group=kv_group
-                        ),
-                    )
-                else:
-                    yield start_idx, end_idx, hash_val
+                    if make_key:
+                        yield (
+                            start_idx,
+                            end_idx,
+                            self._make_key_by_hash(
+                                hash_val, request_configs, kv_group=kv_group
+                            ),
+                        )
+                    else:
+                        yield start_idx, end_idx, hash_val
         elif hashes is not None:
             assert offsets is not None, (
                 "If hashes are provided, offsets must also be provided."
