@@ -96,6 +96,12 @@ class SaveSpec:
     skip_leading_tokens: int
     # Whether the scheduler allow us to save the tokens
     can_save: bool
+    # Whether to save the latent (MLA) group (kv_group=0).
+    # Defaults to True for backward compat. When dsa_two_groups is enabled,
+    # the indexer group (kv_group=1) can be independently gated.
+    can_save_latent: bool = True
+    # Whether to save the indexer (DSA) group (kv_group=1).
+    can_save_indexer: bool = False
 
 
 @dataclass
@@ -377,6 +383,8 @@ class ReqMeta:
         discard_partial_chunks: bool = True,
         save_decode_cache: bool = False,
         is_sparse_decode: bool = False,
+        save_full_chunk_in_decode: bool = False,
+        dsa_two_groups: bool = False,
     ) -> Optional["ReqMeta"]:
         """Create the request metadata from a request tracker.
 
@@ -420,6 +428,24 @@ class ReqMeta:
             or request_skip
         )
 
+        # Decode-full-chunk rule: when save_full_chunk_in_decode is enabled,
+        # only save during decode if a full chunk boundary is crossed.
+        # This sidesteps the plane-major append cost (each store is a complete
+        # tight buffer for exactly chunk_size tokens, no in-place growth).
+        # Applied to BOTH latent and indexer groups.
+        if (
+            tracker.is_decode_phase
+            and save_full_chunk_in_decode
+            and not skip_save
+        ):
+            # Only save if we've crossed a full chunk boundary since last save
+            new_boundary = (
+                (tracker.num_saved_tokens + input_token_len)
+                // lmcache_chunk_size * lmcache_chunk_size
+            )
+            if new_boundary <= tracker.num_saved_tokens:
+                skip_save = True
+
         if skip_save and load_spec is None:
             return None
 
@@ -437,9 +463,25 @@ class ReqMeta:
             num_tokens_to_save = input_token_len
 
         # If we need to save, update the number of saved tokens
+        # NOTE: num_saved_tokens is advanced optimistically before the store
+        # completes. If the store fails (CPU memory pressure), the scheduler
+        # will skip re-storing on later steps. This is partially mitigated by
+        # the lookup-miss re-store path in the async lookup client (min(hit)
+        # aggregation detects missing chunks). A full fix would defer the
+        # advance until wait_for_save confirms success (requires worker→scheduler
+        # feedback channel — future work).
         if not skip_save:
             tracker.num_saved_tokens = num_tokens_to_save
-        save_spec = SaveSpec(skip_leading_tokens, not skip_save)
+
+        # Determine per-group save flags for two-group DSA mode.
+        can_save_latent = not skip_save
+        can_save_indexer = not skip_save and dsa_two_groups
+        save_spec = SaveSpec(
+            skip_leading_tokens,
+            not skip_save,
+            can_save_latent=can_save_latent,
+            can_save_indexer=can_save_indexer,
+        )
 
         # Calculate the token ids and slot mappings for load and save
         if is_sparse_decode and load_spec is not None and skip_save:
@@ -1342,6 +1384,7 @@ class LMCacheConnectorV1Impl:
                         slot_mapping=retrieve_slot_mapping,
                         vllm_cached_tokens=request.load_spec.vllm_cached_tokens,
                         sync=sync,
+                        kv_group=0,
                     )
                     # NOTE: retrieve for two layers at the first layer
                     next(layerwise_retriever)
@@ -1588,12 +1631,27 @@ class LMCacheConnectorV1Impl:
         kvcaches = list(self.kv_caches.values())
         is_first = True
 
+        # Determine kv_group from layer name for two-group DSA mode.
+        # Indexer layers contain "indexer" in their name; latent layers do not.
+        dsa_two_groups = getattr(self.config, "dsa_two_groups", False)
+        is_indexer_layer = dsa_two_groups and "indexer" in layer_name
+        kv_group = 1 if is_indexer_layer else 0
+
         for request in connector_metadata.requests:
             save_spec = request.save_spec
             if (
                 save_spec is None or not save_spec.can_save
             ) and self.kv_role != "kv_producer":
                 continue
+
+            # Per-group gating: in two-group mode, skip indexer save if
+            # can_save_indexer is False, and skip latent save if
+            # can_save_latent is False.
+            if dsa_two_groups and save_spec is not None:
+                if is_indexer_layer and not save_spec.can_save_indexer:
+                    continue
+                if not is_indexer_layer and not save_spec.can_save_latent:
+                    continue
 
             layerwise_storer = self._layerwise_save_storers.get(request.req_id)
             if layerwise_storer is None:
@@ -1612,6 +1670,22 @@ class LMCacheConnectorV1Impl:
                     slot_mapping = request.slot_mapping[0].to(
                         device=self.device, dtype=torch.long
                     )
+
+                # Two-group DSA: for indexer layers, the attn_metadata.slot_mapping
+                # is already the indexer slot mapping (the model_runner sets it
+                # for kv_cache_gid > 0). Use it directly instead of the latent
+                # group's request.slot_mapping (which comes from the scheduler
+                # metadata and is the latent group 0 slot mapping).
+                if is_indexer_layer:
+                    idx_slot = getattr(attn_metadata, "slot_mapping", None)
+                    if idx_slot is not None:
+                        slot_mapping = idx_slot.to(
+                            device=self.device, dtype=torch.long
+                        )
+                    elif getattr(attn_metadata, "indexer_slot_mapping", None) is not None:
+                        slot_mapping = attn_metadata.indexer_slot_mapping.to(
+                            device=self.device, dtype=torch.long
+                        )
 
                 if self.kv_role == "kv_producer":
                     skip_leading_tokens = 0
@@ -1650,6 +1724,7 @@ class LMCacheConnectorV1Impl:
                     offset=skip_leading_tokens,
                     sync=is_first,
                     req_id=request.req_id,
+                    kv_group=kv_group,
                     cached_keys = request.cached_keys,
                     cached_starts=request.cached_starts,
                     cached_ends=request.cached_ends,
@@ -2078,6 +2153,10 @@ class LMCacheConnectorV1Impl:
                 load_spec=load_spec,
                 discard_partial_chunks=self._discard_partial_chunks,
                 save_decode_cache=self.config.save_decode_cache,
+                save_full_chunk_in_decode=getattr(
+                    self.config, "save_full_chunk_in_decode", False
+                ),
+                dsa_two_groups=getattr(self.config, "dsa_two_groups", False),
             )
             if req_meta is not None:
                 meta.add_request(req_meta)
@@ -2124,6 +2203,10 @@ class LMCacheConnectorV1Impl:
                     load_spec=load_spec,
                     discard_partial_chunks=self._discard_partial_chunks,
                     save_decode_cache=self.config.save_decode_cache,
+                    save_full_chunk_in_decode=getattr(
+                        self.config, "save_full_chunk_in_decode", False
+                    ),
+                    dsa_two_groups=getattr(self.config, "dsa_two_groups", False),
                 )
                 if req_meta is not None:
                     req_meta.resumed_from_preemption = req.resumed_from_preemption
@@ -2258,7 +2341,11 @@ class LMCacheConnectorV1Impl:
                 load_spec=load_spec,
                 discard_partial_chunks=self._discard_partial_chunks,
                 save_decode_cache=self.config.save_decode_cache,
-                is_sparse_decode=is_sparse_decode
+                is_sparse_decode=is_sparse_decode,
+                save_full_chunk_in_decode=getattr(
+                    self.config, "save_full_chunk_in_decode", False
+                ),
+                dsa_two_groups=getattr(self.config, "dsa_two_groups", False),
             )
             if req_meta is not None:
                 req_meta.resumed_from_preemption = preempted

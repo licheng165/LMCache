@@ -176,6 +176,7 @@ class TokenDatabase(metaclass=abc.ABCMeta):
         mask: Optional[torch.Tensor] = None,
         make_key: bool = True,
         request_configs: Optional[dict] = None,
+        kv_group: int = 0,
     ) -> Iterable[ProcessTokensResult]:
         """Process the tokens and return the corresponding cache engine keys.
 
@@ -205,7 +206,8 @@ class TokenDatabase(metaclass=abc.ABCMeta):
         raise NotImplementedError
 
     def _make_key_by_hash(
-        self, chunk_hash: int, request_configs: Optional[dict] = None
+        self, chunk_hash: int, request_configs: Optional[dict] = None,
+        kv_group: int = 0,
     ):
         assert self.metadata is not None
         # When save_only_first_rank is enabled (for MLA), we deliberately
@@ -218,6 +220,7 @@ class TokenDatabase(metaclass=abc.ABCMeta):
             chunk_hash,
             self.metadata.kv_dtype,
             request_configs,
+            kv_group=kv_group,
         )
 
     def _canonicalize_hash_inputs(
@@ -344,6 +347,7 @@ class ChunkedTokenDatabase(TokenDatabase):
         mask: Optional[torch.Tensor] = None,
         make_key: bool = True,
         request_configs: Optional[dict] = None,
+        kv_group: int = 0,
     ) -> Iterable[ProcessTokensResult]:
         """Process the tokens/hashes and return the corresponding cache engine keys.
 
@@ -392,14 +396,16 @@ class ChunkedTokenDatabase(TokenDatabase):
                 if start_idx < num_falses:
                     continue
                 else:
-                    if make_key:
-                        yield (
-                            start_idx,
-                            end_idx,
-                            self._make_key_by_hash(hash_val, request_configs),
-                        )
-                    else:
-                        yield start_idx, end_idx, hash_val
+                if make_key:
+                    yield (
+                        start_idx,
+                        end_idx,
+                        self._make_key_by_hash(
+                            hash_val, request_configs, kv_group=kv_group
+                        ),
+                    )
+                else:
+                    yield start_idx, end_idx, hash_val
         elif hashes is not None:
             assert offsets is not None, (
                 "If hashes are provided, offsets must also be provided."
@@ -411,7 +417,9 @@ class ChunkedTokenDatabase(TokenDatabase):
                     yield (
                         start_idx,
                         end_idx,
-                        self._make_key_by_hash(hash_val, request_configs),
+                        self._make_key_by_hash(
+                            hash_val, request_configs, kv_group=kv_group
+                        ),
                     )
                 else:
                     yield start_idx, end_idx, hash_val
@@ -469,6 +477,7 @@ class SegmentTokenDatabase(TokenDatabase):
         mask: Optional[torch.Tensor] = None,
         make_key: bool = True,
         request_configs: Optional[dict] = None,
+        kv_group: int = 0,
     ) -> Iterable[ProcessTokensResult]:
         """Process the tokens and return the corresponding cache engine keys.
 
@@ -542,7 +551,9 @@ class SegmentTokenDatabase(TokenDatabase):
                     yield (
                         start_idx,
                         end_idx,
-                        self._make_key_by_hash(hash_val, request_configs),
+                        self._make_key_by_hash(
+                            hash_val, request_configs, kv_group=kv_group
+                        ),
                     )
                 else:
                     yield start_idx, end_idx, hash_val

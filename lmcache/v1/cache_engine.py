@@ -113,6 +113,16 @@ class LMCacheEngine:
             self.config.get_extra_config_value("save_only_first_rank", metadata.use_mla)
             and metadata.use_mla
         )
+        # save_indexer_only_first_rank: same rank-0-only policy for the DSA
+        # indexer group. Defaults to save_only_first_rank when dsa_two_groups
+        # is enabled (indexer is small; per-rank keys waste CPU memory).
+        self.dsa_two_groups = getattr(self.config, "dsa_two_groups", False)
+        self.save_indexer_only_first_rank = (
+            self.config.get_extra_config_value(
+                "save_indexer_only_first_rank",
+                self.save_only_first_rank if self.dsa_two_groups else False,
+            )
+        )
 
         if self.save_only_first_rank and self.gpu_connector is not None:
             self.broadcast_stream = (
@@ -157,12 +167,10 @@ class LMCacheEngine:
 
         self.use_layerwise = config.use_layerwise
 
-        # TODO: support save_only_first_rank when use layerwise
-        # if use_layerwise is True, all ranks will initialize the storage_manager
-        # if save_only_first_rank is False, all ranks will initialize
-        # the storage_manager
-        # if save_only_first_rank is True, only the first rank and
-        # lookup server workers will initialize the storage_manager
+        # save_only_first_rank + layerwise: store_layer now has _is_passive()
+        # guard (see store_layer). When save_only_first_rank is True, only the
+        # first rank and lookup server workers initialize the storage_manager.
+        # When False, all ranks initialize the storage_manager.
         self.storage_manager: Optional[StorageManager] = None
 
         # KV events
@@ -596,6 +604,18 @@ class LMCacheEngine:
             logger.warning("LMCache is unhealthy, skipping store_layer operation")
             return
 
+        # Passive rank guard: when save_only_first_rank is enabled, only rank 0
+        # stores. This closes the known TODO at cache_engine.py:160-165 —
+        # previously store_layer had no _is_passive() check, causing duplicate
+        # stores on non-rank-0 workers under MLA + layerwise.
+        if self._is_passive():
+            logger.debug(
+                "Passive rank (save_only_first_rank), skipping store_layer"
+            )
+            for layer_id in range(self.num_layers):
+                yield
+            return
+
         assert self.storage_manager is not None
         assert self.gpu_connector is not None, (
             "gpu_connector is required for store_layer operation"
@@ -645,8 +665,10 @@ class LMCacheEngine:
             assert isinstance(request_configs, dict)
 
         prev_key = 0
+        kv_group = kwargs.get("kv_group", 0)
         for start, end, key in self.token_database.process_tokens(
-            tokens=tokens, mask=mask, request_configs=request_configs
+            tokens=tokens, mask=mask, request_configs=request_configs,
+            kv_group=kv_group,
         ):
             assert isinstance(key, CacheEngineKey)
 
@@ -962,10 +984,12 @@ class LMCacheEngine:
             assert isinstance(request_configs, dict)
 
         location = None
+        kv_group = kwargs.get("kv_group", 0)
         for start, end, key in self.token_database.process_tokens(
             tokens=tokens,
             mask=mask,
             request_configs=request_configs,
+            kv_group=kv_group,
         ):
             assert isinstance(key, CacheEngineKey)
 
@@ -1769,6 +1793,13 @@ class LMCacheEngine:
         the data directly, but from the "active" worker (i.e., rank 0 in MLA)
         """
         return self.save_only_first_rank and not self.metadata.is_first_rank()
+
+    def _is_indexer_passive(self):
+        """Same as _is_passive but for the DSA indexer group (kv_group=1)."""
+        return (
+            self.save_indexer_only_first_rank
+            and not self.metadata.is_first_rank()
+        )
 
     def _maybe_unpin_retrieved_objs(
         self,

@@ -77,6 +77,16 @@ class MemoryFormat(Enum):
     """[1, num_layers, num_tokens, aligned_head_size]
     """
 
+    KV_MLA_LATENT_FMT = auto()
+    """MLA latent-only (two-group DSA path): 1D stacked planes
+    [k_nope plane: N*kH | k_pe plane: N*vH] per layer-chunk.
+    """
+
+    KV_DSA_INDEX_FMT = auto()
+    """DSA indexer-only (two-group DSA path): 1D single plane
+    [indexer plane: N*dsaH] per layer-chunk.
+    """
+
     def token_dim(self) -> int:
         if self == MemoryFormat.KV_2LTD:
             return 2
@@ -89,6 +99,10 @@ class MemoryFormat(Enum):
         elif self == MemoryFormat.BINARY_BUFFER:
             return 0
         elif self == MemoryFormat.KV_MLA_FMT:
+            return 2
+        elif self == MemoryFormat.KV_MLA_LATENT_FMT:
+            return 2
+        elif self == MemoryFormat.KV_DSA_INDEX_FMT:
             return 2
         return 0
 
@@ -2110,6 +2124,8 @@ class MixedMemoryAllocator(MemoryAllocatorInterface):
             MemoryFormat.KV_2TD,
             MemoryFormat.KV_T2D,
             MemoryFormat.KV_MLA_FMT,
+            MemoryFormat.KV_MLA_LATENT_FMT,
+            MemoryFormat.KV_DSA_INDEX_FMT,
         ]:
             with self.host_mem_lock:
                 return self.pin_allocator.allocate(shapes, dtypes, fmt, str(self))
@@ -2134,6 +2150,8 @@ class MixedMemoryAllocator(MemoryAllocatorInterface):
             MemoryFormat.KV_2TD,
             MemoryFormat.KV_T2D,
             MemoryFormat.KV_MLA_FMT,
+            MemoryFormat.KV_MLA_LATENT_FMT,
+            MemoryFormat.KV_DSA_INDEX_FMT,
         ]:
             with self.host_mem_lock:
                 return self.pin_allocator.batched_allocate(
@@ -2152,6 +2170,8 @@ class MixedMemoryAllocator(MemoryAllocatorInterface):
             MemoryFormat.KV_2TD,
             MemoryFormat.KV_T2D,
             MemoryFormat.KV_MLA_FMT,
+            MemoryFormat.KV_MLA_LATENT_FMT,
+            MemoryFormat.KV_DSA_INDEX_FMT,
         ]:
             with self.host_mem_lock:
                 self.pin_allocator.free(memory_obj)
@@ -2177,6 +2197,8 @@ class MixedMemoryAllocator(MemoryAllocatorInterface):
             MemoryFormat.KV_2TD,
             MemoryFormat.KV_T2D,
             MemoryFormat.KV_MLA_FMT,
+            MemoryFormat.KV_MLA_LATENT_FMT,
+            MemoryFormat.KV_DSA_INDEX_FMT,
         ]:
             with self.host_mem_lock:
                 self.pin_allocator.batched_free(memory_objs)
