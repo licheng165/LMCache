@@ -614,6 +614,8 @@ class LMCacheEngine:
             )
             for layer_id in range(self.num_layers):
                 yield
+            # Extra yield consumed by wait_for_save() after the last layer.
+            yield
             return
 
         assert self.storage_manager is not None
@@ -648,6 +650,7 @@ class LMCacheEngine:
             # Still need to yield to avoid StopIteration
             for layer_id in range(self.num_layers):
                 yield
+            yield
             return
 
         cached_keys = kwargs.get("cached_keys")
