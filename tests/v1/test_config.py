@@ -120,9 +120,18 @@ def test_get_lookup_server_worker_ids(use_mla):
     lookup_server_worker_ids = config.get_lookup_server_worker_ids(use_mla, 8)
     # test default value
     if use_mla:
+        # MLA default: save_only_first_rank=true → lookup only on rank 0
         assert lookup_server_worker_ids == [0]
     else:
         assert lookup_server_worker_ids == [0, 1, 2, 3, 4, 5, 6, 7]
+
+    # MLA + per-rank store: query every TP rank
+    config_mla_per_rank = LMCacheEngineConfig.from_defaults(
+        extra_config={"save_only_first_rank": False},
+    )
+    assert config_mla_per_rank.get_lookup_server_worker_ids(True, 8) == list(
+        range(8)
+    )
 
     # test different config
     # TODO: not support format "[]" or "[0, 3, 6]

@@ -640,11 +640,18 @@ def _get_lmcache_worker_ids(self, use_mla, world_size):
 
 def _get_lookup_server_worker_ids(self, use_mla, world_size):
     if not self.lookup_server_worker_ids:
-        # if mla is not enabled, return all worker ids, which means start
-        # lookup server on all worker as default;
-        # if mla is enabled, return [0], which means start lookup
-        # server on worker 0 as default.
-        return [0] if use_mla else list(range(world_size))
+        # Non-MLA: lookup server on every worker (scheduler takes min hit count).
+        if not use_mla:
+            return list(range(world_size))
+        # MLA + save_only_first_rank (default): only rank 0 stores/lookup keys.
+        save_only_first_rank = self.get_extra_config_value(
+            "save_only_first_rank", use_mla
+        )
+        if save_only_first_rank:
+            return [0]
+        # MLA + per-rank store: each TP rank has distinct worker_id keys; the
+        # scheduler must query every rank and use min(hit) to stay consistent.
+        return list(range(world_size))
 
     # check the input
     for worker_id in self.lookup_server_worker_ids:

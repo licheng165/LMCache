@@ -61,7 +61,6 @@ SPARSE_DECODE_RETRIEVE_TOKENS = int(
     os.environ.get("LMCACHE_SPARSE_DECODE_RETRIEVE_TOKENS", "2048")
 )
 
-
 def _sparse_slot_mapping_len(prompt_tokens: int) -> int:
     return min(SPARSE_DECODE_RETRIEVE_TOKENS, prompt_tokens)
 
@@ -642,6 +641,7 @@ class LMCacheConnectorV1Impl:
         self.layerwise_retrievers: list[
             Generator[Optional[torch.Tensor], None, None]
         ] = []
+        self._layerwise_retriever_is_sparse: list[bool] = []
         self._layerwise_save_storers: dict[
             str, Generator[Optional[torch.Tensor], None, None]
         ] = {}
@@ -701,6 +701,31 @@ class LMCacheConnectorV1Impl:
         self._invalid_block_ids: set[int] = set()
         if role != KVConnectorRole.SCHEDULER:
             self._worker_retrieve_state: dict[str, WorkerRetrieveState] = {}
+            self._warn_mla_per_rank_lookup_config(config)
+
+    def _warn_mla_per_rank_lookup_config(self, config: LMCacheEngineConfig) -> None:
+        metadata = self.lmcache_engine_metadata
+        if metadata is None or not metadata.use_mla:
+            return
+        save_only_first_rank = (
+            config.get_extra_config_value("save_only_first_rank", metadata.use_mla)
+            and metadata.use_mla
+        )
+        if save_only_first_rank:
+            return
+        lookup_ids = config.get_lookup_server_worker_ids(
+            metadata.use_mla, metadata.world_size
+        )
+        if len(lookup_ids) < metadata.world_size:
+            logger.warning(
+                "MLA per-rank store (save_only_first_rank=false) but lookup "
+                "server runs on ranks %s only (world_size=%d). The scheduler "
+                "may trust rank0 hit count while other TP ranks miss KV on "
+                "retrieve_layer → garbled generation. Remove "
+                "lookup_server_worker_ids override or list all TP ranks.",
+                lookup_ids,
+                metadata.world_size,
+            )
 
     def _check_legacy_register_kv_caches(self) -> None:
         """Check for legacy connector without register_kv_caches implementation."""
@@ -903,14 +928,80 @@ class LMCacheConnectorV1Impl:
             request.decode_token_mask = token_mask
         return token_mask
 
+    @staticmethod
+    def _full_hit_recalc_last_token(
+        load_spec: Optional[LoadSpec],
+        prompt_len: int,
+        *,
+        is_sparse_decode: bool,
+    ) -> bool:
+        """True when vLLM expects the last prompt token to be recomputed, not loaded."""
+        if is_sparse_decode or load_spec is None:
+            return False
+        return (
+            load_spec.lmcache_cached_tokens >= prompt_len
+            and load_spec.lmcache_cached_tokens > load_spec.vllm_cached_tokens
+        )
+
+    @staticmethod
+    def _trim_prefill_for_recalc_last(
+        request: "ReqMeta",
+        retrieve_tokens: list[int],
+        slot_mapping: torch.Tensor,
+    ) -> tuple[list[int], torch.Tensor]:
+        """Handle vLLM recalc_last=1 on a full-cache-hit prefill retrieve.
+
+        We intentionally do NOT trim retrieve_tokens or slot_mapping. Rationale:
+
+        Chunk keys hash the chunk's tokens (token_database._prefix_hash yields
+        the hash AFTER each chunk), so the last partial chunk's key depends on
+        its token count. The store saved the full prompt (partial =
+        prompt_len % chunk_size tokens, e.g. 191 for a 18879-prompt with
+        chunk_size=256). If we trimmed retrieve_tokens to prompt_len-1 here,
+        the queried partial chunk would be 190 tokens and its key
+        H(tokens[0:prompt_len-1]) would NOT match the stored key
+        H(tokens[0:prompt_len]) -- the last partial chunk silently misses
+        (the "missing 190" / "loaded 18688/18878" shortfall).
+
+        By keeping retrieve_tokens and slot_mapping at prompt_len, the retrieve
+        queries the same partial chunk the store saved (191 tokens, matching
+        key) and scatters KV to all prompt_len slots. vLLM, on a full-hit with
+        recalc_last=1, still recomputes the last prompt token's logits (and KV)
+        -- overwriting whatever we scattered into that slot -- so loading it is
+        harmless. This also keeps token_count == len(slot_mapping) so the dense
+        prefill retrieve copies exactly match chunk sizes (no OOB).
+
+        Note: this means num_retrieved_tokens (18879) will be 1 more than
+        num_expected_load (18878 = lmcache_cached - recalc_last); the shortfall
+        guard uses a strict `<`, so no false warning is emitted.
+        """
+        return retrieve_tokens, slot_mapping
+
     def _drain_layerwise_retrievers(self) -> None:
         """Finish suspended layerwise generators to avoid GC cost on reset."""
-        for retriever in self.layerwise_retrievers:
+        for idx, retriever in enumerate(self.layerwise_retrievers):
+            is_sparse = (
+                idx < len(self._layerwise_retriever_is_sparse)
+                and self._layerwise_retriever_is_sparse[idx]
+            )
             try:
-                next(retriever)
+                if is_sparse:
+                    self._drain_sparse_layerwise_retriever(retriever)
+                else:
+                    next(retriever)
             except StopIteration:
                 pass
         self.layerwise_retrievers.clear()
+        self._layerwise_retriever_is_sparse.clear()
+
+    def _drain_sparse_layerwise_retriever(
+        self, retriever: Generator[Any, Any, Any]
+    ) -> None:
+        """Close sparse head-token-wise retrievers waiting on send()."""
+        try:
+            retriever.close()
+        except (GeneratorExit, RuntimeError, ValueError):
+            pass
 
     def _should_defer_lookup_unpin_for_sparse_decode(self, request: ReqMeta) -> bool:
         """Keep lookup pins across decode steps while sparse retrieve is active."""
@@ -1142,10 +1233,31 @@ class LMCacheConnectorV1Impl:
                 lmcache_cached_tokens,
                 is_sparse_decode=request.is_sparse_decode,
             )
+            recalc_last_applied = self._full_hit_recalc_last_token(
+                request.load_spec,
+                len(request.token_ids),
+                is_sparse_decode=request.is_sparse_decode,
+            )
+            if recalc_last_applied:
+                retrieve_tokens, slot_mapping = self._trim_prefill_for_recalc_last(
+                    request, retrieve_tokens, slot_mapping
+                )
             token_count = len(retrieve_tokens)
             token_mask = self._load_token_mask_for_retrieve(
                 request, token_count, self._lmcache_chunk_size
             )
+            if (
+                not request.is_sparse_decode
+                and token_count > len(slot_mapping)
+            ):
+                logger.warning(
+                    "Request %s: retrieve_len=%d exceeds slot_mapping len=%d "
+                    "(KV scatter will be incomplete → garbage). "
+                    "Often chunked-prefill metadata out of sync with lookup_hit.",
+                    request.req_id,
+                    token_count,
+                    len(slot_mapping),
+                )
 
             if self.use_layerwise or request.is_sparse_decode:
                 if idx == last_idx:
@@ -1207,10 +1319,10 @@ class LMCacheConnectorV1Impl:
                     # NOTE: retrieve layers one by one with cpu prefetch
                     next(layerwise_retriever)
                     location = retrieve_kwargs.get("cached_retrieve_location")
-                    metadata_warm = bool(
+                    kwargs_metadata_warm = bool(
                         retrieve_kwargs.get("_retrieve_metadata_warm")
-                        or request.cached_keys
                     )
+                    metadata_warm = bool(kwargs_metadata_warm or request.cached_keys)
                     self._save_worker_retrieve_state_from_request(
                         request,
                         location=location,
@@ -1218,12 +1330,11 @@ class LMCacheConnectorV1Impl:
                         token_count=token_count,
                     )
                     self.layerwise_retrievers.append(layerwise_retriever)
+                    self._layerwise_retriever_is_sparse.append(True)
                 else:
-                    retrieve_slot_mapping = (
-                        slot_mapping
-                        if lmcache_cached_tokens >= len(slot_mapping)
-                        else slot_mapping[:lmcache_cached_tokens]
-                    )
+                    retrieve_slot_mapping = slot_mapping
+                    if lmcache_cached_tokens < len(slot_mapping):
+                        retrieve_slot_mapping = slot_mapping[:lmcache_cached_tokens]
                     layerwise_retriever = self.lmcache_engine.retrieve_layer(
                         retrieve_tokens,
                         token_mask,
@@ -1236,12 +1347,11 @@ class LMCacheConnectorV1Impl:
                     next(layerwise_retriever)
                     next(layerwise_retriever)
                     self.layerwise_retrievers.append(layerwise_retriever)
+                    self._layerwise_retriever_is_sparse.append(False)
             else:
-                retrieve_slot_mapping = (
-                    slot_mapping
-                    if lmcache_cached_tokens >= len(slot_mapping)
-                    else slot_mapping[:lmcache_cached_tokens]
-                )
+                retrieve_slot_mapping = slot_mapping
+                if lmcache_cached_tokens < len(slot_mapping):
+                    retrieve_slot_mapping = slot_mapping[:lmcache_cached_tokens]
                 ret_token_mask = self.lmcache_engine.retrieve(
                     retrieve_tokens,
                     token_mask,
@@ -1257,6 +1367,8 @@ class LMCacheConnectorV1Impl:
                 num_expected_tokens = (
                     lmcache_cached_tokens - request.load_spec.vllm_cached_tokens
                 )
+                if recalc_last_applied:
+                    num_expected_tokens -= 1
                 if num_retrieved_tokens < num_expected_tokens:
                     logger.error(
                         "Request %s"
@@ -1575,7 +1687,10 @@ class LMCacheConnectorV1Impl:
                     request.req_id, None
                 )
                 if layerwise_storer is not None:
-                    next(layerwise_storer)
+                    try:
+                        next(layerwise_storer)
+                    except StopIteration:
+                        pass
                 self._maybe_lookup_unpin_for_request(request)
             return
 
@@ -2126,9 +2241,15 @@ class LMCacheConnectorV1Impl:
                 all_token_ids=all_token_ids,
             )
 
-            is_sparse_decode = self.enable_sparse_attention and (request.num_computed_tokens > request.num_prompt_tokens)
+            is_sparse_decode = self.enable_sparse_attention and (
+                request.num_computed_tokens > request_tracker.prompt_len
+            )
             if is_sparse_decode:
-                load_spec = LoadSpec(vllm_cached_tokens=0, lmcache_cached_tokens=len(request.prompt_token_ids), can_load=True)
+                load_spec = LoadSpec(
+                    vllm_cached_tokens=0,
+                    lmcache_cached_tokens=request_tracker.prompt_len,
+                    can_load=True,
+                )
 
             req_meta = ReqMeta.from_request_tracker(
                 request_tracker,
