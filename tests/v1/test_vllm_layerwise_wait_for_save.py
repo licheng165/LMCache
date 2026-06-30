@@ -80,6 +80,12 @@ def _make_connector(requests):
     connector._lmcache_chunk_size = 8
     connector.kv_caches = {"layer0": torch.zeros(1)}
     connector._layerwise_save_storers = {}
+    # lmcache_ascend patches LMCacheConnectorV1Impl at import time; __new__ skips
+    # LMCacheAscendConnectorV1Impl.__init__ which normally sets these.
+    connector.store_async = False
+    connector._wait_for_save_done = True
+    connector._finished_req_ids_waiting_for_save = set()
+    connector._late_finished_sending = set()
     return connector, metadata, engine
 
 
