@@ -2317,6 +2317,58 @@ class LMCacheConnectorV1Impl:
                 # group's request.slot_mapping (which comes from the scheduler
                 # metadata and is the latent group 0 slot mapping).
                 if is_indexer_layer:
+                    # #region agent log
+                    # Introspect attn_metadata to discover where the indexer
+                    # slot mapping lives (only for the first indexer layer, to
+                    # avoid spamming). This is diagnostic for H1.
+                    if (
+                        self._indexer_layer_names
+                        and layer_name == self._indexer_layer_names[0]
+                    ):
+                        _am = attn_metadata
+                        _am_type = type(_am).__name__
+                        _attrs = {}
+                        for _name in dir(_am):
+                            if any(
+                                k in _name.lower()
+                                for k in ("slot", "mapping", "block", "index")
+                            ):
+                                if _name.startswith("_"):
+                                    continue
+                                try:
+                                    _v = getattr(_am, _name)
+                                except Exception:
+                                    _v = "<exc>"
+                                if _v is None:
+                                    _attrs[_name] = None
+                                elif isinstance(_v, torch.Tensor):
+                                    _attrs[_name] = {
+                                        "kind": "tensor",
+                                        "shape": list(_v.shape),
+                                        "head": _v.flatten()[:4].tolist(),
+                                    }
+                                elif isinstance(_v, (list, tuple)):
+                                    _attrs[_name] = {
+                                        "kind": type(_v).__name__,
+                                        "len": len(_v),
+                                        "first_type": type(_v[0]).__name__ if _v else None,
+                                    }
+                                else:
+                                    _attrs[_name] = {
+                                        "kind": type(_v).__name__,
+                                        "repr": repr(_v)[:80],
+                                    }
+                        _dbg_log_792df4(
+                            "attn_metadata introspect (indexer layer)",
+                            {
+                                "req_id": request.req_id,
+                                "layer_name": layer_name,
+                                "attn_metadata_type": _am_type,
+                                "slot_related_attrs": _attrs,
+                            },
+                            hypothesis_id="H1",
+                        )
+                    # #endregion
                     idx_slot = getattr(attn_metadata, "slot_mapping", None)
                     save_slot_source = "request.slot_mapping"
                     if idx_slot is not None:
