@@ -1429,6 +1429,32 @@ class LMCacheConnectorV1Impl:
                             **retrieve_kwargs,
                         )
                     )
+                    # #region agent log
+                    from lmcache.v1.debug_agent_log import agent_debug_log
+
+                    agent_debug_log(
+                        "E",
+                        "vllm_v1_adapter.py:start_load_kv:sparse_decode",
+                        "sparse decode start_load_kv",
+                        {
+                            "req_id": request.req_id,
+                            "token_count": token_count,
+                            "cached_keys_chunks": (
+                                len(request.cached_keys[0])
+                                if request.cached_keys and request.cached_keys[0]
+                                else 0
+                            ),
+                            "has_cached_tensors": request.cached_tensors is not None,
+                            "has_cached_memory_objs": (
+                                request.cached_memory_objs is not None
+                            ),
+                            "metadata_warm_kwargs": bool(
+                                retrieve_kwargs.get("_retrieve_metadata_warm")
+                            ),
+                            "bound_state": bound_state is not None,
+                        },
+                    )
+                    # #endregion
                     # NOTE: retrieve layers one by one with cpu prefetch
                     next(layerwise_retriever)
                     location = retrieve_kwargs.get("cached_retrieve_location")

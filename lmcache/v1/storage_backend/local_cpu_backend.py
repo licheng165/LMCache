@@ -222,6 +222,33 @@ class LocalCPUBackend(AllocatorBackendInterface):
         mem_objs = []
         with self.cpu_lock:
             for key in keys:
+                # #region agent log
+                if key not in self.hot_cache:
+                    from lmcache.v1.debug_agent_log import agent_debug_log
+
+                    sample_layer_keys = [
+                        str(k)
+                        for k in list(self.hot_cache.keys())[:5]
+                    ]
+                    same_layer = sum(
+                        1
+                        for k in self.hot_cache
+                        if getattr(k, "layer_id", None) == getattr(key, "layer_id", None)
+                        and getattr(k, "chunk_hash", None) == getattr(key, "chunk_hash", None)
+                    )
+                    agent_debug_log(
+                        "B",
+                        "local_cpu_backend.py:batched_get_non_blocking",
+                        "hot_cache miss",
+                        {
+                            "missing_key": str(key),
+                            "num_keys_requested": len(keys),
+                            "hot_cache_size": len(self.hot_cache),
+                            "same_layer_chunk_hash_count": same_layer,
+                            "sample_hot_keys": sample_layer_keys,
+                        },
+                    )
+                # #endregion
                 mem_obj = self.hot_cache[key]
                 mem_obj.ref_count_up()
                 mem_objs.append(mem_obj)
