@@ -1123,25 +1123,75 @@ class LMCacheConnectorV1Impl:
     def _is_dsa_two_groups(self) -> bool:
         return bool(getattr(self.config, "dsa_two_groups", False))
 
+    @staticmethod
+    def _indexer_slot_mapping_from_attn_metadata(
+        attn_metadata, layer_name: Optional[str] = None
+    ) -> Optional[torch.Tensor]:
+        """Return the DSA indexer slot mapping from vLLM attention metadata.
+
+        vLLM may pass either a single metadata object or a per-layer metadata
+        dict. In the dict form, indexer layers have their own
+        DeepseekV32IndexerMetadata whose slot mapping is stored as
+        ``slot_mapping``. Latent/SFA metadata instead carries the group-1 slot
+        mapping as ``indexer_slot_mapping``.
+        """
+        if isinstance(attn_metadata, dict):
+            if layer_name is not None:
+                meta = attn_metadata.get(layer_name)
+                if meta is not None:
+                    slot_mapping = getattr(meta, "slot_mapping", None)
+                    if slot_mapping is not None:
+                        return slot_mapping
+                    slot_mapping = getattr(meta, "indexer_slot_mapping", None)
+                    if slot_mapping is not None:
+                        return slot_mapping
+
+                latent_layer_name = layer_name.replace(
+                    ".indexer.k_cache", ".attn"
+                )
+                latent_meta = attn_metadata.get(latent_layer_name)
+                if latent_meta is not None:
+                    slot_mapping = getattr(
+                        latent_meta, "indexer_slot_mapping", None
+                    )
+                    if slot_mapping is not None:
+                        return slot_mapping
+
+            for name, meta in attn_metadata.items():
+                if "indexer" not in name:
+                    continue
+                slot_mapping = getattr(meta, "slot_mapping", None)
+                if slot_mapping is not None:
+                    return slot_mapping
+
+            for meta in attn_metadata.values():
+                slot_mapping = getattr(meta, "indexer_slot_mapping", None)
+                if slot_mapping is not None:
+                    return slot_mapping
+            return None
+
+        slot_mapping = getattr(attn_metadata, "indexer_slot_mapping", None)
+        if slot_mapping is not None:
+            return slot_mapping
+        return getattr(attn_metadata, "slot_mapping", None)
+
     def _indexer_retrieve_slot_mapping(
-        self, attn_metadata, lmcache_cached_tokens: int
+        self,
+        attn_metadata,
+        lmcache_cached_tokens: int,
+        layer_name: Optional[str] = None,
     ) -> Optional[torch.Tensor]:
         """Return the indexer group's slot mapping for prefix retrieve.
 
-        Mirrors the save path's indexer slot logic: the model_runner sets
-        attn_metadata.slot_mapping to the indexer group's mapping when
-        kv_cache_gid > 0; otherwise fall back to an explicit
-        indexer_slot_mapping attribute. Sliced to the latent hit count.
+        Mirrors the save path's indexer slot logic and handles both vLLM's
+        per-layer metadata dict and single-object metadata forms.
         """
         attn_slot = _am_get(attn_metadata, "slot_mapping", None)
         idx_attr = _am_get(attn_metadata, "indexer_slot_mapping", None)
-        # start_load_kv runs before the first forward layer; attn_metadata.slot_mapping
-        # is the latent group mapping. Prefer explicit indexer mapping when present.
-        idx_slot = idx_attr
-        source = "attn.indexer_slot_mapping" if idx_attr is not None else None
-        if idx_slot is None:
-            idx_slot = attn_slot
-            source = "attn.slot_mapping" if attn_slot is not None else None
+        idx_slot = self._indexer_slot_mapping_from_attn_metadata(
+            attn_metadata, layer_name
+        )
+        source = "indexer_slot_mapping_from_attn_metadata"
         if idx_slot is None:
             _agent_debug_log(
                 "vllm_v1_adapter:_indexer_retrieve_slot_mapping",
@@ -1943,8 +1993,15 @@ class LMCacheConnectorV1Impl:
                         self._is_dsa_two_groups()
                         and self._kvcaches_for_group(1)
                     ):
+                        indexer_layer_name = (
+                            self._indexer_layer_names[0]
+                            if self._indexer_layer_names
+                            else None
+                        )
                         idx_slot = self._indexer_retrieve_slot_mapping(
-                            attn_metadata, lmcache_cached_tokens
+                            attn_metadata,
+                            lmcache_cached_tokens,
+                            indexer_layer_name,
                         )
                         if idx_slot is not None:
                             indexer_retriever = self.lmcache_engine.retrieve_layer(
@@ -2318,11 +2375,10 @@ class LMCacheConnectorV1Impl:
                         device=self.device, dtype=torch.long
                     )
 
-                # Two-group DSA: for indexer layers, the attn_metadata.slot_mapping
-                # is already the indexer slot mapping (the model_runner sets it
-                # for kv_cache_gid > 0). Use it directly instead of the latent
-                # group's request.slot_mapping (which comes from the scheduler
-                # metadata and is the latent group 0 slot mapping).
+                # Two-group DSA: for indexer layers, use the indexer group's
+                # slot mapping. vLLM may pass a per-layer metadata dict; the
+                # indexer metadata stores this as "slot_mapping", while the
+                # latent metadata stores it as "indexer_slot_mapping".
                 if is_indexer_layer:
                     # #region agent log
                     # Introspect attn_metadata to discover where the indexer
@@ -2430,38 +2486,18 @@ class LMCacheConnectorV1Impl:
                             hypothesis_id="H1",
                         )
                     # #endregion
-                    # The indexer slot mapping lives on the per-layer metadata
-                    # object (attn_metadata[layer_name], e.g.
-                    # DeepseekV32IndexerMetadata), not on the top-level dict.
-                    _idx_meta = _am_get(attn_metadata, layer_name, None)
-                    idx_slot = None
-                    _idx_slot_source = None
-                    if _idx_meta is not None:
-                        # Try common slot-mapping field names on the per-layer
-                        # metadata object.
-                        for _fname in (
-                            "slot_mapping",
-                            "slot_mapping_list",
-                            "block_mapping",
-                        ):
-                            _cand = getattr(_idx_meta, _fname, None)
-                            if _cand is not None:
-                                idx_slot = _cand
-                                _idx_slot_source = f"per_layer.{_fname}"
-                                break
-                    save_slot_source = "request.slot_mapping"
+                    idx_slot = self._indexer_slot_mapping_from_attn_metadata(
+                        attn_metadata, layer_name
+                    )
+                    save_slot_source = (
+                        "indexer_slot_mapping_from_attn_metadata"
+                        if idx_slot is not None
+                        else "missing"
+                    )
                     if idx_slot is not None:
                         slot_mapping = idx_slot.to(
                             device=self.device, dtype=torch.long
                         )
-                        save_slot_source = _idx_slot_source
-                    elif _am_get(attn_metadata, "indexer_slot_mapping", None) is not None:
-                        slot_mapping = _am_get(
-                            attn_metadata, "indexer_slot_mapping"
-                        ).to(
-                            device=self.device, dtype=torch.long
-                        )
-                        save_slot_source = "attn.indexer_slot_mapping"
                     if (
                         self._indexer_layer_names
                         and layer_name == self._indexer_layer_names[0]
@@ -2482,20 +2518,7 @@ class LMCacheConnectorV1Impl:
                             hypothesis_id="D",
                         )
 
-                # Two-group DSA safety: if this is an indexer layer but vLLM
-                # provided no indexer-specific slot mapping (neither
-                # attn_metadata.slot_mapping nor attn_metadata.indexer_slot_mapping
-                # is set), the fallback above is the LATENT group's
-                # request.slot_mapping. Scattering indexer KV into the indexer
-                # paged buffer using the latent slot mapping corrupts the cache
-                # (wrong slots / OOB) and leads to bad decode output + NPU
-                # faults. Skip the indexer save for this request until vLLM
-                # exposes an indexer slot mapping.
-                if is_indexer_layer:
-                    # Skip only if we fell back to the latent request.slot_mapping
-                    # (no indexer-specific slot mapping was found on the
-                    # per-layer metadata or the top-level attn_metadata).
-                    if save_slot_source == "request.slot_mapping":
+                    if idx_slot is None:
                         # #region agent log
                         _dbg_log_792df4(
                             "indexer save skipped: no indexer slot mapping",
@@ -2508,6 +2531,11 @@ class LMCacheConnectorV1Impl:
                             },
                         )
                         # #endregion
+                        logger.warning(
+                            "Skipping DSA indexer save for layer %s: "
+                            "indexer slot mapping is unavailable",
+                            layer_name,
+                        )
                         continue
 
                 if self.kv_role == "kv_producer":
