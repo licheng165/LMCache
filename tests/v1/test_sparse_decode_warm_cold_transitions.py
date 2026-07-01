@@ -193,20 +193,22 @@ class TestAscendEngineWarmColdMetadata:
         assert retrieve_kwargs["cached_retrieve_location"] == "LocalCPUBackend"
 
     def test_metadata_refresh_requires_all_layer_keys(self) -> None:
+        from lmcache.utils import CacheEngineKey
+
         engine = AscendLMCacheEngine.__new__(AscendLMCacheEngine)
         engine.storage_manager = MagicMock()
         engine.retrieve_locations = ["LocalCPUBackend"]
         engine.num_layers = 2
         engine.token_database = MagicMock()
-        key = MagicMock()
-        layer0 = MagicMock()
-        layer1 = MagicMock()
-        key.split_layers.return_value = [layer0, layer1]
-        engine.token_database.process_tokens.return_value = [(0, 256, key)]
-        engine.storage_manager.contains.side_effect = [
-            "LocalCPUBackend",
-            None,
-        ]
+        base_key = CacheEngineKey("model", 1, 0, 42, torch.bfloat16)
+        engine.token_database.process_tokens.return_value = [(0, 256, base_key)]
+
+        def contains_side_effect(key, search_range=None):
+            if getattr(key, "layer_id", None) == 0:
+                return "LocalCPUBackend"
+            return None
+
+        engine.storage_manager.contains.side_effect = contains_side_effect
 
         cached_keys: list[list] = [[], []]
         cached_starts: list[int] = []
@@ -224,6 +226,7 @@ class TestAscendEngineWarmColdMetadata:
             retrieve_kwargs={},
         )
 
+        assert engine.storage_manager.contains.call_count == 2
         assert location is None
         assert starts == []
         assert ends == []
@@ -237,7 +240,7 @@ class TestSparseDecodeTokenMask:
             token_ids=[0] * 512,
             load_spec=LoadSpec(
                 vllm_cached_tokens=384,
-                lmcache_cached_tokens=512,
+                lmcache_cached_tokens=256,
                 can_load=True,
             ),
             is_sparse_decode=True,
