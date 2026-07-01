@@ -1926,6 +1926,16 @@ class LMCacheConnectorV1Impl:
 
         connector_metadata = self._parent._get_connector_metadata()
         assert isinstance(connector_metadata, LMCacheConnectorMetadata)
+        # #region agent log
+        _dbg_log("wait_for_save_entry", {
+            "kv_role": getattr(self, "kv_role", None),
+            "use_layerwise": getattr(self, "use_layerwise", None),
+            "num_requests": len(connector_metadata.requests),
+            "req_ids": [getattr(r, "req_id", None) for r in connector_metadata.requests],
+            "storer_keys": list(self._layerwise_save_storers.keys()),
+            "next_counts": dict(getattr(self, "_dbg_next_counts", {})),
+        })
+        # #endregion
 
         if self.kv_role == "kv_consumer":
             # Don't do save if the role is kv_consumer
