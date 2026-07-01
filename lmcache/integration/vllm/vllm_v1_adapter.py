@@ -1175,6 +1175,34 @@ class LMCacheConnectorV1Impl:
             return slot_mapping
         return getattr(attn_metadata, "slot_mapping", None)
 
+    @staticmethod
+    def _pad_chunk_local_slot_mapping(
+        slot_mapping: torch.Tensor,
+        total_tokens: int,
+        token_offset: int,
+    ) -> torch.Tensor:
+        """Convert a chunk-local slot mapping to token-sequence coordinates.
+
+        LMCache store_layer returns absolute token ranges, e.g. [4096, 8192)
+        for the second chunked-prefill step. vLLM's per-layer indexer metadata
+        may only carry the current chunk's slot mapping of length 4096. Pad the
+        leading range with dummy values so later slot_mapping[start:end] slicing
+        returns the chunk-local mapping.
+        """
+        if token_offset <= 0 or len(slot_mapping) >= total_tokens:
+            return slot_mapping
+
+        expected_local_tokens = total_tokens - token_offset
+        if len(slot_mapping) != expected_local_tokens:
+            return slot_mapping
+
+        padded = torch.empty(
+            total_tokens, device=slot_mapping.device, dtype=slot_mapping.dtype
+        )
+        padded[:token_offset] = 0
+        padded[token_offset:] = slot_mapping
+        return padded
+
     def _indexer_retrieve_slot_mapping(
         self,
         attn_metadata,
@@ -2552,6 +2580,39 @@ class LMCacheConnectorV1Impl:
                         // self._lmcache_chunk_size
                         * self._lmcache_chunk_size
                     )
+
+                if is_indexer_layer:
+                    raw_slot_len = len(slot_mapping)
+                    slot_mapping = self._pad_chunk_local_slot_mapping(
+                        slot_mapping,
+                        total_tokens=len(token_ids),
+                        token_offset=skip_leading_tokens,
+                    )
+                    if len(slot_mapping) != raw_slot_len:
+                        _agent_debug_log(
+                            "vllm_v1_adapter:save_kv_layer",
+                            "padded chunk-local indexer slot mapping",
+                            {
+                                "req_id": request.req_id,
+                                "layer_name": layer_name,
+                                "raw_slot_len": raw_slot_len,
+                                "padded_slot_len": len(slot_mapping),
+                                "skip_leading_tokens": skip_leading_tokens,
+                                "total_tokens": len(token_ids),
+                            },
+                            hypothesis_id="D",
+                        )
+                    elif len(slot_mapping) < len(token_ids):
+                        logger.warning(
+                            "Skipping DSA indexer save for layer %s: "
+                            "slot mapping length %d does not cover token range "
+                            "[%d, %d)",
+                            layer_name,
+                            len(slot_mapping),
+                            skip_leading_tokens,
+                            len(token_ids),
+                        )
+                        continue
 
                 store_mask = torch.ones(len(token_ids), dtype=torch.bool)
                 store_mask[:skip_leading_tokens] = False
