@@ -168,6 +168,7 @@ class TestWorkerRetrieveState:
         impl._drop_worker_retrieve_state("req-1")
         engine.lookup_unpin.assert_called_once_with("req-1")
 
+        engine.lookup_unpin.reset_mock()
         impl._worker_retrieve_state = {
             "req-1": WorkerRetrieveState(metadata_warm=True, cached_keys=[["k"]]),
             "req-2": WorkerRetrieveState(metadata_warm=True, cached_keys=[["k2"]]),
