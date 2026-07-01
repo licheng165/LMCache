@@ -2828,6 +2828,40 @@ class LMCacheConnectorV1Impl:
                         total_tokens=len(token_ids),
                         token_offset=skip_leading_tokens,
                     )
+                    # #region agent log
+                    # H_TP1: check whether the indexer slot mapping is within
+                    # this rank's indexer kv_caches slot capacity (TP>1 OOB).
+                    if (
+                        self._indexer_layer_names
+                        and layer_name == self._indexer_layer_names[0]
+                        and kvcaches
+                    ):
+                        _kc0 = kvcaches[0]
+                        _kc_shape = list(_kc0.shape)
+                        _capacity = (
+                            _kc_shape[0] * _kc_shape[1]
+                            if len(_kc_shape) >= 2
+                            else 0
+                        )
+                        _smin = int(slot_mapping.min().item())
+                        _smax = int(slot_mapping.max().item())
+                        _dbg_log_792df4(
+                            "indexer slot bounds vs kvcaches capacity",
+                            {
+                                "req_id": request.req_id,
+                                "layer_name": layer_name,
+                                "kv_group": kv_group,
+                                "slot_len": len(slot_mapping),
+                                "slot_min": _smin,
+                                "slot_max": _smax,
+                                "kvcaches_shape": _kc_shape,
+                                "kvcaches_capacity": _capacity,
+                                "oob": _smax >= _capacity,
+                                "num_kvcaches": len(kvcaches),
+                            },
+                            hypothesis_id="H_TP1",
+                        )
+                    # #endregion
                     if len(slot_mapping) != raw_slot_len:
                         _agent_debug_log(
                             "vllm_v1_adapter:save_kv_layer",
