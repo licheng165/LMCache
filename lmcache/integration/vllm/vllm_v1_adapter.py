@@ -2837,7 +2837,11 @@ class LMCacheConnectorV1Impl:
                         and kvcaches
                     ):
                         _kc0 = kvcaches[0]
-                        _kc_shape = list(_kc0.shape)
+                        # kv_cache entries may be a tuple/list of tensors
+                        # (e.g. (indexer_k,) for DSA_INDEX); unwrap to tensor.
+                        if isinstance(_kc0, (list, tuple)):
+                            _kc0 = _kc0[0] if _kc0 else None
+                        _kc_shape = list(_kc0.shape) if _kc0 is not None else []
                         _capacity = (
                             _kc_shape[0] * _kc_shape[1]
                             if len(_kc_shape) >= 2
