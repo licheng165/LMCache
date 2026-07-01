@@ -1386,6 +1386,62 @@ class LMCacheConnectorV1Impl:
         request.cached_chunk_ptrs_npu_indexer = state.cached_chunk_ptrs_npu_indexer
         return state
 
+    def _request_has_retrieve_tensor_cache(self, request: ReqMeta) -> bool:
+        num_layers = self._num_layers_for_group(0)
+        tensors = request.cached_tensors
+        if tensors and len(tensors) == num_layers and any(tensors):
+            return True
+        mem = request.cached_memory_objs
+        return bool(mem and len(mem) == num_layers and any(mem))
+
+    def _resolve_store_retrieve_location(self, request: ReqMeta) -> Optional[str]:
+        engine = self.lmcache_engine
+        if engine is None or not request.cached_keys or not request.cached_keys[0]:
+            return None
+        storage_manager = getattr(engine, "storage_manager", None)
+        if storage_manager is None:
+            return getattr(engine, "store_location", None)
+        return storage_manager.contains(
+            request.cached_keys[0][0],
+            getattr(engine, "retrieve_locations", None),
+        )
+
+    def _maybe_seed_worker_retrieve_state_from_store(
+        self, request: ReqMeta
+    ) -> None:
+        """Keep prefill store warm cache on the worker for sparse decode reload."""
+        if not hasattr(self, "_worker_retrieve_state"):
+            return
+        if request.is_sparse_decode:
+            return
+        if not request.cached_keys or not request.cached_starts or not request.cached_ends:
+            return
+        if not self._request_has_retrieve_tensor_cache(request):
+            return
+
+        location = self._resolve_store_retrieve_location(request)
+        self._save_worker_retrieve_state_from_request(
+            request,
+            location=location,
+            metadata_warm=True,
+            token_count=len(request.token_ids),
+        )
+        _agent_debug_log(
+            "vllm_v1_adapter:wait_for_save",
+            "seed worker retrieve state from store",
+            {
+                "req_id": request.req_id,
+                "cached_chunks_l0": len(request.cached_tensors[0])
+                if request.cached_tensors and request.cached_tensors[0]
+                else 0,
+                "cached_ends_tail": request.cached_ends[-1]
+                if request.cached_ends
+                else 0,
+                "location": location,
+            },
+            hypothesis_id="H",
+        )
+
     def _save_worker_retrieve_state_from_request(
         self,
         request: ReqMeta,
@@ -1703,19 +1759,25 @@ class LMCacheConnectorV1Impl:
                         {
                             "req_id": request.req_id,
                             "dsa_two_groups": dsa_two_groups,
+                            "bound_state": bound_state is not None,
                             "indexer_kvcaches": len(self._kvcaches_for_group(1)),
                             "latent_cached_tensors_l0": len(
                                 request.cached_tensors[0]
                             )
                             if request.cached_tensors
+                            and request.cached_tensors[0]
                             else 0,
                             "indexer_cached_tensors_l0": len(
                                 request.cached_tensors_indexer[0]
                             )
                             if request.cached_tensors_indexer
+                            and request.cached_tensors_indexer[0]
                             else 0,
                             "indexer_retriever_created": False,
                             "latent_only_sparse_decode": True,
+                            "metadata_warm": bool(
+                                retrieve_kwargs.get("_retrieve_metadata_warm")
+                            ),
                             "latent_sparse_slot_head": _tensor_head(slot_mapping),
                         },
                         hypothesis_id="E",
@@ -2256,6 +2318,7 @@ class LMCacheConnectorV1Impl:
                             next(layerwise_storer)
                         except StopIteration:
                             pass
+                self._maybe_seed_worker_retrieve_state_from_store(request)
                 self._maybe_lookup_unpin_for_request(request)
             return
 
