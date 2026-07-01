@@ -159,20 +159,24 @@ class TestZombieRequestInMetadata:
         assert "zombie" in impl._worker_retrieve_state
         assert "active" in impl._worker_retrieve_state
 
-    def test_request_removed_from_metadata_prunes_zombie_state(self) -> None:
+    def test_request_removed_from_metadata_keeps_warm_worker_state(self) -> None:
         impl = make_worker_impl()
         engine = MagicMock()
         impl._manager = SimpleNamespace(lmcache_engine=engine)
         impl._worker_retrieve_state = {
-            "zombie": WorkerRetrieveState(metadata_warm=True),
-            "active": WorkerRetrieveState(metadata_warm=True),
+            "zombie": WorkerRetrieveState(
+                metadata_warm=True, cached_keys=[["k"]]
+            ),
+            "active": WorkerRetrieveState(
+                metadata_warm=True, cached_keys=[["k2"]]
+            ),
         }
 
         impl._prune_worker_retrieve_state({"active"})
 
-        assert "zombie" not in impl._worker_retrieve_state
+        assert "zombie" in impl._worker_retrieve_state
         assert "active" in impl._worker_retrieve_state
-        engine.lookup_unpin.assert_called_once_with("zombie")
+        engine.lookup_unpin.assert_not_called()
 
     def test_scheduler_clears_tracker_on_finished_but_worker_needs_prune(self) -> None:
         impl = _make_scheduler_impl()

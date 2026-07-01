@@ -1339,12 +1339,36 @@ class LMCacheConnectorV1Impl:
         if not hasattr(self, "_worker_retrieve_state"):
             return
         dropped_req_ids = set(self._worker_retrieve_state) - active_req_ids
+        kept_warm_req_ids: list[str] = []
         for req_id in dropped_req_ids:
+            state = self._worker_retrieve_state.get(req_id)
+            if state is not None and (state.metadata_warm or state.cached_keys):
+                kept_warm_req_ids.append(req_id)
+                continue
             self._release_request_lookup_pins(req_id)
+        if dropped_req_ids:
+            _agent_debug_log(
+                "vllm_v1_adapter:_prune_worker_retrieve_state",
+                "prune worker retrieve state",
+                {
+                    "active_req_ids": sorted(active_req_ids),
+                    "dropped_req_ids": sorted(dropped_req_ids),
+                    "kept_warm_req_ids": kept_warm_req_ids,
+                    "remaining_req_ids": sorted(
+                        {
+                            req_id
+                            for req_id, state in self._worker_retrieve_state.items()
+                            if req_id in active_req_ids
+                            or (state.metadata_warm or state.cached_keys)
+                        }
+                    ),
+                },
+                hypothesis_id="I",
+            )
         self._worker_retrieve_state = {
             req_id: state
             for req_id, state in self._worker_retrieve_state.items()
-            if req_id in active_req_ids
+            if req_id in active_req_ids or (state.metadata_warm or state.cached_keys)
         }
 
     def _drop_worker_retrieve_state(self, req_id: str) -> None:
@@ -1742,6 +1766,36 @@ class LMCacheConnectorV1Impl:
                             self._drop_worker_retrieve_state(request.req_id)
                         bound_state = self._bind_worker_retrieve_state_to_request(
                             request
+                        )
+                        worker_state = self._worker_retrieve_state.get(
+                            request.req_id
+                        )
+                        _agent_debug_log(
+                            "vllm_v1_adapter:start_load_kv",
+                            "bind worker retrieve state",
+                            {
+                                "req_id": request.req_id,
+                                "state_present": worker_state is not None,
+                                "state_metadata_warm": (
+                                    worker_state.metadata_warm
+                                    if worker_state is not None
+                                    else None
+                                ),
+                                "state_cached_keys_layers": (
+                                    len(worker_state.cached_keys)
+                                    if worker_state is not None
+                                    and worker_state.cached_keys
+                                    else 0
+                                ),
+                                "state_cached_ends_tail": (
+                                    worker_state.cached_ends[-1]
+                                    if worker_state is not None
+                                    and worker_state.cached_ends
+                                    else None
+                                ),
+                                "bound_ok": bound_state is not None,
+                            },
+                            hypothesis_id="I",
                         )
                     else:
                         bound_state = None

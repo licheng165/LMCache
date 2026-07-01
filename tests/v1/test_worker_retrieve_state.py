@@ -138,11 +138,24 @@ class TestWorkerRetrieveState:
         req.token_ids = [0] * 4096
         assert impl._should_invalidate_worker_retrieve_state(req, 2048)
 
-    def test_prune_drops_finished_requests(self):
+    def test_prune_keeps_metadata_warm_states_until_request_finished(self):
         impl = _make_impl()
         impl._worker_retrieve_state = {
-            "req-1": WorkerRetrieveState(metadata_warm=True),
-            "req-2": WorkerRetrieveState(metadata_warm=True),
+            "req-1": WorkerRetrieveState(
+                metadata_warm=True, cached_keys=[["k"]]
+            ),
+            "req-2": WorkerRetrieveState(
+                metadata_warm=True, cached_keys=[["k2"]]
+            ),
+        }
+        impl._prune_worker_retrieve_state({"req-1"})
+        assert set(impl._worker_retrieve_state) == {"req-1", "req-2"}
+
+    def test_prune_drops_non_warm_finished_requests(self):
+        impl = _make_impl()
+        impl._worker_retrieve_state = {
+            "req-1": WorkerRetrieveState(metadata_warm=True, cached_keys=[["k"]]),
+            "req-2": WorkerRetrieveState(),
         }
         impl._prune_worker_retrieve_state({"req-1"})
         assert set(impl._worker_retrieve_state) == {"req-1"}
@@ -156,11 +169,11 @@ class TestWorkerRetrieveState:
         engine.lookup_unpin.assert_called_once_with("req-1")
 
         impl._worker_retrieve_state = {
-            "req-1": WorkerRetrieveState(metadata_warm=True),
-            "req-2": WorkerRetrieveState(metadata_warm=True),
+            "req-1": WorkerRetrieveState(metadata_warm=True, cached_keys=[["k"]]),
+            "req-2": WorkerRetrieveState(metadata_warm=True, cached_keys=[["k2"]]),
         }
         impl._prune_worker_retrieve_state({"req-1"})
-        engine.lookup_unpin.assert_called_with("req-2")
+        engine.lookup_unpin.assert_not_called()
 
     def test_defer_lookup_unpin_for_active_sparse_decode(self):
         impl = _make_impl()
