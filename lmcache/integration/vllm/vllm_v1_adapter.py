@@ -1285,7 +1285,8 @@ class LMCacheConnectorV1Impl:
                     if is_sparse:
                         self._drain_sparse_layerwise_retriever(retriever)
                     else:
-                        next(retriever)
+                        while True:
+                            next(retriever)
                 except StopIteration:
                     pass
         self.layerwise_retrievers.clear()
@@ -1500,6 +1501,33 @@ class LMCacheConnectorV1Impl:
         assert self.lmcache_engine is not None
 
         self._drain_layerwise_retrievers()
+
+        load_count = sum(
+            1
+            for req in metadata.requests
+            if req.load_spec is not None and req.load_spec.can_load
+        )
+        gpu_connector = getattr(self.lmcache_engine, "gpu_connector", None)
+        if gpu_connector is not None and hasattr(
+            gpu_connector, "set_layerwise_staging_concurrency"
+        ):
+            # Each loading request holds a staging buffer for the full layer
+            # loop; add one slot for an overlapping layerwise store.
+            gpu_connector.set_layerwise_staging_concurrency(
+                max(2, load_count + 1)
+            )
+        _agent_debug_log(
+            "vllm_v1_adapter:start_load_kv",
+            "staging concurrency",
+            {
+                "load_count": load_count,
+                "staging_concurrency": getattr(
+                    gpu_connector, "_layerwise_staging_concurrency", None
+                ),
+                "existing_retrievers": len(self.layerwise_retrievers),
+            },
+            hypothesis_id="A",
+        )
 
         last_idx = -1
         for idx, request in enumerate(metadata.requests):
