@@ -181,6 +181,32 @@ def _build_slot_mapping(
     return slots[:num_tokens]
 
 
+def _flatten_block_ids(block_ids) -> list[int]:
+    if block_ids is None:
+        return []
+    flattened: list[int] = []
+    for elem in block_ids:
+        if isinstance(elem, (list, tuple)):
+            flattened.extend(elem)
+        else:
+            flattened.append(elem)
+    return flattened
+
+
+def _split_kv_group_block_ids(block_ids) -> tuple[list[int], Optional[list[int]]]:
+    """Return latent and optional indexer block ids from vLLM block metadata."""
+    if block_ids is None or len(block_ids) == 0:
+        return [], None
+    first = block_ids[0]
+    if isinstance(first, (list, tuple)):
+        latent_block_ids = _flatten_block_ids(block_ids[0])
+        indexer_block_ids = (
+            _flatten_block_ids(block_ids[1]) if len(block_ids) > 1 else None
+        )
+        return latent_block_ids, indexer_block_ids
+    return _flatten_block_ids(block_ids), None
+
+
 @dataclass
 class LoadSpec:
     # Number of tokens cached in vLLM
@@ -245,6 +271,7 @@ class RequestTracker:
     # The block ids that has been allocated so far
     # NOTE: allocated blocks could be more than the number of tokens
     allocated_block_ids: list[int]
+    allocated_block_ids_indexer: Optional[list[int]] = None
 
     # The number of tokens that has been saved
     num_saved_tokens: int = 0
@@ -322,20 +349,9 @@ class RequestTracker:
         # tuple[list[int]]
         # Need to check the type of request.block_ids
 
-        unfolded_block_ids = []
-
-        if not isinstance(new_request.block_ids[0], list):
-            unfolded_block_ids = new_request.block_ids.copy()
-        else:
-            # According to the vLLM code
-            # (https://github.com/vllm-project/vllm/blob/main/vllm/v1/core/
-            # sched/scheduler.py#L943),
-            # only one KVCacheGroup is supported in connector for now.
-
-            # TODO: Please support multiple KVCacheGroup in connector.
-            # NOTE: Also, `update` method in RequestTracker should be
-            # updated accordingly.
-            unfolded_block_ids = new_request.block_ids[0].copy()
+        unfolded_block_ids, indexer_block_ids = _split_kv_group_block_ids(
+            new_request.block_ids
+        )
 
         # NOTE: Initialized in `update_state_after_alloc`
         disagg_spec = tmp_disagg_tracker.pop(new_request.req_id, None)
@@ -349,6 +365,7 @@ class RequestTracker:
             prompt_len=len(new_request.prompt_token_ids),
             token_ids=new_request.prompt_token_ids[:num_tokens_to_compute].copy(),
             allocated_block_ids=unfolded_block_ids,
+            allocated_block_ids_indexer=indexer_block_ids,
             num_saved_tokens=lmcache_cached_tokens,
             disagg_spec=disagg_spec,
             mm_hashes=mm_hashes,
@@ -376,25 +393,11 @@ class RequestTracker:
         restore token_ids for preempted requests to ensure chunk keys match
         """
 
-        if new_block_ids is None:
-            # https://github.com/vllm-project/vllm/commit/
-            # b029de9902aa3ac58806c8c17776c7074175b6db#
-            # diff-cafd89ce8a698a56acb24ada62831cbc7a980782f78a52d1742ba238031f296cL94
-            new_block_ids = []
-        elif len(new_block_ids) == 0:
-            new_block_ids = []
-        elif isinstance(new_block_ids, tuple):
-            new_block_ids = new_block_ids[0]
-        elif isinstance(new_block_ids, list):
-            # If input is a list, flatten it to handle potential nesting.
-            # This also correctly processes already-flat lists.
-            new_block_ids = [
-                i
-                for elem in new_block_ids
-                for i in (elem if isinstance(elem, list) else [elem])
-            ]
-        else:
+        if new_block_ids is not None and not isinstance(new_block_ids, (list, tuple)):
             raise ValueError(f"Unsupported new_block_ids type {type(new_block_ids)}")
+        new_block_ids, new_indexer_block_ids = _split_kv_group_block_ids(
+            new_block_ids
+        )
 
         if preempted:
             assert all_token_ids is not None, (
@@ -420,6 +423,7 @@ class RequestTracker:
             self.cached_chunk_ptrs_npu_indexer.clear()
             # the block ids will change after preemption
             self.allocated_block_ids = new_block_ids
+            self.allocated_block_ids_indexer = new_indexer_block_ids
             # reset the number of saved tokens
             self.num_saved_tokens = lmcache_cached_tokens
             num_computed_tokens = max(lmcache_cached_tokens, vllm_cached_tokens)
@@ -435,6 +439,10 @@ class RequestTracker:
             self.token_ids = all_token_ids[:num_tokens_needed]
         else:
             self.allocated_block_ids.extend(new_block_ids)
+            if new_indexer_block_ids is not None:
+                if self.allocated_block_ids_indexer is None:
+                    self.allocated_block_ids_indexer = []
+                self.allocated_block_ids_indexer.extend(new_indexer_block_ids)
             self.token_ids.extend(new_token_ids)
 
         # When a request is scheduled again, and the number of new tokens
@@ -477,6 +485,7 @@ class ReqMeta:
     token_ids: list[int]  # torch.Tensor
     # Single-element list; sparse decode reuses tracker.sparse_slot_mapping by reference.
     slot_mapping: list[torch.Tensor] = field(default_factory=list)
+    indexer_slot_mapping: list[torch.Tensor] = field(default_factory=list)
 
     # key of cached object
     cached_keys: list[list] = field(default_factory=list)
@@ -689,6 +698,55 @@ class ReqMeta:
                 )
             ]
 
+        indexer_slot_mapping: list[torch.Tensor] = []
+        if dsa_two_groups and tracker.allocated_block_ids_indexer:
+            indexer_num_blocks = len(tracker.allocated_block_ids_indexer)
+            if len(token_ids) > indexer_num_blocks * block_size:
+                logger.error(
+                    "The number of tokens is more than the number of indexer "
+                    "blocks for request %s. Something might be wrong in "
+                    "scheduling logic!",
+                    tracker.req_id,
+                )
+                logger.error(
+                    "Num tokens: %d, num indexer blocks: %d, block size: %d",
+                    len(token_ids),
+                    indexer_num_blocks,
+                    block_size,
+                )
+            if not is_sparse_decode:
+                indexer_slot_mapping = [
+                    _build_slot_mapping(
+                        tracker.allocated_block_ids_indexer,
+                        block_size,
+                        len(token_ids),
+                    )
+                ]
+                _agent_debug_log(
+                    "vllm_v1_adapter:ReqMeta.from_request_tracker",
+                    "built indexer slot mapping from scheduler blocks",
+                    {
+                        "req_id": tracker.req_id,
+                        "num_tokens": len(token_ids),
+                        "latent_blocks": len(tracker.allocated_block_ids),
+                        "indexer_blocks": indexer_num_blocks,
+                        "indexer_slot_len": len(indexer_slot_mapping[0]),
+                        "indexer_slot_head": _tensor_head(indexer_slot_mapping[0]),
+                    },
+                    hypothesis_id="J",
+                )
+        elif dsa_two_groups:
+            _agent_debug_log(
+                "vllm_v1_adapter:ReqMeta.from_request_tracker",
+                "no scheduler indexer block ids",
+                {
+                    "req_id": tracker.req_id,
+                    "num_tokens": len(token_ids),
+                    "latent_blocks": len(tracker.allocated_block_ids),
+                },
+                hypothesis_id="J",
+            )
+
         if load_spec is not None and load_spec.can_load:
             logger.debug(
                 "Scheduled to load %d tokens (%d cached in vLLM) for request %s",
@@ -723,6 +781,7 @@ class ReqMeta:
             req_id=tracker.req_id,
             token_ids=token_ids,
             slot_mapping=slot_mapping,
+            indexer_slot_mapping=indexer_slot_mapping,
             is_last_prefill=is_last_prefill,
             is_sparse_decode=is_sparse_decode,
             save_spec=save_spec,
@@ -2083,6 +2142,7 @@ class LMCacheConnectorV1Impl:
                     # latent-only (this branch is prefill/prefix, not sparse).
                     indexer_retriever = None
                     idx_slot = None
+                    idx_slot_source = None
                     if (
                         self._is_dsa_two_groups()
                         and self._kvcaches_for_group(1)
@@ -2092,11 +2152,34 @@ class LMCacheConnectorV1Impl:
                             if self._indexer_layer_names
                             else None
                         )
-                        idx_slot = self._indexer_retrieve_slot_mapping(
-                            attn_metadata,
-                            lmcache_cached_tokens,
-                            indexer_layer_name,
-                        )
+                        if request.indexer_slot_mapping:
+                            idx_slot = request.indexer_slot_mapping[0].to(
+                                device=self.device, dtype=torch.long
+                            )
+                            idx_slot_source = "request.indexer_slot_mapping"
+                            if lmcache_cached_tokens < len(idx_slot):
+                                idx_slot = idx_slot[:lmcache_cached_tokens]
+                            if len(idx_slot) < lmcache_cached_tokens:
+                                _agent_debug_log(
+                                    "vllm_v1_adapter:start_load_kv",
+                                    "request indexer slot mapping too short",
+                                    {
+                                        "req_id": request.req_id,
+                                        "lmcache_cached_tokens": lmcache_cached_tokens,
+                                        "indexer_slot_len": len(idx_slot),
+                                    },
+                                    hypothesis_id="B",
+                                )
+                                idx_slot = None
+                                idx_slot_source = None
+                        if idx_slot is None:
+                            idx_slot = self._indexer_retrieve_slot_mapping(
+                                attn_metadata,
+                                lmcache_cached_tokens,
+                                indexer_layer_name,
+                            )
+                            if idx_slot is not None:
+                                idx_slot_source = "attn_metadata"
                         if idx_slot is not None:
                             indexer_retriever = self.lmcache_engine.retrieve_layer(
                                 retrieve_tokens,
@@ -2117,6 +2200,7 @@ class LMCacheConnectorV1Impl:
                             "req_id": request.req_id,
                             "indexer_retriever_created": indexer_retriever is not None,
                             "indexer_kvcaches": len(self._kvcaches_for_group(1)),
+                            "indexer_slot_source": idx_slot_source,
                             "latent_slot_head": _tensor_head(slot_mapping),
                             "indexer_slot_head": _tensor_head(idx_slot),
                             "slots_match_head": (
