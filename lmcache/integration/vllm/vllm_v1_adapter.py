@@ -125,6 +125,13 @@ def _dbg_log_792df4(message, data, hypothesis_id="H1", run_id="pre-fix"):
 # #endregion
 
 
+def _am_get(attn_metadata, key, default=None):
+    """Read a field from attn_metadata that may be a dict or an object."""
+    if isinstance(attn_metadata, dict):
+        return attn_metadata.get(key, default)
+    return getattr(attn_metadata, key, default)
+
+
 def _tensor_head(t: Optional[torch.Tensor], n: int = 4) -> Optional[list]:
     if t is None or t.numel() == 0:
         return None
@@ -1126,8 +1133,8 @@ class LMCacheConnectorV1Impl:
         kv_cache_gid > 0; otherwise fall back to an explicit
         indexer_slot_mapping attribute. Sliced to the latent hit count.
         """
-        attn_slot = getattr(attn_metadata, "slot_mapping", None)
-        idx_attr = getattr(attn_metadata, "indexer_slot_mapping", None)
+        attn_slot = _am_get(attn_metadata, "slot_mapping", None)
+        idx_attr = _am_get(attn_metadata, "indexer_slot_mapping", None)
         # start_load_kv runs before the first forward layer; attn_metadata.slot_mapping
         # is the latent group mapping. Prefer explicit indexer mapping when present.
         idx_slot = idx_attr
@@ -2328,15 +2335,25 @@ class LMCacheConnectorV1Impl:
                         _am = attn_metadata
                         _am_type = type(_am).__name__
                         _attrs = {}
-                        for _name in dir(_am):
+                        # attn_metadata may be a dict (compiled-graph path) or
+                        # an object; iterate the right namespace.
+                        if isinstance(_am, dict):
+                            _names = list(_am.keys())
+                        else:
+                            _names = [
+                                n for n in dir(_am) if not n.startswith("_")
+                            ]
+                        for _name in _names:
                             if any(
-                                k in _name.lower()
+                                k in str(_name).lower()
                                 for k in ("slot", "mapping", "block", "index")
                             ):
-                                if _name.startswith("_"):
-                                    continue
                                 try:
-                                    _v = getattr(_am, _name)
+                                    _v = (
+                                        _am[_name]
+                                        if isinstance(_am, dict)
+                                        else getattr(_am, _name)
+                                    )
                                 except Exception:
                                     _v = "<exc>"
                                 if _v is None:
@@ -2364,20 +2381,25 @@ class LMCacheConnectorV1Impl:
                                 "req_id": request.req_id,
                                 "layer_name": layer_name,
                                 "attn_metadata_type": _am_type,
+                                "all_keys": (
+                                    list(_am.keys()) if isinstance(_am, dict) else None
+                                ),
                                 "slot_related_attrs": _attrs,
                             },
                             hypothesis_id="H1",
                         )
                     # #endregion
-                    idx_slot = getattr(attn_metadata, "slot_mapping", None)
+                    idx_slot = _am_get(attn_metadata, "slot_mapping", None)
                     save_slot_source = "request.slot_mapping"
                     if idx_slot is not None:
                         slot_mapping = idx_slot.to(
                             device=self.device, dtype=torch.long
                         )
                         save_slot_source = "attn.slot_mapping"
-                    elif getattr(attn_metadata, "indexer_slot_mapping", None) is not None:
-                        slot_mapping = attn_metadata.indexer_slot_mapping.to(
+                    elif _am_get(attn_metadata, "indexer_slot_mapping", None) is not None:
+                        slot_mapping = _am_get(
+                            attn_metadata, "indexer_slot_mapping"
+                        ).to(
                             device=self.device, dtype=torch.long
                         )
                         save_slot_source = "attn.indexer_slot_mapping"
@@ -2411,8 +2433,8 @@ class LMCacheConnectorV1Impl:
                 # faults. Skip the indexer save for this request until vLLM
                 # exposes an indexer slot mapping.
                 if is_indexer_layer:
-                    _idx_attn_slot = getattr(attn_metadata, "slot_mapping", None)
-                    _idx_attr_slot = getattr(
+                    _idx_attn_slot = _am_get(attn_metadata, "slot_mapping", None)
+                    _idx_attr_slot = _am_get(
                         attn_metadata, "indexer_slot_mapping", None
                     )
                     if _idx_attn_slot is None and _idx_attr_slot is None:
