@@ -1055,6 +1055,19 @@ class LMCacheConnectorV1Impl:
                 self._latent_kvcaches.append(kv_cache)
         # Backward-compatible flat list = latent group (the default group).
         self._kvcaches_list = self._latent_kvcaches
+        _agent_debug_log(
+            "vllm_v1_adapter:_refresh_kvcaches_list",
+            "kv cache groups registered",
+            {
+                "dsa_two_groups": dsa_two_groups,
+                "latent_layers": len(self._latent_kvcaches),
+                "indexer_layers": len(self._indexer_kvcaches),
+                "latent_layer_names_head": self._latent_layer_names[:4],
+                "indexer_layer_names_head": self._indexer_layer_names[:4],
+                "all_layer_names_head": list(self.kv_caches.keys())[:8],
+            },
+            hypothesis_id="F",
+        )
         if dsa_two_groups and len(self._indexer_kvcaches) == 0:
             logger.warning(
                 "dsa_two_groups is enabled but no indexer KV caches were "
@@ -1716,6 +1729,8 @@ class LMCacheConnectorV1Impl:
                         "sparse decode retrieve",
                         {
                             "req_id": request.req_id,
+                            "dsa_two_groups": dsa_two_groups,
+                            "indexer_kvcaches": len(self._kvcaches_for_group(1)),
                             "latent_cached_tensors_l0": len(
                                 request.cached_tensors[0]
                             )
@@ -2072,6 +2087,16 @@ class LMCacheConnectorV1Impl:
         if not kvcaches:
             # No caches registered for this group (e.g. indexer not
             # registered with the connector); nothing to store.
+            if dsa_two_groups and kv_group == 1 and is_indexer_layer:
+                _agent_debug_log(
+                    "vllm_v1_adapter:save_kv_layer",
+                    "indexer save skipped: no kvcaches",
+                    {
+                        "layer_name": layer_name,
+                        "indexer_layer_names_head": self._indexer_layer_names[:4],
+                    },
+                    hypothesis_id="F",
+                )
             return
 
         for request in connector_metadata.requests:
