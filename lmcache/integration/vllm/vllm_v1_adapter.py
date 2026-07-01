@@ -1803,6 +1803,46 @@ class LMCacheConnectorV1Impl:
             layerwise_storer = self._layerwise_save_storers.get(
                 (request.req_id, kv_group)
             )
+            # Forward-boundary recovery: the store_layer generator is sized for
+            # exactly one forward (num_layers layer yields + 1 drain yield). It
+            # is normally drained and popped by wait_for_save between forwards.
+            # Some vLLM-Ascend forward paths do not call wait_for_save between
+            # consecutive forwards (e.g. chunked prefill), which would leave the
+            # previous forward's storer in place and cause the next forward's
+            # save_kv_layer calls to exhaust it (StopIteration). When we see the
+            # group's first layer again while a storer still exists, drain the
+            # old storer fully and create a fresh one for the new forward.
+            if layerwise_storer is not None:
+                _first_layer = (
+                    self._indexer_layer_names[0]
+                    if kv_group == 1 and self._indexer_layer_names
+                    else (
+                        self._latent_layer_names[0]
+                        if self._latent_layer_names
+                        else None
+                    )
+                )
+                if _first_layer is not None and layer_name == _first_layer:
+                    try:
+                        while True:
+                            next(layerwise_storer)
+                    except StopIteration:
+                        pass
+                    self._layerwise_save_storers.pop(
+                        (request.req_id, kv_group), None
+                    )
+                    layerwise_storer = None
+                    # #region agent log
+                    _counts = getattr(self, "_dbg_next_counts", None)
+                    if _counts is not None:
+                        _counts[(request.req_id, kv_group)] = 0
+                    _dbg_log("forward_boundary_recreate", {
+                        "req_id": request.req_id,
+                        "kv_group": kv_group,
+                        "layer_name": layer_name,
+                        "num_layers": getattr(self, "num_layers", None),
+                    })
+                    # #endregion
             if layerwise_storer is None:
                 token_ids = request.token_ids
                 assert isinstance(token_ids, list)
