@@ -64,6 +64,8 @@ class LMCacheMetadata:
     engine_id: Optional[str] = None
     """ extra config from kv_connector (e.g., lmcache_rpc_port) """
     kv_connector_extra_config: Optional[dict] = None
+    """ vLLM max_model_len; used to cap layerwise GPU staging in two-group DSA """
+    max_model_len: Optional[int] = None
 
     def is_first_rank(self) -> bool:
         """Check if the current worker is the first rank"""

@@ -156,6 +156,7 @@ class VllmServiceFactory(BaseServiceFactory):
             chunk_size=self.lmcache_config.chunk_size,
             engine_id=engine_id,
             kv_connector_extra_config=kv_connector_extra_config,
+            max_model_len=getattr(model_config, "max_model_len", None),
         )
         return self.metadata
 
