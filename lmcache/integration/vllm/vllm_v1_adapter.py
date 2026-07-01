@@ -98,6 +98,33 @@ def _agent_debug_log(
     # #endregion
 
 
+# #region agent log
+def _dbg_log_792df4(message, data, hypothesis_id="H1", run_id="pre-fix"):
+    """792df4 debug session instrumentation (writes to debug-792df4.log)."""
+    try:
+        import json as _j
+        import time as _t
+
+        with open("debug-792df4.log", "a", encoding="utf-8") as _f:
+            _f.write(
+                _j.dumps(
+                    {
+                        "sessionId": "792df4",
+                        "runId": run_id,
+                        "hypothesisId": hypothesis_id,
+                        "location": "vllm_v1_adapter:save_kv_layer",
+                        "message": message,
+                        "data": data,
+                        "timestamp": int(_t.time() * 1000),
+                    }
+                )
+                + "\n"
+            )
+    except OSError:
+        pass
+# #endregion
+
+
 def _tensor_head(t: Optional[torch.Tensor], n: int = 4) -> Optional[list]:
     if t is None or t.numel() == 0:
         return None
@@ -2321,6 +2348,35 @@ class LMCacheConnectorV1Impl:
                             },
                             hypothesis_id="D",
                         )
+
+                # Two-group DSA safety: if this is an indexer layer but vLLM
+                # provided no indexer-specific slot mapping (neither
+                # attn_metadata.slot_mapping nor attn_metadata.indexer_slot_mapping
+                # is set), the fallback above is the LATENT group's
+                # request.slot_mapping. Scattering indexer KV into the indexer
+                # paged buffer using the latent slot mapping corrupts the cache
+                # (wrong slots / OOB) and leads to bad decode output + NPU
+                # faults. Skip the indexer save for this request until vLLM
+                # exposes an indexer slot mapping.
+                if is_indexer_layer:
+                    _idx_attn_slot = getattr(attn_metadata, "slot_mapping", None)
+                    _idx_attr_slot = getattr(
+                        attn_metadata, "indexer_slot_mapping", None
+                    )
+                    if _idx_attn_slot is None and _idx_attr_slot is None:
+                        # #region agent log
+                        _dbg_log_792df4(
+                            "indexer save skipped: no indexer slot mapping",
+                            {
+                                "req_id": request.req_id,
+                                "layer_name": layer_name,
+                                "kv_group": kv_group,
+                                "slot_len": len(slot_mapping),
+                                "slot_head": _tensor_head(slot_mapping),
+                            },
+                        )
+                        # #endregion
+                        continue
 
                 if self.kv_role == "kv_producer":
                     skip_leading_tokens = 0
