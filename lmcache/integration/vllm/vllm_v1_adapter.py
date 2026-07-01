@@ -1007,7 +1007,15 @@ class LMCacheConnectorV1Impl:
         tokens: list[int], lmcache_cached_tokens: int, *, is_sparse_decode: bool
     ) -> list[int]:
         """Return token ids for retrieve without redundant list copy on decode."""
-        if is_sparse_decode or lmcache_cached_tokens >= len(tokens):
+        if is_sparse_decode:
+            # Sparse decode only scatters into the first N slots (see
+            # _sparse_slot_mapping_len). Metadata/chunk keys must cover the
+            # same token span as slot_mapping, not the full decode sequence.
+            window = _sparse_slot_mapping_len(
+                lmcache_cached_tokens if lmcache_cached_tokens > 0 else len(tokens)
+            )
+            return tokens[:window]
+        if lmcache_cached_tokens >= len(tokens):
             return tokens
         return tokens[:lmcache_cached_tokens]
 
@@ -1028,8 +1036,15 @@ class LMCacheConnectorV1Impl:
             token_mask = torch.ones(token_count, dtype=torch.bool)
 
         if request.load_spec is not None:
+            prefix_tokens = request.load_spec.vllm_cached_tokens
+            if request.is_sparse_decode:
+                prefix_tokens = max(
+                    prefix_tokens,
+                    request.load_spec.lmcache_cached_tokens,
+                )
+            prefix_tokens = min(prefix_tokens, token_count)
             masked_token_count = (
-                request.load_spec.vllm_cached_tokens
+                prefix_tokens
                 // lmcache_chunk_size
                 * lmcache_chunk_size
             )
@@ -1442,6 +1457,14 @@ class LMCacheConnectorV1Impl:
                         {
                             "req_id": request.req_id,
                             "token_count": token_count,
+                            "slot_mapping_len": len(slot_mapping),
+                            "vllm_cached_tokens": request.load_spec.vllm_cached_tokens,
+                            "lmcache_cached_tokens": (
+                                request.load_spec.lmcache_cached_tokens
+                            ),
+                            "masked_false_count": int(
+                                (token_mask == False).sum().item()  # noqa: E712
+                            ),
                             "cached_keys_chunks": (
                                 len(request.cached_keys[0])
                                 if request.cached_keys and request.cached_keys[0]

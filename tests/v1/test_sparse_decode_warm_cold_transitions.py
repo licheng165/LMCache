@@ -13,6 +13,7 @@ from lmcache.integration.vllm.vllm_v1_adapter import (
     LoadSpec,
     ReqMeta,
     WorkerRetrieveState,
+    _sparse_slot_mapping_len,
 )
 from tests.v1.connector_test_utils import make_worker_impl
 
@@ -251,3 +252,38 @@ class TestSparseDecodeTokenMask:
         assert token_mask[256:].eq(True).all()
         assert request.decode_token_mask is not None
         assert request.decode_token_mask[:256].eq(False).all()
+
+    def test_decode_token_mask_uses_lmcache_prefix_on_run2(self) -> None:
+        impl = make_worker_impl()
+        window = _sparse_slot_mapping_len(16384)
+        request = ReqMeta(
+            req_id="req-2",
+            token_ids=[0] * 18879,
+            load_spec=LoadSpec(
+                vllm_cached_tokens=0,
+                lmcache_cached_tokens=16384,
+                can_load=True,
+            ),
+            is_sparse_decode=True,
+            decode_token_mask=torch.ones(window, dtype=torch.bool),
+        )
+
+        retrieve_tokens = impl._load_tokens_for_retrieve(
+            request.token_ids,
+            request.load_spec.lmcache_cached_tokens,
+            is_sparse_decode=True,
+        )
+        token_mask = impl._load_token_mask_for_retrieve(request, len(retrieve_tokens), 256)
+
+        assert len(retrieve_tokens) == window
+        assert token_mask.eq(False).all()
+
+    def test_sparse_retrieve_tokens_match_slot_mapping_window(self) -> None:
+        impl = make_worker_impl()
+        tokens = list(range(18879))
+        retrieve_tokens = impl._load_tokens_for_retrieve(
+            tokens,
+            lmcache_cached_tokens=16384,
+            is_sparse_decode=True,
+        )
+        assert len(retrieve_tokens) == _sparse_slot_mapping_len(16384)
