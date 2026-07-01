@@ -1673,6 +1673,49 @@ class LMCacheConnectorV1Impl:
             getattr(engine, "retrieve_locations", None),
         )
 
+    def _warm_request_retrieve_metadata(
+        self,
+        request: ReqMeta,
+        tokens: torch.Tensor,
+        mask: torch.Tensor,
+        *,
+        kv_group: int,
+        dsa_two_groups: bool,
+    ) -> tuple[Optional[str], bool]:
+        ensure_metadata = getattr(
+            self.lmcache_engine, "_ensure_retrieve_chunk_metadata", None
+        )
+        if ensure_metadata is None:
+            return None, False
+
+        cache_kwargs = _retrieve_cache_kwargs(
+            request, kv_group=kv_group, dsa_two_groups=dsa_two_groups
+        )
+        cached_keys = cache_kwargs["cached_keys"]
+        cached_starts = cache_kwargs["cached_starts"]
+        cached_ends = cache_kwargs["cached_ends"]
+        ret_mask = torch.zeros(len(tokens), dtype=torch.bool, device="cpu")
+        retrieve_kwargs: dict[str, Any] = {"kv_group": kv_group}
+
+        location, _, _, _ = ensure_metadata(
+            tokens=tokens,
+            mask=mask,
+            request_configs=request.request_configs,
+            cached_keys=cached_keys,
+            cached_starts=cached_starts,
+            cached_ends=cached_ends,
+            ret_mask=ret_mask,
+            retrieve_kwargs=retrieve_kwargs,
+        )
+        if location is None:
+            location = retrieve_kwargs.get("cached_retrieve_location")
+        metadata_warm = bool(
+            retrieve_kwargs.get("_retrieve_metadata_warm")
+            and cached_keys
+            and cached_ends
+        )
+        return location, metadata_warm
+
     def _maybe_seed_worker_retrieve_state_from_store(
         self, request: ReqMeta
     ) -> None:
@@ -2193,6 +2236,41 @@ class LMCacheConnectorV1Impl:
                             next(indexer_retriever)
                             next(indexer_retriever)
 
+                    dsa_two_groups = self._is_dsa_two_groups()
+                    prefix_location, metadata_warm = (
+                        self._warm_request_retrieve_metadata(
+                            request,
+                            retrieve_tokens,
+                            token_mask,
+                            kv_group=0,
+                            dsa_two_groups=dsa_two_groups,
+                        )
+                    )
+                    indexer_metadata_warm = False
+                    if indexer_retriever is not None:
+                        indexer_location, indexer_metadata_warm = (
+                            self._warm_request_retrieve_metadata(
+                                request,
+                                retrieve_tokens,
+                                token_mask,
+                                kv_group=1,
+                                dsa_two_groups=dsa_two_groups,
+                            )
+                        )
+                        if prefix_location is None:
+                            prefix_location = indexer_location
+                    if prefix_location is None:
+                        prefix_location = self._resolve_store_retrieve_location(
+                            request
+                        )
+                    metadata_warm = bool(metadata_warm or indexer_metadata_warm)
+                    self._save_worker_retrieve_state_from_request(
+                        request,
+                        location=prefix_location,
+                        metadata_warm=metadata_warm,
+                        token_count=lmcache_cached_tokens,
+                    )
+
                     _agent_debug_log(
                         "vllm_v1_adapter:start_load_kv",
                         "two-group prefill retrieve",
@@ -2201,6 +2279,18 @@ class LMCacheConnectorV1Impl:
                             "indexer_retriever_created": indexer_retriever is not None,
                             "indexer_kvcaches": len(self._kvcaches_for_group(1)),
                             "indexer_slot_source": idx_slot_source,
+                            "metadata_warm": metadata_warm,
+                            "cached_keys_layers": len(request.cached_keys),
+                            "cached_ends_tail": request.cached_ends[-1]
+                            if request.cached_ends
+                            else None,
+                            "indexer_cached_keys_layers": len(
+                                request.cached_keys_indexer
+                            ),
+                            "indexer_cached_ends_tail": request.cached_ends_indexer[-1]
+                            if request.cached_ends_indexer
+                            else None,
+                            "location": prefix_location,
                             "latent_slot_head": _tensor_head(slot_mapping),
                             "indexer_slot_head": _tensor_head(idx_slot),
                             "slots_match_head": (
