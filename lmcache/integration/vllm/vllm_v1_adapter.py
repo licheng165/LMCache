@@ -2375,6 +2375,41 @@ class LMCacheConnectorV1Impl:
                                         "kind": type(_v).__name__,
                                         "repr": repr(_v)[:80],
                                     }
+                        # Drill into the per-layer metadata object (e.g.
+                        # DeepseekV32IndexerMetadata) to find the slot field.
+                        _per_layer = {}
+                        _idx_meta_obj = (
+                            _am.get(layer_name) if isinstance(_am, dict) else None
+                        )
+                        if _idx_meta_obj is not None:
+                            for _fn in dir(_idx_meta_obj):
+                                if _fn.startswith("_"):
+                                    continue
+                                try:
+                                    _fv = getattr(_idx_meta_obj, _fn)
+                                except Exception:
+                                    _fv = "<exc>"
+                                if isinstance(_fv, torch.Tensor):
+                                    _per_layer[_fn] = {
+                                        "kind": "tensor",
+                                        "shape": list(_fv.shape),
+                                        "head": _fv.flatten()[:4].tolist(),
+                                    }
+                                elif isinstance(_fv, (list, tuple)):
+                                    _per_layer[_fn] = {
+                                        "kind": type(_fv).__name__,
+                                        "len": len(_fv),
+                                        "first_type": (
+                                            type(_fv[0]).__name__ if _fv else None
+                                        ),
+                                    }
+                                elif _fv is None:
+                                    _per_layer[_fn] = None
+                                else:
+                                    _per_layer[_fn] = {
+                                        "kind": type(_fv).__name__,
+                                        "repr": repr(_fv)[:80],
+                                    }
                         _dbg_log_792df4(
                             "attn_metadata introspect (indexer layer)",
                             {
@@ -2385,17 +2420,41 @@ class LMCacheConnectorV1Impl:
                                     list(_am.keys()) if isinstance(_am, dict) else None
                                 ),
                                 "slot_related_attrs": _attrs,
+                                "per_layer_indexer_meta_type": (
+                                    type(_idx_meta_obj).__name__
+                                    if _idx_meta_obj is not None
+                                    else None
+                                ),
+                                "per_layer_indexer_meta_attrs": _per_layer,
                             },
                             hypothesis_id="H1",
                         )
                     # #endregion
-                    idx_slot = _am_get(attn_metadata, "slot_mapping", None)
+                    # The indexer slot mapping lives on the per-layer metadata
+                    # object (attn_metadata[layer_name], e.g.
+                    # DeepseekV32IndexerMetadata), not on the top-level dict.
+                    _idx_meta = _am_get(attn_metadata, layer_name, None)
+                    idx_slot = None
+                    _idx_slot_source = None
+                    if _idx_meta is not None:
+                        # Try common slot-mapping field names on the per-layer
+                        # metadata object.
+                        for _fname in (
+                            "slot_mapping",
+                            "slot_mapping_list",
+                            "block_mapping",
+                        ):
+                            _cand = getattr(_idx_meta, _fname, None)
+                            if _cand is not None:
+                                idx_slot = _cand
+                                _idx_slot_source = f"per_layer.{_fname}"
+                                break
                     save_slot_source = "request.slot_mapping"
                     if idx_slot is not None:
                         slot_mapping = idx_slot.to(
                             device=self.device, dtype=torch.long
                         )
-                        save_slot_source = "attn.slot_mapping"
+                        save_slot_source = _idx_slot_source
                     elif _am_get(attn_metadata, "indexer_slot_mapping", None) is not None:
                         slot_mapping = _am_get(
                             attn_metadata, "indexer_slot_mapping"
@@ -2433,11 +2492,10 @@ class LMCacheConnectorV1Impl:
                 # faults. Skip the indexer save for this request until vLLM
                 # exposes an indexer slot mapping.
                 if is_indexer_layer:
-                    _idx_attn_slot = _am_get(attn_metadata, "slot_mapping", None)
-                    _idx_attr_slot = _am_get(
-                        attn_metadata, "indexer_slot_mapping", None
-                    )
-                    if _idx_attn_slot is None and _idx_attr_slot is None:
+                    # Skip only if we fell back to the latent request.slot_mapping
+                    # (no indexer-specific slot mapping was found on the
+                    # per-layer metadata or the top-level attn_metadata).
+                    if save_slot_source == "request.slot_mapping":
                         # #region agent log
                         _dbg_log_792df4(
                             "indexer save skipped: no indexer slot mapping",
