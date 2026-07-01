@@ -680,12 +680,17 @@ class LMCacheConnectorV1Impl:
     ) -> None:
         """Initialize connector-specific state variables."""
         self.async_loading = config.enable_async_loading
+        # Each entry is a (primary, secondary) retriever pair. primary is the
+        # latent (kv_group=0) retriever; secondary is the indexer (kv_group=1)
+        # retriever for two-group prefix retrieve, or None for sparse decode /
+        # single-group. Both are advanced per layer in wait_for_layer_load.
         self.layerwise_retrievers: list[
-            Generator[Optional[torch.Tensor], None, None]
+            tuple[Optional[Generator[Optional[torch.Tensor], None, None]],
+                  Optional[Generator[Optional[torch.Tensor], None, None]]]
         ] = []
         self._layerwise_retriever_is_sparse: list[bool] = []
         self._layerwise_save_storers: dict[
-            str, Generator[Optional[torch.Tensor], None, None]
+            tuple[str, int], Generator[Optional[torch.Tensor], None, None]
         ] = {}
         self._stats_monitor = LMCStatsMonitor.GetOrCreate()
         self.enable_sparse_attention = config.enable_sparse_attention
@@ -714,6 +719,15 @@ class LMCacheConnectorV1Impl:
 
         self.kv_caches: dict[str, torch.Tensor] = {}
         self._kvcaches_list: list[torch.Tensor] = []
+        # Two-group MLA+DSA: latent (kv_group=0) and indexer (kv_group=1)
+        # caches are partitioned by layer name ("indexer" in name) so that
+        # per-group store/retrieve can pass the correct, group-filtered
+        # kvcaches list to the connector. _kvcaches_list stays equal to the
+        # latent list for backward-compatible latent-only callers.
+        self._latent_layer_names: list[str] = []
+        self._indexer_layer_names: list[str] = []
+        self._latent_kvcaches: list[torch.Tensor] = []
+        self._indexer_kvcaches: list[torch.Tensor] = []
         self._block_size = vllm_config.cache_config.block_size
         self.load_specs: dict[str, LoadSpec] = {}
         self.kv_cache_manager: Optional["KVCacheManager"] = None
@@ -911,7 +925,60 @@ class LMCacheConnectorV1Impl:
             kv_layer_groups_manager.build_kv_layer_groups(self.kv_caches)
 
     def _refresh_kvcaches_list(self) -> None:
-        self._kvcaches_list = list(self.kv_caches.values())
+        self._latent_layer_names = []
+        self._indexer_layer_names = []
+        self._latent_kvcaches = []
+        self._indexer_kvcaches = []
+        dsa_two_groups = getattr(self.config, "dsa_two_groups", False)
+        for layer_name, kv_cache in self.kv_caches.items():
+            if dsa_two_groups and "indexer" in layer_name:
+                self._indexer_layer_names.append(layer_name)
+                self._indexer_kvcaches.append(kv_cache)
+            else:
+                self._latent_layer_names.append(layer_name)
+                self._latent_kvcaches.append(kv_cache)
+        # Backward-compatible flat list = latent group (the default group).
+        self._kvcaches_list = self._latent_kvcaches
+        if dsa_two_groups and len(self._indexer_kvcaches) == 0:
+            logger.warning(
+                "dsa_two_groups is enabled but no indexer KV caches were "
+                "registered with the connector (no layer name contains "
+                "'indexer'). Two-group store/retrieve for the indexer group "
+                "will be skipped. Ensure vLLM registers the indexer KV cache "
+                "group with this connector."
+            )
+
+    def _kvcaches_for_group(self, kv_group: int) -> list[torch.Tensor]:
+        """Return the per-group kv_caches list for the connector."""
+        if kv_group == 1 and getattr(self.config, "dsa_two_groups", False):
+            return self._indexer_kvcaches
+        return self._latent_kvcaches
+
+    def _num_layers_for_group(self, kv_group: int) -> int:
+        return len(self._kvcaches_for_group(kv_group))
+
+    def _is_dsa_two_groups(self) -> bool:
+        return bool(getattr(self.config, "dsa_two_groups", False))
+
+    def _indexer_retrieve_slot_mapping(
+        self, attn_metadata, lmcache_cached_tokens: int
+    ) -> Optional[torch.Tensor]:
+        """Return the indexer group's slot mapping for prefix retrieve.
+
+        Mirrors the save path's indexer slot logic: the model_runner sets
+        attn_metadata.slot_mapping to the indexer group's mapping when
+        kv_cache_gid > 0; otherwise fall back to an explicit
+        indexer_slot_mapping attribute. Sliced to the latent hit count.
+        """
+        idx_slot = getattr(attn_metadata, "slot_mapping", None)
+        if idx_slot is None:
+            idx_slot = getattr(attn_metadata, "indexer_slot_mapping", None)
+        if idx_slot is None:
+            return None
+        idx_slot = idx_slot.to(device=self.device, dtype=torch.long)
+        if lmcache_cached_tokens < len(idx_slot):
+            idx_slot = idx_slot[:lmcache_cached_tokens]
+        return idx_slot
 
     # TODO(chunxiaozheng): in the latest lmcache_connector, we use `register_kv_caches`
     #  to init self.kv_caches, we keep it in order to be compatible with old versions
@@ -1021,18 +1088,22 @@ class LMCacheConnectorV1Impl:
 
     def _drain_layerwise_retrievers(self) -> None:
         """Finish suspended layerwise generators to avoid GC cost on reset."""
-        for idx, retriever in enumerate(self.layerwise_retrievers):
+        for idx, retriever_pair in enumerate(self.layerwise_retrievers):
             is_sparse = (
                 idx < len(self._layerwise_retriever_is_sparse)
                 and self._layerwise_retriever_is_sparse[idx]
             )
-            try:
-                if is_sparse:
-                    self._drain_sparse_layerwise_retriever(retriever)
-                else:
-                    next(retriever)
-            except StopIteration:
-                pass
+            primary, secondary = retriever_pair
+            for retriever in (primary, secondary):
+                if retriever is None:
+                    continue
+                try:
+                    if is_sparse:
+                        self._drain_sparse_layerwise_retriever(retriever)
+                    else:
+                        next(retriever)
+                except StopIteration:
+                    pass
         self.layerwise_retrievers.clear()
         self._layerwise_retriever_is_sparse.clear()
 
@@ -1371,7 +1442,7 @@ class LMCacheConnectorV1Impl:
                         metadata_warm=metadata_warm,
                         token_count=token_count,
                     )
-                    self.layerwise_retrievers.append(layerwise_retriever)
+                    self.layerwise_retrievers.append((layerwise_retriever, None))
                     self._layerwise_retriever_is_sparse.append(True)
                 else:
                     retrieve_slot_mapping = slot_mapping
@@ -1389,7 +1460,35 @@ class LMCacheConnectorV1Impl:
                     # NOTE: retrieve for two layers at the first layer
                     next(layerwise_retriever)
                     next(layerwise_retriever)
-                    self.layerwise_retrievers.append(layerwise_retriever)
+
+                    # Two-group DSA: also retrieve the indexer group (kv_group=1)
+                    # for the same latent hit token count, scattering into vLLM's
+                    # indexer KV via the indexer slot mapping. Decode stays
+                    # latent-only (this branch is prefill/prefix, not sparse).
+                    indexer_retriever = None
+                    if (
+                        self._is_dsa_two_groups()
+                        and self._kvcaches_for_group(1)
+                    ):
+                        idx_slot = self._indexer_retrieve_slot_mapping(
+                            attn_metadata, lmcache_cached_tokens
+                        )
+                        if idx_slot is not None:
+                            indexer_retriever = self.lmcache_engine.retrieve_layer(
+                                retrieve_tokens,
+                                token_mask,
+                                kvcaches=self._kvcaches_for_group(1),
+                                slot_mapping=idx_slot,
+                                vllm_cached_tokens=request.load_spec.vllm_cached_tokens,
+                                sync=sync,
+                                kv_group=1,
+                            )
+                            next(indexer_retriever)
+                            next(indexer_retriever)
+
+                    self.layerwise_retrievers.append(
+                        (layerwise_retriever, indexer_retriever)
+                    )
                     self._layerwise_retriever_is_sparse.append(False)
             else:
                 retrieve_slot_mapping = slot_mapping
@@ -1556,7 +1655,7 @@ class LMCacheConnectorV1Impl:
                     len(self.layerwise_retrievers),
                 )
                 break
-            layerwise_retriever = self.layerwise_retrievers[idx]
+            layerwise_retriever, indexer_retriever = self.layerwise_retrievers[idx]
             if request.is_sparse_decode:
                 if selected_tokens is None:
                     selected_tokens_per_req = None
@@ -1577,6 +1676,11 @@ class LMCacheConnectorV1Impl:
                 decode_row += 1
             else:
                 ret_token_mask = next(layerwise_retriever)
+                # Advance the indexer retriever in lockstep for two-group
+                # prefix retrieve. Its ret_mask is not reported to the
+                # scheduler; only the latent mask is.
+                if indexer_retriever is not None:
+                    next(indexer_retriever)
 
             if self.current_layer == self.num_layers - 1 and not request.is_sparse_decode:
                 assert ret_token_mask is not None
@@ -1628,7 +1732,6 @@ class LMCacheConnectorV1Impl:
 
         assert len(self.kv_caches) > 0
 
-        kvcaches = list(self.kv_caches.values())
         is_first = True
 
         # Determine kv_group from layer name for two-group DSA mode.
@@ -1636,6 +1739,14 @@ class LMCacheConnectorV1Impl:
         dsa_two_groups = getattr(self.config, "dsa_two_groups", False)
         is_indexer_layer = dsa_two_groups and "indexer" in layer_name
         kv_group = 1 if is_indexer_layer else 0
+        # Pass only the current group's kv_caches so the connector's
+        # batched_from_gpu iterates over the correct group's layer tensors
+        # and _lazy_initialize_buffer detects the right format per group.
+        kvcaches = self._kvcaches_for_group(kv_group)
+        if not kvcaches:
+            # No caches registered for this group (e.g. indexer not
+            # registered with the connector); nothing to store.
+            return
 
         for request in connector_metadata.requests:
             save_spec = request.save_spec
@@ -1653,7 +1764,9 @@ class LMCacheConnectorV1Impl:
                 if not is_indexer_layer and not save_spec.can_save_latent:
                     continue
 
-            layerwise_storer = self._layerwise_save_storers.get(request.req_id)
+            layerwise_storer = self._layerwise_save_storers.get(
+                (request.req_id, kv_group)
+            )
             if layerwise_storer is None:
                 token_ids = request.token_ids
                 assert isinstance(token_ids, list)
@@ -1731,7 +1844,9 @@ class LMCacheConnectorV1Impl:
                     cached_memory_objs=request.cached_memory_objs,
                     cached_tensors=request.cached_tensors,
                 )
-                self._layerwise_save_storers[request.req_id] = layerwise_storer
+                self._layerwise_save_storers[
+                    (request.req_id, kv_group)
+                ] = layerwise_storer
                 if is_first:
                     is_first = False
 
@@ -1758,14 +1873,17 @@ class LMCacheConnectorV1Impl:
 
         if self.use_layerwise:
             for request in connector_metadata.requests:
-                layerwise_storer = self._layerwise_save_storers.pop(
-                    request.req_id, None
-                )
-                if layerwise_storer is not None:
-                    try:
-                        next(layerwise_storer)
-                    except StopIteration:
-                        pass
+                # Drain both the latent (kv_group=0) and indexer (kv_group=1)
+                # storers for this request.
+                for _kv_group in (0, 1):
+                    layerwise_storer = self._layerwise_save_storers.pop(
+                        (request.req_id, _kv_group), None
+                    )
+                    if layerwise_storer is not None:
+                        try:
+                            next(layerwise_storer)
+                        except StopIteration:
+                            pass
                 self._maybe_lookup_unpin_for_request(request)
             return
 
@@ -2365,7 +2483,10 @@ class LMCacheConnectorV1Impl:
         if getattr(self, "use_layerwise", False) and hasattr(
             self, "_layerwise_save_storers"
         ):
-            self._layerwise_save_storers.pop(request.request_id, None)
+            for _kv_group in (0, 1):
+                self._layerwise_save_storers.pop(
+                    (request.request_id, _kv_group), None
+                )
 
         self._drop_worker_retrieve_state(request.request_id)
 
