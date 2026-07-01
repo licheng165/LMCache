@@ -2559,6 +2559,23 @@ class LMCacheConnectorV1Impl:
         dsa_two_groups = getattr(self.config, "dsa_two_groups", False)
         is_indexer_layer = dsa_two_groups and "indexer" in layer_name
         kv_group = 1 if is_indexer_layer else 0
+        # #region agent log
+        # TEMPORARY diagnostic (H_TP2/isolation): force-skip the indexer save
+        # to determine whether the TP>1 NPU OOB crash originates in the
+        # lmcache indexer save path or in the model/vLLM graph itself.
+        if is_indexer_layer:
+            _dbg_log_792df4(
+                "indexer save FORCE-SKIPPED (TP>1 isolation diagnostic)",
+                {
+                    "layer_name": layer_name,
+                    "kv_group": kv_group,
+                    "num_kvcaches": len(self._kvcaches_for_group(1)),
+                    "num_layers": getattr(self, "num_layers", None),
+                },
+                hypothesis_id="H_TP2",
+            )
+            return
+        # #endregion
         # Pass only the current group's kv_caches so the connector's
         # batched_from_gpu iterates over the correct group's layer tensors
         # and _lazy_initialize_buffer detects the right format per group.
@@ -2862,6 +2879,12 @@ class LMCacheConnectorV1Impl:
                                 "kvcaches_capacity": _capacity,
                                 "oob": _smax >= _capacity,
                                 "num_kvcaches": len(kvcaches),
+                                "num_layers": getattr(self, "num_layers", None),
+                                "latent_kvcaches": len(self._latent_kvcaches),
+                                "indexer_kvcaches": len(self._indexer_kvcaches),
+                                "indexer_layer_names_count": len(
+                                    self._indexer_layer_names
+                                ),
                             },
                             hypothesis_id="H_TP1",
                         )
