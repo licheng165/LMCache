@@ -1021,9 +1021,12 @@ class LMCacheConnectorV1Impl:
         if request.is_sparse_decode and request.decode_token_mask is not None:
             mask = request.decode_token_mask
             if mask.numel() == token_count:
-                return mask
+                token_mask = mask.clone()
+            else:
+                token_mask = torch.ones(token_count, dtype=torch.bool)
+        else:
+            token_mask = torch.ones(token_count, dtype=torch.bool)
 
-        token_mask = torch.ones(token_count, dtype=torch.bool)
         if request.load_spec is not None:
             masked_token_count = (
                 request.load_spec.vllm_cached_tokens

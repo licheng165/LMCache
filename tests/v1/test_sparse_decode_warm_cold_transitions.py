@@ -190,3 +190,64 @@ class TestAscendEngineWarmColdMetadata:
         engine.storage_manager.contains.assert_called_once()
         assert location == "LocalCPUBackend"
         assert retrieve_kwargs["cached_retrieve_location"] == "LocalCPUBackend"
+
+    def test_metadata_refresh_requires_all_layer_keys(self) -> None:
+        engine = AscendLMCacheEngine.__new__(AscendLMCacheEngine)
+        engine.storage_manager = MagicMock()
+        engine.retrieve_locations = ["LocalCPUBackend"]
+        engine.num_layers = 2
+        engine.token_database = MagicMock()
+        key = MagicMock()
+        layer0 = MagicMock()
+        layer1 = MagicMock()
+        key.split_layers.return_value = [layer0, layer1]
+        engine.token_database.process_tokens.return_value = [(0, 256, key)]
+        engine.storage_manager.contains.side_effect = [
+            "LocalCPUBackend",
+            None,
+        ]
+
+        cached_keys: list[list] = [[], []]
+        cached_starts: list[int] = []
+        cached_ends: list[int] = []
+        ret_mask = torch.zeros(256, dtype=torch.bool)
+
+        location, starts, ends, keys = engine._ensure_retrieve_chunk_metadata(
+            tokens=[0] * 256,
+            mask=None,
+            request_configs=None,
+            cached_keys=cached_keys,
+            cached_starts=cached_starts,
+            cached_ends=cached_ends,
+            ret_mask=ret_mask,
+            retrieve_kwargs={},
+        )
+
+        assert location is None
+        assert starts == []
+        assert ends == []
+        assert keys == []
+
+
+class TestSparseDecodeTokenMask:
+    def test_decode_token_mask_applies_vllm_prefix_mask(self) -> None:
+        request = ReqMeta(
+            req_id="req-1",
+            token_ids=[0] * 512,
+            load_spec=LoadSpec(
+                vllm_cached_tokens=384,
+                lmcache_cached_tokens=512,
+                can_load=True,
+            ),
+            is_sparse_decode=True,
+            decode_token_mask=torch.ones(512, dtype=torch.bool),
+        )
+
+        token_mask = make_worker_impl()._load_token_mask_for_retrieve(
+            request, 512, 256
+        )
+
+        assert token_mask[:256].eq(False).all()
+        assert token_mask[256:].eq(True).all()
+        assert request.decode_token_mask is not None
+        assert request.decode_token_mask[:256].eq(False).all()
