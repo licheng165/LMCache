@@ -2530,10 +2530,26 @@ class LMCacheConnectorV1Impl:
         Args:
             layer_name (str): the name of the layer.
             kv_layer (torch.Tensor): the paged KV buffer of the current
-                layer in vLLM.
+            layer in vLLM.
             attn_metadata (AttentionMetadata): the attention metadata.
             **kwargs: additional arguments for the save operation.
         """
+        # #region agent log
+        _dbg_log_792df4(
+            "save_kv_layer ENTRY",
+            {
+                "layer_name": layer_name,
+                "use_layerwise": getattr(self, "use_layerwise", None),
+                "kv_role": getattr(self, "kv_role", None),
+                "has_connector_meta": (
+                    getattr(self, "_parent", None) is not None
+                    and getattr(self._parent, "_connector_metadata", None)
+                    is not None
+                ),
+            },
+            hypothesis_id="H_TP2",
+        )
+        # #endregion
         assert self.lmcache_engine is not None
 
         if not self.use_layerwise:
