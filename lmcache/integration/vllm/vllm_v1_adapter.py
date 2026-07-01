@@ -1360,6 +1360,12 @@ class LMCacheConnectorV1Impl:
         state = self._worker_retrieve_state.get(request.req_id)
         if state is None:
             return False
+        if request.is_sparse_decode:
+            # Sparse decode retrieves a sliding window (e.g. 2048 tokens) while
+            # warm cache covers the full prompt — window < cached_ends is normal.
+            if state.token_count and len(request.token_ids) < state.token_count:
+                return True
+            return False
         if state.cached_ends and token_count < state.cached_ends[-1]:
             return True
         return False
@@ -1704,6 +1710,35 @@ class LMCacheConnectorV1Impl:
                         if self._should_invalidate_worker_retrieve_state(
                             request, token_count
                         ):
+                            _agent_debug_log(
+                                "vllm_v1_adapter:start_load_kv",
+                                "drop worker retrieve state",
+                                {
+                                    "req_id": request.req_id,
+                                    "token_count": token_count,
+                                    "prompt_len": len(request.token_ids),
+                                    "state_token_count": (
+                                        self._worker_retrieve_state.get(
+                                            request.req_id
+                                        ).token_count
+                                        if request.req_id
+                                        in self._worker_retrieve_state
+                                        else None
+                                    ),
+                                    "state_cached_ends_tail": (
+                                        self._worker_retrieve_state[
+                                            request.req_id
+                                        ].cached_ends[-1]
+                                        if request.req_id
+                                        in self._worker_retrieve_state
+                                        and self._worker_retrieve_state[
+                                            request.req_id
+                                        ].cached_ends
+                                        else None
+                                    ),
+                                },
+                                hypothesis_id="H2",
+                            )
                             self._drop_worker_retrieve_state(request.req_id)
                         bound_state = self._bind_worker_retrieve_state_to_request(
                             request

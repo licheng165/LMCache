@@ -112,6 +112,32 @@ class TestWorkerRetrieveState:
         )
         assert impl._should_invalidate_worker_retrieve_state(_make_request(), 128)
 
+    def test_sparse_decode_window_does_not_invalidate_full_prompt_cache(self):
+        impl = _make_impl()
+        impl._worker_retrieve_state["req-1"] = WorkerRetrieveState(
+            cached_keys=[["k"]],
+            cached_starts=[0],
+            cached_ends=[18879],
+            metadata_warm=True,
+            token_count=18879,
+        )
+        req = _make_request()
+        req.token_ids = [0] * 18879
+        assert not impl._should_invalidate_worker_retrieve_state(req, 2048)
+
+    def test_sparse_decode_prompt_shrink_invalidates(self):
+        impl = _make_impl()
+        impl._worker_retrieve_state["req-1"] = WorkerRetrieveState(
+            cached_keys=[["k"]],
+            cached_starts=[0],
+            cached_ends=[18879],
+            metadata_warm=True,
+            token_count=18879,
+        )
+        req = _make_request()
+        req.token_ids = [0] * 4096
+        assert impl._should_invalidate_worker_retrieve_state(req, 2048)
+
     def test_prune_drops_finished_requests(self):
         impl = _make_impl()
         impl._worker_retrieve_state = {
