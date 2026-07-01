@@ -65,6 +65,73 @@ def _sparse_slot_mapping_len(prompt_tokens: int) -> int:
     return min(SPARSE_DECODE_RETRIEVE_TOKENS, prompt_tokens)
 
 
+def _agent_debug_log(
+    location: str,
+    message: str,
+    data: dict,
+    *,
+    hypothesis_id: str = "A",
+    run_id: str = "pre-fix",
+) -> None:
+    # #region agent log
+    try:
+        import json
+        import time
+
+        with open("debug-d9c30c.log", "a", encoding="utf-8") as _f:
+            _f.write(
+                json.dumps(
+                    {
+                        "sessionId": "d9c30c",
+                        "runId": run_id,
+                        "hypothesisId": hypothesis_id,
+                        "location": location,
+                        "message": message,
+                        "data": data,
+                        "timestamp": int(time.time() * 1000),
+                    }
+                )
+                + "\n"
+            )
+    except OSError:
+        pass
+    # #endregion
+
+
+def _tensor_head(t: Optional[torch.Tensor], n: int = 4) -> Optional[list]:
+    if t is None or t.numel() == 0:
+        return None
+    return t.flatten()[:n].tolist()
+
+
+def _retrieve_cache_kwargs(
+    obj: Any,
+    *,
+    kv_group: int,
+    dsa_two_groups: bool,
+) -> dict[str, Any]:
+    """Return per-group cached retrieve/store kwargs for two-group DSA."""
+    if dsa_two_groups and kv_group == 1:
+        return {
+            "cached_keys": obj.cached_keys_indexer,
+            "cached_starts": obj.cached_starts_indexer,
+            "cached_ends": obj.cached_ends_indexer,
+            "cached_memory_objs": obj.cached_memory_objs_indexer,
+            "cached_tensors": obj.cached_tensors_indexer,
+            "cached_chunk_dev_ptrs": obj.cached_chunk_dev_ptrs_indexer,
+            "cached_chunk_ptrs_npu": obj.cached_chunk_ptrs_npu_indexer,
+        }
+    return {
+        "cached_keys": obj.cached_keys,
+        "cached_starts": obj.cached_starts,
+        "cached_ends": obj.cached_ends,
+        "cached_memory_objs": obj.cached_memory_objs,
+        "cached_tensors": obj.cached_tensors,
+        "cached_chunk_dev_ptrs": obj.cached_chunk_dev_ptrs,
+        "cached_chunk_ptrs_npu": obj.cached_chunk_ptrs_npu,
+    }
+
+
 def _build_slot_mapping(
     block_ids: list[int], block_size: int, num_tokens: int
 ) -> torch.Tensor:
@@ -177,6 +244,16 @@ class RequestTracker:
     cached_chunk_dev_ptrs: list[list[int]] = field(default_factory=list)
     # Sparse decode only: prebuilt NPU tensor of chunk device ptrs, one entry per layer.
     cached_chunk_ptrs_npu: list[Optional[torch.Tensor]] = field(default_factory=list)
+    # Two-group DSA: separate sparse/prefill retrieve cache for kv_group=1 (indexer).
+    cached_keys_indexer: list[list] = field(default_factory=list)
+    cached_starts_indexer: list[int] = field(default_factory=list)
+    cached_ends_indexer: list[int] = field(default_factory=list)
+    cached_memory_objs_indexer: list[list] = field(default_factory=list)
+    cached_tensors_indexer: list[list] = field(default_factory=list)
+    cached_chunk_dev_ptrs_indexer: list[list[int]] = field(default_factory=list)
+    cached_chunk_ptrs_npu_indexer: list[Optional[torch.Tensor]] = field(
+        default_factory=list
+    )
     # Sparse decode only: prompt token ids for retrieve keys, built once.
     sparse_token_ids: list[int] = field(default_factory=list, repr=False)
     # Sparse decode only: single-element list holding CPU then NPU slot_mapping.
@@ -293,6 +370,20 @@ class RequestTracker:
             self.sparse_slot_mapping.clear()
             self.sparse_decode_token_mask = None
             self.sparse_decode_ret_mask = None
+            self.cached_keys.clear()
+            self.cached_starts.clear()
+            self.cached_ends.clear()
+            self.cached_memory_objs.clear()
+            self.cached_tensors.clear()
+            self.cached_chunk_dev_ptrs.clear()
+            self.cached_chunk_ptrs_npu.clear()
+            self.cached_keys_indexer.clear()
+            self.cached_starts_indexer.clear()
+            self.cached_ends_indexer.clear()
+            self.cached_memory_objs_indexer.clear()
+            self.cached_tensors_indexer.clear()
+            self.cached_chunk_dev_ptrs_indexer.clear()
+            self.cached_chunk_ptrs_npu_indexer.clear()
             # the block ids will change after preemption
             self.allocated_block_ids = new_block_ids
             # reset the number of saved tokens
@@ -330,6 +421,15 @@ class WorkerRetrieveState:
     cached_tensors: list[list] = field(default_factory=list)
     cached_chunk_dev_ptrs: list[list[int]] = field(default_factory=list)
     cached_chunk_ptrs_npu: list[Optional[torch.Tensor]] = field(default_factory=list)
+    cached_keys_indexer: list[list] = field(default_factory=list)
+    cached_starts_indexer: list[int] = field(default_factory=list)
+    cached_ends_indexer: list[int] = field(default_factory=list)
+    cached_memory_objs_indexer: list[list] = field(default_factory=list)
+    cached_tensors_indexer: list[list] = field(default_factory=list)
+    cached_chunk_dev_ptrs_indexer: list[list[int]] = field(default_factory=list)
+    cached_chunk_ptrs_npu_indexer: list[Optional[torch.Tensor]] = field(
+        default_factory=list
+    )
     location: Optional[str] = None
     metadata_warm: bool = False
     token_count: int = 0
@@ -352,6 +452,15 @@ class ReqMeta:
     cached_tensors: list[list] = field(default_factory=list)
     cached_chunk_dev_ptrs: list[list[int]] = field(default_factory=list)
     cached_chunk_ptrs_npu: list[Optional[torch.Tensor]] = field(default_factory=list)
+    cached_keys_indexer: list[list] = field(default_factory=list)
+    cached_starts_indexer: list[int] = field(default_factory=list)
+    cached_ends_indexer: list[int] = field(default_factory=list)
+    cached_memory_objs_indexer: list[list] = field(default_factory=list)
+    cached_tensors_indexer: list[list] = field(default_factory=list)
+    cached_chunk_dev_ptrs_indexer: list[list[int]] = field(default_factory=list)
+    cached_chunk_ptrs_npu_indexer: list[Optional[torch.Tensor]] = field(
+        default_factory=list
+    )
     # Sparse decode only: shared with RequestTracker, reused across decode steps.
     decode_token_mask: Optional[torch.Tensor] = field(default=None, repr=False)
     decode_ret_mask: Optional[torch.Tensor] = field(default=None, repr=False)
@@ -593,6 +702,13 @@ class ReqMeta:
             cached_tensors=tracker.cached_tensors,
             cached_chunk_dev_ptrs=tracker.cached_chunk_dev_ptrs,
             cached_chunk_ptrs_npu=tracker.cached_chunk_ptrs_npu,
+            cached_keys_indexer=tracker.cached_keys_indexer,
+            cached_starts_indexer=tracker.cached_starts_indexer,
+            cached_ends_indexer=tracker.cached_ends_indexer,
+            cached_memory_objs_indexer=tracker.cached_memory_objs_indexer,
+            cached_tensors_indexer=tracker.cached_tensors_indexer,
+            cached_chunk_dev_ptrs_indexer=tracker.cached_chunk_dev_ptrs_indexer,
+            cached_chunk_ptrs_npu_indexer=tracker.cached_chunk_ptrs_npu_indexer,
             decode_token_mask=decode_token_mask,
             decode_ret_mask=decode_ret_mask,
         )
@@ -970,14 +1086,64 @@ class LMCacheConnectorV1Impl:
         kv_cache_gid > 0; otherwise fall back to an explicit
         indexer_slot_mapping attribute. Sliced to the latent hit count.
         """
-        idx_slot = getattr(attn_metadata, "slot_mapping", None)
+        attn_slot = getattr(attn_metadata, "slot_mapping", None)
+        idx_attr = getattr(attn_metadata, "indexer_slot_mapping", None)
+        # start_load_kv runs before the first forward layer; attn_metadata.slot_mapping
+        # is the latent group mapping. Prefer explicit indexer mapping when present.
+        idx_slot = idx_attr
+        source = "attn.indexer_slot_mapping" if idx_attr is not None else None
         if idx_slot is None:
-            idx_slot = getattr(attn_metadata, "indexer_slot_mapping", None)
+            idx_slot = attn_slot
+            source = "attn.slot_mapping" if attn_slot is not None else None
         if idx_slot is None:
+            _agent_debug_log(
+                "vllm_v1_adapter:_indexer_retrieve_slot_mapping",
+                "no indexer slot mapping available",
+                {
+                    "lmcache_cached_tokens": lmcache_cached_tokens,
+                    "has_attn_slot_mapping": attn_slot is not None,
+                    "has_indexer_slot_mapping": idx_attr is not None,
+                },
+                hypothesis_id="B",
+            )
             return None
         idx_slot = idx_slot.to(device=self.device, dtype=torch.long)
         if lmcache_cached_tokens < len(idx_slot):
             idx_slot = idx_slot[:lmcache_cached_tokens]
+        _agent_debug_log(
+            "vllm_v1_adapter:_indexer_retrieve_slot_mapping",
+            "indexer retrieve slot mapping",
+            {
+                "lmcache_cached_tokens": lmcache_cached_tokens,
+                "source": source,
+                "idx_slot_len": len(idx_slot),
+                "idx_slot_head": _tensor_head(idx_slot),
+                "attn_slot_head": _tensor_head(
+                    attn_slot.to(dtype=torch.long) if attn_slot is not None else None
+                ),
+                "indexer_attr_head": _tensor_head(
+                    idx_attr.to(dtype=torch.long) if idx_attr is not None else None
+                ),
+            },
+            hypothesis_id="A",
+        )
+        return idx_slot
+
+    def _sparse_indexer_slot_mapping(
+        self,
+        attn_metadata,
+        latent_sparse_slots: torch.Tensor,
+        lmcache_cached_tokens: int,
+    ) -> torch.Tensor:
+        """Indexer slots for sparse decode, aligned to the latent sparse window."""
+        sparse_len = len(latent_sparse_slots)
+        idx_slot = self._indexer_retrieve_slot_mapping(
+            attn_metadata, lmcache_cached_tokens
+        )
+        if idx_slot is None or idx_slot.numel() == 0:
+            return latent_sparse_slots
+        if idx_slot.numel() >= sparse_len:
+            return idx_slot[:sparse_len]
         return idx_slot
 
     # TODO(chunxiaozheng): in the latest lmcache_connector, we use `register_kv_caches`
@@ -1197,6 +1363,13 @@ class LMCacheConnectorV1Impl:
         request.cached_tensors = state.cached_tensors
         request.cached_chunk_dev_ptrs = state.cached_chunk_dev_ptrs
         request.cached_chunk_ptrs_npu = state.cached_chunk_ptrs_npu
+        request.cached_keys_indexer = state.cached_keys_indexer
+        request.cached_starts_indexer = state.cached_starts_indexer
+        request.cached_ends_indexer = state.cached_ends_indexer
+        request.cached_memory_objs_indexer = state.cached_memory_objs_indexer
+        request.cached_tensors_indexer = state.cached_tensors_indexer
+        request.cached_chunk_dev_ptrs_indexer = state.cached_chunk_dev_ptrs_indexer
+        request.cached_chunk_ptrs_npu_indexer = state.cached_chunk_ptrs_npu_indexer
         return state
 
     def _save_worker_retrieve_state_from_request(
@@ -1219,6 +1392,13 @@ class LMCacheConnectorV1Impl:
             cached_tensors=request.cached_tensors,
             cached_chunk_dev_ptrs=request.cached_chunk_dev_ptrs,
             cached_chunk_ptrs_npu=request.cached_chunk_ptrs_npu,
+            cached_keys_indexer=request.cached_keys_indexer,
+            cached_starts_indexer=request.cached_starts_indexer,
+            cached_ends_indexer=request.cached_ends_indexer,
+            cached_memory_objs_indexer=request.cached_memory_objs_indexer,
+            cached_tensors_indexer=request.cached_tensors_indexer,
+            cached_chunk_dev_ptrs_indexer=request.cached_chunk_dev_ptrs_indexer,
+            cached_chunk_ptrs_npu_indexer=request.cached_chunk_ptrs_npu_indexer,
             location=location,
             metadata_warm=metadata_warm,
             token_count=token_count,
@@ -1377,6 +1557,23 @@ class LMCacheConnectorV1Impl:
             token_mask = self._load_token_mask_for_retrieve(
                 request, token_count, self._lmcache_chunk_size
             )
+            _agent_debug_log(
+                "vllm_v1_adapter:start_load_kv",
+                "retrieve plan",
+                {
+                    "req_id": request.req_id,
+                    "is_sparse_decode": request.is_sparse_decode,
+                    "lmcache_cached_tokens": lmcache_cached_tokens,
+                    "vllm_cached_tokens": request.load_spec.vllm_cached_tokens,
+                    "prompt_len": len(request.token_ids),
+                    "token_count": token_count,
+                    "mask_load_true": int(token_mask.sum().item()),
+                    "mask_load_false": int((~token_mask).sum().item()),
+                    "latent_slot_len": len(slot_mapping),
+                    "latent_slot_head": _tensor_head(slot_mapping),
+                },
+                hypothesis_id="C",
+            )
             if (
                 not request.is_sparse_decode
                 and token_count > len(slot_mapping)
@@ -1417,20 +1614,19 @@ class LMCacheConnectorV1Impl:
                     else:
                         bound_state = None
 
+                    dsa_two_groups = self._is_dsa_two_groups()
+                    latent_cache = _retrieve_cache_kwargs(
+                        request, kv_group=0, dsa_two_groups=dsa_two_groups
+                    )
                     retrieve_kwargs: dict[str, Any] = {
                         "kvcaches": kvcaches,
                         "slot_mapping": slot_mapping,
                         "vllm_cached_tokens": request.load_spec.vllm_cached_tokens,
                         "lmcache_cached_tokens": request.load_spec.lmcache_cached_tokens,
                         "sync": sync,
-                        "cached_keys": request.cached_keys,
-                        "cached_starts": request.cached_starts,
-                        "cached_ends": request.cached_ends,
-                        "cached_memory_objs": request.cached_memory_objs,
-                        "cached_tensors": request.cached_tensors,
-                        "cached_chunk_dev_ptrs": request.cached_chunk_dev_ptrs,
-                        "cached_chunk_ptrs_npu": request.cached_chunk_ptrs_npu,
+                        "kv_group": 0,
                         "req_id": request.req_id,
+                        **latent_cache,
                     }
                     retrieve_kwargs.update(
                         self._sparse_decode_retrieve_warm_kwargs(
@@ -1454,13 +1650,74 @@ class LMCacheConnectorV1Impl:
                         retrieve_kwargs.get("_retrieve_metadata_warm")
                     )
                     metadata_warm = bool(kwargs_metadata_warm or request.cached_keys)
+
+                    indexer_retriever = None
+                    indexer_sparse_slots = slot_mapping
+                    if dsa_two_groups and self._kvcaches_for_group(1):
+                        indexer_sparse_slots = self._sparse_indexer_slot_mapping(
+                            attn_metadata,
+                            slot_mapping,
+                            request.load_spec.lmcache_cached_tokens,
+                        )
+                        indexer_cache = _retrieve_cache_kwargs(
+                            request, kv_group=1, dsa_two_groups=True
+                        )
+                        indexer_retrieve_kwargs: dict[str, Any] = {
+                            "kvcaches": self._kvcaches_for_group(1),
+                            "slot_mapping": indexer_sparse_slots,
+                            "vllm_cached_tokens": request.load_spec.vllm_cached_tokens,
+                            "lmcache_cached_tokens": request.load_spec.lmcache_cached_tokens,
+                            "sync": sync,
+                            "kv_group": 1,
+                            "req_id": request.req_id,
+                            **indexer_cache,
+                        }
+                        if request.decode_ret_mask is not None:
+                            indexer_retrieve_kwargs["ret_mask"] = request.decode_ret_mask
+                        indexer_retriever = (
+                            self.lmcache_engine.retrieve_layer_head_token_wise(
+                                retrieve_tokens,
+                                token_mask,
+                                **indexer_retrieve_kwargs,
+                            )
+                        )
+                        next(indexer_retriever)
+
+                    _agent_debug_log(
+                        "vllm_v1_adapter:start_load_kv",
+                        "sparse decode retrieve",
+                        {
+                            "req_id": request.req_id,
+                            "latent_cached_tensors_l0": len(
+                                request.cached_tensors[0]
+                            )
+                            if request.cached_tensors
+                            else 0,
+                            "indexer_cached_tensors_l0": len(
+                                request.cached_tensors_indexer[0]
+                            )
+                            if request.cached_tensors_indexer
+                            else 0,
+                            "indexer_retriever_created": indexer_retriever is not None,
+                            "latent_sparse_slot_head": _tensor_head(slot_mapping),
+                            "indexer_sparse_slot_head": _tensor_head(
+                                indexer_sparse_slots
+                            ),
+                            "sparse_slots_match_head": _tensor_head(slot_mapping)
+                            == _tensor_head(indexer_sparse_slots),
+                        },
+                        hypothesis_id="E",
+                    )
+
                     self._save_worker_retrieve_state_from_request(
                         request,
                         location=location,
                         metadata_warm=metadata_warm,
                         token_count=token_count,
                     )
-                    self.layerwise_retrievers.append((layerwise_retriever, None))
+                    self.layerwise_retrievers.append(
+                        (layerwise_retriever, indexer_retriever)
+                    )
                     self._layerwise_retriever_is_sparse.append(True)
                 else:
                     retrieve_slot_mapping = slot_mapping
@@ -1484,6 +1741,7 @@ class LMCacheConnectorV1Impl:
                     # indexer KV via the indexer slot mapping. Decode stays
                     # latent-only (this branch is prefill/prefix, not sparse).
                     indexer_retriever = None
+                    idx_slot = None
                     if (
                         self._is_dsa_two_groups()
                         and self._kvcaches_for_group(1)
@@ -1503,6 +1761,24 @@ class LMCacheConnectorV1Impl:
                             )
                             next(indexer_retriever)
                             next(indexer_retriever)
+
+                    _agent_debug_log(
+                        "vllm_v1_adapter:start_load_kv",
+                        "two-group prefill retrieve",
+                        {
+                            "req_id": request.req_id,
+                            "indexer_retriever_created": indexer_retriever is not None,
+                            "indexer_kvcaches": len(self._kvcaches_for_group(1)),
+                            "latent_slot_head": _tensor_head(slot_mapping),
+                            "indexer_slot_head": _tensor_head(idx_slot),
+                            "slots_match_head": (
+                                _tensor_head(slot_mapping) == _tensor_head(idx_slot)
+                                if idx_slot is not None
+                                else None
+                            ),
+                        },
+                        hypothesis_id="A",
+                    )
 
                     self.layerwise_retrievers.append(
                         (layerwise_retriever, indexer_retriever)
@@ -1691,6 +1967,10 @@ class LMCacheConnectorV1Impl:
                 ret_token_mask = layerwise_retriever.send(
                     (selected_tokens_per_req, token_start_index_per_req)
                 )
+                if indexer_retriever is not None:
+                    indexer_retriever.send(
+                        (selected_tokens_per_req, token_start_index_per_req)
+                    )
                 decode_row += 1
             else:
                 ret_token_mask = next(layerwise_retriever)
@@ -1838,13 +2118,35 @@ class LMCacheConnectorV1Impl:
                 # metadata and is the latent group 0 slot mapping).
                 if is_indexer_layer:
                     idx_slot = getattr(attn_metadata, "slot_mapping", None)
+                    save_slot_source = "request.slot_mapping"
                     if idx_slot is not None:
                         slot_mapping = idx_slot.to(
                             device=self.device, dtype=torch.long
                         )
+                        save_slot_source = "attn.slot_mapping"
                     elif getattr(attn_metadata, "indexer_slot_mapping", None) is not None:
                         slot_mapping = attn_metadata.indexer_slot_mapping.to(
                             device=self.device, dtype=torch.long
+                        )
+                        save_slot_source = "attn.indexer_slot_mapping"
+                    if (
+                        self._indexer_layer_names
+                        and layer_name == self._indexer_layer_names[0]
+                    ):
+                        _agent_debug_log(
+                            "vllm_v1_adapter:save_kv_layer",
+                            "indexer save slot mapping",
+                            {
+                                "req_id": request.req_id,
+                                "layer_name": layer_name,
+                                "save_slot_source": save_slot_source,
+                                "slot_len": len(slot_mapping),
+                                "slot_head": _tensor_head(slot_mapping),
+                                "request_slot_head": _tensor_head(
+                                    request.slot_mapping[0].to(dtype=torch.long)
+                                ),
+                            },
+                            hypothesis_id="D",
                         )
 
                 if self.kv_role == "kv_producer":
@@ -1876,6 +2178,11 @@ class LMCacheConnectorV1Impl:
 
                 # TODO (Jiayi): need to make layerwise storing
                 # compatible with disagg spec
+                group_cache = _retrieve_cache_kwargs(
+                    request,
+                    kv_group=kv_group,
+                    dsa_two_groups=dsa_two_groups,
+                )
                 layerwise_storer = self.lmcache_engine.store_layer(
                     token_ids,
                     mask=store_mask,
@@ -1885,11 +2192,7 @@ class LMCacheConnectorV1Impl:
                     sync=is_first,
                     req_id=request.req_id,
                     kv_group=kv_group,
-                    cached_keys = request.cached_keys,
-                    cached_starts=request.cached_starts,
-                    cached_ends=request.cached_ends,
-                    cached_memory_objs=request.cached_memory_objs,
-                    cached_tensors=request.cached_tensors,
+                    **group_cache,
                 )
                 self._layerwise_save_storers[
                     (request.req_id, kv_group)
