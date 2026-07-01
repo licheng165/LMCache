@@ -1692,37 +1692,10 @@ class LMCacheConnectorV1Impl:
                     )
                     metadata_warm = bool(kwargs_metadata_warm or request.cached_keys)
 
+                    # Sparse decode reloads latent KV from LMCache warm cache only.
+                    # Indexer KV stays in vLLM's GPU cache from prefill; prefix
+                    # hit (non-sparse branch below) loads both groups.
                     indexer_retriever = None
-                    indexer_sparse_slots = slot_mapping
-                    if dsa_two_groups and self._kvcaches_for_group(1):
-                        indexer_sparse_slots = self._sparse_indexer_slot_mapping(
-                            attn_metadata,
-                            slot_mapping,
-                            request.load_spec.lmcache_cached_tokens,
-                        )
-                        indexer_cache = _retrieve_cache_kwargs(
-                            request, kv_group=1, dsa_two_groups=True
-                        )
-                        indexer_retrieve_kwargs: dict[str, Any] = {
-                            "kvcaches": self._kvcaches_for_group(1),
-                            "slot_mapping": indexer_sparse_slots,
-                            "vllm_cached_tokens": request.load_spec.vllm_cached_tokens,
-                            "lmcache_cached_tokens": request.load_spec.lmcache_cached_tokens,
-                            "sync": sync,
-                            "kv_group": 1,
-                            "req_id": request.req_id,
-                            **indexer_cache,
-                        }
-                        if request.decode_ret_mask is not None:
-                            indexer_retrieve_kwargs["ret_mask"] = request.decode_ret_mask
-                        indexer_retriever = (
-                            self.lmcache_engine.retrieve_layer_head_token_wise(
-                                retrieve_tokens,
-                                token_mask,
-                                **indexer_retrieve_kwargs,
-                            )
-                        )
-                        next(indexer_retriever)
 
                     _agent_debug_log(
                         "vllm_v1_adapter:start_load_kv",
@@ -1741,13 +1714,9 @@ class LMCacheConnectorV1Impl:
                             )
                             if request.cached_tensors_indexer
                             else 0,
-                            "indexer_retriever_created": indexer_retriever is not None,
+                            "indexer_retriever_created": False,
+                            "latent_only_sparse_decode": True,
                             "latent_sparse_slot_head": _tensor_head(slot_mapping),
-                            "indexer_sparse_slot_head": _tensor_head(
-                                indexer_sparse_slots
-                            ),
-                            "sparse_slots_match_head": _tensor_head(slot_mapping)
-                            == _tensor_head(indexer_sparse_slots),
                         },
                         hypothesis_id="E",
                     )
