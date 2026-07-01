@@ -57,31 +57,6 @@ if TYPE_CHECKING:
 
 logger = init_logger(__name__)
 
-# #region agent log
-import json as _dbg_json
-import time as _dbg_time
-
-_DBG_LOG_PATH = "debug-792df4.log"
-_DBG_SESSION = "792df4"
-
-
-def _dbg_log(message, data, location="vllm_v1_adapter.py"):
-    """Append one NDJSON line to the debug log file (debug mode instrumentation)."""
-    try:
-        line = _dbg_json.dumps({
-            "sessionId": _DBG_SESSION,
-            "id": f"log_{int(_dbg_time.time()*1000)}",
-            "timestamp": int(_dbg_time.time() * 1000),
-            "location": location,
-            "message": message,
-            "data": data,
-        })
-        with open(_DBG_LOG_PATH, "a") as _f:
-            _f.write(line + "\n")
-    except Exception:
-        pass
-# #endregion
-
 SPARSE_DECODE_RETRIEVE_TOKENS = int(
     os.environ.get("LMCACHE_SPARSE_DECODE_RETRIEVE_TOKENS", "2048")
 )
@@ -964,17 +939,6 @@ class LMCacheConnectorV1Impl:
                 self._latent_kvcaches.append(kv_cache)
         # Backward-compatible flat list = latent group (the default group).
         self._kvcaches_list = self._latent_kvcaches
-        # #region agent log
-        _dbg_log("refresh_kvcaches_list", {
-            "dsa_two_groups": dsa_two_groups,
-            "total_kv_caches": len(self.kv_caches),
-            "latent_count": len(self._latent_kvcaches),
-            "indexer_count": len(self._indexer_kvcaches),
-            "num_layers": getattr(self, "num_layers", None),
-            "latent_names": list(self._latent_layer_names)[:5],
-            "indexer_names": list(self._indexer_layer_names)[:5],
-        })
-        # #endregion
         if dsa_two_groups and len(self._indexer_kvcaches) == 0:
             logger.warning(
                 "dsa_two_groups is enabled but no indexer KV caches were "
@@ -1832,17 +1796,6 @@ class LMCacheConnectorV1Impl:
                         (request.req_id, kv_group), None
                     )
                     layerwise_storer = None
-                    # #region agent log
-                    _counts = getattr(self, "_dbg_next_counts", None)
-                    if _counts is not None:
-                        _counts[(request.req_id, kv_group)] = 0
-                    _dbg_log("forward_boundary_recreate", {
-                        "req_id": request.req_id,
-                        "kv_group": kv_group,
-                        "layer_name": layer_name,
-                        "num_layers": getattr(self, "num_layers", None),
-                    })
-                    # #endregion
             if layerwise_storer is None:
                 token_ids = request.token_ids
                 assert isinstance(token_ids, list)
@@ -1926,39 +1879,7 @@ class LMCacheConnectorV1Impl:
                 if is_first:
                     is_first = False
 
-            # #region agent log
-            _counts = getattr(self, "_dbg_next_counts", None)
-            if _counts is None:
-                _counts = {}
-                self._dbg_next_counts = _counts
-            _ck = (request.req_id, kv_group)
-            _counts[_ck] = _counts.get(_ck, 0) + 1
-            _dbg_log("save_kv_layer_next", {
-                "req_id": request.req_id,
-                "kv_group": kv_group,
-                "layer_name": layer_name,
-                "is_new_storer": _counts[_ck] == 1,
-                "next_count": _counts[_ck],
-                "num_layers": getattr(self, "num_layers", None),
-                "latent_count": len(self._latent_kvcaches),
-                "indexer_count": len(self._indexer_kvcaches),
-                "storer_id": id(layerwise_storer),
-            })
-            try:
-                next(layerwise_storer)
-            except StopIteration:
-                _dbg_log("save_kv_layer_StopIteration", {
-                    "req_id": request.req_id,
-                    "kv_group": kv_group,
-                    "layer_name": layer_name,
-                    "next_count": _counts[_ck],
-                    "num_layers": getattr(self, "num_layers", None),
-                    "latent_count": len(self._latent_kvcaches),
-                    "indexer_count": len(self._indexer_kvcaches),
-                    "storer_id": id(layerwise_storer),
-                })
-                raise
-            # #endregion
+            next(layerwise_storer)
 
     @_lmcache_nvtx_annotate
     def wait_for_save(self):
@@ -1966,16 +1887,6 @@ class LMCacheConnectorV1Impl:
 
         connector_metadata = self._parent._get_connector_metadata()
         assert isinstance(connector_metadata, LMCacheConnectorMetadata)
-        # #region agent log
-        _dbg_log("wait_for_save_entry", {
-            "kv_role": getattr(self, "kv_role", None),
-            "use_layerwise": getattr(self, "use_layerwise", None),
-            "num_requests": len(connector_metadata.requests),
-            "req_ids": [getattr(r, "req_id", None) for r in connector_metadata.requests],
-            "storer_keys": list(self._layerwise_save_storers.keys()),
-            "next_counts": dict(getattr(self, "_dbg_next_counts", {})),
-        })
-        # #endregion
 
         if self.kv_role == "kv_consumer":
             # Don't do save if the role is kv_consumer
@@ -1997,29 +1908,11 @@ class LMCacheConnectorV1Impl:
                     layerwise_storer = self._layerwise_save_storers.pop(
                         (request.req_id, _kv_group), None
                     )
-                    # #region agent log
-                    _counts = getattr(self, "_dbg_next_counts", {})
-                    _dbg_log("wait_for_save_pop", {
-                        "req_id": request.req_id,
-                        "kv_group": _kv_group,
-                        "had_storer": layerwise_storer is not None,
-                        "next_count_so_far": _counts.get(
-                            (request.req_id, _kv_group), 0
-                        ),
-                        "num_layers": getattr(self, "num_layers", None),
-                    })
-                    # #endregion
                     if layerwise_storer is not None:
                         try:
                             next(layerwise_storer)
                         except StopIteration:
                             pass
-                # #region agent log
-                _counts = getattr(self, "_dbg_next_counts", None)
-                if _counts is not None:
-                    _counts.pop((request.req_id, 0), None)
-                    _counts.pop((request.req_id, 1), None)
-                # #endregion
                 self._maybe_lookup_unpin_for_request(request)
             return
 
