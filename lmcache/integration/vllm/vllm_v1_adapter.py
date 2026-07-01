@@ -99,7 +99,13 @@ def _agent_debug_log(
 
 
 # #region agent log
-def _dbg_log_792df4(message, data, hypothesis_id="H1", run_id="pre-fix"):
+def _dbg_log_792df4(
+    message,
+    data,
+    hypothesis_id="H1",
+    run_id="pre-fix",
+    location="vllm_v1_adapter",
+):
     """792df4 debug session instrumentation (writes to debug-792df4.log)."""
     try:
         import json as _j
@@ -112,7 +118,7 @@ def _dbg_log_792df4(message, data, hypothesis_id="H1", run_id="pre-fix"):
                         "sessionId": "792df4",
                         "runId": run_id,
                         "hypothesisId": hypothesis_id,
-                        "location": "vllm_v1_adapter:save_kv_layer",
+                        "location": location,
                         "message": message,
                         "data": data,
                         "timestamp": int(_t.time() * 1000),
@@ -122,6 +128,47 @@ def _dbg_log_792df4(message, data, hypothesis_id="H1", run_id="pre-fix"):
             )
     except OSError:
         pass
+
+
+def _dbg_tp_rank():
+    try:
+        from vllm.distributed.parallel_state import get_tensor_model_parallel_rank
+
+        return get_tensor_model_parallel_rank()
+    except Exception:
+        return None
+
+
+def _dbg_kv_cache_capacity(kvcaches):
+    if not kvcaches:
+        return {"kvcaches_shape": [], "kvcaches_capacity": 0}
+    _kc0 = kvcaches[0]
+    if isinstance(_kc0, (list, tuple)):
+        _kc0 = _kc0[0] if _kc0 else None
+    _kc_shape = list(_kc0.shape) if _kc0 is not None else []
+    _capacity = _kc_shape[0] * _kc_shape[1] if len(_kc_shape) >= 2 else 0
+    return {"kvcaches_shape": _kc_shape, "kvcaches_capacity": _capacity}
+
+
+def _dbg_slot_bounds(slot_mapping, kvcaches):
+    cap = _dbg_kv_cache_capacity(kvcaches)
+    if slot_mapping is None or len(slot_mapping) == 0:
+        return {
+            **cap,
+            "slot_len": 0,
+            "slot_min": None,
+            "slot_max": None,
+            "oob": False,
+        }
+    _smin = int(slot_mapping.min().item())
+    _smax = int(slot_mapping.max().item())
+    return {
+        **cap,
+        "slot_len": len(slot_mapping),
+        "slot_min": _smin,
+        "slot_max": _smax,
+        "oob": _smax >= cap["kvcaches_capacity"],
+    }
 # #endregion
 
 
@@ -1964,6 +2011,34 @@ class LMCacheConnectorV1Impl:
             token_mask = self._load_token_mask_for_retrieve(
                 request, token_count, self._lmcache_chunk_size
             )
+            # #region agent log
+            _dbg_log_792df4(
+                "start_load_kv retrieve plan",
+                {
+                    "req_id": request.req_id,
+                    "tp_rank": _dbg_tp_rank(),
+                    "can_load": True,
+                    "is_sparse_decode": request.is_sparse_decode,
+                    "lmcache_cached_tokens": lmcache_cached_tokens,
+                    "vllm_cached_tokens": request.load_spec.vllm_cached_tokens,
+                    "token_count": token_count,
+                    "latent_slot": _dbg_slot_bounds(
+                        slot_mapping, self._kvcaches_for_group(0)
+                    ),
+                    "indexer_slot": (
+                        _dbg_slot_bounds(
+                            request.indexer_slot_mapping[0].to(dtype=torch.long),
+                            self._kvcaches_for_group(1),
+                        )
+                        if self._is_dsa_two_groups()
+                        and request.indexer_slot_mapping
+                        else None
+                    ),
+                },
+                hypothesis_id="H_TP6",
+                location="vllm_v1_adapter:start_load_kv",
+            )
+            # #endregion
             _agent_debug_log(
                 "vllm_v1_adapter:start_load_kv",
                 "retrieve plan",
@@ -2451,6 +2526,21 @@ class LMCacheConnectorV1Impl:
         if not self.layerwise_retrievers:
             return
 
+        # #region agent log
+        if self.current_layer == 0:
+            _dbg_log_792df4(
+                "wait_for_layer_load layer0",
+                {
+                    "layer_name": layer_name,
+                    "tp_rank": _dbg_tp_rank(),
+                    "num_retrievers": len(self.layerwise_retrievers),
+                    "num_layers": getattr(self, "num_layers", None),
+                },
+                hypothesis_id="H_TP6",
+                location="vllm_v1_adapter:wait_for_layer_load",
+            )
+        # #endregion
+
         row_of_req = (
             {rid: row for row, rid in enumerate(request_ids)}
             if request_ids is not None
@@ -2539,6 +2629,7 @@ class LMCacheConnectorV1Impl:
             "save_kv_layer ENTRY",
             {
                 "layer_name": layer_name,
+                "tp_rank": _dbg_tp_rank(),
                 "use_layerwise": getattr(self, "use_layerwise", None),
                 "kv_role": getattr(self, "kv_role", None),
                 "has_connector_meta": (
@@ -2547,7 +2638,8 @@ class LMCacheConnectorV1Impl:
                     is not None
                 ),
             },
-            hypothesis_id="H_TP2",
+            hypothesis_id="H_TP7",
+            location="vllm_v1_adapter:save_kv_layer",
         )
         # #endregion
         assert self.lmcache_engine is not None
@@ -2576,21 +2668,22 @@ class LMCacheConnectorV1Impl:
         is_indexer_layer = dsa_two_groups and "indexer" in layer_name
         kv_group = 1 if is_indexer_layer else 0
         # #region agent log
-        # TEMPORARY diagnostic (H_TP2/isolation): force-skip the indexer save
-        # to determine whether the TP>1 NPU OOB crash originates in the
-        # lmcache indexer save path or in the model/vLLM graph itself.
-        if is_indexer_layer:
-            _dbg_log_792df4(
-                "indexer save FORCE-SKIPPED (TP>1 isolation diagnostic)",
-                {
-                    "layer_name": layer_name,
-                    "kv_group": kv_group,
-                    "num_kvcaches": len(self._kvcaches_for_group(1)),
-                    "num_layers": getattr(self, "num_layers", None),
-                },
-                hypothesis_id="H_TP2",
-            )
-            return
+        # H_TP7 isolation: skip ALL lmcache saves (latent + indexer). H_TP2
+        # proved indexer-only skip does not fix TP>1 crash; this tests whether
+        # ANY save path (including latent batched_from_gpu) is the trigger.
+        _dbg_log_792df4(
+            "ALL save FORCE-SKIPPED (save path isolation)",
+            {
+                "layer_name": layer_name,
+                "kv_group": kv_group,
+                "tp_rank": _dbg_tp_rank(),
+                "num_kvcaches": len(self._kvcaches_for_group(kv_group)),
+                "num_layers": getattr(self, "num_layers", None),
+            },
+            hypothesis_id="H_TP7",
+            location="vllm_v1_adapter:save_kv_layer",
+        )
+        return
         # #endregion
         # Pass only the current group's kv_caches so the connector's
         # batched_from_gpu iterates over the correct group's layer tensors
