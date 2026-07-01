@@ -1216,18 +1216,84 @@ class LMCacheConnectorV1Impl:
         """
         attn_slot = _am_get(attn_metadata, "slot_mapping", None)
         idx_attr = _am_get(attn_metadata, "indexer_slot_mapping", None)
-        idx_slot = self._indexer_slot_mapping_from_attn_metadata(
-            attn_metadata, layer_name
-        )
-        source = "indexer_slot_mapping_from_attn_metadata"
+        candidates: list[tuple[str, torch.Tensor]] = []
+
+        def add_candidate(source: str, slot_mapping) -> None:
+            if isinstance(slot_mapping, torch.Tensor):
+                candidates.append((source, slot_mapping))
+
+        if isinstance(attn_metadata, dict):
+            if layer_name is not None:
+                latent_layer_name = layer_name.replace(
+                    ".indexer.k_cache", ".attn"
+                )
+                latent_meta = attn_metadata.get(latent_layer_name)
+                if latent_meta is not None:
+                    add_candidate(
+                        "latent_meta.indexer_slot_mapping",
+                        getattr(latent_meta, "indexer_slot_mapping", None),
+                    )
+
+                meta = attn_metadata.get(layer_name)
+                if meta is not None:
+                    add_candidate(
+                        "indexer_meta.indexer_slot_mapping",
+                        getattr(meta, "indexer_slot_mapping", None),
+                    )
+                    add_candidate(
+                        "indexer_meta.slot_mapping",
+                        getattr(meta, "slot_mapping", None),
+                    )
+
+            for name, meta in attn_metadata.items():
+                if "indexer" in name:
+                    continue
+                add_candidate(
+                    "any_latent_meta.indexer_slot_mapping",
+                    getattr(meta, "indexer_slot_mapping", None),
+                )
+
+            for name, meta in attn_metadata.items():
+                if "indexer" not in name:
+                    continue
+                add_candidate(
+                    "any_indexer_meta.indexer_slot_mapping",
+                    getattr(meta, "indexer_slot_mapping", None),
+                )
+                add_candidate(
+                    "any_indexer_meta.slot_mapping",
+                    getattr(meta, "slot_mapping", None),
+                )
+        else:
+            add_candidate(
+                "attn_metadata.indexer_slot_mapping",
+                getattr(attn_metadata, "indexer_slot_mapping", None),
+            )
+            add_candidate(
+                "attn_metadata.slot_mapping",
+                getattr(attn_metadata, "slot_mapping", None),
+            )
+
+        idx_slot = None
+        source = "missing"
+        for candidate_source, candidate in candidates:
+            if len(candidate) >= lmcache_cached_tokens:
+                idx_slot = candidate
+                source = candidate_source
+                break
+
         if idx_slot is None:
             _agent_debug_log(
                 "vllm_v1_adapter:_indexer_retrieve_slot_mapping",
-                "no indexer slot mapping available",
+                "no full-length indexer slot mapping available",
                 {
                     "lmcache_cached_tokens": lmcache_cached_tokens,
                     "has_attn_slot_mapping": attn_slot is not None,
                     "has_indexer_slot_mapping": idx_attr is not None,
+                    "candidate_lengths": [
+                        {"source": candidate_source, "len": len(candidate)}
+                        for candidate_source, candidate in candidates
+                    ],
                 },
                 hypothesis_id="B",
             )
