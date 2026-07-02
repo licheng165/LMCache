@@ -99,6 +99,11 @@ class LMCacheConnectorV1Dynamic(KVConnectorBase_V1):
             layer_name, selected_tokens, token_start_index, request_ids
         )
 
+    def verify_decode_window_layer_load(self, layer_name: str, **kwargs) -> bool:
+        return self._lmcache_engine.verify_decode_window_layer_load(
+            layer_name, **kwargs
+        )
+
     def save_kv_layer(
         self,
         layer_name: str,
