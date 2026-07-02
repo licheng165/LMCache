@@ -294,10 +294,15 @@ class RequestTracker:
 
         mm_hashes, mm_positions = extract_mm_features(new_request, modify=True)
 
+        num_tokens_to_track = min(
+            len(new_request.prompt_token_ids),
+            max(num_tokens_to_compute, lmcache_cached_tokens),
+        )
+
         return RequestTracker(
             req_id=new_request.req_id,
             prompt_len=len(new_request.prompt_token_ids),
-            token_ids=new_request.prompt_token_ids[:num_tokens_to_compute].copy(),
+            token_ids=new_request.prompt_token_ids[:num_tokens_to_track].copy(),
             allocated_block_ids=unfolded_block_ids,
             allocated_block_ids_indexer=indexer_block_ids,
             num_saved_tokens=lmcache_cached_tokens,
@@ -614,7 +619,21 @@ class ReqMeta:
                     tracker.prompt_len,
                 )
         else:
-            token_ids = input_token_ids[:num_tokens_to_save]
+            retrieve_token_len = 0
+            if load_spec is not None and load_spec.can_load:
+                retrieve_token_len = load_spec.lmcache_cached_tokens
+            token_len = max(num_tokens_to_save, retrieve_token_len)
+            token_ids = input_token_ids[:token_len]
+            if retrieve_token_len > 0 and len(token_ids) < retrieve_token_len:
+                logger.warning(
+                    "Request %s prefix-hit token metadata is shorter than "
+                    "LMCache hit: tokens=%d lmcache_cached_tokens=%d "
+                    "prompt_len=%d",
+                    tracker.req_id,
+                    len(token_ids),
+                    retrieve_token_len,
+                    tracker.prompt_len,
+                )
 
             # If the request has multimodal hashes, apply them to the token ids
             if tracker.mm_hashes:
@@ -1292,11 +1311,9 @@ class LMCacheConnectorV1Impl:
             )
 
         idx_slot = None
-        source = "missing"
-        for candidate_source, candidate in candidates:
+        for _, candidate in candidates:
             if len(candidate) >= lmcache_cached_tokens:
                 idx_slot = candidate
-                source = candidate_source
                 break
 
         if idx_slot is None:
@@ -2083,7 +2100,6 @@ class LMCacheConnectorV1Impl:
                     # latent-only (this branch is prefill/prefix, not sparse).
                     indexer_retriever = None
                     idx_slot = None
-                    idx_slot_source = None
                     if (
                         self._is_dsa_two_groups()
                         and self._kvcaches_for_group(1)
@@ -2097,20 +2113,16 @@ class LMCacheConnectorV1Impl:
                             idx_slot = request.indexer_slot_mapping[0].to(
                                 device=self.device, dtype=torch.long
                             )
-                            idx_slot_source = "request.indexer_slot_mapping"
                             if lmcache_cached_tokens < len(idx_slot):
                                 idx_slot = idx_slot[:lmcache_cached_tokens]
                             if len(idx_slot) < lmcache_cached_tokens:
                                 idx_slot = None
-                                idx_slot_source = None
                         if idx_slot is None:
                             idx_slot = self._indexer_retrieve_slot_mapping(
                                 attn_metadata,
                                 lmcache_cached_tokens,
                                 indexer_layer_name,
                             )
-                            if idx_slot is not None:
-                                idx_slot_source = "attn_metadata"
                         if idx_slot is not None:
                             indexer_retriever = self.lmcache_engine.retrieve_layer(
                                 retrieve_tokens,
@@ -2575,7 +2587,6 @@ class LMCacheConnectorV1Impl:
                 token_ids = request.token_ids
                 assert isinstance(token_ids, list)
                 assert request.slot_mapping is not None and len(request.slot_mapping) > 0
-                save_slot_source = "request.slot_mapping"
                 if request.is_sparse_decode:
                     if request.slot_mapping[0].device.type != torch.device(
                         self.device
@@ -2601,20 +2612,10 @@ class LMCacheConnectorV1Impl:
                     idx_slot = self._indexer_slot_mapping_from_attn_metadata(
                         attn_metadata, layer_name
                     )
-                    save_slot_source = (
-                        "indexer_slot_mapping_from_attn_metadata"
-                        if idx_slot is not None
-                        else "missing"
-                    )
                     if idx_slot is not None:
                         slot_mapping = idx_slot.to(
                             device=self.device, dtype=torch.long
                         )
-                    if (
-                        self._indexer_layer_names
-                        and layer_name == self._indexer_layer_names[0]
-                    ):
-
                     if idx_slot is None:
                         logger.warning(
                             "Skipping DSA indexer save for layer %s: "
@@ -2639,7 +2640,6 @@ class LMCacheConnectorV1Impl:
                     )
 
                 if is_indexer_layer:
-                    raw_slot_len = len(slot_mapping)
                     slot_mapping = self._pad_chunk_local_slot_mapping(
                         slot_mapping,
                         total_tokens=len(token_ids),
