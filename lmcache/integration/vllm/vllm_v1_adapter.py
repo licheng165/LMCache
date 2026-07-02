@@ -169,6 +169,27 @@ def _dbg_slot_bounds(slot_mapping, kvcaches):
         "slot_max": _smax,
         "oob": _smax >= cap["kvcaches_capacity"],
     }
+
+
+def _dbg_sync_dsa_store_stream(engine, kv_group, layer_name, reason):
+    """Serialize interleaved latent/indexer store ops on one store_stream."""
+    conn = getattr(engine, "gpu_connector", None)
+    stream = getattr(conn, "store_stream", None)
+    if stream is None:
+        return
+    stream.synchronize()
+    _dbg_log_792df4(
+        "store_stream synchronized (dsa_two_groups)",
+        {
+            "kv_group": kv_group,
+            "layer_name": layer_name,
+            "reason": reason,
+            "tp_rank": _dbg_tp_rank(),
+        },
+        hypothesis_id="H_INTERLEAVE",
+        run_id="post-fix",
+        location="vllm_v1_adapter:save_kv_layer",
+    )
 # #endregion
 
 
@@ -3121,8 +3142,14 @@ class LMCacheConnectorV1Impl:
                                 "padded_slot_len": len(slot_mapping),
                                 "skip_leading_tokens": skip_leading_tokens,
                                 "total_tokens": len(token_ids),
+                                "active_slot_head": _tensor_head(
+                                    slot_mapping[
+                                        skip_leading_tokens : skip_leading_tokens + 4
+                                    ]
+                                ),
                             },
-                            hypothesis_id="H_LATENT",
+                            hypothesis_id="H_CHUNK",
+                            run_id="post-fix",
                             location="vllm_v1_adapter:save_kv_layer",
                         )
 
@@ -3280,6 +3307,13 @@ class LMCacheConnectorV1Impl:
                 self._layerwise_save_storers[storer_key] = layerwise_storer
 
             next(layerwise_storer)
+            if dsa_two_groups:
+                _dbg_sync_dsa_store_stream(
+                    self.lmcache_engine,
+                    kv_group,
+                    layer_name,
+                    "after_save_kv_layer",
+                )
 
     @_lmcache_nvtx_annotate
     def wait_for_save(self):
