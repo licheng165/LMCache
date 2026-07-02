@@ -983,6 +983,10 @@ class LMCacheConnectorV1Impl:
             Union[str, tuple[str, int]],
             Generator[Optional[torch.Tensor], None, None],
         ] = {}
+        # Under dsa_two_groups + TP>1, latent store_layer is deferred until
+        # after all indexer layers in a forward to avoid interleaved latent/
+        # indexer GPU transfers on store_stream (MTE OOB on chunk 2+).
+        self._deferred_latent_pending: set[str] = set()
         self._stats_monitor = LMCStatsMonitor.GetOrCreate()
         self.enable_sparse_attention = config.enable_sparse_attention
 
@@ -2669,6 +2673,123 @@ class LMCacheConnectorV1Impl:
 
         return
 
+    def _should_defer_latent_save_under_tp(self) -> bool:
+        if not getattr(self.config, "dsa_two_groups", False):
+            return False
+        meta = getattr(self.lmcache_engine, "metadata", None)
+        world_size = getattr(meta, "world_size", 1) if meta else 1
+        return world_size > 1
+
+    @staticmethod
+    def _drain_layerwise_storer_fully(storer) -> None:
+        if storer is None:
+            return
+        try:
+            while True:
+                next(storer)
+        except StopIteration:
+            pass
+
+    def _flush_deferred_latent_store(
+        self,
+        request: "ReqMeta",
+        save_spec: Optional["SaveSpec"],
+    ) -> None:
+        """Run a full latent store_layer after indexer layers finish (TP>1)."""
+        if request.req_id not in self._deferred_latent_pending:
+            return
+        if save_spec is None or not save_spec.can_save_latent:
+            self._deferred_latent_pending.discard(request.req_id)
+            return
+
+        self._refresh_kvcaches_list()
+        kvcaches = self._kvcaches_for_group(0)
+        if not kvcaches:
+            self._deferred_latent_pending.discard(request.req_id)
+            return
+
+        token_ids = request.token_ids
+        assert isinstance(token_ids, list)
+        assert request.slot_mapping is not None and len(request.slot_mapping) > 0
+        if request.is_sparse_decode:
+            if request.slot_mapping[0].device.type != torch.device(self.device).type:
+                request.slot_mapping[0] = request.slot_mapping[0].to(
+                    device=self.device, dtype=torch.long
+                )
+            slot_mapping = request.slot_mapping[0]
+        else:
+            slot_mapping = request.slot_mapping[0].to(
+                device=self.device, dtype=torch.long
+            )
+
+        if self.kv_role == "kv_producer":
+            skip_leading_tokens = 0
+        else:
+            skip_leading_tokens = save_spec.skip_leading_tokens
+            if skip_leading_tokens == len(token_ids):
+                self._deferred_latent_pending.discard(request.req_id)
+                return
+            skip_leading_tokens = (
+                skip_leading_tokens
+                // self._lmcache_chunk_size
+                * self._lmcache_chunk_size
+            )
+
+        store_mask = torch.ones(len(token_ids), dtype=torch.bool)
+        store_mask[:skip_leading_tokens] = False
+
+        store_kwargs: dict[str, Any] = {
+            "cached_keys": request.cached_keys,
+            "cached_starts": request.cached_starts,
+            "cached_ends": request.cached_ends,
+            "cached_memory_objs": request.cached_memory_objs,
+            "cached_tensors": request.cached_tensors,
+        }
+
+        # #region agent log
+        _dbg_log_792df4(
+            "deferred latent flush start",
+            {
+                "req_id": request.req_id,
+                "tp_rank": _dbg_tp_rank(),
+                "token_ids_len": len(token_ids),
+                "skip_leading_tokens": skip_leading_tokens,
+                "slot": _dbg_slot_bounds(slot_mapping, kvcaches),
+                "num_latent_layers": len(kvcaches),
+            },
+            hypothesis_id="H_DEFER",
+            run_id="post-fix",
+            location="vllm_v1_adapter:_flush_deferred_latent_store",
+        )
+        # #endregion
+
+        storer = self.lmcache_engine.store_layer(
+            token_ids,
+            mask=store_mask,
+            kvcaches=kvcaches,
+            slot_mapping=slot_mapping,
+            offset=skip_leading_tokens,
+            sync=True,
+            req_id=request.req_id,
+            **store_kwargs,
+        )
+        self._drain_layerwise_storer_fully(storer)
+        self._deferred_latent_pending.discard(request.req_id)
+
+        # #region agent log
+        _dbg_log_792df4(
+            "deferred latent flush done",
+            {
+                "req_id": request.req_id,
+                "tp_rank": _dbg_tp_rank(),
+                "skip_leading_tokens": skip_leading_tokens,
+            },
+            hypothesis_id="H_DEFER",
+            run_id="post-fix",
+            location="vllm_v1_adapter:_flush_deferred_latent_store",
+        )
+        # #endregion
+
     @_lmcache_nvtx_annotate
     def save_kv_layer(
         self,
@@ -2762,6 +2883,14 @@ class LMCacheConnectorV1Impl:
                     continue
                 if not is_indexer_layer and not save_spec.can_save_latent:
                     continue
+
+            # TP>1 + dsa_two_groups: skip interleaved latent saves during
+            # forward; flush the full latent store after the last indexer
+            # layer (or in wait_for_save as fallback).
+            if self._should_defer_latent_save_under_tp() and not is_indexer_layer:
+                if save_spec is not None and save_spec.can_save_latent:
+                    self._deferred_latent_pending.add(request.req_id)
+                continue
 
             storer_key = self._save_storer_key(request.req_id, kv_group)
             layerwise_storer = self._layerwise_save_storers.get(storer_key)
@@ -3299,6 +3428,14 @@ class LMCacheConnectorV1Impl:
 
             next(layerwise_storer)
 
+            if (
+                is_indexer_layer
+                and self._should_defer_latent_save_under_tp()
+                and self._indexer_layer_names
+                and layer_name == self._indexer_layer_names[-1]
+            ):
+                self._flush_deferred_latent_store(request, save_spec)
+
     @_lmcache_nvtx_annotate
     def wait_for_save(self):
         """Blocking until the KV cache is saved to the connector buffer."""
@@ -3319,6 +3456,12 @@ class LMCacheConnectorV1Impl:
             return
 
         if self.use_layerwise:
+            if self._should_defer_latent_save_under_tp():
+                for request in connector_metadata.requests:
+                    if request.req_id in self._deferred_latent_pending:
+                        self._flush_deferred_latent_store(
+                            request, request.save_spec
+                        )
             for request in connector_metadata.requests:
                 # Drain both the latent (kv_group=0) and indexer (kv_group=1)
                 # storers for this request.
@@ -3327,10 +3470,7 @@ class LMCacheConnectorV1Impl:
                         self._save_storer_key(request.req_id, _kv_group), None
                     )
                     if layerwise_storer is not None:
-                        try:
-                            next(layerwise_storer)
-                        except StopIteration:
-                            pass
+                        self._drain_layerwise_storer_fully(layerwise_storer)
                 self._maybe_seed_worker_retrieve_state_from_store(request)
                 self._maybe_lookup_unpin_for_request(request)
             return
