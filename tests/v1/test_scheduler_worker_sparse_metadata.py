@@ -8,6 +8,7 @@ from unittest.mock import MagicMock
 
 # Third Party
 import pytest
+import torch
 
 pytest.importorskip("vllm")
 
@@ -146,6 +147,58 @@ class TestBuildConnectorMetaSparseSyntheticLoadSpec:
         req_meta = meta.requests[0]
         assert req_meta.token_ids == sparse_tokens
         assert tracker.sparse_token_ids == sparse_tokens
+
+    def test_decode_window_sparse_load_uses_current_window_start(self) -> None:
+        impl = _make_scheduler_impl()
+        impl._decode_window_save_window_size = 256
+
+        req_id = "sparse-window"
+        prompt_len = 356
+        prompt = list(range(prompt_len))
+        decode_tokens = list(range(10_000, 10_157))
+        all_tokens = prompt + decode_tokens
+        vllm_req = SimpleNamespace(
+            request_id=req_id,
+            num_prompt_tokens=prompt_len,
+            prompt_token_ids=prompt,
+            num_computed_tokens=512,
+            all_token_ids=all_tokens,
+        )
+
+        impl._unfinished_requests[req_id] = vllm_req
+        tracker = RequestTracker(
+            req_id=req_id,
+            prompt_len=prompt_len,
+            token_ids=all_tokens[:512],
+            allocated_block_ids=list(range(40)),
+            num_saved_tokens=256,
+        )
+        tracker.is_decode_phase = True
+        tracker.sparse_token_ids = all_tokens[:256]
+        tracker.sparse_slot_mapping = [torch.arange(256)]
+        impl._request_trackers[req_id] = tracker
+
+        scheduler_output = StubSchedulerOutput(
+            finished_req_ids=set(),
+            scheduled_new_reqs=[],
+            scheduled_cached_reqs=StubCachedRequestData(
+                req_ids=[req_id],
+                new_token_ids=[[all_tokens[512]]],
+                new_block_ids=[[]],
+            ),
+            num_scheduled_tokens={req_id: 1},
+        )
+
+        meta = impl.build_connector_meta(scheduler_output)
+        req_meta = next(req for req in meta.requests if req.is_sparse_decode)
+
+        assert req_meta.load_spec is not None
+        assert req_meta.load_spec.can_load is True
+        assert req_meta.load_spec.lmcache_cached_tokens == 512
+        assert req_meta.token_ids == all_tokens[:512]
+        assert tracker.sparse_token_ids == all_tokens[:512]
+        assert req_meta.slot_mapping[0].numel() == 512
+        assert tracker.sparse_slot_mapping[0].numel() == 512
 
 
 class TestZombieRequestInMetadata:
