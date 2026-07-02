@@ -150,23 +150,6 @@ def _dbg_kv_cache_capacity(kvcaches):
     return {"kvcaches_shape": _kc_shape, "kvcaches_capacity": _capacity}
 
 
-def _dbg_sync_store_stream(engine, reason: str) -> None:
-    """Flush async layerwise store ops before the next forward."""
-    conn = getattr(engine, "gpu_connector", None)
-    stream = getattr(conn, "store_stream", None)
-    if stream is None:
-        return
-    stream.synchronize()
-    # #region agent log
-    _dbg_log_792df4(
-        "store_stream synchronized",
-        {"reason": reason},
-        hypothesis_id="H_ASYNC",
-        location="vllm_v1_adapter:_dbg_sync_store_stream",
-    )
-    # #endregion
-
-
 def _dbg_slot_bounds(slot_mapping, kvcaches):
     cap = _dbg_kv_cache_capacity(kvcaches)
     if slot_mapping is None or len(slot_mapping) == 0:
@@ -2717,6 +2700,28 @@ class LMCacheConnectorV1Impl:
         dsa_two_groups = getattr(self.config, "dsa_two_groups", False)
         is_indexer_layer = dsa_two_groups and "indexer" in layer_name
         kv_group = 1 if is_indexer_layer else 0
+        # #region agent log
+        # H_TP5: skip latent save under TP>1 to isolate latent vs indexer path.
+        # H_ASYNC was REJECTED (sync ran, crash persisted).
+        _meta = getattr(self.lmcache_engine, "metadata", None)
+        if (
+            not is_indexer_layer
+            and dsa_two_groups
+            and _meta is not None
+            and getattr(_meta, "world_size", 1) > 1
+        ):
+            _dbg_log_792df4(
+                "LATENT save FORCE-SKIPPED (H_TP5 isolation)",
+                {
+                    "layer_name": layer_name,
+                    "tp_rank": _dbg_tp_rank(),
+                    "kv_group": kv_group,
+                },
+                hypothesis_id="H_TP5",
+                location="vllm_v1_adapter:save_kv_layer",
+            )
+            return
+        # #endregion
         # Latent path uses the same kv list as dev-qzy (_kvcaches_list); indexer
         # uses the partitioned indexer caches only.
         kvcaches = self._kvcaches_for_group(kv_group)
@@ -2779,10 +2784,20 @@ class LMCacheConnectorV1Impl:
                             next(layerwise_storer)
                     except StopIteration:
                         pass
-                    _dbg_sync_store_stream(
-                        self.lmcache_engine,
-                        f"forward_boundary_drain_req={request.req_id}_kv_group={kv_group}",
+                    # #region agent log
+                    _dbg_log_792df4(
+                        "forward_boundary storer drained",
+                        {
+                            "req_id": request.req_id,
+                            "kv_group": kv_group,
+                            "layer_name": layer_name,
+                            "tp_rank": _dbg_tp_rank(),
+                            "token_ids_len": len(request.token_ids),
+                        },
+                        hypothesis_id="H_FWD",
+                        location="vllm_v1_adapter:save_kv_layer",
                     )
+                    # #endregion
                     self._layerwise_save_storers.pop(
                         (request.req_id, kv_group), None
                     )
@@ -3211,15 +3226,6 @@ class LMCacheConnectorV1Impl:
                 ] = layerwise_storer
 
             next(layerwise_storer)
-            if (
-                dsa_two_groups
-                and is_indexer_layer
-                and getattr(self.lmcache_engine.metadata, "world_size", 1) > 1
-            ):
-                _dbg_sync_store_stream(
-                    self.lmcache_engine,
-                    f"after_indexer_save_layer={layer_name}",
-                )
 
     @_lmcache_nvtx_annotate
     def wait_for_save(self):
@@ -3253,10 +3259,6 @@ class LMCacheConnectorV1Impl:
                             next(layerwise_storer)
                         except StopIteration:
                             pass
-                _dbg_sync_store_stream(
-                    self.lmcache_engine,
-                    f"wait_for_save_req={request.req_id}",
-                )
                 self._maybe_seed_worker_retrieve_state_from_store(request)
                 self._maybe_lookup_unpin_for_request(request)
             return
