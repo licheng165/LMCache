@@ -1203,7 +1203,12 @@ class LMCacheConnectorV1Impl:
                 self._latent_kvcaches.append(kv_cache)
         # Backward-compatible flat list = latent group (the default group).
         self._kvcaches_list = self._latent_kvcaches
-        if dsa_two_groups and len(self._indexer_kvcaches) == 0:
+        if (
+            dsa_two_groups
+            and len(self._indexer_kvcaches) == 0
+            and len(self.kv_caches) > 0
+            and getattr(self, "_role", None) != KVConnectorRole.SCHEDULER
+        ):
             logger.warning(
                 "dsa_two_groups is enabled but no indexer KV caches were "
                 "registered with the connector (no layer name contains "
