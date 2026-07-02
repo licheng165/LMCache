@@ -1553,13 +1553,8 @@ class LMCacheConnectorV1Impl:
         *,
         is_sparse_decode: bool,
     ) -> bool:
-        """True when vLLM expects the last prompt token to be recomputed, not loaded."""
-        if is_sparse_decode or load_spec is None:
-            return False
-        return (
-            load_spec.lmcache_cached_tokens >= prompt_len
-            and load_spec.lmcache_cached_tokens > load_spec.vllm_cached_tokens
-        )
+        """Disable LMCache-side recalc_last handling for full prefix hits."""
+        return False
 
     @staticmethod
     def _trim_prefill_for_recalc_last(
@@ -1567,7 +1562,11 @@ class LMCacheConnectorV1Impl:
         retrieve_tokens: list[int],
         slot_mapping: torch.Tensor,
     ) -> tuple[list[int], torch.Tensor]:
-        """Handle vLLM recalc_last=1 on a full-cache-hit prefill retrieve.
+        """Legacy no-op for vLLM recalc_last=1 on full-cache-hit prefill.
+
+        LMCache-side recalc_last handling is currently disabled by
+        _full_hit_recalc_last_token(). Keep this helper no-op so re-enabling the
+        path will not resurrect the partial-chunk key mismatch described below.
 
         We intentionally do NOT trim retrieve_tokens or slot_mapping. Rationale:
 

@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Prefill full-hit recalc_last: keep tokens/slots for partial-chunk key match."""
+"""Prefill full-hit recalc_last is disabled in the LMCache load path."""
 
 # Standard
 from types import SimpleNamespace
@@ -39,9 +39,9 @@ def _make_prefill_req(*, prompt_len: int = 18879) -> ReqMeta:
 
 
 class TestFullHitRecalcLast:
-    def test_detects_full_hit_prefill(self) -> None:
+    def test_full_hit_prefill_does_not_apply_recalc_last(self) -> None:
         spec = LoadSpec(0, 18879, True)
-        assert LMCacheConnectorV1Impl._full_hit_recalc_last_token(
+        assert not LMCacheConnectorV1Impl._full_hit_recalc_last_token(
             spec, 18879, is_sparse_decode=False
         )
         assert not LMCacheConnectorV1Impl._full_hit_recalc_last_token(
@@ -164,7 +164,7 @@ class TestFullHitRecalcLast:
                 lmcache_cached_tokens=8,
                 can_load=True,
             ),
-            recalc_last_applied=True,
+            recalc_last_applied=False,
         )
 
         assert "phase=adapter_dense_prefix_retrieve" in message
@@ -172,7 +172,7 @@ class TestFullHitRecalcLast:
         assert "kv_group=1" in message
         assert "group=dsa_index" in message
         assert "lmcache_cached_tokens=8" in message
-        assert "recalc_last=True" in message
+        assert "recalc_last=False" in message
         assert "tokens.len=8" in message
         assert "token_mask_true=8" in message
         assert "slot_mapping.len=8" in message
