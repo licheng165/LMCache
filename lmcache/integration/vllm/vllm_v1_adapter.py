@@ -1538,13 +1538,13 @@ class LMCacheConnectorV1Impl:
     ) -> list[int]:
         """Return token ids for retrieve without redundant list copy on decode."""
         if is_sparse_decode:
-            # Sparse decode only scatters into the first N slots (see
-            # _sparse_slot_mapping_len). Metadata/chunk keys must cover the
-            # same token span as slot_mapping, not the full decode sequence.
-            window = _sparse_slot_mapping_len(
-                lmcache_cached_tokens if lmcache_cached_tokens > 0 else len(tokens)
-            )
-            return tokens[:window]
+            # Sparse decode scatters into a compact scratch slot window, but
+            # selected_tokens can point anywhere in the cached prefix. Retrieve
+            # metadata and cached chunk pointers must therefore cover the full
+            # LMCache-hit prefix, not only the scratch window length.
+            if lmcache_cached_tokens > 0:
+                return tokens[:lmcache_cached_tokens]
+            return tokens
         if lmcache_cached_tokens >= len(tokens):
             return tokens
         return tokens[:lmcache_cached_tokens]
@@ -1567,11 +1567,9 @@ class LMCacheConnectorV1Impl:
 
         if request.load_spec is not None:
             prefix_tokens = request.load_spec.vllm_cached_tokens
-            if request.is_sparse_decode:
-                prefix_tokens = max(
-                    prefix_tokens,
-                    request.load_spec.lmcache_cached_tokens,
-                )
+            # Sparse decode still needs LMCache chunks for the selected prefix
+            # tokens. lmcache_cached_tokens means "available in LMCache", not
+            # "already resident in vLLM", so do not mask it out here.
             prefix_tokens = min(prefix_tokens, token_count)
             masked_token_count = (
                 prefix_tokens
