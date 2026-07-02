@@ -169,27 +169,6 @@ def _dbg_slot_bounds(slot_mapping, kvcaches):
         "slot_max": _smax,
         "oob": _smax >= cap["kvcaches_capacity"],
     }
-
-
-def _dbg_sync_dsa_store_stream(engine, kv_group, layer_name, reason):
-    """Serialize interleaved latent/indexer store ops on one store_stream."""
-    conn = getattr(engine, "gpu_connector", None)
-    stream = getattr(conn, "store_stream", None)
-    if stream is None:
-        return
-    stream.synchronize()
-    _dbg_log_792df4(
-        "store_stream synchronized (dsa_two_groups)",
-        {
-            "kv_group": kv_group,
-            "layer_name": layer_name,
-            "reason": reason,
-            "tp_rank": _dbg_tp_rank(),
-        },
-        hypothesis_id="H_INTERLEAVE",
-        run_id="post-fix",
-        location="vllm_v1_adapter:save_kv_layer",
-    )
 # #endregion
 
 
@@ -2845,22 +2824,9 @@ class LMCacheConnectorV1Impl:
                         device=self.device, dtype=torch.long
                     )
 
-                # Under TP>1, MLA latent save must use per-layer attn_metadata
-                # slot_mapping (rank-local paged slots), not scheduler block
-                # slots from request.slot_mapping — same pattern as indexer save.
-                if not is_indexer_layer:
-                    _meta = getattr(self.lmcache_engine, "metadata", None)
-                    if _meta is not None and getattr(_meta, "world_size", 1) > 1:
-                        latent_slot = self._latent_slot_mapping_from_attn_metadata(
-                            attn_metadata, layer_name
-                        )
-                        if latent_slot is not None:
-                            slot_mapping = latent_slot.to(
-                                device=self.device, dtype=torch.long
-                            )
-                            save_slot_source = (
-                                "latent_slot_mapping_from_attn_metadata"
-                            )
+                # Latent save matches dev-qzy: use scheduler request.slot_mapping
+                # (cumulative across chunked-prefill steps). Indexer save still
+                # uses per-layer attn metadata + chunk-local padding below.
 
                 # Two-group DSA: for indexer layers, use the indexer group's
                 # slot mapping. vLLM may pass a per-layer metadata dict; the
@@ -3117,42 +3083,6 @@ class LMCacheConnectorV1Impl:
                         )
                         continue
 
-                if (
-                    not is_indexer_layer
-                    and save_slot_source == "latent_slot_mapping_from_attn_metadata"
-                ):
-                    raw_slot_len = len(slot_mapping)
-                    slot_mapping = self._pad_chunk_local_slot_mapping(
-                        slot_mapping,
-                        total_tokens=len(token_ids),
-                        token_offset=skip_leading_tokens,
-                    )
-                    if (
-                        self._latent_layer_names
-                        and layer_name == self._latent_layer_names[0]
-                        and len(slot_mapping) != raw_slot_len
-                    ):
-                        _dbg_log_792df4(
-                            "padded chunk-local latent slot mapping",
-                            {
-                                "req_id": request.req_id,
-                                "layer_name": layer_name,
-                                "tp_rank": _dbg_tp_rank(),
-                                "raw_slot_len": raw_slot_len,
-                                "padded_slot_len": len(slot_mapping),
-                                "skip_leading_tokens": skip_leading_tokens,
-                                "total_tokens": len(token_ids),
-                                "active_slot_head": _tensor_head(
-                                    slot_mapping[
-                                        skip_leading_tokens : skip_leading_tokens + 4
-                                    ]
-                                ),
-                            },
-                            hypothesis_id="H_CHUNK",
-                            run_id="post-fix",
-                            location="vllm_v1_adapter:save_kv_layer",
-                        )
-
                 # #region agent log
                 if (
                     not is_indexer_layer
@@ -3160,23 +3090,44 @@ class LMCacheConnectorV1Impl:
                     and layer_name == self._latent_layer_names[0]
                     and kvcaches
                 ):
+                    _sched_slot = (
+                        request.slot_mapping[0].to(device=self.device, dtype=torch.long)
+                        if request.slot_mapping
+                        else None
+                    )
+                    _attn_slot = self._latent_slot_mapping_from_attn_metadata(
+                        attn_metadata, layer_name
+                    )
+                    _log_data = {
+                        "req_id": request.req_id,
+                        "layer_name": layer_name,
+                        "tp_rank": _dbg_tp_rank(),
+                        "save_slot_source": save_slot_source,
+                        "slot": _dbg_slot_bounds(slot_mapping, kvcaches),
+                        "token_ids_len": len(token_ids),
+                        "skip_leading_tokens": skip_leading_tokens,
+                        "scheduler_slot_len": len(_sched_slot) if _sched_slot is not None else 0,
+                        "scheduler_slot_head": _tensor_head(_sched_slot),
+                    }
+                    if skip_leading_tokens > 0 and _sched_slot is not None:
+                        _log_data["scheduler_active_slot_head"] = _tensor_head(
+                            _sched_slot[
+                                skip_leading_tokens : skip_leading_tokens + 4
+                            ]
+                        )
+                    if _attn_slot is not None:
+                        _attn_slot = _attn_slot.to(device=self.device, dtype=torch.long)
+                        _log_data["attn_slot_len"] = len(_attn_slot)
+                        _log_data["attn_slot_head"] = _tensor_head(_attn_slot)
+                        if skip_leading_tokens > 0:
+                            _log_data["attn_active_slot_head"] = _tensor_head(
+                                _attn_slot[:4]
+                            )
                     _dbg_log_792df4(
                         "latent slot bounds vs kvcaches capacity",
-                        {
-                            "req_id": request.req_id,
-                            "layer_name": layer_name,
-                            "tp_rank": _dbg_tp_rank(),
-                            "save_slot_source": save_slot_source,
-                            "slot": _dbg_slot_bounds(slot_mapping, kvcaches),
-                            "token_ids_len": len(token_ids),
-                            "skip_leading_tokens": skip_leading_tokens,
-                            "scheduler_slot_head": _tensor_head(
-                                request.slot_mapping[0]
-                                if request.slot_mapping
-                                else None
-                            ),
-                        },
-                        hypothesis_id="H_LATENT",
+                        _log_data,
+                        hypothesis_id="H_SCHED",
+                        run_id="post-fix",
                         location="vllm_v1_adapter:save_kv_layer",
                     )
                 # #endregion
@@ -3289,7 +3240,7 @@ class LMCacheConnectorV1Impl:
                             ),
                         },
                         hypothesis_id=(
-                            "H_LATENT" if kv_group == 0 else "H_META"
+                            "H_SCHED" if kv_group == 0 else "H_META"
                         ),
                         location="vllm_v1_adapter:save_kv_layer",
                     )
@@ -3307,13 +3258,6 @@ class LMCacheConnectorV1Impl:
                 self._layerwise_save_storers[storer_key] = layerwise_storer
 
             next(layerwise_storer)
-            if dsa_two_groups:
-                _dbg_sync_dsa_store_stream(
-                    self.lmcache_engine,
-                    kv_group,
-                    layer_name,
-                    "after_save_kv_layer",
-                )
 
     @_lmcache_nvtx_annotate
     def wait_for_save(self):
