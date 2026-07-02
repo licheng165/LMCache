@@ -980,7 +980,8 @@ class LMCacheConnectorV1Impl:
         ] = []
         self._layerwise_retriever_is_sparse: list[bool] = []
         self._layerwise_save_storers: dict[
-            tuple[str, int], Generator[Optional[torch.Tensor], None, None]
+            Union[str, tuple[str, int]],
+            Generator[Optional[torch.Tensor], None, None],
         ] = {}
         self._stats_monitor = LMCStatsMonitor.GetOrCreate()
         self.enable_sparse_attention = config.enable_sparse_attention
@@ -1262,6 +1263,34 @@ class LMCacheConnectorV1Impl:
 
     def _is_dsa_two_groups(self) -> bool:
         return bool(getattr(self.config, "dsa_two_groups", False))
+
+    @staticmethod
+    def _save_storer_key(req_id: str, kv_group: int) -> Union[str, tuple[str, int]]:
+        """Latent (kv_group=0) uses dev-qzy req_id key; indexer uses (req_id, 1)."""
+        if kv_group == 0:
+            return req_id
+        return (req_id, kv_group)
+
+    @staticmethod
+    def _latent_slot_mapping_from_attn_metadata(
+        attn_metadata, layer_name: Optional[str] = None
+    ) -> Optional[torch.Tensor]:
+        """Return MLA latent slot mapping from per-layer vLLM attention metadata."""
+        if isinstance(attn_metadata, dict):
+            if layer_name is not None:
+                meta = attn_metadata.get(layer_name)
+                if meta is not None:
+                    slot_mapping = getattr(meta, "slot_mapping", None)
+                    if slot_mapping is not None:
+                        return slot_mapping
+            for name, meta in attn_metadata.items():
+                if "indexer" in name:
+                    continue
+                slot_mapping = getattr(meta, "slot_mapping", None)
+                if slot_mapping is not None:
+                    return slot_mapping
+            return None
+        return getattr(attn_metadata, "slot_mapping", None)
 
     @staticmethod
     def _indexer_slot_mapping_from_attn_metadata(
@@ -2700,28 +2729,6 @@ class LMCacheConnectorV1Impl:
         dsa_two_groups = getattr(self.config, "dsa_two_groups", False)
         is_indexer_layer = dsa_two_groups and "indexer" in layer_name
         kv_group = 1 if is_indexer_layer else 0
-        # #region agent log
-        # H_TP5: skip latent save under TP>1 to isolate latent vs indexer path.
-        # H_ASYNC was REJECTED (sync ran, crash persisted).
-        _meta = getattr(self.lmcache_engine, "metadata", None)
-        if (
-            not is_indexer_layer
-            and dsa_two_groups
-            and _meta is not None
-            and getattr(_meta, "world_size", 1) > 1
-        ):
-            _dbg_log_792df4(
-                "LATENT save FORCE-SKIPPED (H_TP5 isolation)",
-                {
-                    "layer_name": layer_name,
-                    "tp_rank": _dbg_tp_rank(),
-                    "kv_group": kv_group,
-                },
-                hypothesis_id="H_TP5",
-                location="vllm_v1_adapter:save_kv_layer",
-            )
-            return
-        # #endregion
         # Latent path uses the same kv list as dev-qzy (_kvcaches_list); indexer
         # uses the partitioned indexer caches only.
         kvcaches = self._kvcaches_for_group(kv_group)
@@ -2756,9 +2763,8 @@ class LMCacheConnectorV1Impl:
                 if not is_indexer_layer and not save_spec.can_save_latent:
                     continue
 
-            layerwise_storer = self._layerwise_save_storers.get(
-                (request.req_id, kv_group)
-            )
+            storer_key = self._save_storer_key(request.req_id, kv_group)
+            layerwise_storer = self._layerwise_save_storers.get(storer_key)
             # Forward-boundary recovery: the store_layer generator is sized for
             # exactly one forward (num_layers layer yields + 1 drain yield). It
             # is normally drained and popped by wait_for_save between forwards.
@@ -2798,14 +2804,13 @@ class LMCacheConnectorV1Impl:
                         location="vllm_v1_adapter:save_kv_layer",
                     )
                     # #endregion
-                    self._layerwise_save_storers.pop(
-                        (request.req_id, kv_group), None
-                    )
+                    self._layerwise_save_storers.pop(storer_key, None)
                     layerwise_storer = None
             if layerwise_storer is None:
                 token_ids = request.token_ids
                 assert isinstance(token_ids, list)
                 assert request.slot_mapping is not None and len(request.slot_mapping) > 0
+                save_slot_source = "request.slot_mapping"
                 if request.is_sparse_decode:
                     if request.slot_mapping[0].device.type != torch.device(
                         self.device
@@ -2818,6 +2823,23 @@ class LMCacheConnectorV1Impl:
                     slot_mapping = request.slot_mapping[0].to(
                         device=self.device, dtype=torch.long
                     )
+
+                # Under TP>1, MLA latent save must use per-layer attn_metadata
+                # slot_mapping (rank-local paged slots), not scheduler block
+                # slots from request.slot_mapping — same pattern as indexer save.
+                if not is_indexer_layer:
+                    _meta = getattr(self.lmcache_engine, "metadata", None)
+                    if _meta is not None and getattr(_meta, "world_size", 1) > 1:
+                        latent_slot = self._latent_slot_mapping_from_attn_metadata(
+                            attn_metadata, layer_name
+                        )
+                        if latent_slot is not None:
+                            slot_mapping = latent_slot.to(
+                                device=self.device, dtype=torch.long
+                            )
+                            save_slot_source = (
+                                "latent_slot_mapping_from_attn_metadata"
+                            )
 
                 # Two-group DSA: for indexer layers, use the indexer group's
                 # slot mapping. vLLM may pass a per-layer metadata dict; the
@@ -3074,6 +3096,36 @@ class LMCacheConnectorV1Impl:
                         )
                         continue
 
+                if (
+                    not is_indexer_layer
+                    and save_slot_source == "latent_slot_mapping_from_attn_metadata"
+                ):
+                    raw_slot_len = len(slot_mapping)
+                    slot_mapping = self._pad_chunk_local_slot_mapping(
+                        slot_mapping,
+                        total_tokens=len(token_ids),
+                        token_offset=skip_leading_tokens,
+                    )
+                    if (
+                        self._latent_layer_names
+                        and layer_name == self._latent_layer_names[0]
+                        and len(slot_mapping) != raw_slot_len
+                    ):
+                        _dbg_log_792df4(
+                            "padded chunk-local latent slot mapping",
+                            {
+                                "req_id": request.req_id,
+                                "layer_name": layer_name,
+                                "tp_rank": _dbg_tp_rank(),
+                                "raw_slot_len": raw_slot_len,
+                                "padded_slot_len": len(slot_mapping),
+                                "skip_leading_tokens": skip_leading_tokens,
+                                "total_tokens": len(token_ids),
+                            },
+                            hypothesis_id="H_LATENT",
+                            location="vllm_v1_adapter:save_kv_layer",
+                        )
+
                 # #region agent log
                 if (
                     not is_indexer_layer
@@ -3087,6 +3139,7 @@ class LMCacheConnectorV1Impl:
                             "req_id": request.req_id,
                             "layer_name": layer_name,
                             "tp_rank": _dbg_tp_rank(),
+                            "save_slot_source": save_slot_source,
                             "slot": _dbg_slot_bounds(slot_mapping, kvcaches),
                             "token_ids_len": len(token_ids),
                             "skip_leading_tokens": skip_leading_tokens,
@@ -3096,7 +3149,7 @@ class LMCacheConnectorV1Impl:
                                 else None
                             ),
                         },
-                        hypothesis_id="H_META",
+                        hypothesis_id="H_LATENT",
                         location="vllm_v1_adapter:save_kv_layer",
                     )
                 # #endregion
@@ -3165,6 +3218,7 @@ class LMCacheConnectorV1Impl:
                             ),
                             "is_passive": self.lmcache_engine._is_passive(),
                             "sync": sync,
+                            "save_slot_source": save_slot_source,
                             "slot": _dbg_slot_bounds(slot_mapping, kvcaches),
                             "scheduler_slot_len": (
                                 len(request.slot_mapping[0])
@@ -3207,11 +3261,11 @@ class LMCacheConnectorV1Impl:
                                 else 0
                             ),
                         },
-                        hypothesis_id="H_META",
+                        hypothesis_id=(
+                            "H_LATENT" if kv_group == 0 else "H_META"
+                        ),
                         location="vllm_v1_adapter:save_kv_layer",
                     )
-                # #endregion
-                layerwise_storer = self.lmcache_engine.store_layer(
                     token_ids,
                     mask=store_mask,
                     kvcaches=kvcaches,
@@ -3221,9 +3275,7 @@ class LMCacheConnectorV1Impl:
                     req_id=request.req_id,
                     **store_kwargs,
                 )
-                self._layerwise_save_storers[
-                    (request.req_id, kv_group)
-                ] = layerwise_storer
+                self._layerwise_save_storers[storer_key] = layerwise_storer
 
             next(layerwise_storer)
 
@@ -3252,7 +3304,7 @@ class LMCacheConnectorV1Impl:
                 # storers for this request.
                 for _kv_group in (0, 1):
                     layerwise_storer = self._layerwise_save_storers.pop(
-                        (request.req_id, _kv_group), None
+                        self._save_storer_key(request.req_id, _kv_group), None
                     )
                     if layerwise_storer is not None:
                         try:
@@ -3861,7 +3913,7 @@ class LMCacheConnectorV1Impl:
         ):
             for _kv_group in (0, 1):
                 self._layerwise_save_storers.pop(
-                    (request.request_id, _kv_group), None
+                    self._save_storer_key(request.request_id, _kv_group), None
                 )
 
         self._drop_worker_retrieve_state(request.request_id)
