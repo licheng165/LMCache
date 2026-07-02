@@ -2668,22 +2668,32 @@ class LMCacheConnectorV1Impl:
         is_indexer_layer = dsa_two_groups and "indexer" in layer_name
         kv_group = 1 if is_indexer_layer else 0
         # #region agent log
-        # H_TP7 isolation: skip ALL lmcache saves (latent + indexer). H_TP2
-        # proved indexer-only skip does not fix TP>1 crash; this tests whether
-        # ANY save path (including latent batched_from_gpu) is the trigger.
-        _dbg_log_792df4(
-            "ALL save FORCE-SKIPPED (save path isolation)",
-            {
-                "layer_name": layer_name,
-                "kv_group": kv_group,
-                "tp_rank": _dbg_tp_rank(),
-                "num_kvcaches": len(self._kvcaches_for_group(kv_group)),
-                "num_layers": getattr(self, "num_layers", None),
-            },
-            hypothesis_id="H_TP7",
-            location="vllm_v1_adapter:save_kv_layer",
-        )
-        return
+        # H_TP5 isolation: skip latent save only. H_TP7 proved ANY save triggers
+        # the TP>1 crash; H_TP2 proved indexer-only skip still crashes while
+        # latent save runs — latent is the remaining suspect.
+        if not is_indexer_layer:
+            _passive = (
+                self.lmcache_engine._is_passive()
+                if self.lmcache_engine is not None
+                else None
+            )
+            _dbg_log_792df4(
+                "latent save FORCE-SKIPPED (latent path isolation)",
+                {
+                    "layer_name": layer_name,
+                    "kv_group": kv_group,
+                    "tp_rank": _dbg_tp_rank(),
+                    "save_only_first_rank": getattr(
+                        self.lmcache_engine, "save_only_first_rank", None
+                    ),
+                    "is_passive": _passive,
+                    "num_kvcaches": len(self._kvcaches_for_group(0)),
+                    "num_layers": getattr(self, "num_layers", None),
+                },
+                hypothesis_id="H_TP5",
+                location="vllm_v1_adapter:save_kv_layer",
+            )
+            return
         # #endregion
         # Pass only the current group's kv_caches so the connector's
         # batched_from_gpu iterates over the correct group's layer tensors
@@ -3043,6 +3053,35 @@ class LMCacheConnectorV1Impl:
                     kv_group=kv_group,
                     dsa_two_groups=dsa_two_groups,
                 )
+                # #region agent log
+                _first_latent = (
+                    self._latent_layer_names[0] if self._latent_layer_names else None
+                )
+                _first_indexer = (
+                    self._indexer_layer_names[0]
+                    if self._indexer_layer_names
+                    else None
+                )
+                if layer_name in (_first_latent, _first_indexer):
+                    _dbg_log_792df4(
+                        "store_layer create",
+                        {
+                            "req_id": request.req_id,
+                            "layer_name": layer_name,
+                            "kv_group": kv_group,
+                            "tp_rank": _dbg_tp_rank(),
+                            "save_only_first_rank": getattr(
+                                self.lmcache_engine, "save_only_first_rank", None
+                            ),
+                            "is_passive": self.lmcache_engine._is_passive(),
+                            "slot": _dbg_slot_bounds(slot_mapping, kvcaches),
+                            "skip_leading_tokens": skip_leading_tokens,
+                            "num_token_ids": len(token_ids),
+                        },
+                        hypothesis_id="H_TP5" if kv_group == 0 else "H_TP1",
+                        location="vllm_v1_adapter:save_kv_layer",
+                    )
+                # #endregion
                 layerwise_storer = self.lmcache_engine.store_layer(
                     token_ids,
                     mask=store_mask,
