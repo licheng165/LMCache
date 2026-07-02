@@ -166,6 +166,24 @@ def _build_slot_mapping(
     return slots[:num_tokens]
 
 
+def _dsa_backup_window_tokens() -> int:
+    value = int(os.environ.get("VLLM_ASCEND_DSA_DECODE_WINDOW_TOKENS", "1024"))
+    if value < 0:
+        raise ValueError("DSA decode backup window must be non-negative.")
+    return value
+
+
+def _dsa_decode_backup_due(
+    prompt_len: int,
+    saved_tokens: int,
+    token_count: int,
+) -> bool:
+    window_tokens = _dsa_backup_window_tokens()
+    if window_tokens <= 0 or token_count <= prompt_len:
+        return False
+    return token_count > saved_tokens and (token_count - prompt_len) % window_tokens == 0
+
+
 @dataclass
 class LoadSpec:
     # Number of tokens cached in vLLM
@@ -444,6 +462,8 @@ class ReqMeta:
 
     # Whether is sparse attention and decode or not
     is_sparse_decode: bool = False
+    # Side-channel backup save. It must not affect load/retrieve lifetime.
+    is_decode_backup: bool = False
 
     # Skip save or not
     save_spec: Optional[SaveSpec] = None
@@ -1040,9 +1060,105 @@ class LMCacheConnectorV1Impl:
             engine.lookup_unpin(req_id)
 
     def _maybe_lookup_unpin_for_request(self, request: ReqMeta) -> None:
+        if request.is_decode_backup:
+            return
         if self._should_defer_lookup_unpin_for_sparse_decode(request):
             return
         self._release_request_lookup_pins(request.req_id)
+
+    def _token_ids_for_backup_save(
+        self,
+        tracker: RequestTracker,
+        token_count: int,
+    ) -> list[int]:
+        token_ids: Union[list[int], torch.Tensor] = tracker.token_ids[:token_count]
+        if tracker.mm_hashes:
+            token_ids = torch.tensor(token_ids)
+            assert tracker.mm_positions is not None, (
+                "tracker got mm_hashes but no mm_positions"
+            )
+            apply_mm_hashes_to_token_ids(
+                token_ids, tracker.mm_hashes, tracker.mm_positions
+            )
+            return token_ids.tolist()
+        return list(token_ids)
+
+    def _build_decode_backup_req_meta(
+        self,
+        tracker: RequestTracker,
+    ) -> Optional[ReqMeta]:
+        request_skip = (tracker.request_configs or {}).get("lmcache.skip_save", False)
+        if tracker.skip_save or request_skip or not tracker.is_decode_phase:
+            return None
+
+        token_count = len(tracker.token_ids)
+        if not _dsa_decode_backup_due(
+            tracker.prompt_len,
+            tracker.num_saved_tokens,
+            token_count,
+        ):
+            return None
+
+        window_tokens = _dsa_backup_window_tokens()
+        if window_tokens > 0 and window_tokens % self._block_size != 0:
+            raise ValueError(
+                "DSA decode backup window must be a multiple of the latent "
+                f"block size: window={window_tokens}, block_size={self._block_size}."
+            )
+        if tracker.num_saved_tokens % self._lmcache_chunk_size != 0:
+            raise ValueError(
+                "DSA decode backup can only start from an LMCache chunk "
+                "boundary in this first implementation: "
+                f"saved={tracker.num_saved_tokens}, "
+                f"chunk={self._lmcache_chunk_size}."
+            )
+        if token_count > len(tracker.allocated_block_ids) * self._block_size:
+            raise RuntimeError(
+                "DSA decode backup expects the original full decode KV to be "
+                "resident on NPU, but the request does not own enough blocks: "
+                f"tokens={token_count}, blocks={len(tracker.allocated_block_ids)}, "
+                f"block_size={self._block_size}."
+            )
+
+        token_ids = self._token_ids_for_backup_save(tracker, token_count)
+        req_meta = ReqMeta(
+            req_id=tracker.req_id,
+            token_ids=token_ids,
+            slot_mapping=[
+                _build_slot_mapping(
+                    tracker.allocated_block_ids,
+                    self._block_size,
+                    token_count,
+                )
+            ],
+            is_last_prefill=True,
+            is_sparse_decode=True,
+            is_decode_backup=True,
+            save_spec=SaveSpec(tracker.num_saved_tokens, True),
+            load_spec=None,
+            disagg_spec=tracker.disagg_spec,
+            request_configs=tracker.request_configs,
+            cached_keys=tracker.cached_keys,
+            cached_starts=tracker.cached_starts,
+            cached_ends=tracker.cached_ends,
+            cached_memory_objs=tracker.cached_memory_objs,
+            cached_tensors=tracker.cached_tensors,
+            cached_chunk_dev_ptrs=tracker.cached_chunk_dev_ptrs,
+            cached_chunk_ptrs_npu=tracker.cached_chunk_ptrs_npu,
+        )
+        tracker.num_saved_tokens = token_count
+        return req_meta
+
+    def _maybe_add_decode_backup_req_meta(
+        self,
+        meta: LMCacheConnectorMetadata,
+        tracker: RequestTracker,
+    ) -> None:
+        if not self.enable_sparse_attention:
+            return
+        req_meta = self._build_decode_backup_req_meta(tracker)
+        if req_meta is not None:
+            meta.add_request(req_meta)
 
     def _prune_worker_retrieve_state(self, active_req_ids: set[str]) -> None:
         if not hasattr(self, "_worker_retrieve_state"):
@@ -2239,6 +2355,7 @@ class LMCacheConnectorV1Impl:
                 if req_meta is not None:
                     req_meta.resumed_from_preemption = req.resumed_from_preemption
                     meta.add_request(req_meta)
+                self._maybe_add_decode_backup_req_meta(meta, request_tracker)
             return meta
 
         for i, req_id in enumerate(cached_reqs.req_ids):
@@ -2368,6 +2485,7 @@ class LMCacheConnectorV1Impl:
             if req_meta is not None:
                 req_meta.resumed_from_preemption = preempted
                 meta.add_request(req_meta)
+            self._maybe_add_decode_backup_req_meta(meta, request_tracker)
 
         return meta
 
