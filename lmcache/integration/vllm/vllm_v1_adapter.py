@@ -2807,6 +2807,11 @@ class LMCacheConnectorV1Impl:
                     self._layerwise_save_storers.pop(storer_key, None)
                     layerwise_storer = None
             if layerwise_storer is None:
+                # Refresh from the live kv_caches dict before creating a new
+                # storer. Chunked prefill may update registered buffers between
+                # forwards; stale _latent_kvcaches pointers cause MTE OOB.
+                self._refresh_kvcaches_list()
+                kvcaches = self._kvcaches_for_group(kv_group)
                 token_ids = request.token_ids
                 assert isinstance(token_ids, list)
                 assert request.slot_mapping is not None and len(request.slot_mapping) > 0
@@ -3166,11 +3171,15 @@ class LMCacheConnectorV1Impl:
                             dsa_two_groups=True,
                         )
                     )
-                # Match dev-qzy: sync=True only when creating the latent storer.
-                # Each save_kv_layer call resets a local is_first flag, which
-                # incorrectly gave indexer storers sync=True as well and could
-                # double-synchronize the NPU store stream under TP>1.
-                sync = layerwise_storer is None and kv_group == 0
+                # Match dev-qzy: sync=True when creating the latent storer.
+                # Under TP>1 + dsa_two_groups, also sync indexer storers so
+                # latent/indexer transfers do not overlap on store_stream.
+                _meta = getattr(self.lmcache_engine, "metadata", None)
+                _world_size = getattr(_meta, "world_size", 1) if _meta else 1
+                sync = layerwise_storer is None and (
+                    kv_group == 0
+                    or (dsa_two_groups and _world_size > 1)
+                )
                 # #region agent log
                 _first_latent = (
                     self._latent_layer_names[0] if self._latent_layer_names else None
@@ -3181,6 +3190,29 @@ class LMCacheConnectorV1Impl:
                     else None
                 )
                 if layer_name in (_first_latent, _first_indexer):
+                    _live_kv = self.kv_caches.get(layer_name)
+                    _listed_kv = (
+                        kvcaches[
+                            self._latent_layer_names.index(layer_name)
+                            if not is_indexer_layer
+                            else self._indexer_layer_names.index(layer_name)
+                        ]
+                        if (
+                            (not is_indexer_layer and layer_name in self._latent_layer_names)
+                            or (is_indexer_layer and layer_name in self._indexer_layer_names)
+                        )
+                        else None
+                    )
+                    _live_ptr = None
+                    if isinstance(_live_kv, torch.Tensor):
+                        _live_ptr = int(_live_kv.data_ptr())
+                    elif isinstance(_live_kv, (list, tuple)) and _live_kv:
+                        _live_ptr = int(_live_kv[0].data_ptr())
+                    _listed_ptr = None
+                    if isinstance(_listed_kv, torch.Tensor):
+                        _listed_ptr = int(_listed_kv.data_ptr())
+                    elif isinstance(_listed_kv, (list, tuple)) and _listed_kv:
+                        _listed_ptr = int(_listed_kv[0].data_ptr())
                     _meta = getattr(self.lmcache_engine, "metadata", None)
                     _dbg_log_792df4(
                         "worker store_layer create",
@@ -3238,10 +3270,18 @@ class LMCacheConnectorV1Impl:
                                 if request.indexer_slot_mapping
                                 else 0
                             ),
+                            "live_kv_data_ptr": _live_ptr,
+                            "listed_kv_data_ptr": _listed_ptr,
+                            "kv_ptr_stale": (
+                                _live_ptr is not None
+                                and _listed_ptr is not None
+                                and _live_ptr != _listed_ptr
+                            ),
                         },
                         hypothesis_id=(
-                            "H_SCHED" if kv_group == 0 else "H_META"
+                            "H_STALE" if kv_group == 0 else "H_META"
                         ),
+                        run_id="post-fix",
                         location="vllm_v1_adapter:save_kv_layer",
                     )
                 # #endregion
