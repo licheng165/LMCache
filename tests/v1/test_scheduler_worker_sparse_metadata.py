@@ -46,6 +46,7 @@ def _make_scheduler_impl() -> LMCacheConnectorV1Impl:
     impl.force_skip_save = False
     impl._block_size = 16
     impl._lmcache_chunk_size = 256
+    impl._decode_window_save_window_size = 0
     impl._discard_partial_chunks = True
     impl._request_trackers = {}
     impl._unfinished_requests = {}
@@ -199,3 +200,102 @@ class TestZombieRequestInMetadata:
         impl.build_connector_meta(scheduler_output)
         assert req_id not in impl._request_trackers
         assert req_id not in impl._unfinished_requests
+
+
+class TestDecodeWindowSaveMetadata:
+    def test_decode_window_save_includes_prefill_tail_at_boundary(self) -> None:
+        impl = _make_scheduler_impl()
+        impl.enable_sparse_attention = False
+        impl._decode_window_save_window_size = 256
+
+        req_id = "decode-window"
+        prompt_len = 356
+        prompt = list(range(prompt_len))
+        decode_tokens = list(range(10_000, 10_156))
+        vllm_req = SimpleNamespace(
+            request_id=req_id,
+            num_prompt_tokens=prompt_len,
+            prompt_token_ids=prompt,
+            num_computed_tokens=prompt_len + 155,
+            all_token_ids=prompt + decode_tokens,
+        )
+        impl._unfinished_requests[req_id] = vllm_req
+        tracker = RequestTracker(
+            req_id=req_id,
+            prompt_len=prompt_len,
+            token_ids=prompt + decode_tokens[:-1],
+            allocated_block_ids=list(range(32)),
+            num_saved_tokens=256,
+        )
+        tracker.is_decode_phase = True
+        impl._request_trackers[req_id] = tracker
+
+        scheduler_output = StubSchedulerOutput(
+            finished_req_ids=set(),
+            scheduled_new_reqs=[],
+            scheduled_cached_reqs=StubCachedRequestData(
+                req_ids=[req_id],
+                new_token_ids=[[decode_tokens[-1]]],
+                new_block_ids=[[]],
+            ),
+            num_scheduled_tokens={req_id: 1},
+        )
+
+        meta = impl.build_connector_meta(scheduler_output)
+
+        assert len(meta.requests) == 1
+        req_meta = meta.requests[0]
+        assert req_meta.is_decode_window_save is True
+        assert req_meta.decode_window_start == 256
+        assert req_meta.decode_window_end == 512
+        assert req_meta.decode_window_size == 256
+        assert req_meta.save_spec is not None
+        assert req_meta.save_spec.skip_leading_tokens == 256
+        assert req_meta.token_ids == prompt + decode_tokens
+        assert len(req_meta.slot_mapping[0]) == 512
+        assert tracker.num_saved_tokens == 256
+        assert tracker.decode_window_save_next_start == 512
+
+    def test_decode_window_save_waits_until_boundary(self) -> None:
+        impl = _make_scheduler_impl()
+        impl.enable_sparse_attention = False
+        impl._decode_window_save_window_size = 256
+
+        req_id = "decode-window"
+        prompt_len = 356
+        prompt = list(range(prompt_len))
+        decode_tokens = list(range(10_000, 10_155))
+        vllm_req = SimpleNamespace(
+            request_id=req_id,
+            num_prompt_tokens=prompt_len,
+            prompt_token_ids=prompt,
+            num_computed_tokens=prompt_len + 154,
+            all_token_ids=prompt + decode_tokens,
+        )
+        impl._unfinished_requests[req_id] = vllm_req
+        tracker = RequestTracker(
+            req_id=req_id,
+            prompt_len=prompt_len,
+            token_ids=prompt + decode_tokens[:-1],
+            allocated_block_ids=list(range(32)),
+            num_saved_tokens=256,
+        )
+        tracker.is_decode_phase = True
+        impl._request_trackers[req_id] = tracker
+
+        scheduler_output = StubSchedulerOutput(
+            finished_req_ids=set(),
+            scheduled_new_reqs=[],
+            scheduled_cached_reqs=StubCachedRequestData(
+                req_ids=[req_id],
+                new_token_ids=[[decode_tokens[-1]]],
+                new_block_ids=[[]],
+            ),
+            num_scheduled_tokens={req_id: 1},
+        )
+
+        meta = impl.build_connector_meta(scheduler_output)
+
+        assert meta.requests == []
+        assert tracker.num_saved_tokens == 256
+        assert tracker.decode_window_save_next_start == 256

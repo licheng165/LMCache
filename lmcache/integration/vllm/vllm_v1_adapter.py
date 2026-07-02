@@ -147,6 +147,14 @@ def _dsa_debug_minmax_count(value: Any) -> Any:
         return f"{type(value).__name__}:minmax_failed:{exc}"
 
 
+def _env_flag(name: str, default: str = "0") -> bool:
+    return os.environ.get(name, default).lower() in ("1", "true", "yes", "on")
+
+
+def _decode_window_save_debug_enabled() -> bool:
+    return _env_flag("LMCACHE_DECODE_WINDOW_SAVE_DEBUG")
+
+
 def _sparse_slot_mapping_len(prompt_tokens: int) -> int:
     return min(SPARSE_DECODE_RETRIEVE_TOKENS, prompt_tokens)
 
@@ -264,6 +272,8 @@ class RequestTracker:
     # Sparse decode only: reused across decode steps to avoid per-step allocation.
     sparse_decode_token_mask: Optional[torch.Tensor] = field(default=None, repr=False)
     sparse_decode_ret_mask: Optional[torch.Tensor] = field(default=None, repr=False)
+    # Decode window save only: independent progress for the side-channel save path.
+    decode_window_save_next_start: Optional[int] = field(default=None, repr=False)
 
     @_lmcache_nvtx_annotate
     @staticmethod
@@ -435,6 +445,11 @@ class ReqMeta:
     # Sparse decode only: shared with RequestTracker, reused across decode steps.
     decode_token_mask: Optional[torch.Tensor] = field(default=None, repr=False)
     decode_ret_mask: Optional[torch.Tensor] = field(default=None, repr=False)
+    # Decode window save side-channel metadata. This must not affect load/save state.
+    is_decode_window_save: bool = False
+    decode_window_start: Optional[int] = None
+    decode_window_end: Optional[int] = None
+    decode_window_size: Optional[int] = None
 
     # Set by scheduler when a cached request resumes after preemption.
     resumed_from_preemption: bool = False
@@ -453,6 +468,70 @@ class ReqMeta:
     disagg_spec: Optional[DisaggSpec] = None
     # the configs of the request
     request_configs: Optional[dict] = None
+
+    @staticmethod
+    def _token_ids_with_mm_hashes(
+        token_ids: list[int],
+        tracker: RequestTracker,
+    ) -> list[int]:
+        if not tracker.mm_hashes:
+            return token_ids
+
+        token_ids_tensor = torch.tensor(token_ids)
+        assert tracker.mm_positions is not None, (
+            "tracker got mm_hashes but no mm_positions"
+        )
+        apply_mm_hashes_to_token_ids(
+            token_ids_tensor, tracker.mm_hashes, tracker.mm_positions
+        )
+        return token_ids_tensor.tolist()
+
+    @staticmethod
+    def from_decode_window_save(
+        tracker: RequestTracker,
+        block_size: int,
+        window_start: int,
+        window_end: int,
+        window_size: int,
+    ) -> Optional["ReqMeta"]:
+        """Create isolated metadata for a decode-window side-channel save."""
+        if window_start < 0 or window_end <= window_start:
+            return None
+        if window_end > len(tracker.token_ids):
+            return None
+
+        token_ids = tracker.token_ids[:window_end].copy()
+        token_ids = ReqMeta._token_ids_with_mm_hashes(token_ids, tracker)
+
+        num_blocks = len(tracker.allocated_block_ids)
+        if window_end > num_blocks * block_size:
+            logger.warning(
+                "Skipping decode window save for request %s: "
+                "window_end=%d exceeds slot capacity %d",
+                tracker.req_id,
+                window_end,
+                num_blocks * block_size,
+            )
+            return None
+
+        return ReqMeta(
+            req_id=tracker.req_id,
+            token_ids=token_ids,
+            slot_mapping=[
+                _build_slot_mapping(
+                    tracker.allocated_block_ids, block_size, len(token_ids)
+                )
+            ],
+            is_last_prefill=True,
+            save_spec=SaveSpec(window_start, True),
+            load_spec=None,
+            disagg_spec=None,
+            request_configs=tracker.request_configs,
+            is_decode_window_save=True,
+            decode_window_start=window_start,
+            decode_window_end=window_end,
+            decode_window_size=window_size,
+        )
 
     @staticmethod
     def from_request_tracker(
@@ -533,30 +612,13 @@ class ReqMeta:
                 tracker.sparse_token_ids = input_token_ids[
                     : load_spec.lmcache_cached_tokens
                 ]
-                if tracker.mm_hashes:
-                    token_ids_tensor = torch.tensor(tracker.sparse_token_ids)
-                    assert tracker.mm_positions is not None, (
-                        "tracker got mm_hashes but no mm_positions"
-                    )
-                    apply_mm_hashes_to_token_ids(
-                        token_ids_tensor, tracker.mm_hashes, tracker.mm_positions
-                    )
-                    tracker.sparse_token_ids = token_ids_tensor.tolist()
+                tracker.sparse_token_ids = ReqMeta._token_ids_with_mm_hashes(
+                    tracker.sparse_token_ids, tracker
+                )
             token_ids = tracker.sparse_token_ids
         else:
             token_ids = input_token_ids[:num_tokens_to_save]
-
-            # If the request has multimodal hashes, apply them to the token ids
-            if tracker.mm_hashes:
-                # TODO: Optimize this
-                token_ids = torch.tensor(token_ids)
-                assert tracker.mm_positions is not None, (
-                    "tracker got mm_hashes but no mm_positions"
-                )
-                apply_mm_hashes_to_token_ids(
-                    token_ids, tracker.mm_hashes, tracker.mm_positions
-                )
-                token_ids = token_ids.tolist()
+            token_ids = ReqMeta._token_ids_with_mm_hashes(token_ids, tracker)
 
         num_blocks = len(tracker.allocated_block_ids)
 
@@ -754,7 +816,7 @@ class LMCacheConnectorV1Impl:
             Generator[Optional[torch.Tensor], None, None]
         ] = []
         self._layerwise_save_storers: dict[
-            str, Generator[Optional[torch.Tensor], None, None]
+            Any, Generator[Optional[torch.Tensor], None, None]
         ] = {}
         self._stats_monitor = LMCStatsMonitor.GetOrCreate()
         self.enable_sparse_attention = config.enable_sparse_attention
@@ -797,6 +859,9 @@ class LMCacheConnectorV1Impl:
         )
 
         self._lmcache_chunk_size = config.chunk_size
+        self._decode_window_save_window_size = (
+            self._get_decode_window_save_window_size(config)
+        )
 
         self.skip_last_n_tokens = vllm_config.kv_transfer_config.get_from_extra_config(
             "skip_last_n_tokens", 0
@@ -812,6 +877,44 @@ class LMCacheConnectorV1Impl:
         self._invalid_block_ids: set[int] = set()
         if role != KVConnectorRole.SCHEDULER:
             self._worker_retrieve_state: dict[str, WorkerRetrieveState] = {}
+
+    def _get_decode_window_save_window_size(
+        self, config: LMCacheEngineConfig
+    ) -> int:
+        raw_window_size = os.environ.get("LMCACHE_DECODE_WINDOW_SAVE_WINDOW_SIZE")
+        if raw_window_size is None:
+            raw_window_size = config.get_extra_config_value(
+                "decode_window_save_window_size", 0
+            )
+
+        try:
+            window_size = int(raw_window_size or 0)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(
+                "decode_window_save_window_size must be an integer, "
+                f"got {raw_window_size!r}"
+            ) from exc
+
+        if window_size == 0:
+            return 0
+        if window_size < self._lmcache_chunk_size:
+            raise ValueError(
+                "decode_window_save_window_size must be >= lmcache chunk_size "
+                f"({self._lmcache_chunk_size}), got {window_size}"
+            )
+        if window_size % self._lmcache_chunk_size != 0:
+            raise ValueError(
+                "decode_window_save_window_size must be a multiple of "
+                f"lmcache chunk_size ({self._lmcache_chunk_size}), got {window_size}"
+            )
+
+        logger.info(
+            "Decode window save side-channel enabled: window_size=%d, "
+            "lmcache_chunk_size=%d",
+            window_size,
+            self._lmcache_chunk_size,
+        )
+        return window_size
 
     def _check_legacy_register_kv_caches(self) -> None:
         """Check for legacy connector without register_kv_caches implementation."""
@@ -1031,6 +1134,33 @@ class LMCacheConnectorV1Impl:
             and request.load_spec.can_load
         )
 
+    @staticmethod
+    def _is_decode_window_save_request(request: ReqMeta) -> bool:
+        return bool(getattr(request, "is_decode_window_save", False))
+
+    @staticmethod
+    def _layerwise_save_storer_key(request: ReqMeta) -> Any:
+        if not LMCacheConnectorV1Impl._is_decode_window_save_request(request):
+            return request.req_id
+        return (
+            request.req_id,
+            "decode_window_save",
+            getattr(request, "decode_window_start", None),
+            getattr(request, "decode_window_end", None),
+        )
+
+    def _drop_layerwise_save_storers(self, req_id: str) -> None:
+        if not hasattr(self, "_layerwise_save_storers"):
+            return
+        for storer_key in list(self._layerwise_save_storers):
+            if storer_key == req_id:
+                self._layerwise_save_storers.pop(storer_key, None)
+            elif isinstance(storer_key, tuple) and storer_key[:2] == (
+                req_id,
+                "decode_window_save",
+            ):
+                self._layerwise_save_storers.pop(storer_key, None)
+
     def _release_request_lookup_pins(self, req_id: str) -> None:
         manager = getattr(self, "_manager", None)
         if manager is None:
@@ -1040,9 +1170,37 @@ class LMCacheConnectorV1Impl:
             engine.lookup_unpin(req_id)
 
     def _maybe_lookup_unpin_for_request(self, request: ReqMeta) -> None:
+        if self._is_decode_window_save_request(request):
+            return
         if self._should_defer_lookup_unpin_for_sparse_decode(request):
             return
         self._release_request_lookup_pins(request.req_id)
+
+    def _log_decode_window_save_call(
+        self,
+        request: ReqMeta,
+        token_ids: list[int],
+        slot_mapping: torch.Tensor,
+        skip_leading_tokens: int,
+        *,
+        layerwise: bool,
+    ) -> None:
+        if not _decode_window_save_debug_enabled():
+            return
+        logger.warning(
+            "[DECODE_WINDOW_SAVE] store req=%s window=[%s,%s) "
+            "window_size=%s lmcache_chunk_size=%s token_len=%s "
+            "slot_mapping_len=%s skip_leading_tokens=%s layerwise=%s",
+            request.req_id,
+            getattr(request, "decode_window_start", None),
+            getattr(request, "decode_window_end", None),
+            getattr(request, "decode_window_size", None),
+            self._lmcache_chunk_size,
+            len(token_ids),
+            len(slot_mapping),
+            skip_leading_tokens,
+            layerwise,
+        )
 
     def _prune_worker_retrieve_state(self, active_req_ids: set[str]) -> None:
         if not hasattr(self, "_worker_retrieve_state"):
@@ -1193,7 +1351,11 @@ class LMCacheConnectorV1Impl:
         metadata = self._parent._get_connector_metadata()
         assert isinstance(metadata, LMCacheConnectorMetadata)
 
-        active_req_ids = {req.req_id for req in metadata.requests}
+        active_req_ids = {
+            req.req_id
+            for req in metadata.requests
+            if not self._is_decode_window_save_request(req)
+        }
         self._prune_worker_retrieve_state(active_req_ids)
 
         assert len(self.kv_caches) > 0
@@ -1709,7 +1871,8 @@ class LMCacheConnectorV1Impl:
             ) and self.kv_role != "kv_producer":
                 continue
 
-            layerwise_storer = self._layerwise_save_storers.get(request.req_id)
+            storer_key = self._layerwise_save_storer_key(request)
+            layerwise_storer = self._layerwise_save_storers.get(storer_key)
             if layerwise_storer is None:
                 token_ids = request.token_ids
                 assert isinstance(token_ids, list)
@@ -1727,7 +1890,10 @@ class LMCacheConnectorV1Impl:
                         device=self.device, dtype=torch.long
                     )
 
-                if self.kv_role == "kv_producer":
+                if (
+                    self.kv_role == "kv_producer"
+                    and not self._is_decode_window_save_request(request)
+                ):
                     skip_leading_tokens = 0
                 else:
                     assert save_spec is not None
@@ -1753,6 +1919,14 @@ class LMCacheConnectorV1Impl:
                     skip_leading_tokens,
                     request.req_id,
                 )
+                if self._is_decode_window_save_request(request):
+                    self._log_decode_window_save_call(
+                        request,
+                        token_ids,
+                        slot_mapping,
+                        skip_leading_tokens,
+                        layerwise=True,
+                    )
 
                 # TODO (Jiayi): need to make layerwise storing
                 # compatible with disagg spec
@@ -1770,7 +1944,7 @@ class LMCacheConnectorV1Impl:
                     cached_memory_objs=request.cached_memory_objs,
                     cached_tensors=request.cached_tensors,
                 )
-                self._layerwise_save_storers[request.req_id] = layerwise_storer
+                self._layerwise_save_storers[storer_key] = layerwise_storer
                 if is_first:
                     is_first = False
 
@@ -1798,7 +1972,7 @@ class LMCacheConnectorV1Impl:
         if self.use_layerwise:
             for request in connector_metadata.requests:
                 layerwise_storer = self._layerwise_save_storers.pop(
-                    request.req_id, None
+                    self._layerwise_save_storer_key(request), None
                 )
                 if layerwise_storer is not None:
                     next(layerwise_storer)
@@ -1862,6 +2036,14 @@ class LMCacheConnectorV1Impl:
                 skip_leading_tokens,
                 request.req_id,
             )
+            if self._is_decode_window_save_request(request):
+                self._log_decode_window_save_call(
+                    request,
+                    token_ids,
+                    slot_mapping,
+                    skip_leading_tokens,
+                    layerwise=False,
+                )
 
             is_last_prefill = request.is_last_prefill
             if is_last_prefill:
@@ -2127,6 +2309,76 @@ class LMCacheConnectorV1Impl:
 
         self.load_specs[request.request_id].can_load = True
 
+    def _should_decode_window_save(self, tracker: RequestTracker) -> bool:
+        window_size = getattr(self, "_decode_window_save_window_size", 0)
+        if window_size <= 0:
+            return False
+        if self.kv_role == "kv_consumer":
+            return False
+        if tracker.disagg_spec is not None:
+            return False
+        if tracker.skip_save:
+            return False
+        if (tracker.request_configs or {}).get("lmcache.skip_save", False):
+            return False
+        if not tracker.is_decode_phase:
+            return False
+        return len(tracker.token_ids) > tracker.prompt_len
+
+    def _init_decode_window_save_start(self, tracker: RequestTracker) -> int:
+        if tracker.decode_window_save_next_start is not None:
+            return tracker.decode_window_save_next_start
+        prompt_chunk_start = (
+            tracker.prompt_len // self._lmcache_chunk_size * self._lmcache_chunk_size
+        )
+        saved_chunk_start = (
+            tracker.num_saved_tokens
+            // self._lmcache_chunk_size
+            * self._lmcache_chunk_size
+        )
+        start = max(prompt_chunk_start, saved_chunk_start)
+        tracker.decode_window_save_next_start = start
+        return start
+
+    def _add_decode_window_save_metas(
+        self,
+        meta: LMCacheConnectorMetadata,
+        tracker: RequestTracker,
+    ) -> None:
+        if not self._should_decode_window_save(tracker):
+            return
+
+        window_size = self._decode_window_save_window_size
+        next_start = self._init_decode_window_save_start(tracker)
+
+        while len(tracker.token_ids) >= next_start + window_size:
+            window_start = next_start
+            window_end = window_start + window_size
+            req_meta = ReqMeta.from_decode_window_save(
+                tracker,
+                self._block_size,
+                window_start,
+                window_end,
+                window_size,
+            )
+            if req_meta is None:
+                return
+
+            meta.add_request(req_meta)
+            tracker.decode_window_save_next_start = window_end
+            next_start = window_end
+
+            if _decode_window_save_debug_enabled():
+                logger.warning(
+                    "[DECODE_WINDOW_SAVE] scheduled req=%s window=[%d,%d) "
+                    "tokens_len=%d prompt_len=%d",
+                    tracker.req_id,
+                    window_start,
+                    window_end,
+                    len(tracker.token_ids),
+                    tracker.prompt_len,
+                )
+
     @_lmcache_nvtx_annotate
     def build_connector_meta(
         self, scheduler_output: SchedulerOutput
@@ -2192,6 +2444,7 @@ class LMCacheConnectorV1Impl:
             )
             if req_meta is not None:
                 meta.add_request(req_meta)
+            self._add_decode_window_save_metas(meta, request_tracker)
 
         cached_reqs = scheduler_output.scheduled_cached_reqs
 
@@ -2228,6 +2481,7 @@ class LMCacheConnectorV1Impl:
                     all_token_ids=all_token_ids,
                 )
 
+                self._add_decode_window_save_metas(meta, request_tracker)
                 req_meta = ReqMeta.from_request_tracker(
                     request_tracker,
                     self._block_size,
@@ -2352,9 +2606,16 @@ class LMCacheConnectorV1Impl:
                 all_token_ids=all_token_ids,
             )
 
-            is_sparse_decode = self.enable_sparse_attention and (request.num_computed_tokens > request.num_prompt_tokens)
+            self._add_decode_window_save_metas(meta, request_tracker)
+            is_sparse_decode = self.enable_sparse_attention and (
+                request.num_computed_tokens > request.num_prompt_tokens
+            )
             if is_sparse_decode:
-                load_spec = LoadSpec(vllm_cached_tokens=0, lmcache_cached_tokens=len(request.prompt_token_ids), can_load=True)
+                load_spec = LoadSpec(
+                    vllm_cached_tokens=0,
+                    lmcache_cached_tokens=len(request.prompt_token_ids),
+                    can_load=True,
+                )
 
             req_meta = ReqMeta.from_request_tracker(
                 request_tracker,
@@ -2363,7 +2624,7 @@ class LMCacheConnectorV1Impl:
                 load_spec=load_spec,
                 discard_partial_chunks=self._discard_partial_chunks,
                 save_decode_cache=self.config.save_decode_cache,
-                is_sparse_decode=is_sparse_decode
+                is_sparse_decode=is_sparse_decode,
             )
             if req_meta is not None:
                 req_meta.resumed_from_preemption = preempted
@@ -2383,7 +2644,7 @@ class LMCacheConnectorV1Impl:
         if getattr(self, "use_layerwise", False) and hasattr(
             self, "_layerwise_save_storers"
         ):
-            self._layerwise_save_storers.pop(request.request_id, None)
+            self._drop_layerwise_save_storers(request.request_id)
 
         self._drop_worker_retrieve_state(request.request_id)
 
