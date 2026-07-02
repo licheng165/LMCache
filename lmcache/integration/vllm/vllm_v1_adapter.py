@@ -445,6 +445,8 @@ class ReqMeta:
     # Sparse decode only: shared with RequestTracker, reused across decode steps.
     decode_token_mask: Optional[torch.Tensor] = field(default=None, repr=False)
     decode_ret_mask: Optional[torch.Tensor] = field(default=None, repr=False)
+    # Sparse decode verify only: full scheduled prefix for decode-window keys.
+    decode_window_verify_token_ids: list[int] = field(default_factory=list)
     # Decode window save side-channel metadata. This must not affect load/save state.
     is_decode_window_save: bool = False
     decode_window_start: Optional[int] = None
@@ -707,6 +709,12 @@ class ReqMeta:
                 _dsa_debug_shape(decode_ret_mask),
             )
 
+        decode_window_verify_token_ids: list[int] = []
+        if is_sparse_decode:
+            decode_window_verify_token_ids = ReqMeta._token_ids_with_mm_hashes(
+                input_token_ids.copy(), tracker
+            )
+
         # Note: We keep load_spec even when can_load=False to pass metrics to worker
         return ReqMeta(
             req_id=tracker.req_id,
@@ -727,6 +735,7 @@ class ReqMeta:
             cached_chunk_ptrs_npu=tracker.cached_chunk_ptrs_npu,
             decode_token_mask=decode_token_mask,
             decode_ret_mask=decode_ret_mask,
+            decode_window_verify_token_ids=decode_window_verify_token_ids,
         )
 
 
@@ -1059,6 +1068,18 @@ class LMCacheConnectorV1Impl:
 
     def _refresh_kvcaches_list(self) -> None:
         self._kvcaches_list = list(self.kv_caches.values())
+        self._kv_layer_name_to_index = {
+            layer_name: idx for idx, layer_name in enumerate(self.kv_caches)
+        }
+
+    def _layer_index_from_name(self, layer_name: str) -> int:
+        layer_map = getattr(self, "_kv_layer_name_to_index", None)
+        if layer_map is None:
+            self._refresh_kvcaches_list()
+            layer_map = getattr(self, "_kv_layer_name_to_index", {})
+        if layer_name in layer_map:
+            return int(layer_map[layer_name])
+        return max(0, min(self.current_layer - 1, self.num_layers - 1))
 
     # TODO(chunxiaozheng): in the latest lmcache_connector, we use `register_kv_caches`
     #  to init self.kv_caches, we keep it in order to be compatible with old versions
@@ -1824,6 +1845,188 @@ class LMCacheConnectorV1Impl:
                 self._drain_layerwise_retrievers()
 
         return
+
+    @_lmcache_nvtx_annotate
+    def verify_decode_window_layer_load(
+        self,
+        layer_name: str,
+        *,
+        selected_tokens: Any = None,
+        selected_counts: Any = None,
+        slot_mapping: Any = None,
+        request_ids: Optional[list[str]] = None,
+        kvcaches: Any = None,
+    ) -> bool:
+        """Shadow-load decode-window topk rows without touching normal state."""
+        if self._decode_window_save_window_size <= 0:
+            return False
+        if self.lmcache_engine is None:
+            return False
+        if (
+            selected_tokens is None
+            or selected_counts is None
+            or slot_mapping is None
+            or kvcaches is None
+        ):
+            return False
+
+        gpu_connector = getattr(self.lmcache_engine, "gpu_connector", None)
+        saved_connector_state: dict[str, Any] = {}
+        if gpu_connector is not None:
+            for attr in (
+                "kvcaches",
+                "_sparse_direct_layer_states",
+                "_sparse_direct_kvcaches_id",
+                "_sparse_direct_validated_layers",
+            ):
+                if hasattr(gpu_connector, attr):
+                    value = getattr(gpu_connector, attr)
+                    if isinstance(value, set):
+                        value = set(value)
+                    saved_connector_state[attr] = value
+
+        try:
+            metadata = self._parent._get_connector_metadata()
+            assert isinstance(metadata, LMCacheConnectorMetadata)
+            sparse_requests = [
+                request
+                for request in metadata.requests
+                if request.is_sparse_decode
+                and not self._is_decode_window_save_request(request)
+            ]
+            if request_ids is None:
+                request_ids = [request.req_id for request in sparse_requests]
+            request_by_id = {request.req_id: request for request in sparse_requests}
+
+            counts = selected_counts
+            if isinstance(counts, torch.Tensor):
+                counts = counts.detach().to(device="cpu", dtype=torch.long).tolist()
+            else:
+                counts = [int(count) for count in counts]
+
+            layer_idx = self._layer_index_from_name(layer_name)
+            rows = min(len(request_ids), len(counts))
+            loaded_rows = 0
+            loaded_tokens = 0
+            for row in range(rows):
+                req_id = request_ids[row]
+                request = request_by_id.get(req_id)
+                if request is None:
+                    logger.error(
+                        "[DECODE_WINDOW_VERIFY] missing sparse request "
+                        "layer=%s req=%s request_ids=%s",
+                        layer_name,
+                        req_id,
+                        request_ids[:_dsa_debug_limit()],
+                    )
+                    continue
+
+                count = int(counts[row])
+                if count <= 0:
+                    continue
+
+                if (request.request_configs or {}).get("lmcache.skip_save", False):
+                    continue
+
+                selected_row = selected_tokens[row]
+                slot_mapping_row = slot_mapping[row]
+                count = min(
+                    count,
+                    int(selected_row.shape[0]),
+                    int(slot_mapping_row.shape[0]),
+                )
+                if count <= 0:
+                    continue
+
+                selected_row = selected_row[:count]
+                slot_mapping_row = slot_mapping_row[:count]
+                if slot_mapping_row.device.type != torch.device(self.device).type:
+                    slot_mapping_row = slot_mapping_row.to(
+                        device=self.device, dtype=torch.long
+                    )
+                else:
+                    slot_mapping_row = slot_mapping_row.to(dtype=torch.long)
+
+                token_ids = (
+                    request.decode_window_verify_token_ids
+                    if request.decode_window_verify_token_ids
+                    else request.token_ids
+                )
+                if not token_ids:
+                    continue
+
+                token_mask = torch.ones(len(token_ids), dtype=torch.bool)
+                cached_keys: list[list] = []
+                cached_starts: list[int] = []
+                cached_ends: list[int] = []
+                cached_memory_objs: list[list] = []
+                cached_tensors: list[list] = []
+                cached_chunk_dev_ptrs: list[list[int]] = []
+                cached_chunk_ptrs_npu: list[Optional[torch.Tensor]] = []
+                if (
+                    isinstance(kvcaches, (tuple, list))
+                    and len(kvcaches) == 2
+                    and isinstance(kvcaches[0], torch.Tensor)
+                ):
+                    # New list object per row: the Ascend sparse-direct fast
+                    # state captures slot_mapping_ref, so rows with different
+                    # destination slots must not share that cached state.
+                    verify_kvcaches = [kvcaches for _ in range(self.num_layers)]
+                else:
+                    verify_kvcaches = list(kvcaches)
+                retrieve_kwargs: dict[str, Any] = {
+                    "kvcaches": verify_kvcaches,
+                    "slot_mapping": slot_mapping_row,
+                    "vllm_cached_tokens": 0,
+                    "lmcache_cached_tokens": len(token_ids),
+                    "sync": True,
+                    "cached_keys": cached_keys,
+                    "cached_starts": cached_starts,
+                    "cached_ends": cached_ends,
+                    "cached_memory_objs": cached_memory_objs,
+                    "cached_tensors": cached_tensors,
+                    "cached_chunk_dev_ptrs": cached_chunk_dev_ptrs,
+                    "cached_chunk_ptrs_npu": cached_chunk_ptrs_npu,
+                    "req_id": f"{req_id}:decode_window_verify",
+                    "request_configs": request.request_configs,
+                }
+
+                retriever = self.lmcache_engine.retrieve_layer_head_token_wise(
+                    token_ids,
+                    token_mask,
+                    **retrieve_kwargs,
+                )
+                try:
+                    next(retriever)
+                    for _ in range(layer_idx + 1):
+                        retriever.send((selected_row, 0))
+                finally:
+                    retriever.close()
+
+                loaded_rows += 1
+                loaded_tokens += count
+
+            if _decode_window_save_debug_enabled() and loaded_tokens:
+                logger.warning(
+                    "[DECODE_WINDOW_VERIFY] load layer=%s layer_idx=%d "
+                    "rows=%d tokens=%d request_ids=%s",
+                    layer_name,
+                    layer_idx,
+                    loaded_rows,
+                    loaded_tokens,
+                    request_ids[:_dsa_debug_limit()],
+                )
+            return loaded_tokens > 0
+        except Exception:
+            logger.exception(
+                "[DECODE_WINDOW_VERIFY] load_error layer=%s",
+                layer_name,
+            )
+            return False
+        finally:
+            if gpu_connector is not None:
+                for attr, value in saved_connector_state.items():
+                    setattr(gpu_connector, attr, value)
 
     @_lmcache_nvtx_annotate
     def save_kv_layer(
