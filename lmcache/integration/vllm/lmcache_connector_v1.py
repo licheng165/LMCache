@@ -152,6 +152,9 @@ class LMCacheConnectorV1Dynamic(KVConnectorBase_V1):
         """Return block IDs that failed to load during the last interval."""
         return self._lmcache_engine.get_block_ids_with_load_errors()
 
+    def get_completed_decode_window_saves(self) -> dict[str, int]:
+        return self._lmcache_engine.get_completed_decode_window_saves()
+
     def shutdown(self):
         """
         Shutdown the connector. This is called when the worker process

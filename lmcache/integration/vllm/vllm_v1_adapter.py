@@ -885,6 +885,7 @@ class LMCacheConnectorV1Impl:
         self._invalid_block_ids: set[int] = set()
         if role != KVConnectorRole.SCHEDULER:
             self._worker_retrieve_state: dict[str, WorkerRetrieveState] = {}
+            self._completed_decode_window_saves: dict[str, int] = {}
 
     def _get_decode_window_save_window_size(
         self, config: LMCacheEngineConfig
@@ -1220,6 +1221,25 @@ class LMCacheConnectorV1Impl:
             skip_leading_tokens,
             layerwise,
         )
+
+    def _mark_decode_window_save_completed(self, request: ReqMeta) -> None:
+        if not self._is_decode_window_save_request(request):
+            return
+        window_end = request.decode_window_end
+        if window_end is None:
+            return
+        completed = getattr(self, "_completed_decode_window_saves", None)
+        if completed is None:
+            return
+        completed[request.req_id] = max(completed.get(request.req_id, 0), window_end)
+
+    def get_completed_decode_window_saves(self) -> dict[str, int]:
+        completed = getattr(self, "_completed_decode_window_saves", None)
+        if not completed:
+            return {}
+        drained = dict(completed)
+        completed.clear()
+        return drained
 
     def _prune_worker_retrieve_state(self, active_req_ids: set[str]) -> None:
         if not hasattr(self, "_worker_retrieve_state"):
@@ -1995,6 +2015,7 @@ class LMCacheConnectorV1Impl:
                 )
                 if layerwise_storer is not None:
                     next(layerwise_storer)
+                    self._mark_decode_window_save_completed(request)
                 self._maybe_lookup_unpin_for_request(request)
             return
 
@@ -2088,6 +2109,7 @@ class LMCacheConnectorV1Impl:
                 request_configs=request.request_configs,
                 req_id=request.req_id,
             )
+            self._mark_decode_window_save_completed(request)
 
             # Update skip_leading_tokens only on last rank to ensure
             # each PP stage stores its own KV cache

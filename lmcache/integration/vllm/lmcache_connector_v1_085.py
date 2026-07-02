@@ -96,6 +96,9 @@ class LMCacheConnectorV1Dynamic(KVConnectorBase_V1):
         """
         self._lmcache_engine.wait_for_save()
 
+    def get_completed_decode_window_saves(self) -> dict[str, int]:
+        return self._lmcache_engine.get_completed_decode_window_saves()
+
     def shutdown(self):
         """
         Shutdown the connector. This is called when the worker process
