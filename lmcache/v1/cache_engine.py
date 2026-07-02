@@ -462,6 +462,7 @@ class LMCacheEngine:
         request_configs = kwargs.get("request_configs")
         if request_configs is not None and len(request_configs) != 0:
             assert isinstance(request_configs, dict)
+        kv_group = kwargs.get("kv_group", 0)
 
         with store_stats.profile_process_tokens():
             prev_key = 0
@@ -558,10 +559,11 @@ class LMCacheEngine:
         tot_time = store_stats.time_to_store()
 
         logger.info(
-            "[req_id=%s] Stored %d out of total %d tokens. "
+            "[req_id=%s kv_group=%s] Stored %d out of total %d tokens. "
             "size: %.4f GB, cost %.4f ms, throughput: %.4f GB/s; "
             "offload_time: %.4f ms, put_time: %.4f ms",
             req_id,
+            kv_group,
             tot_token_num,
             num_to_store_tokens,
             tot_kv_size / 1024**3,
@@ -761,9 +763,10 @@ class LMCacheEngine:
 
             tot_time = time.perf_counter() - t_start
             logger.info(
-                "[req_id=%s] Stored %d out of total %d tokens. "
+                "[req_id=%s kv_group=%s] Stored %d out of total %d tokens. "
                 "size: %.4f GB, cost %.4f ms, throughput: %.4f GB/s",
                 req_id,
+                kv_group,
                 tot_token_num,
                 len(tokens),
                 tot_kv_size / 1024**3,
@@ -913,11 +916,13 @@ class LMCacheEngine:
         # need_to_load: 512 - 288 = 224 tokens
         # retrieved: 256 tokens
         if not self._is_passive():
+            kv_group = kwargs.get("kv_group", 0)
             logger.info(
-                "[req_id=%s] Retrieved %d out of %d required tokens "
+                "[req_id=%s kv_group=%s] Retrieved %d out of %d required tokens "
                 "(from %d total tokens). size: %.4f gb, "
                 "cost %.4f ms, throughput: %.4f GB/s;",
                 req_id,
+                kv_group,
                 retrieved_tokens,
                 num_required_tokens,
                 len(tokens),
@@ -1071,8 +1076,9 @@ class LMCacheEngine:
         self.stats_monitor.on_retrieve_finished(monitor_req_id, retrieved_tokens)
         if not self._is_passive():
             logger.info(
-                "[req_id=%s] Retrieved %d out of %d out of total %d tokens",
+                "[req_id=%s kv_group=%s] Retrieved %d out of %d out of total %d tokens",
                 req_id,
+                kv_group,
                 retrieved_tokens,
                 num_required_tokens,
                 len(tokens),
