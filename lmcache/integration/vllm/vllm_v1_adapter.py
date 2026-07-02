@@ -500,6 +500,28 @@ class RequestTracker:
         if len(new_token_ids) == 1:
             self.is_decode_phase = True
 
+    def seed_sparse_decode_tokens(self, token_ids: list[int]) -> None:
+        """Seed full prompt token ids used to build sparse decode chunk keys."""
+        prompt_tokens = token_ids[: self.prompt_len]
+        if len(prompt_tokens) < self.prompt_len:
+            logger.warning(
+                "Request %s sparse decode token source is shorter than prompt: "
+                "source_tokens=%d prompt_len=%d",
+                self.req_id,
+                len(prompt_tokens),
+                self.prompt_len,
+            )
+        if self.mm_hashes:
+            token_ids_tensor = torch.tensor(prompt_tokens)
+            assert self.mm_positions is not None, (
+                "tracker got mm_hashes but no mm_positions"
+            )
+            apply_mm_hashes_to_token_ids(
+                token_ids_tensor, self.mm_hashes, self.mm_positions
+            )
+            prompt_tokens = token_ids_tensor.tolist()
+        self.sparse_token_ids = prompt_tokens
+
 
 @dataclass
 class WorkerRetrieveState:
@@ -686,20 +708,24 @@ class ReqMeta:
 
         # Calculate the token ids and slot mappings for load and save
         if is_sparse_decode and load_spec is not None and skip_save:
-            if not tracker.sparse_token_ids:
-                tracker.sparse_token_ids = input_token_ids[
-                    : load_spec.lmcache_cached_tokens
-                ]
-                if tracker.mm_hashes:
-                    token_ids_tensor = torch.tensor(tracker.sparse_token_ids)
-                    assert tracker.mm_positions is not None, (
-                        "tracker got mm_hashes but no mm_positions"
-                    )
-                    apply_mm_hashes_to_token_ids(
-                        token_ids_tensor, tracker.mm_hashes, tracker.mm_positions
-                    )
-                    tracker.sparse_token_ids = token_ids_tensor.tolist()
+            if (
+                not tracker.sparse_token_ids
+                or len(tracker.sparse_token_ids) < load_spec.lmcache_cached_tokens
+            ):
+                tracker.seed_sparse_decode_tokens(
+                    input_token_ids[: load_spec.lmcache_cached_tokens]
+                )
             token_ids = tracker.sparse_token_ids
+            if len(token_ids) < load_spec.lmcache_cached_tokens:
+                logger.warning(
+                    "Request %s sparse decode token metadata is shorter than "
+                    "LMCache hit: sparse_tokens=%d lmcache_cached_tokens=%d "
+                    "prompt_len=%d",
+                    tracker.req_id,
+                    len(token_ids),
+                    load_spec.lmcache_cached_tokens,
+                    tracker.prompt_len,
+                )
         else:
             token_ids = input_token_ids[:num_tokens_to_save]
 
@@ -1785,6 +1811,111 @@ class LMCacheConnectorV1Impl:
             getattr(engine, "retrieve_locations", None),
         )
 
+    @staticmethod
+    def _ensure_layer_cache_shape(dst: list, src: list) -> None:
+        if not src:
+            return
+        if not dst:
+            dst.extend([] for _ in range(len(src)))
+        while len(dst) < len(src):
+            dst.append([])
+
+    @classmethod
+    def _merge_cache_group_by_ranges(
+        cls,
+        *,
+        dst_starts: list[int],
+        dst_ends: list[int],
+        dst_keys: list[list],
+        dst_memory_objs: list[list],
+        dst_tensors: list[list],
+        dst_chunk_dev_ptrs: list[list[int]],
+        dst_chunk_ptrs_npu: list[Optional[torch.Tensor]],
+        src_starts: list[int],
+        src_ends: list[int],
+        src_keys: list[list],
+        src_memory_objs: list[list],
+        src_tensors: list[list],
+        src_chunk_dev_ptrs: list[list[int]],
+        src_chunk_ptrs_npu: list[Optional[torch.Tensor]],
+    ) -> int:
+        if not src_starts or not src_ends:
+            return 0
+
+        existing_ranges = set(zip(dst_starts, dst_ends, strict=False))
+        append_indices: list[int] = []
+        for chunk_idx, chunk_range in enumerate(
+            zip(src_starts, src_ends, strict=False)
+        ):
+            if chunk_range in existing_ranges:
+                continue
+            dst_starts.append(chunk_range[0])
+            dst_ends.append(chunk_range[1])
+            existing_ranges.add(chunk_range)
+            append_indices.append(chunk_idx)
+
+        if not append_indices:
+            return 0
+
+        def append_layer_values(dst: list, src: list) -> None:
+            if not src:
+                return
+            cls._ensure_layer_cache_shape(dst, src)
+            for layer_id, src_layer in enumerate(src):
+                for chunk_idx in append_indices:
+                    if chunk_idx < len(src_layer):
+                        dst[layer_id].append(src_layer[chunk_idx])
+
+        append_layer_values(dst_keys, src_keys)
+        append_layer_values(dst_memory_objs, src_memory_objs)
+        append_layer_values(dst_tensors, src_tensors)
+        append_layer_values(dst_chunk_dev_ptrs, src_chunk_dev_ptrs)
+
+        if dst_chunk_ptrs_npu:
+            dst_chunk_ptrs_npu.clear()
+        if src_chunk_ptrs_npu and not dst_chunk_ptrs_npu:
+            dst_chunk_ptrs_npu.extend(None for _ in range(len(src_chunk_ptrs_npu)))
+        return len(append_indices)
+
+    def _merge_store_cache_into_worker_state(
+        self,
+        state: WorkerRetrieveState,
+        request: ReqMeta,
+    ) -> int:
+        merged_chunks = self._merge_cache_group_by_ranges(
+            dst_starts=state.cached_starts,
+            dst_ends=state.cached_ends,
+            dst_keys=state.cached_keys,
+            dst_memory_objs=state.cached_memory_objs,
+            dst_tensors=state.cached_tensors,
+            dst_chunk_dev_ptrs=state.cached_chunk_dev_ptrs,
+            dst_chunk_ptrs_npu=state.cached_chunk_ptrs_npu,
+            src_starts=request.cached_starts,
+            src_ends=request.cached_ends,
+            src_keys=request.cached_keys,
+            src_memory_objs=request.cached_memory_objs,
+            src_tensors=request.cached_tensors,
+            src_chunk_dev_ptrs=request.cached_chunk_dev_ptrs,
+            src_chunk_ptrs_npu=request.cached_chunk_ptrs_npu,
+        )
+        merged_chunks += self._merge_cache_group_by_ranges(
+            dst_starts=state.cached_starts_indexer,
+            dst_ends=state.cached_ends_indexer,
+            dst_keys=state.cached_keys_indexer,
+            dst_memory_objs=state.cached_memory_objs_indexer,
+            dst_tensors=state.cached_tensors_indexer,
+            dst_chunk_dev_ptrs=state.cached_chunk_dev_ptrs_indexer,
+            dst_chunk_ptrs_npu=state.cached_chunk_ptrs_npu_indexer,
+            src_starts=request.cached_starts_indexer,
+            src_ends=request.cached_ends_indexer,
+            src_keys=request.cached_keys_indexer,
+            src_memory_objs=request.cached_memory_objs_indexer,
+            src_tensors=request.cached_tensors_indexer,
+            src_chunk_dev_ptrs=request.cached_chunk_dev_ptrs_indexer,
+            src_chunk_ptrs_npu=request.cached_chunk_ptrs_npu_indexer,
+        )
+        return merged_chunks
+
     def _warm_request_retrieve_metadata(
         self,
         request: ReqMeta,
@@ -1842,6 +1973,39 @@ class LMCacheConnectorV1Impl:
             return
 
         location = self._resolve_store_retrieve_location(request)
+        existing_state = self._worker_retrieve_state.get(request.req_id)
+        if existing_state is not None and (
+            existing_state.metadata_warm or existing_state.cached_keys
+        ):
+            merged_chunks = self._merge_store_cache_into_worker_state(
+                existing_state, request
+            )
+            existing_state.location = location or existing_state.location
+            existing_state.metadata_warm = True
+            existing_state.token_count = max(
+                existing_state.token_count,
+                len(request.token_ids),
+                request.cached_ends[-1] if request.cached_ends else 0,
+            )
+            _agent_debug_log(
+                "vllm_v1_adapter:wait_for_save",
+                "merge worker retrieve state from store",
+                {
+                    "req_id": request.req_id,
+                    "merged_chunks": merged_chunks,
+                    "cached_chunks_l0": len(existing_state.cached_tensors[0])
+                    if existing_state.cached_tensors
+                    and existing_state.cached_tensors[0]
+                    else 0,
+                    "cached_ends_tail": existing_state.cached_ends[-1]
+                    if existing_state.cached_ends
+                    else 0,
+                    "location": existing_state.location,
+                },
+                hypothesis_id="H",
+            )
+            return
+
         self._save_worker_retrieve_state_from_request(
             request,
             location=location,
@@ -4032,6 +4196,14 @@ class LMCacheConnectorV1Impl:
                 request.num_computed_tokens > request_tracker.prompt_len
             )
             if is_sparse_decode:
+                if (
+                    not request_tracker.sparse_token_ids
+                    or len(request_tracker.sparse_token_ids)
+                    < request_tracker.prompt_len
+                ):
+                    request_tracker.seed_sparse_decode_tokens(
+                        list(request.all_token_ids)
+                    )
                 load_spec = LoadSpec(
                     vllm_cached_tokens=0,
                     lmcache_cached_tokens=request_tracker.prompt_len,

@@ -23,6 +23,26 @@ def _make_impl() -> LMCacheConnectorV1Impl:
     return impl
 
 
+def _make_store_request(
+    *,
+    token_count: int,
+    start: int,
+    end: int,
+    key: str,
+    tensor: str,
+) -> ReqMeta:
+    return ReqMeta(
+        req_id="req-1",
+        token_ids=[0] * token_count,
+        is_sparse_decode=False,
+        cached_keys=[[key]],
+        cached_starts=[start],
+        cached_ends=[end],
+        cached_memory_objs=[[f"mem-{key}"]],
+        cached_tensors=[[tensor]],
+    )
+
+
 def _make_request(*, resumed: bool = False) -> ReqMeta:
     return ReqMeta(
         req_id="req-1",
@@ -76,6 +96,40 @@ class TestWorkerRetrieveState:
         assert fresh.cached_keys == []
         impl._bind_worker_retrieve_state_to_request(fresh)
         assert fresh.cached_keys == [["k"]]
+
+    def test_store_seed_merges_chunked_prefill_hot_cache(self):
+        impl = _make_impl()
+        impl.config = SimpleNamespace(dsa_two_groups=False)
+        impl._latent_kvcaches = [object()]
+        impl.lmcache_engine = SimpleNamespace(
+            storage_manager=None,
+            store_location="LocalCPUBackend",
+        )
+
+        first = _make_store_request(
+            token_count=4096,
+            start=0,
+            end=4096,
+            key="k0",
+            tensor="t0",
+        )
+        second = _make_store_request(
+            token_count=8192,
+            start=4096,
+            end=8192,
+            key="k1",
+            tensor="t1",
+        )
+
+        impl._maybe_seed_worker_retrieve_state_from_store(first)
+        impl._maybe_seed_worker_retrieve_state_from_store(second)
+
+        state = impl._worker_retrieve_state["req-1"]
+        assert state.cached_starts == [0, 4096]
+        assert state.cached_ends == [4096, 8192]
+        assert state.cached_keys == [["k0", "k1"]]
+        assert state.cached_tensors == [["t0", "t1"]]
+        assert state.token_count == 8192
 
     def test_warm_kwargs_only_when_prefix_unchanged(self):
         impl = _make_impl()
