@@ -65,124 +65,11 @@ def _sparse_slot_mapping_len(prompt_tokens: int) -> int:
     return min(SPARSE_DECODE_RETRIEVE_TOKENS, prompt_tokens)
 
 
-def _agent_debug_log(
-    location: str,
-    message: str,
-    data: dict,
-    *,
-    hypothesis_id: str = "A",
-    run_id: str = "pre-fix",
-) -> None:
-    # #region agent log
-    try:
-        import json
-        import time
-
-        with open("debug-d9c30c.log", "a", encoding="utf-8") as _f:
-            _f.write(
-                json.dumps(
-                    {
-                        "sessionId": "d9c30c",
-                        "runId": run_id,
-                        "hypothesisId": hypothesis_id,
-                        "location": location,
-                        "message": message,
-                        "data": data,
-                        "timestamp": int(time.time() * 1000),
-                    }
-                )
-                + "\n"
-            )
-    except OSError:
-        pass
-    # #endregion
-
-
-# #region agent log
-def _dbg_log_792df4(
-    message,
-    data,
-    hypothesis_id="H1",
-    run_id="pre-fix",
-    location="vllm_v1_adapter",
-):
-    """792df4 debug session instrumentation (writes to debug-792df4.log)."""
-    try:
-        import json as _j
-        import time as _t
-
-        with open("debug-792df4.log", "a", encoding="utf-8") as _f:
-            _f.write(
-                _j.dumps(
-                    {
-                        "sessionId": "792df4",
-                        "runId": run_id,
-                        "hypothesisId": hypothesis_id,
-                        "location": location,
-                        "message": message,
-                        "data": data,
-                        "timestamp": int(_t.time() * 1000),
-                    }
-                )
-                + "\n"
-            )
-    except OSError:
-        pass
-
-
-def _dbg_tp_rank():
-    try:
-        from vllm.distributed.parallel_state import get_tensor_model_parallel_rank
-
-        return get_tensor_model_parallel_rank()
-    except Exception:
-        return None
-
-
-def _dbg_kv_cache_capacity(kvcaches):
-    if not kvcaches:
-        return {"kvcaches_shape": [], "kvcaches_capacity": 0}
-    _kc0 = kvcaches[0]
-    if isinstance(_kc0, (list, tuple)):
-        _kc0 = _kc0[0] if _kc0 else None
-    _kc_shape = list(_kc0.shape) if _kc0 is not None else []
-    _capacity = _kc_shape[0] * _kc_shape[1] if len(_kc_shape) >= 2 else 0
-    return {"kvcaches_shape": _kc_shape, "kvcaches_capacity": _capacity}
-
-
-def _dbg_slot_bounds(slot_mapping, kvcaches):
-    cap = _dbg_kv_cache_capacity(kvcaches)
-    if slot_mapping is None or len(slot_mapping) == 0:
-        return {
-            **cap,
-            "slot_len": 0,
-            "slot_min": None,
-            "slot_max": None,
-            "oob": False,
-        }
-    _smin = int(slot_mapping.min().item())
-    _smax = int(slot_mapping.max().item())
-    return {
-        **cap,
-        "slot_len": len(slot_mapping),
-        "slot_min": _smin,
-        "slot_max": _smax,
-        "oob": _smax >= cap["kvcaches_capacity"],
-    }
-# #endregion
-
-
 def _am_get(attn_metadata, key, default=None):
     """Read a field from attn_metadata that may be a dict or an object."""
     if isinstance(attn_metadata, dict):
         return attn_metadata.get(key, default)
     return getattr(attn_metadata, key, default)
-
-
-def _tensor_head(t: Optional[torch.Tensor], n: int = 4) -> Optional[list]:
-    if t is None or t.numel() == 0:
-        return None
-    return t.flatten()[:n].tolist()
 
 
 def _retrieve_cache_kwargs(
@@ -797,31 +684,6 @@ class ReqMeta:
                         len(token_ids),
                     )
                 ]
-                _agent_debug_log(
-                    "vllm_v1_adapter:ReqMeta.from_request_tracker",
-                    "built indexer slot mapping from scheduler blocks",
-                    {
-                        "req_id": tracker.req_id,
-                        "num_tokens": len(token_ids),
-                        "latent_blocks": len(tracker.allocated_block_ids),
-                        "indexer_blocks": indexer_num_blocks,
-                        "indexer_slot_len": len(indexer_slot_mapping[0]),
-                        "indexer_slot_head": _tensor_head(indexer_slot_mapping[0]),
-                    },
-                    hypothesis_id="J",
-                )
-        elif dsa_two_groups:
-            _agent_debug_log(
-                "vllm_v1_adapter:ReqMeta.from_request_tracker",
-                "no scheduler indexer block ids",
-                {
-                    "req_id": tracker.req_id,
-                    "num_tokens": len(token_ids),
-                    "latent_blocks": len(tracker.allocated_block_ids),
-                },
-                hypothesis_id="J",
-            )
-
         if load_spec is not None and load_spec.can_load:
             logger.debug(
                 "Scheduled to load %d tokens (%d cached in vLLM) for request %s",
@@ -880,37 +742,6 @@ class ReqMeta:
             decode_token_mask=decode_token_mask,
             decode_ret_mask=decode_ret_mask,
         )
-        # #region agent log
-        if not is_sparse_decode and token_ids:
-            _dbg_log_792df4(
-                "ReqMeta built (scheduler→worker contract)",
-                {
-                    "req_id": tracker.req_id,
-                    "num_token_ids": len(token_ids),
-                    "latent_slot_len": len(slot_mapping[0]) if slot_mapping else 0,
-                    "latent_slot_head": _tensor_head(
-                        slot_mapping[0] if slot_mapping else None
-                    ),
-                    "indexer_slot_len": (
-                        len(indexer_slot_mapping[0])
-                        if indexer_slot_mapping
-                        else 0
-                    ),
-                    "latent_blocks": len(tracker.allocated_block_ids),
-                    "indexer_blocks": (
-                        len(tracker.allocated_block_ids_indexer)
-                        if tracker.allocated_block_ids_indexer
-                        else 0
-                    ),
-                    "skip_leading_tokens": save_spec.skip_leading_tokens,
-                    "can_save_latent": save_spec.can_save_latent,
-                    "can_save_indexer": save_spec.can_save_indexer,
-                    "dsa_two_groups": dsa_two_groups,
-                },
-                hypothesis_id="H_META",
-                location="vllm_v1_adapter:ReqMeta.from_request_tracker",
-            )
-        # #endregion
         return req_meta
 
 
@@ -1260,19 +1091,6 @@ class LMCacheConnectorV1Impl:
                 self._latent_kvcaches.append(kv_cache)
         # Backward-compatible flat list = latent group (the default group).
         self._kvcaches_list = self._latent_kvcaches
-        _agent_debug_log(
-            "vllm_v1_adapter:_refresh_kvcaches_list",
-            "kv cache groups registered",
-            {
-                "dsa_two_groups": dsa_two_groups,
-                "latent_layers": len(self._latent_kvcaches),
-                "indexer_layers": len(self._indexer_kvcaches),
-                "latent_layer_names_head": self._latent_layer_names[:4],
-                "indexer_layer_names_head": self._indexer_layer_names[:4],
-                "all_layer_names_head": list(self.kv_caches.keys())[:8],
-            },
-            hypothesis_id="F",
-        )
         if dsa_two_groups and len(self._indexer_kvcaches) == 0:
             logger.warning(
                 "dsa_two_groups is enabled but no indexer KV caches were "
@@ -1482,41 +1300,10 @@ class LMCacheConnectorV1Impl:
                 break
 
         if idx_slot is None:
-            _agent_debug_log(
-                "vllm_v1_adapter:_indexer_retrieve_slot_mapping",
-                "no full-length indexer slot mapping available",
-                {
-                    "lmcache_cached_tokens": lmcache_cached_tokens,
-                    "has_attn_slot_mapping": attn_slot is not None,
-                    "has_indexer_slot_mapping": idx_attr is not None,
-                    "candidate_lengths": [
-                        {"source": candidate_source, "len": len(candidate)}
-                        for candidate_source, candidate in candidates
-                    ],
-                },
-                hypothesis_id="B",
-            )
             return None
         idx_slot = idx_slot.to(device=self.device, dtype=torch.long)
         if lmcache_cached_tokens < len(idx_slot):
             idx_slot = idx_slot[:lmcache_cached_tokens]
-        _agent_debug_log(
-            "vllm_v1_adapter:_indexer_retrieve_slot_mapping",
-            "indexer retrieve slot mapping",
-            {
-                "lmcache_cached_tokens": lmcache_cached_tokens,
-                "source": source,
-                "idx_slot_len": len(idx_slot),
-                "idx_slot_head": _tensor_head(idx_slot),
-                "attn_slot_head": _tensor_head(
-                    attn_slot.to(dtype=torch.long) if attn_slot is not None else None
-                ),
-                "indexer_attr_head": _tensor_head(
-                    idx_attr.to(dtype=torch.long) if idx_attr is not None else None
-                ),
-            },
-            hypothesis_id="A",
-        )
         return idx_slot
 
     def _sparse_indexer_slot_mapping(
@@ -1721,25 +1508,6 @@ class LMCacheConnectorV1Impl:
                 kept_warm_req_ids.append(req_id)
                 continue
             self._release_request_lookup_pins(req_id)
-        if dropped_req_ids:
-            _agent_debug_log(
-                "vllm_v1_adapter:_prune_worker_retrieve_state",
-                "prune worker retrieve state",
-                {
-                    "active_req_ids": sorted(active_req_ids),
-                    "dropped_req_ids": sorted(dropped_req_ids),
-                    "kept_warm_req_ids": kept_warm_req_ids,
-                    "remaining_req_ids": sorted(
-                        {
-                            req_id
-                            for req_id, state in self._worker_retrieve_state.items()
-                            if req_id in active_req_ids
-                            or (state.metadata_warm or state.cached_keys)
-                        }
-                    ),
-                },
-                hypothesis_id="I",
-            )
         self._worker_retrieve_state = {
             req_id: state
             for req_id, state in self._worker_retrieve_state.items()
@@ -1987,23 +1755,6 @@ class LMCacheConnectorV1Impl:
                 len(request.token_ids),
                 request.cached_ends[-1] if request.cached_ends else 0,
             )
-            _agent_debug_log(
-                "vllm_v1_adapter:wait_for_save",
-                "merge worker retrieve state from store",
-                {
-                    "req_id": request.req_id,
-                    "merged_chunks": merged_chunks,
-                    "cached_chunks_l0": len(existing_state.cached_tensors[0])
-                    if existing_state.cached_tensors
-                    and existing_state.cached_tensors[0]
-                    else 0,
-                    "cached_ends_tail": existing_state.cached_ends[-1]
-                    if existing_state.cached_ends
-                    else 0,
-                    "location": existing_state.location,
-                },
-                hypothesis_id="H",
-            )
             return
 
         self._save_worker_retrieve_state_from_request(
@@ -2011,21 +1762,6 @@ class LMCacheConnectorV1Impl:
             location=location,
             metadata_warm=True,
             token_count=len(request.token_ids),
-        )
-        _agent_debug_log(
-            "vllm_v1_adapter:wait_for_save",
-            "seed worker retrieve state from store",
-            {
-                "req_id": request.req_id,
-                "cached_chunks_l0": len(request.cached_tensors[0])
-                if request.cached_tensors and request.cached_tensors[0]
-                else 0,
-                "cached_ends_tail": request.cached_ends[-1]
-                if request.cached_ends
-                else 0,
-                "location": location,
-            },
-            hypothesis_id="H",
         )
 
     def _save_worker_retrieve_state_from_request(
@@ -2171,18 +1907,6 @@ class LMCacheConnectorV1Impl:
             gpu_connector.set_layerwise_staging_concurrency(
                 max(2, load_count + 1)
             )
-        _agent_debug_log(
-            "vllm_v1_adapter:start_load_kv",
-            "staging concurrency",
-            {
-                "load_count": load_count,
-                "staging_concurrency": getattr(
-                    gpu_connector, "_layerwise_staging_concurrency", None
-                ),
-                "existing_retrievers": len(self.layerwise_retrievers),
-            },
-            hypothesis_id="A",
-        )
 
         last_idx = -1
         for idx, request in enumerate(metadata.requests):
@@ -2240,51 +1964,6 @@ class LMCacheConnectorV1Impl:
             token_mask = self._load_token_mask_for_retrieve(
                 request, token_count, self._lmcache_chunk_size
             )
-            # #region agent log
-            _dbg_log_792df4(
-                "start_load_kv retrieve plan",
-                {
-                    "req_id": request.req_id,
-                    "tp_rank": _dbg_tp_rank(),
-                    "can_load": True,
-                    "is_sparse_decode": request.is_sparse_decode,
-                    "lmcache_cached_tokens": lmcache_cached_tokens,
-                    "vllm_cached_tokens": request.load_spec.vllm_cached_tokens,
-                    "token_count": token_count,
-                    "latent_slot": _dbg_slot_bounds(
-                        slot_mapping, self._kvcaches_for_group(0)
-                    ),
-                    "indexer_slot": (
-                        _dbg_slot_bounds(
-                            request.indexer_slot_mapping[0].to(dtype=torch.long),
-                            self._kvcaches_for_group(1),
-                        )
-                        if self._is_dsa_two_groups()
-                        and request.indexer_slot_mapping
-                        else None
-                    ),
-                },
-                hypothesis_id="H_TP6",
-                location="vllm_v1_adapter:start_load_kv",
-            )
-            # #endregion
-            _agent_debug_log(
-                "vllm_v1_adapter:start_load_kv",
-                "retrieve plan",
-                {
-                    "req_id": request.req_id,
-                    "is_sparse_decode": request.is_sparse_decode,
-                    "lmcache_cached_tokens": lmcache_cached_tokens,
-                    "vllm_cached_tokens": request.load_spec.vllm_cached_tokens,
-                    "prompt_len": len(request.token_ids),
-                    "token_count": token_count,
-                    "mask_load_true": int(token_mask.sum().item()),
-                    "mask_load_false": int((~token_mask).sum().item()),
-                    "latent_slot_len": len(slot_mapping),
-                    "latent_slot_head": _tensor_head(slot_mapping),
-                },
-                hypothesis_id="C",
-            )
             if (
                 not request.is_sparse_decode
                 and token_count > len(slot_mapping)
@@ -2318,68 +1997,12 @@ class LMCacheConnectorV1Impl:
                         if self._should_invalidate_worker_retrieve_state(
                             request, token_count
                         ):
-                            _agent_debug_log(
-                                "vllm_v1_adapter:start_load_kv",
-                                "drop worker retrieve state",
-                                {
-                                    "req_id": request.req_id,
-                                    "token_count": token_count,
-                                    "prompt_len": len(request.token_ids),
-                                    "state_token_count": (
-                                        self._worker_retrieve_state.get(
-                                            request.req_id
-                                        ).token_count
-                                        if request.req_id
-                                        in self._worker_retrieve_state
-                                        else None
-                                    ),
-                                    "state_cached_ends_tail": (
-                                        self._worker_retrieve_state[
-                                            request.req_id
-                                        ].cached_ends[-1]
-                                        if request.req_id
-                                        in self._worker_retrieve_state
-                                        and self._worker_retrieve_state[
-                                            request.req_id
-                                        ].cached_ends
-                                        else None
-                                    ),
-                                },
-                                hypothesis_id="H2",
-                            )
                             self._drop_worker_retrieve_state(request.req_id)
                         bound_state = self._bind_worker_retrieve_state_to_request(
                             request
                         )
                         worker_state = self._worker_retrieve_state.get(
                             request.req_id
-                        )
-                        _agent_debug_log(
-                            "vllm_v1_adapter:start_load_kv",
-                            "bind worker retrieve state",
-                            {
-                                "req_id": request.req_id,
-                                "state_present": worker_state is not None,
-                                "state_metadata_warm": (
-                                    worker_state.metadata_warm
-                                    if worker_state is not None
-                                    else None
-                                ),
-                                "state_cached_keys_layers": (
-                                    len(worker_state.cached_keys)
-                                    if worker_state is not None
-                                    and worker_state.cached_keys
-                                    else 0
-                                ),
-                                "state_cached_ends_tail": (
-                                    worker_state.cached_ends[-1]
-                                    if worker_state is not None
-                                    and worker_state.cached_ends
-                                    else None
-                                ),
-                                "bound_ok": bound_state is not None,
-                            },
-                            hypothesis_id="I",
                         )
                     else:
                         bound_state = None
@@ -2426,35 +2049,6 @@ class LMCacheConnectorV1Impl:
                     # hit (non-sparse branch below) loads both groups.
                     indexer_retriever = None
 
-                    _agent_debug_log(
-                        "vllm_v1_adapter:start_load_kv",
-                        "sparse decode retrieve",
-                        {
-                            "req_id": request.req_id,
-                            "dsa_two_groups": dsa_two_groups,
-                            "bound_state": bound_state is not None,
-                            "indexer_kvcaches": len(self._kvcaches_for_group(1)),
-                            "latent_cached_tensors_l0": len(
-                                request.cached_tensors[0]
-                            )
-                            if request.cached_tensors
-                            and request.cached_tensors[0]
-                            else 0,
-                            "indexer_cached_tensors_l0": len(
-                                request.cached_tensors_indexer[0]
-                            )
-                            if request.cached_tensors_indexer
-                            and request.cached_tensors_indexer[0]
-                            else 0,
-                            "indexer_retriever_created": False,
-                            "latent_only_sparse_decode": True,
-                            "metadata_warm": bool(
-                                retrieve_kwargs.get("_retrieve_metadata_warm")
-                            ),
-                            "latent_sparse_slot_head": _tensor_head(slot_mapping),
-                        },
-                        hypothesis_id="E",
-                    )
 
                     self._save_worker_retrieve_state_from_request(
                         request,
@@ -2507,16 +2101,6 @@ class LMCacheConnectorV1Impl:
                             if lmcache_cached_tokens < len(idx_slot):
                                 idx_slot = idx_slot[:lmcache_cached_tokens]
                             if len(idx_slot) < lmcache_cached_tokens:
-                                _agent_debug_log(
-                                    "vllm_v1_adapter:start_load_kv",
-                                    "request indexer slot mapping too short",
-                                    {
-                                        "req_id": request.req_id,
-                                        "lmcache_cached_tokens": lmcache_cached_tokens,
-                                        "indexer_slot_len": len(idx_slot),
-                                    },
-                                    hypothesis_id="B",
-                                )
                                 idx_slot = None
                                 idx_slot_source = None
                         if idx_slot is None:
@@ -2575,36 +2159,6 @@ class LMCacheConnectorV1Impl:
                         token_count=lmcache_cached_tokens,
                     )
 
-                    _agent_debug_log(
-                        "vllm_v1_adapter:start_load_kv",
-                        "two-group prefill retrieve",
-                        {
-                            "req_id": request.req_id,
-                            "indexer_retriever_created": indexer_retriever is not None,
-                            "indexer_kvcaches": len(self._kvcaches_for_group(1)),
-                            "indexer_slot_source": idx_slot_source,
-                            "metadata_warm": metadata_warm,
-                            "cached_keys_layers": len(request.cached_keys),
-                            "cached_ends_tail": request.cached_ends[-1]
-                            if request.cached_ends
-                            else None,
-                            "indexer_cached_keys_layers": len(
-                                request.cached_keys_indexer
-                            ),
-                            "indexer_cached_ends_tail": request.cached_ends_indexer[-1]
-                            if request.cached_ends_indexer
-                            else None,
-                            "location": prefix_location,
-                            "latent_slot_head": _tensor_head(slot_mapping),
-                            "indexer_slot_head": _tensor_head(idx_slot),
-                            "slots_match_head": (
-                                _tensor_head(slot_mapping) == _tensor_head(idx_slot)
-                                if idx_slot is not None
-                                else None
-                            ),
-                        },
-                        hypothesis_id="A",
-                    )
 
                     self.layerwise_retrievers.append(
                         (layerwise_retriever, indexer_retriever)
@@ -2755,20 +2309,6 @@ class LMCacheConnectorV1Impl:
         if not self.layerwise_retrievers:
             return
 
-        # #region agent log
-        if self.current_layer == 0:
-            _dbg_log_792df4(
-                "wait_for_layer_load layer0",
-                {
-                    "layer_name": layer_name,
-                    "tp_rank": _dbg_tp_rank(),
-                    "num_retrievers": len(self.layerwise_retrievers),
-                    "num_layers": getattr(self, "num_layers", None),
-                },
-                hypothesis_id="H_TP6",
-                location="vllm_v1_adapter:wait_for_layer_load",
-            )
-        # #endregion
 
         row_of_req = (
             {rid: row for row, rid in enumerate(request_ids)}
@@ -2908,22 +2448,6 @@ class LMCacheConnectorV1Impl:
             "cached_tensors": request.cached_tensors,
         }
 
-        # #region agent log
-        _dbg_log_792df4(
-            "deferred latent flush start",
-            {
-                "req_id": request.req_id,
-                "tp_rank": _dbg_tp_rank(),
-                "token_ids_len": len(token_ids),
-                "skip_leading_tokens": skip_leading_tokens,
-                "slot": _dbg_slot_bounds(slot_mapping, kvcaches),
-                "num_latent_layers": len(kvcaches),
-            },
-            hypothesis_id="H_DEFER",
-            run_id="post-fix",
-            location="vllm_v1_adapter:_flush_deferred_latent_store",
-        )
-        # #endregion
 
         storer = self.lmcache_engine.store_layer(
             token_ids,
@@ -2938,19 +2462,6 @@ class LMCacheConnectorV1Impl:
         self._drain_layerwise_storer_fully(storer)
         self._deferred_latent_pending.discard(request.req_id)
 
-        # #region agent log
-        _dbg_log_792df4(
-            "deferred latent flush done",
-            {
-                "req_id": request.req_id,
-                "tp_rank": _dbg_tp_rank(),
-                "skip_leading_tokens": skip_leading_tokens,
-            },
-            hypothesis_id="H_DEFER",
-            run_id="post-fix",
-            location="vllm_v1_adapter:_flush_deferred_latent_store",
-        )
-        # #endregion
 
     @_lmcache_nvtx_annotate
     def save_kv_layer(
@@ -2970,24 +2481,6 @@ class LMCacheConnectorV1Impl:
             attn_metadata (AttentionMetadata): the attention metadata.
             **kwargs: additional arguments for the save operation.
         """
-        # #region agent log
-        _dbg_log_792df4(
-            "save_kv_layer ENTRY",
-            {
-                "layer_name": layer_name,
-                "tp_rank": _dbg_tp_rank(),
-                "use_layerwise": getattr(self, "use_layerwise", None),
-                "kv_role": getattr(self, "kv_role", None),
-                "has_connector_meta": (
-                    getattr(self, "_parent", None) is not None
-                    and getattr(self._parent, "_connector_metadata", None)
-                    is not None
-                ),
-            },
-            hypothesis_id="H_META",
-            location="vllm_v1_adapter:save_kv_layer",
-        )
-        # #endregion
         assert self.lmcache_engine is not None
 
         if not self.use_layerwise:
@@ -3018,16 +2511,6 @@ class LMCacheConnectorV1Impl:
         if not kvcaches:
             # No caches registered for this group (e.g. indexer not
             # registered with the connector); nothing to store.
-            if dsa_two_groups and kv_group == 1 and is_indexer_layer:
-                _agent_debug_log(
-                    "vllm_v1_adapter:save_kv_layer",
-                    "indexer save skipped: no kvcaches",
-                    {
-                        "layer_name": layer_name,
-                        "indexer_layer_names_head": self._indexer_layer_names[:4],
-                    },
-                    hypothesis_id="F",
-                )
             return
 
         for request in connector_metadata.requests:
@@ -3081,20 +2564,6 @@ class LMCacheConnectorV1Impl:
                             next(layerwise_storer)
                     except StopIteration:
                         pass
-                    # #region agent log
-                    _dbg_log_792df4(
-                        "forward_boundary storer drained",
-                        {
-                            "req_id": request.req_id,
-                            "kv_group": kv_group,
-                            "layer_name": layer_name,
-                            "tp_rank": _dbg_tp_rank(),
-                            "token_ids_len": len(request.token_ids),
-                        },
-                        hypothesis_id="H_FWD",
-                        location="vllm_v1_adapter:save_kv_layer",
-                    )
-                    # #endregion
                     self._layerwise_save_storers.pop(storer_key, None)
                     layerwise_storer = None
             if layerwise_storer is None:
@@ -3129,112 +2598,6 @@ class LMCacheConnectorV1Impl:
                 # indexer metadata stores this as "slot_mapping", while the
                 # latent metadata stores it as "indexer_slot_mapping".
                 if is_indexer_layer:
-                    # #region agent log
-                    # Introspect attn_metadata to discover where the indexer
-                    # slot mapping lives (only for the first indexer layer, to
-                    # avoid spamming). This is diagnostic for H1.
-                    if (
-                        self._indexer_layer_names
-                        and layer_name == self._indexer_layer_names[0]
-                    ):
-                        _am = attn_metadata
-                        _am_type = type(_am).__name__
-                        _attrs = {}
-                        # attn_metadata may be a dict (compiled-graph path) or
-                        # an object; iterate the right namespace.
-                        if isinstance(_am, dict):
-                            _names = list(_am.keys())
-                        else:
-                            _names = [
-                                n for n in dir(_am) if not n.startswith("_")
-                            ]
-                        for _name in _names:
-                            if any(
-                                k in str(_name).lower()
-                                for k in ("slot", "mapping", "block", "index")
-                            ):
-                                try:
-                                    _v = (
-                                        _am[_name]
-                                        if isinstance(_am, dict)
-                                        else getattr(_am, _name)
-                                    )
-                                except Exception:
-                                    _v = "<exc>"
-                                if _v is None:
-                                    _attrs[_name] = None
-                                elif isinstance(_v, torch.Tensor):
-                                    _attrs[_name] = {
-                                        "kind": "tensor",
-                                        "shape": list(_v.shape),
-                                        "head": _v.flatten()[:4].tolist(),
-                                    }
-                                elif isinstance(_v, (list, tuple)):
-                                    _attrs[_name] = {
-                                        "kind": type(_v).__name__,
-                                        "len": len(_v),
-                                        "first_type": type(_v[0]).__name__ if _v else None,
-                                    }
-                                else:
-                                    _attrs[_name] = {
-                                        "kind": type(_v).__name__,
-                                        "repr": repr(_v)[:80],
-                                    }
-                        # Drill into the per-layer metadata object (e.g.
-                        # DeepseekV32IndexerMetadata) to find the slot field.
-                        _per_layer = {}
-                        _idx_meta_obj = (
-                            _am.get(layer_name) if isinstance(_am, dict) else None
-                        )
-                        if _idx_meta_obj is not None:
-                            for _fn in dir(_idx_meta_obj):
-                                if _fn.startswith("_"):
-                                    continue
-                                try:
-                                    _fv = getattr(_idx_meta_obj, _fn)
-                                except Exception:
-                                    _fv = "<exc>"
-                                if isinstance(_fv, torch.Tensor):
-                                    _per_layer[_fn] = {
-                                        "kind": "tensor",
-                                        "shape": list(_fv.shape),
-                                        "head": _fv.flatten()[:4].tolist(),
-                                    }
-                                elif isinstance(_fv, (list, tuple)):
-                                    _per_layer[_fn] = {
-                                        "kind": type(_fv).__name__,
-                                        "len": len(_fv),
-                                        "first_type": (
-                                            type(_fv[0]).__name__ if _fv else None
-                                        ),
-                                    }
-                                elif _fv is None:
-                                    _per_layer[_fn] = None
-                                else:
-                                    _per_layer[_fn] = {
-                                        "kind": type(_fv).__name__,
-                                        "repr": repr(_fv)[:80],
-                                    }
-                        _dbg_log_792df4(
-                            "attn_metadata introspect (indexer layer)",
-                            {
-                                "req_id": request.req_id,
-                                "layer_name": layer_name,
-                                "attn_metadata_type": _am_type,
-                                "all_keys": (
-                                    list(_am.keys()) if isinstance(_am, dict) else None
-                                ),
-                                "slot_related_attrs": _attrs,
-                                "per_layer_indexer_meta_type": (
-                                    type(_idx_meta_obj).__name__
-                                    if _idx_meta_obj is not None
-                                    else None
-                                ),
-                                "per_layer_indexer_meta_attrs": _per_layer,
-                            },
-                            hypothesis_id="H1",
-                        )
-                    # #endregion
                     idx_slot = self._indexer_slot_mapping_from_attn_metadata(
                         attn_metadata, layer_name
                     )
@@ -3251,35 +2614,8 @@ class LMCacheConnectorV1Impl:
                         self._indexer_layer_names
                         and layer_name == self._indexer_layer_names[0]
                     ):
-                        _agent_debug_log(
-                            "vllm_v1_adapter:save_kv_layer",
-                            "indexer save slot mapping",
-                            {
-                                "req_id": request.req_id,
-                                "layer_name": layer_name,
-                                "save_slot_source": save_slot_source,
-                                "slot_len": len(slot_mapping),
-                                "slot_head": _tensor_head(slot_mapping),
-                                "request_slot_head": _tensor_head(
-                                    request.slot_mapping[0].to(dtype=torch.long)
-                                ),
-                            },
-                            hypothesis_id="D",
-                        )
 
                     if idx_slot is None:
-                        # #region agent log
-                        _dbg_log_792df4(
-                            "indexer save skipped: no indexer slot mapping",
-                            {
-                                "req_id": request.req_id,
-                                "layer_name": layer_name,
-                                "kv_group": kv_group,
-                                "slot_len": len(slot_mapping),
-                                "slot_head": _tensor_head(slot_mapping),
-                            },
-                        )
-                        # #endregion
                         logger.warning(
                             "Skipping DSA indexer save for layer %s: "
                             "indexer slot mapping is unavailable",
@@ -3309,65 +2645,7 @@ class LMCacheConnectorV1Impl:
                         total_tokens=len(token_ids),
                         token_offset=skip_leading_tokens,
                     )
-                    # #region agent log
-                    # H_TP1: check whether the indexer slot mapping is within
-                    # this rank's indexer kv_caches slot capacity (TP>1 OOB).
-                    if (
-                        self._indexer_layer_names
-                        and layer_name == self._indexer_layer_names[0]
-                        and kvcaches
-                    ):
-                        _kc0 = kvcaches[0]
-                        # kv_cache entries may be a tuple/list of tensors
-                        # (e.g. (indexer_k,) for DSA_INDEX); unwrap to tensor.
-                        if isinstance(_kc0, (list, tuple)):
-                            _kc0 = _kc0[0] if _kc0 else None
-                        _kc_shape = list(_kc0.shape) if _kc0 is not None else []
-                        _capacity = (
-                            _kc_shape[0] * _kc_shape[1]
-                            if len(_kc_shape) >= 2
-                            else 0
-                        )
-                        _smin = int(slot_mapping.min().item())
-                        _smax = int(slot_mapping.max().item())
-                        _dbg_log_792df4(
-                            "indexer slot bounds vs kvcaches capacity",
-                            {
-                                "req_id": request.req_id,
-                                "layer_name": layer_name,
-                                "kv_group": kv_group,
-                                "slot_len": len(slot_mapping),
-                                "slot_min": _smin,
-                                "slot_max": _smax,
-                                "kvcaches_shape": _kc_shape,
-                                "kvcaches_capacity": _capacity,
-                                "oob": _smax >= _capacity,
-                                "num_kvcaches": len(kvcaches),
-                                "num_layers": getattr(self, "num_layers", None),
-                                "latent_kvcaches": len(self._latent_kvcaches),
-                                "indexer_kvcaches": len(self._indexer_kvcaches),
-                                "indexer_layer_names_count": len(
-                                    self._indexer_layer_names
-                                ),
-                            },
-                            hypothesis_id="H_TP1",
-                        )
-                    # #endregion
-                    if len(slot_mapping) != raw_slot_len:
-                        _agent_debug_log(
-                            "vllm_v1_adapter:save_kv_layer",
-                            "padded chunk-local indexer slot mapping",
-                            {
-                                "req_id": request.req_id,
-                                "layer_name": layer_name,
-                                "raw_slot_len": raw_slot_len,
-                                "padded_slot_len": len(slot_mapping),
-                                "skip_leading_tokens": skip_leading_tokens,
-                                "total_tokens": len(token_ids),
-                            },
-                            hypothesis_id="D",
-                        )
-                    elif len(slot_mapping) < len(token_ids):
+                    if len(slot_mapping) < len(token_ids):
                         logger.warning(
                             "Skipping DSA indexer save for layer %s: "
                             "slot mapping length %d does not cover token range "
@@ -3379,54 +2657,6 @@ class LMCacheConnectorV1Impl:
                         )
                         continue
 
-                # #region agent log
-                if (
-                    not is_indexer_layer
-                    and self._latent_layer_names
-                    and layer_name == self._latent_layer_names[0]
-                    and kvcaches
-                ):
-                    _sched_slot = (
-                        request.slot_mapping[0].to(device=self.device, dtype=torch.long)
-                        if request.slot_mapping
-                        else None
-                    )
-                    _attn_slot = self._latent_slot_mapping_from_attn_metadata(
-                        attn_metadata, layer_name
-                    )
-                    _log_data = {
-                        "req_id": request.req_id,
-                        "layer_name": layer_name,
-                        "tp_rank": _dbg_tp_rank(),
-                        "save_slot_source": save_slot_source,
-                        "slot": _dbg_slot_bounds(slot_mapping, kvcaches),
-                        "token_ids_len": len(token_ids),
-                        "skip_leading_tokens": skip_leading_tokens,
-                        "scheduler_slot_len": len(_sched_slot) if _sched_slot is not None else 0,
-                        "scheduler_slot_head": _tensor_head(_sched_slot),
-                    }
-                    if skip_leading_tokens > 0 and _sched_slot is not None:
-                        _log_data["scheduler_active_slot_head"] = _tensor_head(
-                            _sched_slot[
-                                skip_leading_tokens : skip_leading_tokens + 4
-                            ]
-                        )
-                    if _attn_slot is not None:
-                        _attn_slot = _attn_slot.to(device=self.device, dtype=torch.long)
-                        _log_data["attn_slot_len"] = len(_attn_slot)
-                        _log_data["attn_slot_head"] = _tensor_head(_attn_slot)
-                        if skip_leading_tokens > 0:
-                            _log_data["attn_active_slot_head"] = _tensor_head(
-                                _attn_slot[:4]
-                            )
-                    _dbg_log_792df4(
-                        "latent slot bounds vs kvcaches capacity",
-                        _log_data,
-                        hypothesis_id="H_SCHED",
-                        run_id="post-fix",
-                        location="vllm_v1_adapter:save_kv_layer",
-                    )
-                # #endregion
 
                 store_mask = torch.ones(len(token_ids), dtype=torch.bool)
                 store_mask[:skip_leading_tokens] = False
@@ -3471,111 +2701,6 @@ class LMCacheConnectorV1Impl:
                     kv_group == 0
                     or (dsa_two_groups and _world_size > 1)
                 )
-                # #region agent log
-                _first_latent = (
-                    self._latent_layer_names[0] if self._latent_layer_names else None
-                )
-                _first_indexer = (
-                    self._indexer_layer_names[0]
-                    if self._indexer_layer_names
-                    else None
-                )
-                if layer_name in (_first_latent, _first_indexer):
-                    _live_kv = self.kv_caches.get(layer_name)
-                    _listed_kv = (
-                        kvcaches[
-                            self._latent_layer_names.index(layer_name)
-                            if not is_indexer_layer
-                            else self._indexer_layer_names.index(layer_name)
-                        ]
-                        if (
-                            (not is_indexer_layer and layer_name in self._latent_layer_names)
-                            or (is_indexer_layer and layer_name in self._indexer_layer_names)
-                        )
-                        else None
-                    )
-                    _live_ptr = None
-                    if isinstance(_live_kv, torch.Tensor):
-                        _live_ptr = int(_live_kv.data_ptr())
-                    elif isinstance(_live_kv, (list, tuple)) and _live_kv:
-                        _live_ptr = int(_live_kv[0].data_ptr())
-                    _listed_ptr = None
-                    if isinstance(_listed_kv, torch.Tensor):
-                        _listed_ptr = int(_listed_kv.data_ptr())
-                    elif isinstance(_listed_kv, (list, tuple)) and _listed_kv:
-                        _listed_ptr = int(_listed_kv[0].data_ptr())
-                    _meta = getattr(self.lmcache_engine, "metadata", None)
-                    _dbg_log_792df4(
-                        "worker store_layer create",
-                        {
-                            "req_id": request.req_id,
-                            "layer_name": layer_name,
-                            "kv_group": kv_group,
-                            "tp_rank": _dbg_tp_rank(),
-                            "worker_id": getattr(_meta, "worker_id", None),
-                            "world_size": getattr(_meta, "world_size", None),
-                            "save_only_first_rank": getattr(
-                                self.lmcache_engine, "save_only_first_rank", None
-                            ),
-                            "is_passive": self.lmcache_engine._is_passive(),
-                            "sync": sync,
-                            "save_slot_source": save_slot_source,
-                            "slot": _dbg_slot_bounds(slot_mapping, kvcaches),
-                            "scheduler_slot_len": (
-                                len(request.slot_mapping[0])
-                                if request.slot_mapping
-                                else 0
-                            ),
-                            "scheduler_slot_head": _tensor_head(
-                                request.slot_mapping[0]
-                                if request.slot_mapping
-                                else None
-                            ),
-                            "token_ids_len": len(token_ids),
-                            "skip_leading_tokens": skip_leading_tokens,
-                            "can_save_latent": (
-                                save_spec.can_save_latent if save_spec else None
-                            ),
-                            "can_save_indexer": (
-                                save_spec.can_save_indexer if save_spec else None
-                            ),
-                            "len_mismatch": (
-                                len(token_ids) != len(slot_mapping)
-                                if not request.is_sparse_decode
-                                else False
-                            ),
-                            "num_kvcaches": len(kvcaches),
-                            "engine_num_layers": getattr(
-                                self.lmcache_engine, "num_layers", None
-                            ),
-                            "connector_num_layers": getattr(
-                                getattr(
-                                    self.lmcache_engine, "gpu_connector", None
-                                ),
-                                "num_layers",
-                                None,
-                            ),
-                            "store_kwargs_keys": sorted(store_kwargs.keys()),
-                            "indexer_slot_in_meta": (
-                                len(request.indexer_slot_mapping[0])
-                                if request.indexer_slot_mapping
-                                else 0
-                            ),
-                            "live_kv_data_ptr": _live_ptr,
-                            "listed_kv_data_ptr": _listed_ptr,
-                            "kv_ptr_stale": (
-                                _live_ptr is not None
-                                and _listed_ptr is not None
-                                and _live_ptr != _listed_ptr
-                            ),
-                        },
-                        hypothesis_id=(
-                            "H_STALE" if kv_group == 0 else "H_META"
-                        ),
-                        run_id="post-fix",
-                        location="vllm_v1_adapter:save_kv_layer",
-                    )
-                # #endregion
                 layerwise_storer = self.lmcache_engine.store_layer(
                     token_ids,
                     mask=store_mask,
