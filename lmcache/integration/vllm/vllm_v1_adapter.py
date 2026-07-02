@@ -72,6 +72,32 @@ def _dense_prefix_diag_enabled() -> bool:
     }
 
 
+def _mark_dense_prefix_loaded(
+    forward_context: "ForwardContext",
+    *,
+    req_id: str,
+    token_count: int,
+    kv_group: int,
+) -> None:
+    """Mark this forward as having loaded dense prefix KV from LMCache."""
+    try:
+        forward_context.lmcache_dense_prefix_loaded = True
+        loaded = getattr(forward_context, "lmcache_dense_prefix_loaded_reqs", None)
+        if loaded is None:
+            loaded = []
+            forward_context.lmcache_dense_prefix_loaded_reqs = loaded
+        loaded.append(
+            {
+                "req_id": req_id,
+                "token_count": int(token_count),
+                "kv_group": int(kv_group),
+            }
+        )
+    except Exception:
+        # Diagnostics must never affect the retrieve path.
+        logger.debug("Failed to mark dense prefix load on forward context", exc_info=True)
+
+
 def _seq_diag_summary(name: str, values, sample: int = 4) -> str:
     if values is None:
         return f"{name}=None"
@@ -2179,6 +2205,13 @@ class LMCacheConnectorV1Impl:
                     retrieve_slot_mapping = slot_mapping
                     if lmcache_cached_tokens < len(slot_mapping):
                         retrieve_slot_mapping = slot_mapping[:lmcache_cached_tokens]
+                    if token_count > 0:
+                        _mark_dense_prefix_loaded(
+                            forward_context,
+                            req_id=request.req_id,
+                            token_count=token_count,
+                            kv_group=0,
+                        )
                     if _dense_prefix_diag_enabled():
                         logger.info(
                             "DENSE_PREFIX_DIAG %s",
