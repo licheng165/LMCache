@@ -93,6 +93,15 @@ def _mark_dense_prefix_loaded(
                 "kv_group": int(kv_group),
             }
         )
+        if _dense_prefix_diag_enabled():
+            logger.info(
+                "DENSE_PREFIX_DIAG phase=mark_dense_prefix_loaded "
+                "req_id=%s token_count=%d kv_group=%d forward_context_id=%s",
+                req_id,
+                int(token_count),
+                int(kv_group),
+                id(forward_context),
+            )
     except Exception:
         # Diagnostics must never affect the retrieve path.
         logger.debug("Failed to mark dense prefix load on forward context", exc_info=True)
