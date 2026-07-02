@@ -442,6 +442,8 @@ class RequestTracker:
 
         if new_block_ids is not None and not isinstance(new_block_ids, (list, tuple)):
             raise ValueError(f"Unsupported new_block_ids type {type(new_block_ids)}")
+        if new_block_ids is None:
+            new_block_ids = []
         new_block_ids, new_indexer_block_ids = _split_kv_group_block_ids(
             new_block_ids
         )
@@ -824,7 +826,7 @@ class ReqMeta:
             decode_ret_mask = tracker.sparse_decode_ret_mask
 
         # Note: We keep load_spec even when can_load=False to pass metrics to worker
-        return ReqMeta(
+        req_meta = ReqMeta(
             req_id=tracker.req_id,
             token_ids=token_ids,
             slot_mapping=slot_mapping,
@@ -852,6 +854,38 @@ class ReqMeta:
             decode_token_mask=decode_token_mask,
             decode_ret_mask=decode_ret_mask,
         )
+        # #region agent log
+        if not is_sparse_decode and token_ids:
+            _dbg_log_792df4(
+                "ReqMeta built (scheduler→worker contract)",
+                {
+                    "req_id": tracker.req_id,
+                    "num_token_ids": len(token_ids),
+                    "latent_slot_len": len(slot_mapping[0]) if slot_mapping else 0,
+                    "latent_slot_head": _tensor_head(
+                        slot_mapping[0] if slot_mapping else None
+                    ),
+                    "indexer_slot_len": (
+                        len(indexer_slot_mapping[0])
+                        if indexer_slot_mapping
+                        else 0
+                    ),
+                    "latent_blocks": len(tracker.allocated_block_ids),
+                    "indexer_blocks": (
+                        len(tracker.allocated_block_ids_indexer)
+                        if tracker.allocated_block_ids_indexer
+                        else 0
+                    ),
+                    "skip_leading_tokens": save_spec.skip_leading_tokens,
+                    "can_save_latent": save_spec.can_save_latent,
+                    "can_save_indexer": save_spec.can_save_indexer,
+                    "dsa_two_groups": dsa_two_groups,
+                },
+                hypothesis_id="H_META",
+                location="vllm_v1_adapter:ReqMeta.from_request_tracker",
+            )
+        # #endregion
+        return req_meta
 
 
 @dataclass
@@ -2638,7 +2672,7 @@ class LMCacheConnectorV1Impl:
                     is not None
                 ),
             },
-            hypothesis_id="H_TP7",
+            hypothesis_id="H_META",
             location="vllm_v1_adapter:save_kv_layer",
         )
         # #endregion
@@ -2660,44 +2694,14 @@ class LMCacheConnectorV1Impl:
 
         assert len(self.kv_caches) > 0
 
-        is_first = True
+        if not self._kvcaches_list:
+            self._refresh_kvcaches_list()
 
-        # Determine kv_group from layer name for two-group DSA mode.
-        # Indexer layers contain "indexer" in their name; latent layers do not.
         dsa_two_groups = getattr(self.config, "dsa_two_groups", False)
         is_indexer_layer = dsa_two_groups and "indexer" in layer_name
         kv_group = 1 if is_indexer_layer else 0
-        # #region agent log
-        # H_TP5 isolation: skip latent save only. H_TP7 proved ANY save triggers
-        # the TP>1 crash; H_TP2 proved indexer-only skip still crashes while
-        # latent save runs — latent is the remaining suspect.
-        if not is_indexer_layer:
-            _passive = (
-                self.lmcache_engine._is_passive()
-                if self.lmcache_engine is not None
-                else None
-            )
-            _dbg_log_792df4(
-                "latent save FORCE-SKIPPED (latent path isolation)",
-                {
-                    "layer_name": layer_name,
-                    "kv_group": kv_group,
-                    "tp_rank": _dbg_tp_rank(),
-                    "save_only_first_rank": getattr(
-                        self.lmcache_engine, "save_only_first_rank", None
-                    ),
-                    "is_passive": _passive,
-                    "num_kvcaches": len(self._kvcaches_for_group(0)),
-                    "num_layers": getattr(self, "num_layers", None),
-                },
-                hypothesis_id="H_TP5",
-                location="vllm_v1_adapter:save_kv_layer",
-            )
-            return
-        # #endregion
-        # Pass only the current group's kv_caches so the connector's
-        # batched_from_gpu iterates over the correct group's layer tensors
-        # and _lazy_initialize_buffer detects the right format per group.
+        # Latent path uses the same kv list as dev-qzy (_kvcaches_list); indexer
+        # uses the partitioned indexer caches only.
         kvcaches = self._kvcaches_for_group(kv_group)
         if not kvcaches:
             # No caches registered for this group (e.g. indexer not
@@ -3034,6 +3038,33 @@ class LMCacheConnectorV1Impl:
                         )
                         continue
 
+                # #region agent log
+                if (
+                    not is_indexer_layer
+                    and self._latent_layer_names
+                    and layer_name == self._latent_layer_names[0]
+                    and kvcaches
+                ):
+                    _dbg_log_792df4(
+                        "latent slot bounds vs kvcaches capacity",
+                        {
+                            "req_id": request.req_id,
+                            "layer_name": layer_name,
+                            "tp_rank": _dbg_tp_rank(),
+                            "slot": _dbg_slot_bounds(slot_mapping, kvcaches),
+                            "token_ids_len": len(token_ids),
+                            "skip_leading_tokens": skip_leading_tokens,
+                            "scheduler_slot_head": _tensor_head(
+                                request.slot_mapping[0]
+                                if request.slot_mapping
+                                else None
+                            ),
+                        },
+                        hypothesis_id="H_META",
+                        location="vllm_v1_adapter:save_kv_layer",
+                    )
+                # #endregion
+
                 store_mask = torch.ones(len(token_ids), dtype=torch.bool)
                 store_mask[:skip_leading_tokens] = False
 
@@ -3048,11 +3079,31 @@ class LMCacheConnectorV1Impl:
 
                 # TODO (Jiayi): need to make layerwise storing
                 # compatible with disagg spec
-                group_cache = _retrieve_cache_kwargs(
-                    request,
-                    kv_group=kv_group,
-                    dsa_two_groups=dsa_two_groups,
-                )
+                # dev-qzy passes only the core cached_* fields to store_layer.
+                # Indexer-only sparse ptr fields stay on the latent/sparse path.
+                store_kwargs: dict[str, Any] = {
+                    "cached_keys": request.cached_keys,
+                    "cached_starts": request.cached_starts,
+                    "cached_ends": request.cached_ends,
+                    "cached_memory_objs": request.cached_memory_objs,
+                    "cached_tensors": request.cached_tensors,
+                }
+                # Indexer-only extras. Latent (kv_group=0) matches dev-qzy and
+                # does not pass kv_group or indexer cached_* fields.
+                if dsa_two_groups and kv_group == 1:
+                    store_kwargs["kv_group"] = kv_group
+                    store_kwargs.update(
+                        _retrieve_cache_kwargs(
+                            request,
+                            kv_group=1,
+                            dsa_two_groups=True,
+                        )
+                    )
+                # Match dev-qzy: sync=True only when creating the latent storer.
+                # Each save_kv_layer call resets a local is_first flag, which
+                # incorrectly gave indexer storers sync=True as well and could
+                # double-synchronize the NPU store stream under TP>1.
+                sync = layerwise_storer is None and kv_group == 0
                 # #region agent log
                 _first_latent = (
                     self._latent_layer_names[0] if self._latent_layer_names else None
@@ -3063,22 +3114,64 @@ class LMCacheConnectorV1Impl:
                     else None
                 )
                 if layer_name in (_first_latent, _first_indexer):
+                    _meta = getattr(self.lmcache_engine, "metadata", None)
                     _dbg_log_792df4(
-                        "store_layer create",
+                        "worker store_layer create",
                         {
                             "req_id": request.req_id,
                             "layer_name": layer_name,
                             "kv_group": kv_group,
                             "tp_rank": _dbg_tp_rank(),
+                            "worker_id": getattr(_meta, "worker_id", None),
+                            "world_size": getattr(_meta, "world_size", None),
                             "save_only_first_rank": getattr(
                                 self.lmcache_engine, "save_only_first_rank", None
                             ),
                             "is_passive": self.lmcache_engine._is_passive(),
+                            "sync": sync,
                             "slot": _dbg_slot_bounds(slot_mapping, kvcaches),
+                            "scheduler_slot_len": (
+                                len(request.slot_mapping[0])
+                                if request.slot_mapping
+                                else 0
+                            ),
+                            "scheduler_slot_head": _tensor_head(
+                                request.slot_mapping[0]
+                                if request.slot_mapping
+                                else None
+                            ),
+                            "token_ids_len": len(token_ids),
                             "skip_leading_tokens": skip_leading_tokens,
-                            "num_token_ids": len(token_ids),
+                            "can_save_latent": (
+                                save_spec.can_save_latent if save_spec else None
+                            ),
+                            "can_save_indexer": (
+                                save_spec.can_save_indexer if save_spec else None
+                            ),
+                            "len_mismatch": (
+                                len(token_ids) != len(slot_mapping)
+                                if not request.is_sparse_decode
+                                else False
+                            ),
+                            "num_kvcaches": len(kvcaches),
+                            "engine_num_layers": getattr(
+                                self.lmcache_engine, "num_layers", None
+                            ),
+                            "connector_num_layers": getattr(
+                                getattr(
+                                    self.lmcache_engine, "gpu_connector", None
+                                ),
+                                "num_layers",
+                                None,
+                            ),
+                            "store_kwargs_keys": sorted(store_kwargs.keys()),
+                            "indexer_slot_in_meta": (
+                                len(request.indexer_slot_mapping[0])
+                                if request.indexer_slot_mapping
+                                else 0
+                            ),
                         },
-                        hypothesis_id="H_TP5" if kv_group == 0 else "H_TP1",
+                        hypothesis_id="H_META",
                         location="vllm_v1_adapter:save_kv_layer",
                     )
                 # #endregion
@@ -3088,16 +3181,13 @@ class LMCacheConnectorV1Impl:
                     kvcaches=kvcaches,
                     slot_mapping=slot_mapping,
                     offset=skip_leading_tokens,
-                    sync=is_first,
+                    sync=sync,
                     req_id=request.req_id,
-                    kv_group=kv_group,
-                    **group_cache,
+                    **store_kwargs,
                 )
                 self._layerwise_save_storers[
                     (request.req_id, kv_group)
                 ] = layerwise_storer
-                if is_first:
-                    is_first = False
 
             next(layerwise_storer)
 
