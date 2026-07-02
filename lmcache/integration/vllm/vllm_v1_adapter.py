@@ -3266,6 +3266,8 @@ class LMCacheConnectorV1Impl:
                         ),
                         location="vllm_v1_adapter:save_kv_layer",
                     )
+                # #endregion
+                layerwise_storer = self.lmcache_engine.store_layer(
                     token_ids,
                     mask=store_mask,
                     kvcaches=kvcaches,
