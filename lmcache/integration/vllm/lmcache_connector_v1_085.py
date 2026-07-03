@@ -50,7 +50,14 @@ class LMCacheConnectorV1Dynamic(KVConnectorBase_V1):
         """
         self._lmcache_engine.start_load_kv(forward_context, **kwargs)
 
-    def wait_for_layer_load(self, layer_name: str) -> None:
+    def wait_for_layer_load(
+        self,
+        layer_name: str,
+        selected_tokens=None,
+        token_start_index=None,
+        request_ids=None,
+        target_slot_mapping=None,
+    ) -> None:
         """
         Block until the KV for a specific layer is loaded into vLLM's
         paged buffer. This is called from within attention layer to ensure
