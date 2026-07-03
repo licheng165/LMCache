@@ -135,7 +135,20 @@ def _am_get(attn_metadata, key, default=None):
 def _tensor_head(t: Optional[torch.Tensor], n: int = 4) -> Optional[list]:
     if t is None or t.numel() == 0:
         return None
-    return t.flatten()[:n].tolist()
+    try:
+        return t.flatten()[:n].tolist()
+    except Exception:
+        return None
+
+
+def _tensor_tail(t: Optional[torch.Tensor], n: int = 4) -> Optional[list]:
+    if t is None or t.numel() == 0:
+        return None
+    try:
+        flat = t.flatten()
+        return flat[-n:].tolist() if flat.numel() > n else flat.tolist()
+    except Exception:
+        return None
 
 
 def _tensor_debug(t: Optional[torch.Tensor], n: int = 4) -> Optional[dict[str, Any]]:
@@ -147,11 +160,99 @@ def _tensor_debug(t: Optional[torch.Tensor], n: int = 4) -> Optional[dict[str, A
         "device": str(t.device),
         "dtype": str(t.dtype),
         "head": _tensor_head(t, n),
+        "tail": _tensor_tail(t, n),
     }
 
 
 def _safe_len(obj: Any) -> int:
     return len(obj) if obj is not None else 0
+
+
+def _object_debug(obj: Any, max_repr: int = 512) -> Optional[dict[str, Any]]:
+    if obj is None:
+        return None
+    data: dict[str, Any] = {
+        "type": type(obj).__name__,
+        "repr": repr(obj)[:max_repr],
+    }
+    if isinstance(obj, dict):
+        data["keys"] = list(obj.keys())
+    return data
+
+
+def _sequence_debug(seq: Any, n: int = 4) -> dict[str, Any]:
+    if seq is None:
+        return {"present": False, "len": 0, "head": None, "tail": None}
+    try:
+        length = len(seq)
+    except Exception:
+        return {
+            "present": True,
+            "len": None,
+            "head": None,
+            "tail": None,
+            "type": type(seq).__name__,
+        }
+    try:
+        if isinstance(seq, torch.Tensor):
+            flat = seq.flatten()
+            head = flat[:n].tolist()
+            tail = flat[-n:].tolist() if length > n else head
+        else:
+            head = list(seq[:n])
+            tail = list(seq[-n:]) if length > n else head
+    except Exception:
+        head = None
+        tail = None
+    return {
+        "present": True,
+        "len": length,
+        "head": head,
+        "tail": tail,
+        "type": type(seq).__name__,
+    }
+
+
+def _kv_transfer_params_debug(params: Any) -> Optional[dict[str, Any]]:
+    if params is None:
+        return None
+    if not isinstance(params, dict):
+        return {"type": type(params).__name__}
+    disagg_spec = params.get("disagg_spec")
+    data: dict[str, Any] = {
+        "keys": list(params.keys()),
+        "has_disagg_spec": disagg_spec is not None,
+    }
+    if isinstance(disagg_spec, dict):
+        data["disagg_spec"] = {
+            "req_id": disagg_spec.get("req_id"),
+            "receiver_host": disagg_spec.get("receiver_host"),
+            "receiver_init_port": disagg_spec.get("receiver_init_port"),
+            "receiver_alloc_port": disagg_spec.get("receiver_alloc_port"),
+        }
+    return data
+
+
+def _request_debug(request: Any) -> dict[str, Any]:
+    sampling_params = getattr(request, "sampling_params", None)
+    extra_args = getattr(sampling_params, "extra_args", None)
+    return {
+        "request_id": getattr(request, "request_id", None),
+        "req_id": getattr(request, "req_id", None),
+        "num_tokens": getattr(request, "num_tokens", None),
+        "num_computed_tokens": getattr(request, "num_computed_tokens", None),
+        "priority": getattr(request, "priority", None),
+        "prompt_token_ids": _sequence_debug(
+            getattr(request, "prompt_token_ids", None)
+        ),
+        "all_token_ids": _sequence_debug(getattr(request, "all_token_ids", None)),
+        "kv_transfer_params": _kv_transfer_params_debug(
+            getattr(request, "kv_transfer_params", None)
+        ),
+        "sampling_extra_keys": (
+            list(extra_args.keys()) if isinstance(extra_args, dict) else None
+        ),
+    }
 
 
 def _slot_mapping_debug(
@@ -187,6 +288,25 @@ def _save_spec_debug(save_spec: Optional["SaveSpec"]) -> Optional[dict[str, Any]
         "can_save": save_spec.can_save,
         "can_save_latent": save_spec.can_save_latent,
         "can_save_indexer": save_spec.can_save_indexer,
+    }
+
+
+def _req_meta_debug(req_meta: Optional["ReqMeta"]) -> Optional[dict[str, Any]]:
+    if req_meta is None:
+        return None
+    return {
+        "req_id": req_meta.req_id,
+        "token_len": len(req_meta.token_ids),
+        "is_last_prefill": req_meta.is_last_prefill,
+        "is_sparse_decode": req_meta.is_sparse_decode,
+        "resumed_from_preemption": req_meta.resumed_from_preemption,
+        "load_spec": _load_spec_debug(req_meta.load_spec),
+        "save_spec": _save_spec_debug(req_meta.save_spec),
+        "slot_mapping": _slot_mapping_debug(req_meta.slot_mapping),
+        "indexer_slot_mapping": _slot_mapping_debug(req_meta.indexer_slot_mapping),
+        "latent_cache": _cached_group_debug(req_meta, kv_group=0),
+        "indexer_cache": _cached_group_debug(req_meta, kv_group=1),
+        "disagg_spec_present": req_meta.disagg_spec is not None,
     }
 
 
@@ -3339,6 +3459,11 @@ class LMCacheConnectorV1Impl:
 
                 store_mask = torch.ones(len(token_ids), dtype=torch.bool)
                 store_mask[:skip_leading_tokens] = False
+                effective_slot_mapping = (
+                    slot_mapping[skip_leading_tokens:]
+                    if len(slot_mapping) >= skip_leading_tokens
+                    else None
+                )
 
                 logger.debug(
                     "Storing KV cache for %d out of %d tokens "
@@ -3369,6 +3494,9 @@ class LMCacheConnectorV1Impl:
                         "store_true_tokens": int(store_mask.sum().item()),
                         "store_false_tokens": int((~store_mask).sum().item()),
                         "slot_mapping": _tensor_debug(slot_mapping),
+                        "effective_slot_mapping": _tensor_debug(
+                            effective_slot_mapping
+                        ),
                         "cached_group": _cached_group_debug(
                             request, kv_group=kv_group
                         ),
@@ -3624,8 +3752,33 @@ class LMCacheConnectorV1Impl:
             the number of tokens that can be loaded from the
             external KV cache beyond what is already computed.
         """
+        req_id = request.request_id
+        _agent_debug_log(
+            "vllm_v1_adapter:get_num_new_matched_tokens",
+            "lookup entry",
+            {
+                "req_id": req_id,
+                "kv_role": self.kv_role,
+                "num_computed_tokens": num_computed_tokens,
+                "skip_last_n_tokens": self.skip_last_n_tokens,
+                "min_retrieve_tokens": self.config.min_retrieve_tokens,
+                "lookup_client_type": type(self.lookup_client).__name__,
+                "load_specs_before": {
+                    key: _load_spec_debug(value)
+                    for key, value in self.load_specs.items()
+                },
+                "request": _request_debug(request),
+            },
+            hypothesis_id="P",
+        )
         # Ignore DP attention mock requests
         if request.request_id.startswith("mock_req"):
+            _agent_debug_log(
+                "vllm_v1_adapter:get_num_new_matched_tokens",
+                "lookup skipped: mock request",
+                {"req_id": req_id},
+                hypothesis_id="P",
+            )
             return 0
         # to handle preempted requests, we want `get_num_new_matched_tokens` to be
         # idempotent under the condition that `update_state_after_alloc` is NOT called
@@ -3637,18 +3790,49 @@ class LMCacheConnectorV1Impl:
         if self.kv_role == "kv_producer" and not hasattr(
             self.lookup_client, "supports_producer_reuse"
         ):
+            _agent_debug_log(
+                "vllm_v1_adapter:get_num_new_matched_tokens",
+                "lookup skipped: producer without reuse",
+                {
+                    "req_id": req_id,
+                    "kv_role": self.kv_role,
+                    "lookup_client_type": type(self.lookup_client).__name__,
+                },
+                hypothesis_id="P",
+            )
             return 0
-
-        req_id = request.request_id
 
         # lookup_client is always initialized for scheduler role
         assert self.lookup_client is not None
 
-        if (
-            num_external_hit_tokens := self.lookup_client.lookup_cache(lookup_id=req_id)
-        ) != -1:
+        try:
+            num_external_hit_tokens = self.lookup_client.lookup_cache(lookup_id=req_id)
+        except Exception as exc:
+            _agent_debug_log(
+                "vllm_v1_adapter:get_num_new_matched_tokens",
+                "lookup cache error",
+                {
+                    "req_id": req_id,
+                    "error_type": type(exc).__name__,
+                    "error": str(exc),
+                },
+                hypothesis_id="P",
+            )
+            raise
+
+        if num_external_hit_tokens != -1:
             # -1 means no result cached
             # None or int means ongoing (async) or cached result
+            _agent_debug_log(
+                "vllm_v1_adapter:get_num_new_matched_tokens",
+                "lookup cache result",
+                {
+                    "req_id": req_id,
+                    "cached_result": num_external_hit_tokens,
+                    "cached_result_type": type(num_external_hit_tokens).__name__,
+                },
+                hypothesis_id="P",
+            )
             logger.debug(
                 f"Found {num_external_hit_tokens} hit tokens for request"
                 f" {req_id} in the lookup cache."
@@ -3673,13 +3857,60 @@ class LMCacheConnectorV1Impl:
             if self.skip_last_n_tokens > 0:
                 token_ids = token_ids[: -self.skip_last_n_tokens]
 
-            num_external_hit_tokens = self.lookup_client.lookup(
-                token_ids,
-                lookup_id=req_id,
-                request_configs=request_configs,
+            _agent_debug_log(
+                "vllm_v1_adapter:get_num_new_matched_tokens",
+                "lookup request",
+                {
+                    "req_id": req_id,
+                    "token_ids": _sequence_debug(token_ids),
+                    "request_configs": _object_debug(request_configs),
+                    "mm_hashes_present": bool(mm_hashes),
+                    "mm_positions_present": bool(mm_positions),
+                },
+                hypothesis_id="P",
+            )
+            try:
+                num_external_hit_tokens = self.lookup_client.lookup(
+                    token_ids,
+                    lookup_id=req_id,
+                    request_configs=request_configs,
+                )
+            except Exception as exc:
+                _agent_debug_log(
+                    "vllm_v1_adapter:get_num_new_matched_tokens",
+                    "lookup error",
+                    {
+                        "req_id": req_id,
+                        "error_type": type(exc).__name__,
+                        "error": str(exc),
+                        "token_ids": _sequence_debug(token_ids),
+                        "request_configs": _object_debug(request_configs),
+                    },
+                    hypothesis_id="P",
+                )
+                raise
+            _agent_debug_log(
+                "vllm_v1_adapter:get_num_new_matched_tokens",
+                "lookup result",
+                {
+                    "req_id": req_id,
+                    "result": num_external_hit_tokens,
+                    "result_type": type(num_external_hit_tokens).__name__,
+                },
+                hypothesis_id="P",
             )
 
         if num_external_hit_tokens is None:
+            _agent_debug_log(
+                "vllm_v1_adapter:get_num_new_matched_tokens",
+                "lookup pending",
+                {
+                    "req_id": req_id,
+                    "num_computed_tokens": num_computed_tokens,
+                    "request_num_tokens": request.num_tokens,
+                },
+                hypothesis_id="P",
+            )
             logger.debug(
                 "Reqid: %s, Total tokens %d, Inference Engine computed tokens: %d, "
                 "LMCache hit tokens: None.",
@@ -3693,10 +3924,12 @@ class LMCacheConnectorV1Impl:
         # blocks are cached, we need to recompute the last token.
         # This will be removed in the future if vLLM's scheduler provides
         # a better support for this case.
-        need_to_allocate = num_external_hit_tokens - num_computed_tokens
+        raw_need_to_allocate = num_external_hit_tokens - num_computed_tokens
+        need_to_allocate = raw_need_to_allocate
 
         # In, full-prompt-hit case, we need to recompute the last token
-        if num_external_hit_tokens == request.num_tokens:
+        full_prompt_hit = num_external_hit_tokens == request.num_tokens
+        if full_prompt_hit:
             need_to_allocate -= 1
 
         # Check if hit tokens meet the minimum for retrieve
@@ -3704,6 +3937,22 @@ class LMCacheConnectorV1Impl:
         # for skip_leading_tokens to avoid re-storing existing chunks
         min_retrieve = self.config.min_retrieve_tokens
         below_min_retrieve = min_retrieve > 0 and need_to_allocate < min_retrieve
+        _agent_debug_log(
+            "vllm_v1_adapter:get_num_new_matched_tokens",
+            "lookup allocation decision",
+            {
+                "req_id": req_id,
+                "request_num_tokens": request.num_tokens,
+                "num_computed_tokens": num_computed_tokens,
+                "lmcache_hit_tokens": num_external_hit_tokens,
+                "raw_need_to_allocate": raw_need_to_allocate,
+                "full_prompt_hit": full_prompt_hit,
+                "need_to_allocate_after_recalc": need_to_allocate,
+                "min_retrieve_tokens": min_retrieve,
+                "below_min_retrieve": below_min_retrieve,
+            },
+            hypothesis_id="P",
+        )
 
         if below_min_retrieve:
             logger.debug(
@@ -3733,14 +3982,47 @@ class LMCacheConnectorV1Impl:
             lmcache_cached_tokens=num_external_hit_tokens,
             can_load=False,
         )
+        _agent_debug_log(
+            "vllm_v1_adapter:get_num_new_matched_tokens",
+            "lookup load spec stored",
+            {
+                "req_id": req_id,
+                "load_spec": _load_spec_debug(self.load_specs[req_id]),
+                "load_specs_after": {
+                    key: _load_spec_debug(value)
+                    for key, value in self.load_specs.items()
+                },
+            },
+            hypothesis_id="P",
+        )
 
         if below_min_retrieve or need_to_allocate <= 0:
+            _agent_debug_log(
+                "vllm_v1_adapter:get_num_new_matched_tokens",
+                "lookup returns zero",
+                {
+                    "req_id": req_id,
+                    "below_min_retrieve": below_min_retrieve,
+                    "need_to_allocate": need_to_allocate,
+                },
+                hypothesis_id="P",
+            )
             return 0
 
         # TODO: Align to vLLM block size. Should test whether it can be removed
         # need_to_allocate = need_to_allocate // self._block_size * \
         #        self._block_size
 
+        _agent_debug_log(
+            "vllm_v1_adapter:get_num_new_matched_tokens",
+            "lookup returns allocation",
+            {
+                "req_id": req_id,
+                "need_to_allocate": need_to_allocate,
+                "load_spec": _load_spec_debug(self.load_specs[req_id]),
+            },
+            hypothesis_id="P",
+        )
         return need_to_allocate
 
     @_lmcache_nvtx_annotate
@@ -3751,16 +4033,45 @@ class LMCacheConnectorV1Impl:
         For SharedStorageConnector, update _request_needs_load
         if the CacheManager this allocated blocks for us.
         """
+        req_id = request.request_id
+        _agent_debug_log(
+            "vllm_v1_adapter:update_state_after_alloc",
+            "alloc entry",
+            {
+                "req_id": req_id,
+                "kv_role": self.kv_role,
+                "num_external_tokens": num_external_tokens,
+                "load_spec_before": _load_spec_debug(self.load_specs.get(req_id)),
+                "load_specs_keys": list(self.load_specs.keys()),
+                "request": _request_debug(request),
+            },
+            hypothesis_id="P",
+        )
 
         # Clear local status in lookup client when a new request is
         # successfully scheduled.
         assert self.lookup_client is not None
-        self.lookup_client.clear_lookup_status(request.request_id)
+        self.lookup_client.clear_lookup_status(req_id)
+        _agent_debug_log(
+            "vllm_v1_adapter:update_state_after_alloc",
+            "lookup status cleared",
+            {"req_id": req_id, "lookup_client_type": type(self.lookup_client).__name__},
+            hypothesis_id="P",
+        )
 
         kv_transfer_params = (
             request.kv_transfer_params
             if hasattr(request, "kv_transfer_params")
             else None
+        )
+        _agent_debug_log(
+            "vllm_v1_adapter:update_state_after_alloc",
+            "kv transfer params",
+            {
+                "req_id": req_id,
+                "kv_transfer_params": _kv_transfer_params_debug(kv_transfer_params),
+            },
+            hypothesis_id="P",
         )
 
         if kv_transfer_params is not None and "disagg_spec" in kv_transfer_params:
@@ -3779,42 +4090,115 @@ class LMCacheConnectorV1Impl:
             )
 
             tmp_disagg_tracker[request.request_id] = disagg_spec
+            _agent_debug_log(
+                "vllm_v1_adapter:update_state_after_alloc",
+                "disagg spec recorded",
+                {
+                    "req_id": req_id,
+                    "tmp_disagg_tracker_keys": list(tmp_disagg_tracker.keys()),
+                    "disagg_spec": {
+                        "req_id": disagg_spec.req_id,
+                        "receiver_id": disagg_spec.receiver_id,
+                        "receiver_host": disagg_spec.receiver_host,
+                        "receiver_init_port": disagg_spec.receiver_init_port,
+                        "receiver_alloc_port": disagg_spec.receiver_alloc_port,
+                    },
+                },
+                hypothesis_id="P",
+            )
         self._unfinished_requests[request.request_id] = request
+        _agent_debug_log(
+            "vllm_v1_adapter:update_state_after_alloc",
+            "unfinished request recorded",
+            {
+                "req_id": req_id,
+                "unfinished_req_ids": list(self._unfinished_requests.keys()),
+            },
+            hypothesis_id="P",
+        )
 
-        if request.request_id not in self.load_specs:
+        if req_id not in self.load_specs:
             # No KV tokens from external KV cache, return
+            _agent_debug_log(
+                "vllm_v1_adapter:update_state_after_alloc",
+                "alloc skipped: no load spec",
+                {
+                    "req_id": req_id,
+                    "num_external_tokens": num_external_tokens,
+                    "load_specs_keys": list(self.load_specs.keys()),
+                },
+                hypothesis_id="P",
+            )
             return
 
         if num_external_tokens == 0:
             # No need to load anything
-            self.load_specs[request.request_id].can_load = False
+            self.load_specs[req_id].can_load = False
+            _agent_debug_log(
+                "vllm_v1_adapter:update_state_after_alloc",
+                "alloc skipped: zero external tokens",
+                {
+                    "req_id": req_id,
+                    "load_spec_after": _load_spec_debug(self.load_specs[req_id]),
+                },
+                hypothesis_id="P",
+            )
             return
 
         recalc_last = (
             1
             if (
-                self.load_specs[request.request_id].lmcache_cached_tokens
+                self.load_specs[req_id].lmcache_cached_tokens
                 == request.num_tokens
             )
             else 0
         )
+        expected_external_tokens = (
+            self.load_specs[req_id].lmcache_cached_tokens
+            - self.load_specs[req_id].vllm_cached_tokens
+            - recalc_last
+        )
+        _agent_debug_log(
+            "vllm_v1_adapter:update_state_after_alloc",
+            "alloc validation",
+            {
+                "req_id": req_id,
+                "num_external_tokens": num_external_tokens,
+                "expected_external_tokens": expected_external_tokens,
+                "recalc_last": recalc_last,
+                "load_spec_before": _load_spec_debug(self.load_specs[req_id]),
+                "request_num_tokens": request.num_tokens,
+            },
+            hypothesis_id="P",
+        )
         assert (
             num_external_tokens
-            == self.load_specs[request.request_id].lmcache_cached_tokens
-            - self.load_specs[request.request_id].vllm_cached_tokens
-            - recalc_last
+            == expected_external_tokens
         ), (
             f"Mismatch in tokens to load: {num_external_tokens} vs "
-            f"{self.load_specs[request.request_id].lmcache_cached_tokens} "
+            f"{self.load_specs[req_id].lmcache_cached_tokens} "
             "(tokens in lmcache) - "
-            f"{self.load_specs[request.request_id].vllm_cached_tokens} "
+            f"{self.load_specs[req_id].vllm_cached_tokens} "
             "(tokens in vllm) - "
             f"{recalc_last} "
             "(full lmcache hits subtracts last token to recalculate logits)"
-            f" for request {request.request_id}"
+            f" for request {req_id}"
         )
 
-        self.load_specs[request.request_id].can_load = True
+        self.load_specs[req_id].can_load = True
+        _agent_debug_log(
+            "vllm_v1_adapter:update_state_after_alloc",
+            "alloc marked loadable",
+            {
+                "req_id": req_id,
+                "load_spec_after": _load_spec_debug(self.load_specs[req_id]),
+                "load_specs_after": {
+                    key: _load_spec_debug(value)
+                    for key, value in self.load_specs.items()
+                },
+            },
+            hypothesis_id="P",
+        )
 
     @_lmcache_nvtx_annotate
     def build_connector_meta(
@@ -3944,6 +4328,25 @@ class LMCacheConnectorV1Impl:
             )
             if req_meta is not None:
                 meta.add_request(req_meta)
+                _agent_debug_log(
+                    "vllm_v1_adapter:build_connector_meta",
+                    "metadata add new request",
+                    {
+                        "req_id": request.req_id,
+                        "req_meta": _req_meta_debug(req_meta),
+                    },
+                    hypothesis_id="P",
+                )
+            else:
+                _agent_debug_log(
+                    "vllm_v1_adapter:build_connector_meta",
+                    "metadata skip new request",
+                    {
+                        "req_id": request.req_id,
+                        "load_spec": _load_spec_debug(load_spec),
+                    },
+                    hypothesis_id="P",
+                )
 
         cached_reqs = scheduler_output.scheduled_cached_reqs
 
@@ -4019,6 +4422,38 @@ class LMCacheConnectorV1Impl:
                 if req_meta is not None:
                     req_meta.resumed_from_preemption = req.resumed_from_preemption
                     meta.add_request(req_meta)
+                    _agent_debug_log(
+                        "vllm_v1_adapter:build_connector_meta",
+                        "metadata add cached request (list)",
+                        {
+                            "req_id": req.req_id,
+                            "req_meta": _req_meta_debug(req_meta),
+                        },
+                        hypothesis_id="P",
+                    )
+                else:
+                    _agent_debug_log(
+                        "vllm_v1_adapter:build_connector_meta",
+                        "metadata skip cached request (list)",
+                        {
+                            "req_id": req.req_id,
+                            "load_spec": _load_spec_debug(load_spec),
+                        },
+                        hypothesis_id="P",
+                    )
+            _agent_debug_log(
+                "vllm_v1_adapter:build_connector_meta",
+                "metadata build complete",
+                {
+                    "kv_role": self.kv_role,
+                    "cached_reqs_type": "list",
+                    "requests": [
+                        _req_meta_debug(req)
+                        for req in getattr(meta, "requests", [])
+                    ],
+                },
+                hypothesis_id="P",
+            )
             return meta
 
         for i, req_id in enumerate(cached_reqs.req_ids):
@@ -4198,7 +4633,44 @@ class LMCacheConnectorV1Impl:
             if req_meta is not None:
                 req_meta.resumed_from_preemption = preempted
                 meta.add_request(req_meta)
+                _agent_debug_log(
+                    "vllm_v1_adapter:build_connector_meta",
+                    "metadata add cached request",
+                    {
+                        "req_id": req_id,
+                        "req_meta": _req_meta_debug(req_meta),
+                        "load_spec_before_sparse": _load_spec_debug(
+                            load_spec_before_sparse
+                        ),
+                    },
+                    hypothesis_id="P",
+                )
+            else:
+                _agent_debug_log(
+                    "vllm_v1_adapter:build_connector_meta",
+                    "metadata skip cached request",
+                    {
+                        "req_id": req_id,
+                        "load_spec_for_reqmeta": _load_spec_debug(load_spec),
+                        "load_spec_before_sparse": _load_spec_debug(
+                            load_spec_before_sparse
+                        ),
+                    },
+                    hypothesis_id="P",
+                )
 
+        _agent_debug_log(
+            "vllm_v1_adapter:build_connector_meta",
+            "metadata build complete",
+            {
+                "kv_role": self.kv_role,
+                "cached_reqs_type": type(cached_reqs).__name__,
+                "requests": [
+                    _req_meta_debug(req) for req in getattr(meta, "requests", [])
+                ],
+            },
+            hypothesis_id="P",
+        )
         return meta
 
     @_lmcache_nvtx_annotate
