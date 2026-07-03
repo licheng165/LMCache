@@ -147,9 +147,11 @@ class TestWorkerRetrieveState:
         impl = _make_impl()
         impl.config = SimpleNamespace(dsa_two_groups=False)
         impl._latent_kvcaches = [object()]
-        impl.lmcache_engine = SimpleNamespace(
-            storage_manager=None,
-            store_location="LocalCPUBackend",
+        impl._manager = SimpleNamespace(
+            lmcache_engine=SimpleNamespace(
+                storage_manager=None,
+                store_location="LocalCPUBackend",
+            ),
         )
 
         first = _make_store_request(
