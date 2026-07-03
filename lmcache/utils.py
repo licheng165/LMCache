@@ -346,6 +346,9 @@ class CacheEngineKey:
     request_configs: Optional[dict] = field(default_factory=dict)
     tags: Optional[tuple] = field(init=False, default=None)
     _dtype_str: str = field(init=False, default="")
+    kv_group: int = 0
+    """0 = latent (MLA latent KV), 1 = indexer (DSA indexer key).
+    Defaults to 0 for backward compatibility with existing caches."""
 
     def __post_init__(self):
         tag_list = None
@@ -370,6 +373,7 @@ class CacheEngineKey:
                 self.chunk_hash,
                 self._dtype_str,
                 self.tags,
+                self.kv_group,
             )
         )
 
@@ -382,6 +386,7 @@ class CacheEngineKey:
                 and self.chunk_hash == other.chunk_hash
                 and self.dtype == other.dtype
                 and self.tags == other.tags
+                and self.kv_group == other.kv_group
             )
 
         return False
@@ -390,6 +395,7 @@ class CacheEngineKey:
         s = (
             f"{self.model_name}@{self.world_size}"
             f"@{self.worker_id}@{self.chunk_hash_hex}@{self._dtype_str}"
+            f"@{self.kv_group}"
         )
         if self.tags is not None and len(self.tags) != 0:
             tags = [f"{k}%{v}" for k, v in self.tags]
@@ -409,6 +415,7 @@ class CacheEngineKey:
                     dtype=self.dtype,
                     request_configs=self.request_configs,
                     layer_id=layer_id,
+                    kv_group=self.kv_group,
                 )
             )
         return keys
@@ -423,6 +430,7 @@ class CacheEngineKey:
             dtype=self.dtype,
             request_configs=self.request_configs,
             layer_id=0,
+            kv_group=self.kv_group,
         )
         return key
 
@@ -432,9 +440,18 @@ class CacheEngineKey:
         if len(parts) < 5:
             raise ValueError(f"Invalid key string: {s}")
         request_configs = None
-        if len(parts) >= 6:
+        # Format: model@ws@wid@hash@dtype[@kv_group][@tags...]
+        # kv_group defaults to 0 for backward compat with old 5-part keys.
+        # Old format without kv_group had tags at parts[5:] (tag entries
+        # contain '%'). Detect old format by checking for '%' in parts[5].
+        kv_group = 0
+        tag_start = 5
+        if len(parts) > 5 and "%" not in parts[5]:
+            kv_group = int(parts[5])
+            tag_start = 6
+        if len(parts) > tag_start:
             request_configs = {}
-            for kv in parts[5:]:
+            for kv in parts[tag_start:]:
                 kvs = kv.split("%", 1)
                 if len(kvs) != 2:
                     raise ValueError(f"Invalid key string: {s}")
@@ -446,6 +463,7 @@ class CacheEngineKey:
             chunk_hash=int(parts[3], 16),
             dtype=STR_DTYPE_TO_TORCH_DTYPE[parts[4]],
             request_configs=request_configs,
+            kv_group=kv_group,
         )
 
     def to_dict(self):
@@ -457,6 +475,7 @@ class CacheEngineKey:
             "worker_id": self.worker_id,
             "chunk_hash": self.chunk_hash,
             "dtype": self._dtype_str,
+            "kv_group": self.kv_group,
         }
         if self.request_configs is not None and len(self.request_configs) != 0:
             msg["request_configs"] = [
@@ -481,6 +500,7 @@ class CacheEngineKey:
             chunk_hash=d["chunk_hash"],
             dtype=STR_DTYPE_TO_TORCH_DTYPE[d["dtype"]],
             request_configs=request_configs,
+            kv_group=d.get("kv_group", 0),
         )
 
     def with_new_worker_id(self, new_worker_id: int) -> "CacheEngineKey":
@@ -492,6 +512,7 @@ class CacheEngineKey:
             chunk_hash=self.chunk_hash,
             dtype=self.dtype,
             request_configs=self.request_configs,
+            kv_group=self.kv_group,
         )
 
     @property
@@ -517,6 +538,7 @@ class LayerCacheEngineKey(CacheEngineKey):
                 self._dtype_str,
                 self.tags,
                 self.layer_id,
+                self.kv_group,
             )
         )
 
@@ -529,7 +551,8 @@ class LayerCacheEngineKey(CacheEngineKey):
     def to_string(self):
         s = (
             f"{self.model_name}@{self.world_size}"
-            f"@{self.worker_id}@{self.chunk_hash_hex}@{self._dtype_str}@{self.layer_id}"
+            f"@{self.worker_id}@{self.chunk_hash_hex}@{self._dtype_str}"
+            f"@{self.kv_group}@{self.layer_id}"
         )
         if self.tags is not None and len(self.tags) != 0:
             tags = [f"{k}%{v}" for k, v in self.tags]
@@ -549,6 +572,7 @@ class LayerCacheEngineKey(CacheEngineKey):
                     dtype=self.dtype,
                     request_configs=self.request_configs,
                     layer_id=layer_id,
+                    kv_group=self.kv_group,
                 )
             )
         return keys
@@ -559,9 +583,27 @@ class LayerCacheEngineKey(CacheEngineKey):
         if len(parts) < 6:
             raise ValueError(f"Invalid key string: {s}")
         request_configs = None
-        if len(parts) >= 7:
+        # New format: model@ws@wid@hash@dtype@kv_group@layer_id[@tags...]
+        # Old format: model@ws@wid@hash@dtype@layer_id[@tags...]
+        # Detect old format: parts[5] is layer_id (int) and parts[6:]
+        # are tags (contain '%'). In new format, parts[5] is kv_group,
+        # parts[6] is layer_id.
+        kv_group = 0
+        layer_id = 0
+        # Heuristic: old format has exactly 6 parts or parts[6] contains '%'.
+        # New format has parts[6] as an int (layer_id).
+        if len(parts) >= 7 and "%" not in parts[6]:
+            # New format: parts[5]=kv_group, parts[6]=layer_id, parts[7:]=tags
+            kv_group = int(parts[5])
+            layer_id = int(parts[6])
+            tag_start = 7
+        else:
+            # Old format: parts[5]=layer_id, parts[6:]=tags
+            layer_id = int(parts[5])
+            tag_start = 6
+        if len(parts) > tag_start:
             request_configs = {}
-            for kv in parts[6:]:
+            for kv in parts[tag_start:]:
                 kvs = kv.split("%", 1)
                 if len(kvs) != 2:
                     raise ValueError(f"Invalid key string: {s}")
@@ -573,7 +615,8 @@ class LayerCacheEngineKey(CacheEngineKey):
             chunk_hash=int(parts[3], 16),
             dtype=STR_DTYPE_TO_TORCH_DTYPE[parts[4]],
             request_configs=request_configs,
-            layer_id=int(parts[5]),
+            layer_id=layer_id,
+            kv_group=kv_group,
         )
 
 

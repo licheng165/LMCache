@@ -41,6 +41,8 @@ def _make_scheduler_impl() -> LMCacheConnectorV1Impl:
     impl.enable_sparse_attention = True
     impl.config = MagicMock()
     impl.config.save_decode_cache = False
+    impl.config.save_full_chunk_in_decode = False
+    impl.config.dsa_two_groups = False
     impl.config.priority_limit = None
     impl.kv_role = "kv_both"
     impl.force_skip_save = False
@@ -111,6 +113,50 @@ class TestBuildConnectorMetaSparseSyntheticLoadSpec:
         assert req_meta.token_ids == list(range(prompt_len))
         assert req_meta.cached_keys == []
 
+    def test_sparse_decode_seeds_full_prompt_when_tracker_is_chunked(self) -> None:
+        impl = _make_scheduler_impl()
+        req_id = "sparse-req"
+        prompt_len = 18879
+        tracker_token_len = 2495
+        decode_token = 1001
+        vllm_req = _make_vllm_request(
+            req_id, prompt_len, prompt_len + 1, decode_token
+        )
+
+        impl._unfinished_requests[req_id] = vllm_req
+        num_blocks = (prompt_len + impl._block_size - 1) // impl._block_size
+        tracker = RequestTracker(
+            req_id=req_id,
+            prompt_len=prompt_len,
+            token_ids=list(range(tracker_token_len)),
+            allocated_block_ids=list(range(num_blocks)),
+            num_saved_tokens=tracker_token_len,
+        )
+        tracker.is_decode_phase = True
+        impl._request_trackers[req_id] = tracker
+
+        scheduler_output = StubSchedulerOutput(
+            finished_req_ids=set(),
+            scheduled_new_reqs=[],
+            scheduled_cached_reqs=StubCachedRequestData(
+                req_ids=[req_id],
+                new_token_ids=[[decode_token]],
+                new_block_ids=[[num_blocks]],
+            ),
+            num_scheduled_tokens={req_id: 1},
+        )
+
+        meta = impl.build_connector_meta(scheduler_output)
+        req_meta = meta.requests[0]
+
+        assert req_meta.is_sparse_decode
+        assert req_meta.load_spec is not None
+        assert req_meta.load_spec.lmcache_cached_tokens == prompt_len
+        assert len(req_meta.token_ids) == prompt_len
+        assert req_meta.token_ids[0] == 0
+        assert req_meta.token_ids[-1] == prompt_len - 1
+        assert len(tracker.sparse_token_ids) == prompt_len
+
     def test_multi_step_sparse_decode_reuses_tracker_sparse_token_ids(self) -> None:
         impl = _make_scheduler_impl()
         req_id = "sparse-req"
@@ -159,20 +205,24 @@ class TestZombieRequestInMetadata:
         assert "zombie" in impl._worker_retrieve_state
         assert "active" in impl._worker_retrieve_state
 
-    def test_request_removed_from_metadata_prunes_zombie_state(self) -> None:
+    def test_request_removed_from_metadata_keeps_warm_worker_state(self) -> None:
         impl = make_worker_impl()
         engine = MagicMock()
         impl._manager = SimpleNamespace(lmcache_engine=engine)
         impl._worker_retrieve_state = {
-            "zombie": WorkerRetrieveState(metadata_warm=True),
-            "active": WorkerRetrieveState(metadata_warm=True),
+            "zombie": WorkerRetrieveState(
+                metadata_warm=True, cached_keys=[["k"]]
+            ),
+            "active": WorkerRetrieveState(
+                metadata_warm=True, cached_keys=[["k2"]]
+            ),
         }
 
         impl._prune_worker_retrieve_state({"active"})
 
-        assert "zombie" not in impl._worker_retrieve_state
+        assert "zombie" in impl._worker_retrieve_state
         assert "active" in impl._worker_retrieve_state
-        engine.lookup_unpin.assert_called_once_with("zombie")
+        engine.lookup_unpin.assert_not_called()
 
     def test_scheduler_clears_tracker_on_finished_but_worker_needs_prune(self) -> None:
         impl = _make_scheduler_impl()

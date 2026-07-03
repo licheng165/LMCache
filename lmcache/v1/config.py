@@ -280,6 +280,21 @@ _CONFIG_DEFINITIONS: dict[str, dict[str, Any]] = {
         "default": False,
         "env_converter": _to_bool,
     },
+    "save_full_chunk_in_decode": {
+        "type": bool,
+        "default": False,
+        "env_converter": _to_bool,
+    },
+    "save_indexer_only_first_rank": {
+        "type": bool,
+        "default": False,
+        "env_converter": _to_bool,
+    },
+    "dsa_two_groups": {
+        "type": bool,
+        "default": False,
+        "env_converter": _to_bool,
+    },
     "blocking_timeout_secs": {"type": int, "default": 10, "env_converter": int},
     "external_lookup_client": {
         "type": Optional[str],

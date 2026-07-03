@@ -113,6 +113,16 @@ class LMCacheEngine:
             self.config.get_extra_config_value("save_only_first_rank", metadata.use_mla)
             and metadata.use_mla
         )
+        # save_indexer_only_first_rank: same rank-0-only policy for the DSA
+        # indexer group. Defaults to save_only_first_rank when dsa_two_groups
+        # is enabled (indexer is small; per-rank keys waste CPU memory).
+        self.dsa_two_groups = getattr(self.config, "dsa_two_groups", False)
+        self.save_indexer_only_first_rank = (
+            self.config.get_extra_config_value(
+                "save_indexer_only_first_rank",
+                self.save_only_first_rank if self.dsa_two_groups else False,
+            )
+        )
 
         if self.save_only_first_rank and self.gpu_connector is not None:
             self.broadcast_stream = (
@@ -157,12 +167,10 @@ class LMCacheEngine:
 
         self.use_layerwise = config.use_layerwise
 
-        # TODO: support save_only_first_rank when use layerwise
-        # if use_layerwise is True, all ranks will initialize the storage_manager
-        # if save_only_first_rank is False, all ranks will initialize
-        # the storage_manager
-        # if save_only_first_rank is True, only the first rank and
-        # lookup server workers will initialize the storage_manager
+        # save_only_first_rank + layerwise: store_layer now has _is_passive()
+        # guard (see store_layer). When save_only_first_rank is True, only the
+        # first rank and lookup server workers initialize the storage_manager.
+        # When False, all ranks initialize the storage_manager.
         self.storage_manager: Optional[StorageManager] = None
 
         # KV events
@@ -189,13 +197,13 @@ class LMCacheEngine:
         self.fmt = None
         if self.use_layerwise:
             if metadata.use_mla:
-                self.fmt = MemoryFormat.KV_MLA_FMT
+                self.fmt = MemoryFormat.KV_MLA_LATENT_FMT
             elif config.enable_blending:
                 self.fmt = MemoryFormat.KV_2TD
             else:
                 self.fmt = MemoryFormat.KV_T2D
         if metadata.use_mla:
-            self.fmt = MemoryFormat.KV_MLA_FMT
+            self.fmt = MemoryFormat.KV_MLA_LATENT_FMT
 
         # NOTE(ApostaC): we haven't support lookup-cache yet
         self.lookup_cache: dict[CacheEngineKey, Any] = {}
@@ -454,6 +462,7 @@ class LMCacheEngine:
         request_configs = kwargs.get("request_configs")
         if request_configs is not None and len(request_configs) != 0:
             assert isinstance(request_configs, dict)
+        kv_group = kwargs.get("kv_group", 0)
 
         with store_stats.profile_process_tokens():
             prev_key = 0
@@ -550,10 +559,11 @@ class LMCacheEngine:
         tot_time = store_stats.time_to_store()
 
         logger.info(
-            "[req_id=%s] Stored %d out of total %d tokens. "
+            "[req_id=%s kv_group=%s] Stored %d out of total %d tokens. "
             "size: %.4f GB, cost %.4f ms, throughput: %.4f GB/s; "
             "offload_time: %.4f ms, put_time: %.4f ms",
             req_id,
+            kv_group,
             tot_token_num,
             num_to_store_tokens,
             tot_kv_size / 1024**3,
@@ -596,6 +606,20 @@ class LMCacheEngine:
             logger.warning("LMCache is unhealthy, skipping store_layer operation")
             return
 
+        # Passive rank guard: when save_only_first_rank is enabled, only rank 0
+        # stores. This closes the known TODO at cache_engine.py:160-165 —
+        # previously store_layer had no _is_passive() check, causing duplicate
+        # stores on non-rank-0 workers under MLA + layerwise.
+        if self._is_passive():
+            logger.debug(
+                "Passive rank (save_only_first_rank), skipping store_layer"
+            )
+            for layer_id in range(self.num_layers):
+                yield
+            # Extra yield consumed by wait_for_save() after the last layer.
+            yield
+            return
+
         assert self.storage_manager is not None
         assert self.gpu_connector is not None, (
             "gpu_connector is required for store_layer operation"
@@ -628,6 +652,7 @@ class LMCacheEngine:
             # Still need to yield to avoid StopIteration
             for layer_id in range(self.num_layers):
                 yield
+            yield
             return
 
         cached_keys = kwargs.get("cached_keys")
@@ -645,8 +670,11 @@ class LMCacheEngine:
             assert isinstance(request_configs, dict)
 
         prev_key = 0
+        kv_group = kwargs.get("kv_group", 0)
+        store_fmt = self._memory_format_for_kv_group(kv_group)
         for start, end, key in self.token_database.process_tokens(
-            tokens=tokens, mask=mask, request_configs=request_configs
+            tokens=tokens, mask=mask, request_configs=request_configs,
+            kv_group=kv_group,
         ):
             assert isinstance(key, CacheEngineKey)
 
@@ -665,7 +693,7 @@ class LMCacheEngine:
                 kv_shape_single_layer,
                 kv_dtype,
                 batch_size=self.num_layers,
-                fmt=self.fmt,
+                fmt=store_fmt,
                 busy_loop=self.config.get_extra_config_value("force_store_wait", False),
             )
 
@@ -735,9 +763,10 @@ class LMCacheEngine:
 
             tot_time = time.perf_counter() - t_start
             logger.info(
-                "[req_id=%s] Stored %d out of total %d tokens. "
+                "[req_id=%s kv_group=%s] Stored %d out of total %d tokens. "
                 "size: %.4f GB, cost %.4f ms, throughput: %.4f GB/s",
                 req_id,
+                kv_group,
                 tot_token_num,
                 len(tokens),
                 tot_kv_size / 1024**3,
@@ -887,11 +916,13 @@ class LMCacheEngine:
         # need_to_load: 512 - 288 = 224 tokens
         # retrieved: 256 tokens
         if not self._is_passive():
+            kv_group = kwargs.get("kv_group", 0)
             logger.info(
-                "[req_id=%s] Retrieved %d out of %d required tokens "
+                "[req_id=%s kv_group=%s] Retrieved %d out of %d required tokens "
                 "(from %d total tokens). size: %.4f gb, "
                 "cost %.4f ms, throughput: %.4f GB/s;",
                 req_id,
+                kv_group,
                 retrieved_tokens,
                 num_required_tokens,
                 len(tokens),
@@ -962,10 +993,12 @@ class LMCacheEngine:
             assert isinstance(request_configs, dict)
 
         location = None
+        kv_group = kwargs.get("kv_group", 0)
         for start, end, key in self.token_database.process_tokens(
             tokens=tokens,
             mask=mask,
             request_configs=request_configs,
+            kv_group=kv_group,
         ):
             assert isinstance(key, CacheEngineKey)
 
@@ -1043,8 +1076,9 @@ class LMCacheEngine:
         self.stats_monitor.on_retrieve_finished(monitor_req_id, retrieved_tokens)
         if not self._is_passive():
             logger.info(
-                "[req_id=%s] Retrieved %d out of %d out of total %d tokens",
+                "[req_id=%s kv_group=%s] Retrieved %d out of %d out of total %d tokens",
                 req_id,
+                kv_group,
                 retrieved_tokens,
                 num_required_tokens,
                 len(tokens),
@@ -1763,12 +1797,28 @@ class LMCacheEngine:
                 )
                 reordered_chunks.append((None, memory_obj, start, end))
 
+    def _memory_format_for_kv_group(self, kv_group: int = 0) -> MemoryFormat:
+        """Return the CPU chunk format tag for a KV cache group."""
+        if kv_group == 1 and getattr(self.config, "dsa_two_groups", False):
+            return MemoryFormat.KV_DSA_INDEX_FMT
+        if self.metadata.use_mla:
+            return MemoryFormat.KV_MLA_LATENT_FMT
+        assert self.fmt is not None, "Memory format is not initialized"
+        return self.fmt
+
     def _is_passive(self):
         """
         A 'passive' CacheEngine means that the node itself will not store/retrieve
         the data directly, but from the "active" worker (i.e., rank 0 in MLA)
         """
         return self.save_only_first_rank and not self.metadata.is_first_rank()
+
+    def _is_indexer_passive(self):
+        """Same as _is_passive but for the DSA indexer group (kv_group=1)."""
+        return (
+            self.save_indexer_only_first_rank
+            and not self.metadata.is_first_rank()
+        )
 
     def _maybe_unpin_retrieved_objs(
         self,

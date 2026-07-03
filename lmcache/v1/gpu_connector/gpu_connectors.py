@@ -135,6 +135,10 @@ class GPUConnectorInterface(metaclass=abc.ABCMeta):
             # the physical (HND) shape for correct kernel indexing.
             # permute_kv_caches_to_contiguous is a no-op when already contiguous.
             self.kvcaches = permute_kv_caches_to_contiguous(self.kvcaches)
+            # Layerwise store/retrieve passes a per-group list with one entry
+            # per layer. Keep the transfer loop aligned with that list length.
+            if isinstance(self.kvcaches, list) and self.kvcaches:
+                self.num_layers = len(self.kvcaches)
 
 
 class VLLMPagedMemGPUConnectorV2(GPUConnectorInterface):

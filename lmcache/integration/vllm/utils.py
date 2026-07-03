@@ -269,6 +269,7 @@ def create_lmcache_metadata(
         served_model_name=model_cfg.served_model_name,
         engine_id=engine_id,
         kv_connector_extra_config=kv_connector_extra_config,
+        max_model_len=getattr(model_cfg, "max_model_len", None),
     )
 
     return metadata, config
