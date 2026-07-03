@@ -80,6 +80,34 @@ def _build_slot_mapping(
     return slots[:num_tokens]
 
 
+def _dsa_has_device_tensor(value: Any) -> bool:
+    if isinstance(value, torch.Tensor):
+        return value.device.type != "cpu"
+    if isinstance(value, list):
+        return any(_dsa_has_device_tensor(item) for item in value)
+    return False
+
+
+def _dsa_record_current_stream_event() -> Optional[Any]:
+    try:
+        if hasattr(torch, "npu") and hasattr(torch.npu, "Event"):
+            event = torch.npu.Event()
+            event.record(torch.npu.current_stream())
+            return event
+    except Exception:
+        logger.debug("Failed to record NPU DSA payload event", exc_info=True)
+
+    try:
+        if hasattr(torch, "cuda") and torch.cuda.is_available():
+            event = torch.cuda.Event()
+            event.record(torch.cuda.current_stream())
+            return event
+    except Exception:
+        logger.debug("Failed to record CUDA DSA payload event", exc_info=True)
+
+    return None
+
+
 @dataclass
 class LoadSpec:
     # Number of tokens cached in vLLM
@@ -413,15 +441,29 @@ class ReqMeta:
         # Check if request_configs has lmcache.skip_save set to True
         request_skip = (tracker.request_configs or {}).get("lmcache.skip_save", False)
 
-        skip_save = tracker.disagg_spec is None and (
-            tracker.skip_save
-            or (tracker.num_saved_tokens > 0 and input_token_len < chunk_boundary)
-            or (tracker.is_decode_phase and not save_decode_cache)
-            or request_skip
+        allow_final_prefill_partial_save = (
+            is_last_prefill
+            and not tracker.is_decode_phase
+            and not discard_partial_chunks
+            and tracker.num_saved_tokens > 0
+            and input_token_len > tracker.num_saved_tokens
+            and input_token_len < chunk_boundary
         )
+        skip_by_tracker = bool(tracker.skip_save)
+        skip_by_chunk_boundary = (
+            tracker.num_saved_tokens > 0
+            and input_token_len < chunk_boundary
+            and not allow_final_prefill_partial_save
+        )
+        skip_by_decode_phase = bool(tracker.is_decode_phase and not save_decode_cache)
+        skip_by_request_config = bool(request_skip)
 
-        if skip_save and load_spec is None:
-            return None
+        skip_save = tracker.disagg_spec is None and (
+            skip_by_tracker
+            or skip_by_chunk_boundary
+            or skip_by_decode_phase
+            or skip_by_request_config
+        )
 
         # Calculate number of tokens to save based on discard_partial_chunks
         # setting
@@ -435,6 +477,9 @@ class ReqMeta:
             )
         else:
             num_tokens_to_save = input_token_len
+
+        if skip_save and load_spec is None:
+            return None
 
         # If we need to save, update the number of saved tokens
         if not skip_save:
@@ -643,7 +688,7 @@ class LMCacheConnectorV1Impl:
         ] = []
         self._layerwise_retriever_is_sparse: list[bool] = []
         self._layerwise_save_storers: dict[
-            str, Generator[Optional[torch.Tensor], None, None]
+            tuple[str, int, int], Generator[Optional[torch.Tensor], None, None]
         ] = {}
         self._stats_monitor = LMCStatsMonitor.GetOrCreate()
         self.enable_sparse_attention = config.enable_sparse_attention
@@ -1473,6 +1518,7 @@ class LMCacheConnectorV1Impl:
         selected_tokens: list = None,
         token_start_index: list = None,
         request_ids: list = None,
+        target_slot_mapping: list = None,
     ) -> None:
         """Blocking until the KV for a specific layer is loaded into vLLM's
         paged buffer.
@@ -1481,9 +1527,10 @@ class LMCacheConnectorV1Impl:
 
         Args:
             layer_name: the name of that layer
-            selected_tokens: batched sparse token indices per decode request.
-            token_start_index: per-request start offset into slot_mapping.
-            request_ids: req_id for each selected_tokens row (input_batch order).
+            selected_tokens: sparse token indices per decode row.
+            token_start_index: legacy per-row start offset into slot_mapping.
+            request_ids: req_id for each selected_tokens row (duplicates allowed).
+            target_slot_mapping: explicit target slots per selected token row.
         """
         if self.layerwise_retrievers:
             logger.debug(f"Waiting for layer {self.current_layer} to be loaded")
@@ -1493,12 +1540,33 @@ class LMCacheConnectorV1Impl:
         if not self.layerwise_retrievers:
             return
 
-        row_of_req = (
-            {rid: row for row, rid in enumerate(request_ids)}
-            if request_ids is not None
-            else None
-        )
+        rows_of_req = None
+        if request_ids is not None:
+            rows_of_req = {}
+            for row, rid in enumerate(request_ids):
+                rows_of_req.setdefault(rid, []).append(row)
 
+        def _rows(value: Any, rows: list[int]):
+            if hasattr(value, "__getitem__"):
+                if isinstance(value, torch.Tensor):
+                    return value[rows]
+                return [value[row] for row in rows]
+            raise TypeError(f"Unsupported row-indexed value type: {type(value)!r}")
+
+        def _flatten(value: Any):
+            if isinstance(value, torch.Tensor):
+                return value.reshape(-1)
+            if isinstance(value, list):
+                out = []
+                for item in value:
+                    if isinstance(item, torch.Tensor):
+                        out.extend(item.reshape(-1).tolist())
+                    elif isinstance(item, list):
+                        out.extend(item)
+                    else:
+                        out.append(item)
+                return out
+            return value
         idx = 0
         decode_row = 0
         for request in metadata.requests:
@@ -1515,23 +1583,63 @@ class LMCacheConnectorV1Impl:
                 break
             layerwise_retriever = self.layerwise_retrievers[idx]
             if request.is_sparse_decode:
+                payload = None
+                rows = None
                 if selected_tokens is None:
                     selected_tokens_per_req = None
                     token_start_index_per_req = 0
                 else:
-                    row = (
-                        row_of_req[request.req_id]
-                        if row_of_req is not None
-                        else decode_row
+                    if rows_of_req is not None and request.req_id not in rows_of_req:
+                        raise RuntimeError(
+                            "Missing sparse decode row for "
+                            f"layer={layer_name} req={request.req_id} "
+                            f"sparse_decode_row={decode_row}"
+                        )
+                    rows = (
+                        rows_of_req[request.req_id]
+                        if rows_of_req is not None
+                        else [decode_row]
                     )
-                    selected_tokens_per_req = selected_tokens[row]
-                    token_start_index_per_req = (
-                        0 if token_start_index is None else token_start_index[row]
+                    selected_rows = (
+                        int(selected_tokens.shape[0])
+                        if hasattr(selected_tokens, "shape")
+                        and len(selected_tokens.shape) > 0
+                        else len(selected_tokens)
                     )
+                    if max(rows) >= selected_rows:
+                        raise RuntimeError(
+                            "Sparse decode row out of bounds for "
+                            f"layer={layer_name} req={request.req_id} "
+                            f"rows={rows} selected_rows={selected_rows}"
+                        )
+                    selected_tokens_per_req = _rows(selected_tokens, rows)
+                    if target_slot_mapping is not None:
+                        target_slot_mapping_per_req = _rows(target_slot_mapping, rows)
+                        selected_tokens_flat = _flatten(selected_tokens_per_req)
+                        target_slot_mapping_flat = _flatten(target_slot_mapping_per_req)
+                        payload = {
+                            "selected_token_ids": selected_tokens_flat,
+                            "target_slot_mapping": target_slot_mapping_flat,
+                        }
+                        if _dsa_has_device_tensor(
+                            selected_tokens_flat
+                        ) or _dsa_has_device_tensor(target_slot_mapping_flat):
+                            payload_event = _dsa_record_current_stream_event()
+                            if payload_event is not None:
+                                payload["payload_event"] = payload_event
+                        token_start_index_per_req = None
+                    else:
+                        token_start_index_per_req = (
+                            0
+                            if token_start_index is None
+                            else _rows(token_start_index, rows)
+                        )
                 ret_token_mask = layerwise_retriever.send(
-                    (selected_tokens_per_req, token_start_index_per_req)
+                    payload
+                    if payload is not None
+                    else (selected_tokens_per_req, token_start_index_per_req)
                 )
-                decode_row += 1
+                decode_row += len(rows) if rows is not None else 1
             else:
                 ret_token_mask = next(layerwise_retriever)
 
@@ -1595,10 +1703,26 @@ class LMCacheConnectorV1Impl:
             ) and self.kv_role != "kv_producer":
                 continue
 
-            layerwise_storer = self._layerwise_save_storers.get(request.req_id)
+            token_ids = request.token_ids
+            assert isinstance(token_ids, list)
+            if self.kv_role == "kv_producer":
+                skip_leading_tokens = 0
+            else:
+                assert save_spec is not None
+                skip_leading_tokens = save_spec.skip_leading_tokens
+
+                if skip_leading_tokens == len(token_ids):
+                    continue  # skip this request
+                # Align to lmcache chunk size
+                skip_leading_tokens = (
+                    skip_leading_tokens
+                    // self._lmcache_chunk_size
+                    * self._lmcache_chunk_size
+                )
+
+            storer_key = (request.req_id, skip_leading_tokens, len(token_ids))
+            layerwise_storer = self._layerwise_save_storers.get(storer_key)
             if layerwise_storer is None:
-                token_ids = request.token_ids
-                assert isinstance(token_ids, list)
                 assert request.slot_mapping is not None and len(request.slot_mapping) > 0
                 if request.is_sparse_decode:
                     if request.slot_mapping[0].device.type != torch.device(
@@ -1611,21 +1735,6 @@ class LMCacheConnectorV1Impl:
                 else:
                     slot_mapping = request.slot_mapping[0].to(
                         device=self.device, dtype=torch.long
-                    )
-
-                if self.kv_role == "kv_producer":
-                    skip_leading_tokens = 0
-                else:
-                    assert save_spec is not None
-                    skip_leading_tokens = save_spec.skip_leading_tokens
-
-                    if skip_leading_tokens == len(token_ids):
-                        continue  # skip this request
-                    # Align to lmcache chunk size
-                    skip_leading_tokens = (
-                        skip_leading_tokens
-                        // self._lmcache_chunk_size
-                        * self._lmcache_chunk_size
                     )
 
                 store_mask = torch.ones(len(token_ids), dtype=torch.bool)
@@ -1656,7 +1765,7 @@ class LMCacheConnectorV1Impl:
                     cached_memory_objs=request.cached_memory_objs,
                     cached_tensors=request.cached_tensors,
                 )
-                self._layerwise_save_storers[request.req_id] = layerwise_storer
+                self._layerwise_save_storers[storer_key] = layerwise_storer
                 if is_first:
                     is_first = False
 
@@ -1683,10 +1792,16 @@ class LMCacheConnectorV1Impl:
 
         if self.use_layerwise:
             for request in connector_metadata.requests:
-                layerwise_storer = self._layerwise_save_storers.pop(
-                    request.req_id, None
-                )
-                if layerwise_storer is not None:
+                storer_keys = [
+                    key for key in self._layerwise_save_storers
+                    if key[0] == request.req_id
+                ]
+                for storer_key in storer_keys:
+                    layerwise_storer = self._layerwise_save_storers.pop(
+                        storer_key, None
+                    )
+                    if layerwise_storer is None:
+                        continue
                     try:
                         next(layerwise_storer)
                     except StopIteration:
@@ -2278,7 +2393,12 @@ class LMCacheConnectorV1Impl:
         if getattr(self, "use_layerwise", False) and hasattr(
             self, "_layerwise_save_storers"
         ):
-            self._layerwise_save_storers.pop(request.request_id, None)
+            storer_keys = [
+                key for key in self._layerwise_save_storers
+                if key[0] == request.request_id
+            ]
+            for storer_key in storer_keys:
+                self._layerwise_save_storers.pop(storer_key, None)
 
         self._drop_worker_retrieve_state(request.request_id)
 
