@@ -9,14 +9,10 @@ import torch
 
 # First Party
 from lmcache.integration.vllm.vllm_v1_adapter import (
-    DENSE_PREFIX_DIAG_ENV,
     LoadSpec,
     LMCacheConnectorV1Impl,
     ReqMeta,
     RequestTracker,
-    _dense_prefix_diag_enabled,
-    _dense_prefix_diag_message,
-    _mark_dense_prefix_loaded,
 )
 
 
@@ -124,57 +120,3 @@ class TestFullHitRecalcLast:
         assert req_meta.slot_mapping[0].numel() == prompt_len
         assert req_meta.indexer_slot_mapping[0].numel() == prompt_len
         assert req_meta.save_spec.can_save is False
-
-    def test_dense_prefix_diag_env_flag(self, monkeypatch) -> None:
-        monkeypatch.delenv(DENSE_PREFIX_DIAG_ENV, raising=False)
-        assert not _dense_prefix_diag_enabled()
-
-        monkeypatch.setenv(DENSE_PREFIX_DIAG_ENV, "1")
-        assert _dense_prefix_diag_enabled()
-
-    def test_mark_dense_prefix_loaded_sets_forward_context_flag(self) -> None:
-        forward_context = SimpleNamespace()
-
-        _mark_dense_prefix_loaded(
-            forward_context,
-            req_id="req-diag",
-            token_count=18879,
-            kv_group=0,
-        )
-
-        assert forward_context.lmcache_dense_prefix_loaded is True
-        assert forward_context.lmcache_dense_prefix_loaded_reqs == [
-            {
-                "req_id": "req-diag",
-                "token_count": 18879,
-                "kv_group": 0,
-            }
-        ]
-
-    def test_dense_prefix_diag_message_identifies_dsa_group(self) -> None:
-        message = _dense_prefix_diag_message(
-            phase="adapter_dense_prefix_retrieve",
-            req_id="req-diag",
-            kv_group=1,
-            tokens=list(range(8)),
-            token_mask=torch.ones(8, dtype=torch.bool),
-            slot_mapping=torch.arange(20, 28, dtype=torch.long),
-            load_spec=LoadSpec(
-                vllm_cached_tokens=0,
-                lmcache_cached_tokens=8,
-                can_load=True,
-            ),
-            recalc_last_applied=True,
-        )
-
-        assert "phase=adapter_dense_prefix_retrieve" in message
-        assert "req_id=req-diag" in message
-        assert "kv_group=1" in message
-        assert "group=dsa_index" in message
-        assert "lmcache_cached_tokens=8" in message
-        assert "recalc_last=True" in message
-        assert "tokens.len=8" in message
-        assert "token_mask_true=8" in message
-        assert "slot_mapping.len=8" in message
-        assert "slot_mapping.min=20" in message
-        assert "slot_mapping.max=27" in message

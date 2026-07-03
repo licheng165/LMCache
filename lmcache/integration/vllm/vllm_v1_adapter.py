@@ -60,133 +60,6 @@ logger = init_logger(__name__)
 SPARSE_DECODE_RETRIEVE_TOKENS = int(
     os.environ.get("LMCACHE_SPARSE_DECODE_RETRIEVE_TOKENS", "2048")
 )
-DENSE_PREFIX_DIAG_ENV = "LMCACHE_DENSE_PREFIX_DIAG"
-
-
-def _dense_prefix_diag_enabled() -> bool:
-    return os.environ.get(DENSE_PREFIX_DIAG_ENV, "").strip().lower() in {
-        "1",
-        "true",
-        "yes",
-        "on",
-    }
-
-
-def _mark_dense_prefix_loaded(
-    forward_context: "ForwardContext",
-    *,
-    req_id: str,
-    token_count: int,
-    kv_group: int,
-) -> None:
-    """Mark this forward as having loaded dense prefix KV from LMCache."""
-    try:
-        forward_context.lmcache_dense_prefix_loaded = True
-        loaded = getattr(forward_context, "lmcache_dense_prefix_loaded_reqs", None)
-        if loaded is None:
-            loaded = []
-            forward_context.lmcache_dense_prefix_loaded_reqs = loaded
-        loaded.append(
-            {
-                "req_id": req_id,
-                "token_count": int(token_count),
-                "kv_group": int(kv_group),
-            }
-        )
-        if _dense_prefix_diag_enabled():
-            logger.info(
-                "DENSE_PREFIX_DIAG phase=mark_dense_prefix_loaded "
-                "req_id=%s token_count=%d kv_group=%d forward_context_id=%s",
-                req_id,
-                int(token_count),
-                int(kv_group),
-                id(forward_context),
-            )
-    except Exception:
-        # Diagnostics must never affect the retrieve path.
-        logger.debug("Failed to mark dense prefix load on forward context", exc_info=True)
-
-
-def _seq_diag_summary(name: str, values, sample: int = 4) -> str:
-    if values is None:
-        return f"{name}=None"
-    try:
-        count = len(values)
-        head = list(values[:sample])
-        tail = list(values[-sample:]) if count > sample else head
-        return f"{name}.len={count} {name}.head={head} {name}.tail={tail}"
-    except Exception as exc:  # pragma: no cover - diagnostics must not fail path
-        return f"{name}=unavailable({type(exc).__name__})"
-
-
-def _tensor_diag_summary(name: str, tensor, sample: int = 4) -> str:
-    if tensor is None:
-        return f"{name}=None"
-    if not isinstance(tensor, torch.Tensor):
-        return f"{name}=type({type(tensor).__name__})"
-    try:
-        flat = tensor.detach().reshape(-1)
-        numel = flat.numel()
-        parts = [
-            f"{name}.len={numel}",
-            f"{name}.shape={tuple(tensor.shape)}",
-            f"{name}.device={tensor.device}",
-            f"{name}.dtype={tensor.dtype}",
-        ]
-        if numel:
-            head = flat[:sample].cpu().tolist()
-            tail = flat[-sample:].cpu().tolist() if numel > sample else head
-            parts.extend(
-                [
-                    f"{name}.min={flat.min().cpu().item()}",
-                    f"{name}.max={flat.max().cpu().item()}",
-                    f"{name}.head={head}",
-                    f"{name}.tail={tail}",
-                ]
-            )
-        return " ".join(parts)
-    except Exception as exc:  # pragma: no cover - diagnostics must not fail path
-        return f"{name}=unavailable({type(exc).__name__})"
-
-
-def _dense_prefix_diag_message(
-    *,
-    phase: str,
-    req_id: str,
-    kv_group: int,
-    tokens,
-    token_mask,
-    slot_mapping,
-    load_spec: Optional["LoadSpec"],
-    recalc_last_applied: bool,
-    extra: str = "",
-) -> str:
-    group_name = "mla_latent" if kv_group == 0 else "dsa_index"
-    mask_true = "None"
-    if isinstance(token_mask, torch.Tensor):
-        try:
-            mask_true = str(int(token_mask.sum().cpu().item()))
-        except Exception as exc:  # pragma: no cover - diagnostics must not fail path
-            mask_true = f"unavailable({type(exc).__name__})"
-    vllm_cached = load_spec.vllm_cached_tokens if load_spec is not None else None
-    lmcache_cached = load_spec.lmcache_cached_tokens if load_spec is not None else None
-    can_load = load_spec.can_load if load_spec is not None else None
-    pieces = [
-        f"phase={phase}",
-        f"req_id={req_id}",
-        f"kv_group={kv_group}",
-        f"group={group_name}",
-        f"can_load={can_load}",
-        f"vllm_cached_tokens={vllm_cached}",
-        f"lmcache_cached_tokens={lmcache_cached}",
-        f"recalc_last={recalc_last_applied}",
-        _seq_diag_summary("tokens", tokens),
-        f"token_mask_true={mask_true}",
-        _tensor_diag_summary("slot_mapping", slot_mapping),
-    ]
-    if extra:
-        pieces.append(extra)
-    return " ".join(pieces)
 
 
 def _sparse_slot_mapping_len(prompt_tokens: int) -> int:
@@ -2214,27 +2087,6 @@ class LMCacheConnectorV1Impl:
                     retrieve_slot_mapping = slot_mapping
                     if lmcache_cached_tokens < len(slot_mapping):
                         retrieve_slot_mapping = slot_mapping[:lmcache_cached_tokens]
-                    if token_count > 0:
-                        _mark_dense_prefix_loaded(
-                            forward_context,
-                            req_id=request.req_id,
-                            token_count=token_count,
-                            kv_group=0,
-                        )
-                    if _dense_prefix_diag_enabled():
-                        logger.info(
-                            "DENSE_PREFIX_DIAG %s",
-                            _dense_prefix_diag_message(
-                                phase="adapter_dense_prefix_retrieve",
-                                req_id=request.req_id,
-                                kv_group=0,
-                                tokens=retrieve_tokens,
-                                token_mask=token_mask,
-                                slot_mapping=retrieve_slot_mapping,
-                                load_spec=request.load_spec,
-                                recalc_last_applied=recalc_last_applied,
-                            ),
-                        )
                     layerwise_retriever = self.lmcache_engine.retrieve_layer(
                         retrieve_tokens,
                         token_mask,
@@ -2279,20 +2131,6 @@ class LMCacheConnectorV1Impl:
                                 indexer_layer_name,
                             )
                         if idx_slot is not None:
-                            if _dense_prefix_diag_enabled():
-                                logger.info(
-                                    "DENSE_PREFIX_DIAG %s",
-                                    _dense_prefix_diag_message(
-                                        phase="adapter_dense_prefix_retrieve",
-                                        req_id=request.req_id,
-                                        kv_group=1,
-                                        tokens=retrieve_tokens,
-                                        token_mask=token_mask,
-                                        slot_mapping=idx_slot,
-                                        load_spec=request.load_spec,
-                                        recalc_last_applied=recalc_last_applied,
-                                    ),
-                                )
                             indexer_retriever = self.lmcache_engine.retrieve_layer(
                                 retrieve_tokens,
                                 token_mask,
@@ -2305,21 +2143,6 @@ class LMCacheConnectorV1Impl:
                             )
                             next(indexer_retriever)
                             next(indexer_retriever)
-                        elif _dense_prefix_diag_enabled():
-                            logger.warning(
-                                "DENSE_PREFIX_DIAG %s",
-                                _dense_prefix_diag_message(
-                                    phase="adapter_dense_prefix_retrieve",
-                                    req_id=request.req_id,
-                                    kv_group=1,
-                                    tokens=retrieve_tokens,
-                                    token_mask=token_mask,
-                                    slot_mapping=None,
-                                    load_spec=request.load_spec,
-                                    recalc_last_applied=recalc_last_applied,
-                                    extra="indexer_slot_mapping=missing",
-                                ),
-                            )
 
                     dsa_two_groups = self._is_dsa_two_groups()
                     prefix_location, metadata_warm = (
