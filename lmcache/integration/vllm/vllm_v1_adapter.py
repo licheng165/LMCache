@@ -93,7 +93,7 @@ def _agent_debug_log(
                 )
                 + "\n"
             )
-    except OSError:
+    except Exception:
         pass
     # #endregion
 
@@ -120,7 +120,7 @@ def _dbg_log_792df4(message, data, hypothesis_id="H1", run_id="pre-fix"):
                 )
                 + "\n"
             )
-    except OSError:
+    except Exception:
         pass
 # #endregion
 
@@ -136,6 +136,76 @@ def _tensor_head(t: Optional[torch.Tensor], n: int = 4) -> Optional[list]:
     if t is None or t.numel() == 0:
         return None
     return t.flatten()[:n].tolist()
+
+
+def _tensor_debug(t: Optional[torch.Tensor], n: int = 4) -> Optional[dict[str, Any]]:
+    if t is None:
+        return None
+    return {
+        "shape": list(t.shape),
+        "numel": int(t.numel()),
+        "device": str(t.device),
+        "dtype": str(t.dtype),
+        "head": _tensor_head(t, n),
+    }
+
+
+def _safe_len(obj: Any) -> int:
+    return len(obj) if obj is not None else 0
+
+
+def _slot_mapping_debug(
+    slot_mapping: list[torch.Tensor],
+    n: int = 4,
+) -> dict[str, Any]:
+    if not slot_mapping:
+        return {"present": False, "len": 0, "head": None}
+    return {
+        "present": True,
+        "len": len(slot_mapping[0]),
+        "head": _tensor_head(slot_mapping[0], n),
+        "device": str(slot_mapping[0].device),
+        "dtype": str(slot_mapping[0].dtype),
+    }
+
+
+def _load_spec_debug(load_spec: Optional["LoadSpec"]) -> Optional[dict[str, Any]]:
+    if load_spec is None:
+        return None
+    return {
+        "vllm_cached_tokens": load_spec.vllm_cached_tokens,
+        "lmcache_cached_tokens": load_spec.lmcache_cached_tokens,
+        "can_load": load_spec.can_load,
+    }
+
+
+def _save_spec_debug(save_spec: Optional["SaveSpec"]) -> Optional[dict[str, Any]]:
+    if save_spec is None:
+        return None
+    return {
+        "skip_leading_tokens": save_spec.skip_leading_tokens,
+        "can_save": save_spec.can_save,
+        "can_save_latent": save_spec.can_save_latent,
+        "can_save_indexer": save_spec.can_save_indexer,
+    }
+
+
+def _cached_group_debug(obj: Any, *, kv_group: int) -> dict[str, Any]:
+    if kv_group == 1:
+        cached_keys = getattr(obj, "cached_keys_indexer", None)
+        cached_ends = getattr(obj, "cached_ends_indexer", None)
+        cached_tensors = getattr(obj, "cached_tensors_indexer", None)
+    else:
+        cached_keys = getattr(obj, "cached_keys", None)
+        cached_ends = getattr(obj, "cached_ends", None)
+        cached_tensors = getattr(obj, "cached_tensors", None)
+    return {
+        "cached_keys_layers": len(cached_keys) if cached_keys else 0,
+        "cached_ends_tail": cached_ends[-1] if cached_ends else None,
+        "cached_tensors_l0": (
+            len(cached_tensors[0]) if cached_tensors and cached_tensors[0] else 0
+        ),
+    }
 
 
 def _retrieve_cache_kwargs(
@@ -573,11 +643,28 @@ class ReqMeta:
         # Check if request_configs has lmcache.skip_save set to True
         request_skip = (tracker.request_configs or {}).get("lmcache.skip_save", False)
 
+        allow_final_prefill_partial_save = (
+            is_last_prefill
+            and not tracker.is_decode_phase
+            and not discard_partial_chunks
+            and tracker.num_saved_tokens > 0
+            and input_token_len > tracker.num_saved_tokens
+            and input_token_len < chunk_boundary
+        )
+        skip_by_tracker = bool(tracker.skip_save)
+        skip_by_chunk_boundary = bool(
+            tracker.num_saved_tokens > 0
+            and input_token_len < chunk_boundary
+            and not allow_final_prefill_partial_save
+        )
+        skip_by_decode_phase = bool(tracker.is_decode_phase and not save_decode_cache)
+        skip_by_request_config = bool(request_skip)
+        skip_by_decode_full_chunk = False
         skip_save = tracker.disagg_spec is None and (
-            tracker.skip_save
-            or (tracker.num_saved_tokens > 0 and input_token_len < chunk_boundary)
-            or (tracker.is_decode_phase and not save_decode_cache)
-            or request_skip
+            skip_by_tracker
+            or skip_by_chunk_boundary
+            or skip_by_decode_phase
+            or skip_by_request_config
         )
 
         # Decode-full-chunk rule: when save_full_chunk_in_decode is enabled,
@@ -597,9 +684,7 @@ class ReqMeta:
             )
             if new_boundary <= tracker.num_saved_tokens:
                 skip_save = True
-
-        if skip_save and load_spec is None:
-            return None
+                skip_by_decode_full_chunk = True
 
         # Calculate number of tokens to save based on discard_partial_chunks
         # setting
@@ -613,6 +698,78 @@ class ReqMeta:
             )
         else:
             num_tokens_to_save = input_token_len
+
+        _agent_debug_log(
+            "vllm_v1_adapter:ReqMeta.from_request_tracker",
+            "reqmeta save/load decision",
+            {
+                "req_id": tracker.req_id,
+                "input_token_len": input_token_len,
+                "prompt_len": tracker.prompt_len,
+                "is_last_prefill": is_last_prefill,
+                "is_decode_phase": tracker.is_decode_phase,
+                "num_saved_tokens_before": skip_leading_tokens,
+                "chunk_boundary": chunk_boundary,
+                "discard_partial_chunks": discard_partial_chunks,
+                "save_decode_cache": save_decode_cache,
+                "save_full_chunk_in_decode": save_full_chunk_in_decode,
+                "is_sparse_decode": is_sparse_decode,
+                "dsa_two_groups": dsa_two_groups,
+                "load_spec": _load_spec_debug(load_spec),
+                "skip_save": skip_save,
+                "allow_final_prefill_partial_save": (
+                    allow_final_prefill_partial_save
+                ),
+                "skip_by_tracker": skip_by_tracker,
+                "skip_by_chunk_boundary": skip_by_chunk_boundary,
+                "skip_by_decode_phase": skip_by_decode_phase,
+                "skip_by_request_config": skip_by_request_config,
+                "skip_by_decode_full_chunk": skip_by_decode_full_chunk,
+                "disagg_spec_present": tracker.disagg_spec is not None,
+                "num_tokens_to_save": num_tokens_to_save,
+                "latent_blocks": len(tracker.allocated_block_ids),
+                "indexer_blocks": _safe_len(tracker.allocated_block_ids_indexer),
+            },
+            hypothesis_id="K",
+        )
+
+        if skip_save and load_spec is None:
+            _agent_debug_log(
+                "vllm_v1_adapter:ReqMeta.from_request_tracker",
+                "skip reqmeta after save/load decision",
+                {
+                    "req_id": tracker.req_id,
+                    "input_token_len": input_token_len,
+                    "prompt_len": tracker.prompt_len,
+                    "is_last_prefill": is_last_prefill,
+                    "is_decode_phase": tracker.is_decode_phase,
+                    "num_saved_tokens": tracker.num_saved_tokens,
+                    "chunk_boundary": chunk_boundary,
+                    "discard_partial_chunks": discard_partial_chunks,
+                    "save_decode_cache": save_decode_cache,
+                    "save_full_chunk_in_decode": save_full_chunk_in_decode,
+                    "is_sparse_decode": is_sparse_decode,
+                    "dsa_two_groups": dsa_two_groups,
+                    "load_spec": _load_spec_debug(load_spec),
+                    "skip_save": skip_save,
+                    "allow_final_prefill_partial_save": (
+                        allow_final_prefill_partial_save
+                    ),
+                    "skip_by_tracker": skip_by_tracker,
+                    "skip_by_chunk_boundary": skip_by_chunk_boundary,
+                    "skip_by_decode_phase": skip_by_decode_phase,
+                    "skip_by_request_config": skip_by_request_config,
+                    "skip_by_decode_full_chunk": skip_by_decode_full_chunk,
+                    "disagg_spec_present": tracker.disagg_spec is not None,
+                    "num_tokens_to_save": num_tokens_to_save,
+                    "latent_blocks": len(tracker.allocated_block_ids),
+                    "indexer_blocks": _safe_len(
+                        tracker.allocated_block_ids_indexer
+                    ),
+                },
+                hypothesis_id="K",
+            )
+            return None
 
         # If we need to save, update the number of saved tokens
         # NOTE: num_saved_tokens is advanced optimistically before the store
@@ -746,6 +903,27 @@ class ReqMeta:
                 },
                 hypothesis_id="J",
             )
+
+        _agent_debug_log(
+            "vllm_v1_adapter:ReqMeta.from_request_tracker",
+            "reqmeta mappings built",
+            {
+                "req_id": tracker.req_id,
+                "token_ids_len": len(token_ids),
+                "is_sparse_decode": is_sparse_decode,
+                "load_spec": _load_spec_debug(load_spec),
+                "save_spec": _save_spec_debug(save_spec),
+                "slot_mapping": _slot_mapping_debug(slot_mapping),
+                "indexer_slot_mapping": _slot_mapping_debug(indexer_slot_mapping),
+                "latent_blocks": len(tracker.allocated_block_ids),
+                "indexer_blocks": _safe_len(tracker.allocated_block_ids_indexer),
+                "sparse_slot_mapping_reused": (
+                    is_sparse_decode
+                    and bool(getattr(tracker, "sparse_slot_mapping", None))
+                ),
+            },
+            hypothesis_id="K",
+        )
 
         if load_spec is not None and load_spec.can_load:
             logger.debug(
@@ -1907,6 +2085,95 @@ class LMCacheConnectorV1Impl:
             },
             hypothesis_id="A",
         )
+        attn_debug: list[dict[str, Any]] = []
+        if isinstance(attn_metadata, dict):
+            for _name, _meta in list(attn_metadata.items())[:12]:
+                attn_debug.append(
+                    {
+                        "name": str(_name),
+                        "kind": type(_meta).__name__,
+                        "attn_state": str(getattr(_meta, "attn_state", None)),
+                        "num_actual_tokens": getattr(
+                            _meta, "num_actual_tokens", None
+                        ),
+                        "num_decode_tokens": getattr(
+                            _meta, "num_decode_tokens", None
+                        ),
+                        "num_prefill_tokens": getattr(
+                            _meta, "num_prefill_tokens", None
+                        ),
+                        "num_reqs": getattr(_meta, "num_reqs", None),
+                        "seq_lens": _tensor_debug(getattr(_meta, "seq_lens", None)),
+                        "slot_mapping": _tensor_debug(
+                            getattr(_meta, "slot_mapping", None)
+                        ),
+                        "indexer_slot_mapping": _tensor_debug(
+                            getattr(_meta, "indexer_slot_mapping", None)
+                        ),
+                    }
+                )
+        else:
+            attn_debug.append(
+                {
+                    "name": None,
+                    "kind": type(attn_metadata).__name__,
+                    "attn_state": str(getattr(attn_metadata, "attn_state", None)),
+                    "num_actual_tokens": getattr(
+                        attn_metadata, "num_actual_tokens", None
+                    ),
+                    "num_decode_tokens": getattr(
+                        attn_metadata, "num_decode_tokens", None
+                    ),
+                    "num_prefill_tokens": getattr(
+                        attn_metadata, "num_prefill_tokens", None
+                    ),
+                    "num_reqs": getattr(attn_metadata, "num_reqs", None),
+                    "seq_lens": _tensor_debug(
+                        getattr(attn_metadata, "seq_lens", None)
+                    ),
+                    "slot_mapping": _tensor_debug(
+                        getattr(attn_metadata, "slot_mapping", None)
+                    ),
+                    "indexer_slot_mapping": _tensor_debug(
+                        getattr(attn_metadata, "indexer_slot_mapping", None)
+                    ),
+                }
+            )
+        request_debug = []
+        for _req in metadata.requests:
+            request_debug.append(
+                {
+                    "req_id": _req.req_id,
+                    "token_len": len(_req.token_ids),
+                    "is_last_prefill": _req.is_last_prefill,
+                    "is_sparse_decode": _req.is_sparse_decode,
+                    "resumed_from_preemption": _req.resumed_from_preemption,
+                    "load_spec": _load_spec_debug(_req.load_spec),
+                    "save_spec": _save_spec_debug(_req.save_spec),
+                    "slot_mapping": _slot_mapping_debug(_req.slot_mapping),
+                    "indexer_slot_mapping": _slot_mapping_debug(
+                        _req.indexer_slot_mapping
+                    ),
+                    "latent_cache": _cached_group_debug(_req, kv_group=0),
+                    "indexer_cache": _cached_group_debug(_req, kv_group=1),
+                }
+            )
+        _agent_debug_log(
+            "vllm_v1_adapter:start_load_kv",
+            "start load context",
+            {
+                "kv_role": self.kv_role,
+                "use_layerwise": self.use_layerwise,
+                "dsa_two_groups": self._is_dsa_two_groups(),
+                "kv_cache_layers": len(self.kv_caches),
+                "latent_layers": len(self._kvcaches_for_group(0)),
+                "indexer_layers": len(self._kvcaches_for_group(1)),
+                "attn_metadata_type": type(attn_metadata).__name__,
+                "attn_metadata": attn_debug,
+                "requests": request_debug,
+            },
+            hypothesis_id="L",
+        )
 
         last_idx = -1
         for idx, request in enumerate(metadata.requests):
@@ -2449,6 +2716,25 @@ class LMCacheConnectorV1Impl:
         metadata = self._parent._get_connector_metadata()
         assert isinstance(metadata, LMCacheConnectorMetadata)
         if not self.layerwise_retrievers:
+            _agent_debug_log(
+                "vllm_v1_adapter:wait_for_layer_load",
+                "wait skipped: no retrievers",
+                {
+                    "layer_name": layer_name,
+                    "current_layer": self.current_layer,
+                    "request_ids": request_ids,
+                    "selected_tokens_present": selected_tokens is not None,
+                    "metadata_requests": [
+                        {
+                            "req_id": req.req_id,
+                            "is_sparse_decode": req.is_sparse_decode,
+                            "load_spec": _load_spec_debug(req.load_spec),
+                        }
+                        for req in metadata.requests
+                    ],
+                },
+                hypothesis_id="L",
+            )
             return
 
         row_of_req = (
@@ -2486,6 +2772,38 @@ class LMCacheConnectorV1Impl:
                     token_start_index_per_req = (
                         0 if token_start_index is None else token_start_index[row]
                     )
+                _agent_debug_log(
+                    "vllm_v1_adapter:wait_for_layer_load",
+                    "wait dispatch sparse",
+                    {
+                        "req_id": request.req_id,
+                        "layer_name": layer_name,
+                        "current_layer": self.current_layer,
+                        "retriever_idx": idx,
+                        "has_indexer_retriever": indexer_retriever is not None,
+                        "selected_tokens": (
+                            _tensor_debug(selected_tokens_per_req)
+                            if isinstance(selected_tokens_per_req, torch.Tensor)
+                            else None
+                        ),
+                        "token_start_index": (
+                            int(token_start_index_per_req)
+                            if isinstance(token_start_index_per_req, int)
+                            else (
+                                _tensor_debug(token_start_index_per_req)
+                                if isinstance(token_start_index_per_req, torch.Tensor)
+                                else repr(token_start_index_per_req)
+                            )
+                        ),
+                        "request_ids": request_ids,
+                        "load_spec": _load_spec_debug(request.load_spec),
+                        "slot_mapping": _slot_mapping_debug(request.slot_mapping),
+                        "indexer_slot_mapping": _slot_mapping_debug(
+                            request.indexer_slot_mapping
+                        ),
+                    },
+                    hypothesis_id="L",
+                )
                 ret_token_mask = layerwise_retriever.send(
                     (selected_tokens_per_req, token_start_index_per_req)
                 )
@@ -2495,12 +2813,42 @@ class LMCacheConnectorV1Impl:
                     )
                 decode_row += 1
             else:
+                _agent_debug_log(
+                    "vllm_v1_adapter:wait_for_layer_load",
+                    "wait dispatch full",
+                    {
+                        "req_id": request.req_id,
+                        "layer_name": layer_name,
+                        "current_layer": self.current_layer,
+                        "retriever_idx": idx,
+                        "has_indexer_retriever": indexer_retriever is not None,
+                        "load_spec": _load_spec_debug(request.load_spec),
+                        "slot_mapping": _slot_mapping_debug(request.slot_mapping),
+                        "indexer_slot_mapping": _slot_mapping_debug(
+                            request.indexer_slot_mapping
+                        ),
+                    },
+                    hypothesis_id="L",
+                )
                 ret_token_mask = next(layerwise_retriever)
                 # Advance the indexer retriever in lockstep for two-group
                 # prefix retrieve. Its ret_mask is not reported to the
                 # scheduler; only the latent mask is.
                 if indexer_retriever is not None:
                     next(indexer_retriever)
+            _agent_debug_log(
+                "vllm_v1_adapter:wait_for_layer_load",
+                "wait result",
+                {
+                    "req_id": request.req_id,
+                    "layer_name": layer_name,
+                    "current_layer": self.current_layer,
+                    "is_sparse_decode": request.is_sparse_decode,
+                    "ret_token_mask": _tensor_debug(ret_token_mask),
+                    "has_indexer_retriever": indexer_retriever is not None,
+                },
+                hypothesis_id="L",
+            )
 
             if self.current_layer == self.num_layers - 1 and not request.is_sparse_decode:
                 assert ret_token_mask is not None
@@ -2536,15 +2884,60 @@ class LMCacheConnectorV1Impl:
         """
         assert self.lmcache_engine is not None
 
+        if isinstance(kv_layer, (list, tuple)):
+            kv_layer_debug = [_tensor_debug(_t) for _t in kv_layer]
+        else:
+            kv_layer_debug = [_tensor_debug(kv_layer)]
+        _agent_debug_log(
+            "vllm_v1_adapter:save_kv_layer",
+            "save entry",
+            {
+                "layer_name": layer_name,
+                "kv_role": self.kv_role,
+                "use_layerwise": self.use_layerwise,
+                "connector_metadata_present": self._parent._connector_metadata
+                is not None,
+                "kv_layer": kv_layer_debug,
+            },
+            hypothesis_id="M",
+        )
+
         if not self.use_layerwise:
+            _agent_debug_log(
+                "vllm_v1_adapter:save_kv_layer",
+                "save skipped: not layerwise",
+                {
+                    "layer_name": layer_name,
+                    "kv_role": self.kv_role,
+                },
+                hypothesis_id="M",
+            )
             return
 
         if self.kv_role == "kv_consumer":
             # Don't do save if the role is kv_consumer
+            _agent_debug_log(
+                "vllm_v1_adapter:save_kv_layer",
+                "save skipped: kv_consumer",
+                {
+                    "layer_name": layer_name,
+                    "kv_role": self.kv_role,
+                },
+                hypothesis_id="M",
+            )
             return
         if self._parent._connector_metadata is None:
             logger.warning(
                 "In connector.save_kv_layer, but the connector metadata is None"
+            )
+            _agent_debug_log(
+                "vllm_v1_adapter:save_kv_layer",
+                "save skipped: connector metadata none",
+                {
+                    "layer_name": layer_name,
+                    "kv_role": self.kv_role,
+                },
+                hypothesis_id="M",
             )
             return
         connector_metadata = self._parent._get_connector_metadata()
@@ -2563,9 +2956,51 @@ class LMCacheConnectorV1Impl:
         # batched_from_gpu iterates over the correct group's layer tensors
         # and _lazy_initialize_buffer detects the right format per group.
         kvcaches = self._kvcaches_for_group(kv_group)
+        _agent_debug_log(
+            "vllm_v1_adapter:save_kv_layer",
+            "save group resolved",
+            {
+                "layer_name": layer_name,
+                "dsa_two_groups": dsa_two_groups,
+                "is_indexer_layer": is_indexer_layer,
+                "kv_group": kv_group,
+                "group_kvcaches": len(kvcaches),
+                "latent_layers": len(self._kvcaches_for_group(0)),
+                "indexer_layers": len(self._kvcaches_for_group(1)),
+                "requests": [
+                    {
+                        "req_id": req.req_id,
+                        "token_len": len(req.token_ids),
+                        "is_sparse_decode": req.is_sparse_decode,
+                        "is_last_prefill": req.is_last_prefill,
+                        "load_spec": _load_spec_debug(req.load_spec),
+                        "save_spec": _save_spec_debug(req.save_spec),
+                        "slot_mapping": _slot_mapping_debug(req.slot_mapping),
+                        "indexer_slot_mapping": _slot_mapping_debug(
+                            req.indexer_slot_mapping
+                        ),
+                    }
+                    for req in connector_metadata.requests
+                ],
+            },
+            hypothesis_id="M",
+        )
         if not kvcaches:
             # No caches registered for this group (e.g. indexer not
             # registered with the connector); nothing to store.
+            _agent_debug_log(
+                "vllm_v1_adapter:save_kv_layer",
+                "save skipped: no group kvcaches",
+                {
+                    "layer_name": layer_name,
+                    "dsa_two_groups": dsa_two_groups,
+                    "is_indexer_layer": is_indexer_layer,
+                    "kv_group": kv_group,
+                    "latent_layers": len(self._kvcaches_for_group(0)),
+                    "indexer_layers": len(self._kvcaches_for_group(1)),
+                },
+                hypothesis_id="M",
+            )
             if dsa_two_groups and kv_group == 1 and is_indexer_layer:
                 _agent_debug_log(
                     "vllm_v1_adapter:save_kv_layer",
@@ -2583,6 +3018,19 @@ class LMCacheConnectorV1Impl:
             if (
                 save_spec is None or not save_spec.can_save
             ) and self.kv_role != "kv_producer":
+                _agent_debug_log(
+                    "vllm_v1_adapter:save_kv_layer",
+                    "save request skipped: save_spec disabled",
+                    {
+                        "req_id": request.req_id,
+                        "layer_name": layer_name,
+                        "kv_group": kv_group,
+                        "kv_role": self.kv_role,
+                        "save_spec": _save_spec_debug(save_spec),
+                        "load_spec": _load_spec_debug(request.load_spec),
+                    },
+                    hypothesis_id="M",
+                )
                 continue
 
             # Per-group gating: in two-group mode, skip indexer save if
@@ -2590,8 +3038,30 @@ class LMCacheConnectorV1Impl:
             # can_save_latent is False.
             if dsa_two_groups and save_spec is not None:
                 if is_indexer_layer and not save_spec.can_save_indexer:
+                    _agent_debug_log(
+                        "vllm_v1_adapter:save_kv_layer",
+                        "save request skipped: indexer gate disabled",
+                        {
+                            "req_id": request.req_id,
+                            "layer_name": layer_name,
+                            "kv_group": kv_group,
+                            "save_spec": _save_spec_debug(save_spec),
+                        },
+                        hypothesis_id="M",
+                    )
                     continue
                 if not is_indexer_layer and not save_spec.can_save_latent:
+                    _agent_debug_log(
+                        "vllm_v1_adapter:save_kv_layer",
+                        "save request skipped: latent gate disabled",
+                        {
+                            "req_id": request.req_id,
+                            "layer_name": layer_name,
+                            "kv_group": kv_group,
+                            "save_spec": _save_spec_debug(save_spec),
+                        },
+                        hypothesis_id="M",
+                    )
                     continue
 
             layerwise_storer = self._layerwise_save_storers.get(
@@ -2813,6 +3283,19 @@ class LMCacheConnectorV1Impl:
                     skip_leading_tokens = save_spec.skip_leading_tokens
 
                     if skip_leading_tokens == len(token_ids):
+                        _agent_debug_log(
+                            "vllm_v1_adapter:save_kv_layer",
+                            "save request skipped: all tokens already saved",
+                            {
+                                "req_id": request.req_id,
+                                "layer_name": layer_name,
+                                "kv_group": kv_group,
+                                "token_len": len(token_ids),
+                                "skip_leading_tokens": skip_leading_tokens,
+                                "save_spec": _save_spec_debug(save_spec),
+                            },
+                            hypothesis_id="M",
+                        )
                         continue  # skip this request
                     # Align to lmcache chunk size
                     skip_leading_tokens = (
@@ -2873,6 +3356,26 @@ class LMCacheConnectorV1Impl:
                     kv_group=kv_group,
                     dsa_two_groups=dsa_two_groups,
                 )
+                _agent_debug_log(
+                    "vllm_v1_adapter:save_kv_layer",
+                    "store layer create",
+                    {
+                        "req_id": request.req_id,
+                        "layer_name": layer_name,
+                        "kv_group": kv_group,
+                        "is_indexer_layer": is_indexer_layer,
+                        "token_len": len(token_ids),
+                        "skip_leading_tokens": skip_leading_tokens,
+                        "store_true_tokens": int(store_mask.sum().item()),
+                        "store_false_tokens": int((~store_mask).sum().item()),
+                        "slot_mapping": _tensor_debug(slot_mapping),
+                        "cached_group": _cached_group_debug(
+                            request, kv_group=kv_group
+                        ),
+                        "sync": is_first,
+                    },
+                    hypothesis_id="M",
+                )
                 layerwise_storer = self.lmcache_engine.store_layer(
                     token_ids,
                     mask=store_mask,
@@ -2891,6 +3394,18 @@ class LMCacheConnectorV1Impl:
                     is_first = False
 
             next(layerwise_storer)
+            _agent_debug_log(
+                "vllm_v1_adapter:save_kv_layer",
+                "store layer advanced",
+                {
+                    "req_id": request.req_id,
+                    "layer_name": layer_name,
+                    "kv_group": kv_group,
+                    "is_indexer_layer": is_indexer_layer,
+                    "current_storers": list(self._layerwise_save_storers.keys()),
+                },
+                hypothesis_id="M",
+            )
 
     @_lmcache_nvtx_annotate
     def wait_for_save(self):
@@ -2898,6 +3413,30 @@ class LMCacheConnectorV1Impl:
 
         connector_metadata = self._parent._get_connector_metadata()
         assert isinstance(connector_metadata, LMCacheConnectorMetadata)
+
+        _agent_debug_log(
+            "vllm_v1_adapter:wait_for_save",
+            "wait_for_save entry",
+            {
+                "kv_role": self.kv_role,
+                "use_layerwise": self.use_layerwise,
+                "current_storers": list(self._layerwise_save_storers.keys()),
+                "requests": [
+                    {
+                        "req_id": req.req_id,
+                        "token_len": len(req.token_ids),
+                        "is_sparse_decode": req.is_sparse_decode,
+                        "is_last_prefill": req.is_last_prefill,
+                        "load_spec": _load_spec_debug(req.load_spec),
+                        "save_spec": _save_spec_debug(req.save_spec),
+                        "latent_cache": _cached_group_debug(req, kv_group=0),
+                        "indexer_cache": _cached_group_debug(req, kv_group=1),
+                    }
+                    for req in connector_metadata.requests
+                ],
+            },
+            hypothesis_id="N",
+        )
 
         if self.kv_role == "kv_consumer":
             # Don't do save if the role is kv_consumer
@@ -2909,6 +3448,15 @@ class LMCacheConnectorV1Impl:
             for request in connector_metadata.requests:
                 self._maybe_lookup_unpin_for_request(request)
 
+            _agent_debug_log(
+                "vllm_v1_adapter:wait_for_save",
+                "wait_for_save consumer return",
+                {
+                    "kv_role": self.kv_role,
+                    "requests": [req.req_id for req in connector_metadata.requests],
+                },
+                hypothesis_id="N",
+            )
             return
 
         if self.use_layerwise:
@@ -2924,8 +3472,26 @@ class LMCacheConnectorV1Impl:
                             next(layerwise_storer)
                         except StopIteration:
                             pass
+                        _agent_debug_log(
+                            "vllm_v1_adapter:wait_for_save",
+                            "drained layerwise storer",
+                            {
+                                "req_id": request.req_id,
+                                "kv_group": _kv_group,
+                            },
+                            hypothesis_id="N",
+                        )
                 self._maybe_seed_worker_retrieve_state_from_store(request)
                 self._maybe_lookup_unpin_for_request(request)
+            _agent_debug_log(
+                "vllm_v1_adapter:wait_for_save",
+                "wait_for_save layerwise return",
+                {
+                    "remaining_storers": list(self._layerwise_save_storers.keys()),
+                    "requests": [req.req_id for req in connector_metadata.requests],
+                },
+                hypothesis_id="N",
+            )
             return
 
         assert len(self.kv_caches) > 0
@@ -3272,6 +3838,39 @@ class LMCacheConnectorV1Impl:
             self._request_trackers.pop(finished_req_id, None)
             self._unfinished_requests.pop(finished_req_id, None)
 
+        cached_reqs_preview = scheduler_output.scheduled_cached_reqs
+        if isinstance(cached_reqs_preview, list):
+            cached_req_ids_preview = [req.req_id for req in cached_reqs_preview]
+        else:
+            cached_req_ids_preview = list(
+                getattr(cached_reqs_preview, "req_ids", [])
+            )
+        _agent_debug_log(
+            "vllm_v1_adapter:build_connector_meta",
+            "scheduler output summary",
+            {
+                "kv_role": self.kv_role,
+                "force_skip_save": force_skip_save,
+                "new_req_ids": [
+                    request.req_id
+                    for request in scheduler_output.scheduled_new_reqs
+                ],
+                "cached_req_ids": cached_req_ids_preview,
+                "cached_reqs_type": type(cached_reqs_preview).__name__,
+                "finished_req_ids": list(scheduler_output.finished_req_ids),
+                "num_scheduled_tokens": dict(
+                    scheduler_output.num_scheduled_tokens
+                ),
+                "load_specs": {
+                    req_id: _load_spec_debug(load_spec)
+                    for req_id, load_spec in self.load_specs.items()
+                },
+                "tracker_req_ids": list(self._request_trackers.keys()),
+                "unfinished_req_ids": list(self._unfinished_requests.keys()),
+            },
+            hypothesis_id="O",
+        )
+
         # We should load KV for:
         # 1. new requests
         # 2. preempted requests (once per recovery)
@@ -3304,6 +3903,32 @@ class LMCacheConnectorV1Impl:
                 skip_save,
             )
             self._request_trackers[request.req_id] = request_tracker
+            _agent_debug_log(
+                "vllm_v1_adapter:build_connector_meta",
+                "scheduled new request tracker",
+                {
+                    "req_id": request.req_id,
+                    "num_computed_tokens": request.num_computed_tokens,
+                    "num_scheduled_tokens": scheduler_output.num_scheduled_tokens[
+                        request.req_id
+                    ],
+                    "num_tokens_to_compute": num_tokens_to_compute,
+                    "lmcache_cached_tokens": lmcache_cached_tokens,
+                    "load_spec": _load_spec_debug(load_spec),
+                    "skip_save": skip_save,
+                    "prompt_len": request_tracker.prompt_len,
+                    "tracker_token_len": len(request_tracker.token_ids),
+                    "tracker_num_saved_tokens": request_tracker.num_saved_tokens,
+                    "tracker_is_decode_phase": request_tracker.is_decode_phase,
+                    "latent_blocks": len(request_tracker.allocated_block_ids),
+                    "indexer_blocks": _safe_len(
+                        request_tracker.allocated_block_ids_indexer
+                    ),
+                    "dsa_two_groups": getattr(self.config, "dsa_two_groups", False),
+                    "disagg_spec_present": request_tracker.disagg_spec is not None,
+                },
+                hypothesis_id="O",
+            )
 
             req_meta = ReqMeta.from_request_tracker(
                 request_tracker,
@@ -3353,6 +3978,30 @@ class LMCacheConnectorV1Impl:
                     lmcache_cached_tokens=lmcache_cached_tokens,
                     vllm_cached_tokens=vllm_cached_tokens,
                     all_token_ids=all_token_ids,
+                )
+                _agent_debug_log(
+                    "vllm_v1_adapter:build_connector_meta",
+                    "scheduled cached request tracker (list)",
+                    {
+                        "req_id": req.req_id,
+                        "new_token_len": len(req.new_token_ids),
+                        "resumed_from_preemption": req.resumed_from_preemption,
+                        "load_spec": _load_spec_debug(load_spec),
+                        "lmcache_cached_tokens": lmcache_cached_tokens,
+                        "vllm_cached_tokens": vllm_cached_tokens,
+                        "prompt_len": request_tracker.prompt_len,
+                        "tracker_token_len": len(request_tracker.token_ids),
+                        "tracker_num_saved_tokens": request_tracker.num_saved_tokens,
+                        "tracker_is_decode_phase": request_tracker.is_decode_phase,
+                        "latent_blocks": len(request_tracker.allocated_block_ids),
+                        "indexer_blocks": _safe_len(
+                            request_tracker.allocated_block_ids_indexer
+                        ),
+                        "dsa_two_groups": getattr(
+                            self.config, "dsa_two_groups", False
+                        ),
+                    },
+                    hypothesis_id="O",
                 )
 
                 req_meta = ReqMeta.from_request_tracker(
@@ -3486,12 +4135,52 @@ class LMCacheConnectorV1Impl:
             is_sparse_decode = self.enable_sparse_attention and (
                 request.num_computed_tokens > request_tracker.prompt_len
             )
+            load_spec_before_sparse = load_spec
             if is_sparse_decode:
                 load_spec = LoadSpec(
                     vllm_cached_tokens=0,
                     lmcache_cached_tokens=request_tracker.prompt_len,
                     can_load=True,
                 )
+            _agent_debug_log(
+                "vllm_v1_adapter:build_connector_meta",
+                "scheduled cached request tracker",
+                {
+                    "req_id": req_id,
+                    "num_current_tokens": num_current_tokens,
+                    "num_new_tokens": num_new_tokens,
+                    "slice_base": slice_base,
+                    "tracker_len_before_update": tracker_len,
+                    "new_token_len": len(new_token_ids),
+                    "request_num_computed_tokens": request.num_computed_tokens,
+                    "request_num_tokens": request.num_tokens,
+                    "prompt_len": request_tracker.prompt_len,
+                    "preempted": preempted,
+                    "enable_sparse_attention": self.enable_sparse_attention,
+                    "is_sparse_decode": is_sparse_decode,
+                    "sparse_condition": (
+                        request.num_computed_tokens > request_tracker.prompt_len
+                    ),
+                    "load_spec_before_sparse": _load_spec_debug(
+                        load_spec_before_sparse
+                    ),
+                    "load_spec_for_reqmeta": _load_spec_debug(load_spec),
+                    "lmcache_cached_tokens": lmcache_cached_tokens,
+                    "vllm_cached_tokens": vllm_cached_tokens,
+                    "tracker_token_len_after_update": len(
+                        request_tracker.token_ids
+                    ),
+                    "tracker_num_saved_tokens": request_tracker.num_saved_tokens,
+                    "tracker_is_decode_phase": request_tracker.is_decode_phase,
+                    "latent_blocks": len(request_tracker.allocated_block_ids),
+                    "indexer_blocks": _safe_len(
+                        request_tracker.allocated_block_ids_indexer
+                    ),
+                    "dsa_two_groups": getattr(self.config, "dsa_two_groups", False),
+                    "disagg_spec_present": request_tracker.disagg_spec is not None,
+                },
+                hypothesis_id="O",
+            )
 
             req_meta = ReqMeta.from_request_tracker(
                 request_tracker,
