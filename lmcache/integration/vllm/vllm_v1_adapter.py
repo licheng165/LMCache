@@ -2486,6 +2486,7 @@ class LMCacheConnectorV1Impl:
         selected_tokens: list = None,
         token_start_index: list = None,
         request_ids: list = None,
+        target_slot_mapping=None,
     ) -> None:
         """Blocking until the KV for a specific layer is loaded into vLLM's
         paged buffer.
@@ -2497,6 +2498,8 @@ class LMCacheConnectorV1Impl:
             selected_tokens: batched sparse token indices per decode request.
             token_start_index: per-request start offset into slot_mapping.
             request_ids: req_id for each selected_tokens row (input_batch order).
+            target_slot_mapping: optional batched physical destination slots,
+                row-aligned with selected_tokens.
         """
         if self.layerwise_retrievers:
             logger.debug(f"Waiting for layer {self.current_layer} to be loaded")
@@ -2532,6 +2535,7 @@ class LMCacheConnectorV1Impl:
                 if selected_tokens is None:
                     selected_tokens_per_req = None
                     token_start_index_per_req = 0
+                    target_slot_mapping_per_req = None
                 else:
                     row = (
                         row_of_req[request.req_id]
@@ -2542,12 +2546,25 @@ class LMCacheConnectorV1Impl:
                     token_start_index_per_req = (
                         0 if token_start_index is None else token_start_index[row]
                     )
+                    target_slot_mapping_per_req = (
+                        None
+                        if target_slot_mapping is None
+                        else target_slot_mapping[row]
+                    )
                 ret_token_mask = layerwise_retriever.send(
-                    (selected_tokens_per_req, token_start_index_per_req)
+                    (
+                        selected_tokens_per_req,
+                        token_start_index_per_req,
+                        target_slot_mapping_per_req,
+                    )
                 )
                 if indexer_retriever is not None:
                     indexer_retriever.send(
-                        (selected_tokens_per_req, token_start_index_per_req)
+                        (
+                            selected_tokens_per_req,
+                            token_start_index_per_req,
+                            target_slot_mapping_per_req,
+                        )
                     )
                 decode_row += 1
             else:

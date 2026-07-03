@@ -7,6 +7,7 @@ from unittest.mock import MagicMock
 
 # Third Party
 import pytest
+import torch
 
 # First Party
 from lmcache.integration.vllm.vllm_v1_adapter import (
@@ -14,6 +15,10 @@ from lmcache.integration.vllm.vllm_v1_adapter import (
     LoadSpec,
     ReqMeta,
     WorkerRetrieveState,
+)
+from tests.v1.connector_test_utils import (
+    make_sparse_req_meta,
+    make_worker_connector,
 )
 
 
@@ -58,6 +63,47 @@ def _make_request(*, resumed: bool = False) -> ReqMeta:
 
 
 class TestWorkerRetrieveState:
+    def test_wait_for_layer_load_forwards_target_slot_row_by_request_id(self):
+        req = make_sparse_req_meta("req-1", token_count=4)
+        impl, _, _ = make_worker_connector([req], use_layerwise=True)
+        impl.current_layer = 0
+        impl.num_layers = 2
+        impl._layerwise_retriever_is_sparse = [True]
+
+        captured = []
+
+        def _retriever():
+            payload = yield None
+            captured.append(payload)
+            yield torch.ones(4, dtype=torch.bool)
+
+        retriever = _retriever()
+        next(retriever)
+        impl.layerwise_retrievers = [(retriever, None)]
+
+        selected_tokens = torch.tensor(
+            [[10, 11, 12, 13], [18831, 18814, 18810, 18651]],
+            dtype=torch.int32,
+        )
+        target_slot_mapping = torch.tensor(
+            [[100, 101, 102, 103], [900, 901, 902, 903]],
+            dtype=torch.long,
+        )
+
+        impl.wait_for_layer_load(
+            "model.layers.0.self_attn.attn",
+            selected_tokens=selected_tokens,
+            token_start_index=[0, 0],
+            request_ids=["other-req", "req-1"],
+            target_slot_mapping=target_slot_mapping,
+        )
+
+        assert len(captured) == 1
+        selected_row, token_start, target_row = captured[0]
+        assert token_start == 0
+        assert torch.equal(selected_row, selected_tokens[1])
+        assert torch.equal(target_row, target_slot_mapping[1])
+
     def test_bind_rehydrates_scheduler_empty_metadata(self):
         impl = _make_impl()
         request = _make_request()
