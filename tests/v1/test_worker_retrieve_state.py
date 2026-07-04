@@ -99,10 +99,46 @@ class TestWorkerRetrieveState:
         )
 
         assert len(captured) == 1
-        selected_row, token_start, target_row = captured[0]
-        assert token_start == 0
-        assert torch.equal(selected_row, selected_tokens[1])
-        assert torch.equal(target_row, target_slot_mapping[1])
+        selected_payload, token_start, target_payload = captured[0]
+        assert token_start is None
+        assert torch.equal(selected_payload, selected_tokens[1])
+        assert torch.equal(target_payload, target_slot_mapping[1])
+
+    def test_wait_for_layer_load_ordered_sparse_rows_use_view_payload(self):
+        req = make_sparse_req_meta("req-1", token_count=4)
+        impl, _, _ = make_worker_connector([req], use_layerwise=True)
+        impl.current_layer = 0
+        impl.num_layers = 2
+        impl._layerwise_retriever_is_sparse = [True]
+
+        captured = []
+
+        def _retriever():
+            payload = yield None
+            captured.append(payload)
+            yield torch.ones(4, dtype=torch.bool)
+
+        retriever = _retriever()
+        next(retriever)
+        impl.layerwise_retrievers = [(retriever, None)]
+
+        selected_tokens = torch.tensor([[10, 11, 12, 13]], dtype=torch.int32)
+        target_slot_mapping = torch.tensor([[900, 901, 902, 903]], dtype=torch.long)
+
+        impl.wait_for_layer_load(
+            "model.layers.0.self_attn.attn",
+            selected_tokens=selected_tokens,
+            token_start_index=[0],
+            request_ids=["req-1"],
+            target_slot_mapping=target_slot_mapping,
+        )
+
+        selected_payload, token_start, target_payload = captured[0]
+        assert token_start is None
+        assert torch.equal(selected_payload, selected_tokens[0])
+        assert torch.equal(target_payload, target_slot_mapping[0])
+        assert selected_payload.data_ptr() == selected_tokens.data_ptr()
+        assert target_payload.data_ptr() == target_slot_mapping.data_ptr()
 
     def test_bind_rehydrates_scheduler_empty_metadata(self):
         impl = _make_impl()
