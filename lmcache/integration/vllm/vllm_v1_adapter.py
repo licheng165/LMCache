@@ -2101,6 +2101,22 @@ class LMCacheConnectorV1Impl:
 
         connector_metadata = self._parent._get_connector_metadata()
         assert isinstance(connector_metadata, LMCacheConnectorMetadata)
+        if _decode_window_save_debug_enabled():
+            decode_window_requests = sum(
+                1
+                for request in connector_metadata.requests
+                if self._is_decode_window_save_request(request)
+            )
+            logger.warning(
+                "[DECODE_WINDOW_SAVE] adapter_wait_for_save begin "
+                "role=%s layerwise=%s requests=%d decode_window_requests=%d "
+                "pending_storers=%d",
+                self.kv_role,
+                self.use_layerwise,
+                len(connector_metadata.requests),
+                decode_window_requests,
+                len(getattr(self, "_layerwise_save_storers", {})),
+            )
 
         if self.kv_role == "kv_consumer":
             # Don't do save if the role is kv_consumer
@@ -2112,6 +2128,10 @@ class LMCacheConnectorV1Impl:
             for request in connector_metadata.requests:
                 self._maybe_lookup_unpin_for_request(request)
 
+            if _decode_window_save_debug_enabled():
+                logger.warning(
+                    "[DECODE_WINDOW_SAVE] adapter_wait_for_save consumer_done"
+                )
             return
 
         if self.use_layerwise:
@@ -2141,6 +2161,12 @@ class LMCacheConnectorV1Impl:
                         raise
                     self._mark_decode_window_save_completed(request)
                 self._maybe_lookup_unpin_for_request(request)
+            if _decode_window_save_debug_enabled():
+                logger.warning(
+                    "[DECODE_WINDOW_SAVE] adapter_wait_for_save layerwise_done "
+                    "pending_storers=%d",
+                    len(self._layerwise_save_storers),
+                )
             return
 
         assert len(self.kv_caches) > 0
@@ -2242,6 +2268,9 @@ class LMCacheConnectorV1Impl:
                 save_spec.skip_leading_tokens = len(token_ids)
                 if request.disagg_spec:
                     request.disagg_spec.num_transferred_tokens = len(token_ids)
+
+        if _decode_window_save_debug_enabled():
+            logger.warning("[DECODE_WINDOW_SAVE] adapter_wait_for_save done")
 
     @_lmcache_nvtx_annotate
     def get_finished(

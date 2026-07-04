@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 # Standard
+import os
 from typing import TYPE_CHECKING, Any, Optional
 
 # Third Party
@@ -26,6 +27,15 @@ if TYPE_CHECKING:
     from vllm.v1.request import Request
 
 logger = init_logger(__name__)
+
+
+def _decode_window_save_debug_enabled() -> bool:
+    return os.environ.get("LMCACHE_DECODE_WINDOW_SAVE_DEBUG", "0").lower() in (
+        "1",
+        "true",
+        "yes",
+        "on",
+    )
 
 
 class LMCacheConnectorV1Dynamic(KVConnectorBase_V1):
@@ -131,7 +141,14 @@ class LMCacheConnectorV1Dynamic(KVConnectorBase_V1):
 
         This prevents overwrites of paged KV buffer before saving done.
         """
+        if _decode_window_save_debug_enabled():
+            logger.warning(
+                "[DECODE_WINDOW_SAVE] connector_wait_for_save begin engine=%s",
+                type(self._lmcache_engine).__name__,
+            )
         self._lmcache_engine.wait_for_save()
+        if _decode_window_save_debug_enabled():
+            logger.warning("[DECODE_WINDOW_SAVE] connector_wait_for_save done")
 
     def get_finished(
         self, finished_req_ids: set[str]
