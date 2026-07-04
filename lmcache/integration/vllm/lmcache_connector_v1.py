@@ -38,6 +38,21 @@ def _decode_window_save_debug_enabled() -> bool:
     )
 
 
+def _decode_window_save_wait_debug_enabled(engine: Any) -> bool:
+    if not _decode_window_save_debug_enabled():
+        return False
+    if getattr(engine, "_layerwise_save_storers", None):
+        return True
+    try:
+        metadata = engine._parent._get_connector_metadata()
+    except Exception:
+        return False
+    requests = getattr(metadata, "requests", None)
+    if requests is None:
+        return False
+    return any(getattr(request, "is_decode_window_save", False) for request in requests)
+
+
 class LMCacheConnectorV1Dynamic(KVConnectorBase_V1):
     def __init__(
         self,
@@ -141,13 +156,16 @@ class LMCacheConnectorV1Dynamic(KVConnectorBase_V1):
 
         This prevents overwrites of paged KV buffer before saving done.
         """
-        if _decode_window_save_debug_enabled():
+        decode_window_wait_debug = _decode_window_save_wait_debug_enabled(
+            self._lmcache_engine
+        )
+        if decode_window_wait_debug:
             logger.warning(
                 "[DECODE_WINDOW_SAVE] connector_wait_for_save begin engine=%s",
                 type(self._lmcache_engine).__name__,
             )
         self._lmcache_engine.wait_for_save()
-        if _decode_window_save_debug_enabled():
+        if decode_window_wait_debug:
             logger.warning("[DECODE_WINDOW_SAVE] connector_wait_for_save done")
 
     def get_finished(
