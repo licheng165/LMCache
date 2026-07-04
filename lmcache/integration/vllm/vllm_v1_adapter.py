@@ -151,10 +151,6 @@ def _env_flag(name: str, default: str = "0") -> bool:
     return os.environ.get(name, default).lower() in ("1", "true", "yes", "on")
 
 
-def _decode_window_save_debug_enabled() -> bool:
-    return _env_flag("LMCACHE_DECODE_WINDOW_SAVE_DEBUG")
-
-
 def _sparse_slot_mapping_len(prompt_tokens: int) -> int:
     return min(SPARSE_DECODE_RETRIEVE_TOKENS, prompt_tokens)
 
@@ -1201,52 +1197,6 @@ class LMCacheConnectorV1Impl:
             return
         self._release_request_lookup_pins(request.req_id)
 
-    def _log_decode_window_save_call(
-        self,
-        request: ReqMeta,
-        token_ids: list[int],
-        slot_mapping: torch.Tensor,
-        skip_leading_tokens: int,
-        *,
-        layerwise: bool,
-    ) -> None:
-        if not _decode_window_save_debug_enabled():
-            return
-        logger.warning(
-            "[DECODE_WINDOW_SAVE] store req=%s window=[%s,%s) "
-            "window_size=%s lmcache_chunk_size=%s token_len=%s "
-            "slot_mapping_len=%s skip_leading_tokens=%s layerwise=%s",
-            request.req_id,
-            getattr(request, "decode_window_start", None),
-            getattr(request, "decode_window_end", None),
-            getattr(request, "decode_window_size", None),
-            self._lmcache_chunk_size,
-            len(token_ids),
-            len(slot_mapping),
-            skip_leading_tokens,
-            layerwise,
-        )
-
-    def _log_decode_window_save_state(
-        self,
-        message: str,
-        request: ReqMeta,
-        **kwargs: Any,
-    ) -> None:
-        if not _decode_window_save_debug_enabled():
-            return
-        details = " ".join(f"{key}={value}" for key, value in kwargs.items())
-        if details:
-            details = " " + details
-        logger.warning(
-            "[DECODE_WINDOW_SAVE] %s req=%s window=[%s,%s)%s",
-            message,
-            request.req_id,
-            getattr(request, "decode_window_start", None),
-            getattr(request, "decode_window_end", None),
-            details,
-        )
-
     def _mark_decode_window_save_completed(self, request: ReqMeta) -> None:
         if not self._is_decode_window_save_request(request):
             return
@@ -1257,11 +1207,6 @@ class LMCacheConnectorV1Impl:
         if completed is None:
             return
         completed[request.req_id] = max(completed.get(request.req_id, 0), window_end)
-        self._log_decode_window_save_state(
-            "worker_completed",
-            request,
-            completed_end=completed[request.req_id],
-        )
 
     def get_completed_decode_window_saves(self) -> dict[str, int]:
         completed = getattr(self, "_completed_decode_window_saves", None)
@@ -1269,8 +1214,6 @@ class LMCacheConnectorV1Impl:
             return {}
         drained = dict(completed)
         completed.clear()
-        if _decode_window_save_debug_enabled():
-            logger.warning("[DECODE_WINDOW_SAVE] worker_drain_completed %s", drained)
         return drained
 
     def update_connector_output(self, connector_output: Any) -> None:
@@ -1286,12 +1229,6 @@ class LMCacheConnectorV1Impl:
                 tracker.decode_window_save_committed_end,
                 committed_end,
             )
-            if _decode_window_save_debug_enabled():
-                logger.warning(
-                    "[DECODE_WINDOW_SAVE] committed req=%s committed_end=%d",
-                    req_id,
-                    tracker.decode_window_save_committed_end,
-                )
 
     def _prune_worker_retrieve_state(self, active_req_ids: set[str]) -> None:
         if not hasattr(self, "_worker_retrieve_state"):
@@ -1960,16 +1897,6 @@ class LMCacheConnectorV1Impl:
             if (
                 save_spec is None or not save_spec.can_save
             ) and self.kv_role != "kv_producer":
-                if self._is_decode_window_save_request(request):
-                    self._log_decode_window_save_state(
-                        "skip_save_kv_layer",
-                        request,
-                        reason="save_spec_disabled",
-                        has_save_spec=save_spec is not None,
-                        can_save=getattr(save_spec, "can_save", None),
-                        kv_role=self.kv_role,
-                        layer=layer_name,
-                    )
                 continue
 
             storer_key = self._layerwise_save_storer_key(request)
@@ -2001,15 +1928,6 @@ class LMCacheConnectorV1Impl:
                     skip_leading_tokens = save_spec.skip_leading_tokens
 
                     if skip_leading_tokens == len(token_ids):
-                        if self._is_decode_window_save_request(request):
-                            self._log_decode_window_save_state(
-                                "skip_save_kv_layer",
-                                request,
-                                reason="skip_leading_equals_token_len",
-                                layer=layer_name,
-                                token_len=len(token_ids),
-                                skip_leading_tokens=skip_leading_tokens,
-                            )
                         continue  # skip this request
                     # Align to lmcache chunk size
                     skip_leading_tokens = (
@@ -2029,15 +1947,6 @@ class LMCacheConnectorV1Impl:
                     skip_leading_tokens,
                     request.req_id,
                 )
-                if self._is_decode_window_save_request(request):
-                    self._log_decode_window_save_call(
-                        request,
-                        token_ids,
-                        slot_mapping,
-                        skip_leading_tokens,
-                        layerwise=True,
-                    )
-
                 # TODO (Jiayi): need to make layerwise storing
                 # compatible with disagg spec
                 layerwise_storer = self.lmcache_engine.store_layer(
@@ -2062,23 +1971,10 @@ class LMCacheConnectorV1Impl:
                 if is_first:
                     is_first = False
 
-            if self._is_decode_window_save_request(request):
-                self._log_decode_window_save_state(
-                    "advance_layer_begin",
-                    request,
-                    layer=layer_name,
-                    storer_exists=layerwise_storer is not None,
-                    total_storers=len(self._layerwise_save_storers),
-                )
             try:
                 next(layerwise_storer)
             except Exception:
                 if self._is_decode_window_save_request(request):
-                    self._log_decode_window_save_state(
-                        "advance_layer_failed",
-                        request,
-                        layer=layer_name,
-                    )
                     logger.exception(
                         "[DECODE_WINDOW_SAVE] save_kv_layer failed: "
                         "req=%s window=[%s,%s) layer=%s",
@@ -2088,12 +1984,6 @@ class LMCacheConnectorV1Impl:
                         layer_name,
                     )
                 raise
-            if self._is_decode_window_save_request(request):
-                self._log_decode_window_save_state(
-                    "advance_layer_done",
-                    request,
-                    layer=layer_name,
-                )
 
     @_lmcache_nvtx_annotate
     def wait_for_save(self):
@@ -2101,30 +1991,6 @@ class LMCacheConnectorV1Impl:
 
         connector_metadata = self._parent._get_connector_metadata()
         assert isinstance(connector_metadata, LMCacheConnectorMetadata)
-        pending_storers = getattr(self, "_layerwise_save_storers", {})
-        metadata_window_keys = [
-            self._layerwise_save_storer_key(request)
-            for request in connector_metadata.requests
-            if self._is_decode_window_save_request(request)
-        ]
-        decode_window_requests = len(metadata_window_keys)
-        decode_window_wait_debug = (
-            _decode_window_save_debug_enabled()
-            and (decode_window_requests > 0 or len(pending_storers) > 0)
-        )
-        if decode_window_wait_debug:
-            logger.warning(
-                "[DECODE_WINDOW_SAVE] adapter_wait_for_save begin "
-                "role=%s layerwise=%s requests=%d decode_window_requests=%d "
-                "pending_storers=%d metadata_window_keys=%s pending_keys=%s",
-                self.kv_role,
-                self.use_layerwise,
-                len(connector_metadata.requests),
-                decode_window_requests,
-                len(pending_storers),
-                metadata_window_keys[:4],
-                list(pending_storers.keys())[:4],
-            )
 
         if self.kv_role == "kv_consumer":
             # Don't do save if the role is kv_consumer
@@ -2136,10 +2002,6 @@ class LMCacheConnectorV1Impl:
             for request in connector_metadata.requests:
                 self._maybe_lookup_unpin_for_request(request)
 
-            if decode_window_wait_debug:
-                logger.warning(
-                    "[DECODE_WINDOW_SAVE] adapter_wait_for_save consumer_done"
-                )
             return
 
         if self.use_layerwise:
@@ -2147,13 +2009,6 @@ class LMCacheConnectorV1Impl:
                 layerwise_storer = self._layerwise_save_storers.pop(
                     self._layerwise_save_storer_key(request), None
                 )
-                if self._is_decode_window_save_request(request):
-                    self._log_decode_window_save_state(
-                        "wait_for_save",
-                        request,
-                        storer_present=layerwise_storer is not None,
-                        remaining_storers=len(self._layerwise_save_storers),
-                    )
                 if layerwise_storer is not None:
                     try:
                         next(layerwise_storer)
@@ -2169,13 +2024,6 @@ class LMCacheConnectorV1Impl:
                         raise
                     self._mark_decode_window_save_completed(request)
                 self._maybe_lookup_unpin_for_request(request)
-            if decode_window_wait_debug:
-                logger.warning(
-                    "[DECODE_WINDOW_SAVE] adapter_wait_for_save layerwise_done "
-                    "pending_storers=%d pending_keys=%s",
-                    len(self._layerwise_save_storers),
-                    list(self._layerwise_save_storers.keys())[:4],
-                )
             return
 
         assert len(self.kv_caches) > 0
@@ -2235,15 +2083,6 @@ class LMCacheConnectorV1Impl:
                 skip_leading_tokens,
                 request.req_id,
             )
-            if self._is_decode_window_save_request(request):
-                self._log_decode_window_save_call(
-                    request,
-                    token_ids,
-                    slot_mapping,
-                    skip_leading_tokens,
-                    layerwise=False,
-                )
-
             is_last_prefill = request.is_last_prefill
             if is_last_prefill:
                 if request.disagg_spec:
@@ -2277,9 +2116,6 @@ class LMCacheConnectorV1Impl:
                 save_spec.skip_leading_tokens = len(token_ids)
                 if request.disagg_spec:
                     request.disagg_spec.num_transferred_tokens = len(token_ids)
-
-        if decode_window_wait_debug:
-            logger.warning("[DECODE_WINDOW_SAVE] adapter_wait_for_save done")
 
     @_lmcache_nvtx_annotate
     def get_finished(
@@ -2574,17 +2410,6 @@ class LMCacheConnectorV1Impl:
             meta.add_request(req_meta)
             tracker.decode_window_save_next_start = window_end
             next_start = window_end
-
-            if _decode_window_save_debug_enabled():
-                logger.warning(
-                    "[DECODE_WINDOW_SAVE] scheduled req=%s window=[%d,%d) "
-                    "tokens_len=%d prompt_len=%d",
-                    tracker.req_id,
-                    window_start,
-                    window_end,
-                    len(tracker.token_ids),
-                    tracker.prompt_len,
-                )
 
     @_lmcache_nvtx_annotate
     def build_connector_meta(
