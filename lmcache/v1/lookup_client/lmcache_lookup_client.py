@@ -21,6 +21,18 @@ from lmcache.v1.rpc.transport import (
 logger = init_logger(__name__)
 
 
+def _diag_preview(values, limit: int = 4):
+    if values is None:
+        return None
+    try:
+        length = len(values)
+        head = list(values[:limit])
+        tail = list(values[-limit:]) if length > limit else head
+        return {"len": length, "head": head, "tail": tail}
+    except Exception:
+        return {"repr": repr(values)}
+
+
 class LMCacheLookupClient(LookupClientInterface):
     """
     Lookup client that communicates with a lookup server
@@ -113,6 +125,17 @@ class LMCacheLookupClient(LookupClientInterface):
             if not hashes:
                 return 0
 
+            logger.info(
+                "[RANK_LOOKUP_DIAG][client_send] lookup_id=%s chunks=%d "
+                "offset_sum=%d hashes=%s offsets=%s request_configs=%s",
+                lookup_id,
+                len(hashes),
+                sum(offsets),
+                _diag_preview(hashes),
+                _diag_preview(offsets),
+                request_configs,
+            )
+
             msg_buf = [
                 hashes,
                 offsets,
@@ -145,6 +168,12 @@ class LMCacheLookupClient(LookupClientInterface):
         # tokens is different across (TP and PP) ranks,
         # so we can use the minimum value.
         num_hit_toks = min(results)
+        logger.info(
+            "[RANK_LOOKUP_DIAG][client_recv] lookup_id=%s results=%s min=%d",
+            lookup_id,
+            results,
+            num_hit_toks,
+        )
         self.reqs_status[lookup_id] = num_hit_toks
 
         return num_hit_toks
@@ -232,6 +261,18 @@ class LMCacheLookupServer:
                     if not self.enable_blending:
                         hashes = data_frames[0]
                         offsets = data_frames[1]
+                        logger.info(
+                            "[RANK_LOOKUP_DIAG][server_recv] worker_id=%s "
+                            "lookup_id=%s chunks=%d offset_sum=%d hashes=%s "
+                            "offsets=%s request_configs=%s",
+                            self.metadata.worker_id,
+                            lookup_id,
+                            len(hashes),
+                            sum(offsets),
+                            _diag_preview(hashes),
+                            _diag_preview(offsets),
+                            request_configs,
+                        )
                         lookup_result = self.lmcache_engine.lookup(
                             hashes=hashes,
                             offsets=offsets,
@@ -247,6 +288,13 @@ class LMCacheLookupServer:
                             pin=True,
                             request_configs=request_configs,
                         )
+                    logger.info(
+                        "[RANK_LOOKUP_DIAG][server_result] worker_id=%s "
+                        "lookup_id=%s result=%d",
+                        self.metadata.worker_id,
+                        lookup_id,
+                        lookup_result,
+                    )
                     response = lookup_result.to_bytes(4, "big")
                     self.transport.send_response(identity, response)
                 except json.JSONDecodeError as e:

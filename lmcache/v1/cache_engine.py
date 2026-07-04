@@ -672,13 +672,29 @@ class LMCacheEngine:
         prev_key = 0
         kv_group = kwargs.get("kv_group", 0)
         store_fmt = self._memory_format_for_kv_group(kv_group)
-        for start, end, key in self.token_database.process_tokens(
-            tokens=tokens, mask=mask, request_configs=request_configs,
-            kv_group=kv_group,
+        for chunk_idx, (start, end, key) in enumerate(
+            self.token_database.process_tokens(
+                tokens=tokens,
+                mask=mask,
+                request_configs=request_configs,
+                kv_group=kv_group,
+            )
         ):
             assert isinstance(key, CacheEngineKey)
 
             keys_multi_layer = key.split_layers(self.num_layers)
+            logger.info(
+                "[RANK_LOOKUP_DIAG][store_key] worker_id=%s req_id=%s "
+                "chunk_idx=%d range=%d:%d kv_group=%s chunk_hash=%s key0=%s",
+                self.metadata.worker_id,
+                req_id,
+                chunk_idx,
+                start,
+                end,
+                key.kv_group,
+                key.chunk_hash,
+                keys_multi_layer[0].to_string(),
+            )
             # Only check the first layer
             if self.storage_manager.contains(
                 keys_multi_layer[0], self.retrieve_locations
@@ -1151,7 +1167,7 @@ class LMCacheEngine:
 
             # TODO: support batched_contains when layerwise is enabled
             if self.use_layerwise:
-                for start, end, key in chunk_info_iterator:
+                for chunk_idx, (start, end, key) in enumerate(chunk_info_iterator):
                     assert isinstance(key, CacheEngineKey)
 
                     # TODO(Jiayi): Optimize by checking only the existence of the key
@@ -1162,6 +1178,22 @@ class LMCacheEngine:
                         key_all_layers,  # type: ignore
                         search_range,
                         pin,
+                    )
+                    logger.info(
+                        "[RANK_LOOKUP_DIAG][engine_contains] worker_id=%s "
+                        "lookup_id=%s chunk_idx=%d range=%d:%d kv_group=%s "
+                        "chunk_hash=%s key0=%s hit_chunks=%d/%d locations=%s",
+                        self.metadata.worker_id,
+                        lookup_id,
+                        chunk_idx,
+                        start,
+                        end,
+                        key.kv_group,
+                        key.chunk_hash,
+                        key_all_layers[0].to_string(),
+                        hit_chunks,
+                        self.num_layers,
+                        list(block_mapping.keys()),
                     )
                     # Only all layers are hit and hit in one location,
                     # we consider this key as a hit
@@ -1174,6 +1206,14 @@ class LMCacheEngine:
                             self.lookup_pins[lookup_id][location].extend(key_all_layers)
                         res = end
                         continue
+                    logger.info(
+                        "[RANK_LOOKUP_DIAG][engine_result] worker_id=%s "
+                        "lookup_id=%s result=%d miss_at_chunk=%d",
+                        self.metadata.worker_id,
+                        lookup_id,
+                        res,
+                        chunk_idx,
+                    )
                     return res
             else:
                 chunk_info_list = []
@@ -1189,6 +1229,18 @@ class LMCacheEngine:
                 hit_chunks, block_mapping = self.storage_manager.batched_contains(
                     keys, search_range, pin
                 )
+                sample_keys = [key.to_string() for key in keys[:4]]
+                logger.info(
+                    "[RANK_LOOKUP_DIAG][engine_batched_contains] worker_id=%s "
+                    "lookup_id=%s chunks=%d hit_chunks=%d locations=%s "
+                    "sample_keys=%s",
+                    self.metadata.worker_id,
+                    lookup_id,
+                    len(keys),
+                    hit_chunks,
+                    list(block_mapping.keys()),
+                    sample_keys,
+                )
                 if pin and block_mapping:
                     assert lookup_id is not None, (
                         "lookup_id is required when pin is True"
@@ -1198,9 +1250,24 @@ class LMCacheEngine:
                     if idx < hit_chunks:
                         res = end
                         continue
+                    logger.info(
+                        "[RANK_LOOKUP_DIAG][engine_result] worker_id=%s "
+                        "lookup_id=%s result=%d miss_at_chunk=%d",
+                        self.metadata.worker_id,
+                        lookup_id,
+                        res,
+                        idx,
+                    )
                     return res
 
             # all tokens where found, return the maximal end
+            logger.info(
+                "[RANK_LOOKUP_DIAG][engine_result] worker_id=%s lookup_id=%s "
+                "result=%d miss_at_chunk=None",
+                self.metadata.worker_id,
+                lookup_id,
+                res,
+            )
             return res
         finally:
             self.stats_monitor.on_lookup_finished(lookup_stats, res)
