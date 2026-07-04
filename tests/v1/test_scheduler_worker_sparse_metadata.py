@@ -148,14 +148,14 @@ class TestBuildConnectorMetaSparseSyntheticLoadSpec:
         assert req_meta.token_ids == sparse_tokens
         assert tracker.sparse_token_ids == sparse_tokens
 
-    def test_decode_window_sparse_load_uses_current_window_start(self) -> None:
+    def test_decode_window_sparse_load_uses_committed_window_end(self) -> None:
         impl = _make_scheduler_impl()
         impl._decode_window_save_window_size = 256
 
         req_id = "sparse-window"
         prompt_len = 356
         prompt = list(range(prompt_len))
-        decode_tokens = list(range(10_000, 10_157))
+        decode_tokens = list(range(10_000, 10_158))
         all_tokens = prompt + decode_tokens
         vllm_req = SimpleNamespace(
             request_id=req_id,
@@ -184,6 +184,32 @@ class TestBuildConnectorMetaSparseSyntheticLoadSpec:
             scheduled_cached_reqs=StubCachedRequestData(
                 req_ids=[req_id],
                 new_token_ids=[[all_tokens[512]]],
+                new_block_ids=[[]],
+            ),
+            num_scheduled_tokens={req_id: 1},
+        )
+
+        meta = impl.build_connector_meta(scheduler_output)
+        req_meta = next(req for req in meta.requests if req.is_sparse_decode)
+
+        assert req_meta.load_spec is not None
+        assert req_meta.load_spec.can_load is True
+        assert req_meta.load_spec.lmcache_cached_tokens == 256
+        assert req_meta.token_ids == all_tokens[:256]
+        assert tracker.sparse_token_ids == all_tokens[:256]
+        assert req_meta.slot_mapping[0].numel() == 256
+        assert tracker.sparse_slot_mapping[0].numel() == 256
+
+        impl.update_connector_output(
+            SimpleNamespace(completed_decode_window_saves={req_id: 512})
+        )
+        vllm_req.num_computed_tokens = 513
+        scheduler_output = StubSchedulerOutput(
+            finished_req_ids=set(),
+            scheduled_new_reqs=[],
+            scheduled_cached_reqs=StubCachedRequestData(
+                req_ids=[req_id],
+                new_token_ids=[[all_tokens[513]]],
                 new_block_ids=[[]],
             ),
             num_scheduled_tokens={req_id: 1},
@@ -308,6 +334,7 @@ class TestDecodeWindowSaveMetadata:
         assert len(req_meta.slot_mapping[0]) == 512
         assert tracker.num_saved_tokens == 256
         assert tracker.decode_window_save_next_start == 512
+        assert tracker.decode_window_save_committed_end == 256
 
     def test_decode_window_save_waits_until_boundary(self) -> None:
         impl = _make_scheduler_impl()

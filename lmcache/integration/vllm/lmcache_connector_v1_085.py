@@ -20,6 +20,7 @@ if TYPE_CHECKING:
     # Third Party
     from vllm.attention.backends.abstract import AttentionMetadata
     from vllm.forward_context import ForwardContext
+    from vllm.v1.outputs import KVConnectorOutput
     from vllm.v1.request import Request
 
 logger = init_logger(__name__)
@@ -151,3 +152,9 @@ class LMCacheConnectorV1Dynamic(KVConnectorBase_V1):
             scheduler_output (SchedulerOutput): the scheduler output object.
         """
         return self._lmcache_engine.build_connector_meta(scheduler_output)
+
+    def update_connector_output(self, connector_output: "KVConnectorOutput"):
+        """
+        Update scheduler-side LMCache state from worker-side connector output.
+        """
+        self._lmcache_engine.update_connector_output(connector_output)

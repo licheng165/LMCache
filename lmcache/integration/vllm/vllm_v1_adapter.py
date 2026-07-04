@@ -274,6 +274,9 @@ class RequestTracker:
     sparse_decode_ret_mask: Optional[torch.Tensor] = field(default=None, repr=False)
     # Decode window save only: independent progress for decode-window chunks.
     decode_window_save_next_start: Optional[int] = field(default=None, repr=False)
+    # Decode window save only: highest token boundary confirmed readable from
+    # LMCache by worker-side completion output.
+    decode_window_save_committed_end: int = field(default=0, repr=False)
 
     @_lmcache_nvtx_annotate
     @staticmethod
@@ -335,6 +338,7 @@ class RequestTracker:
             skip_save=skip_save,
             request_configs=request_configs,
             num_lmcache_cached_tokens=lmcache_cached_tokens,
+            decode_window_save_committed_end=lmcache_cached_tokens,
         )
 
     def update(
@@ -387,6 +391,7 @@ class RequestTracker:
             self.allocated_block_ids = new_block_ids
             # reset the number of saved tokens
             self.num_saved_tokens = lmcache_cached_tokens
+            self.decode_window_save_committed_end = lmcache_cached_tokens
             num_computed_tokens = max(lmcache_cached_tokens, vllm_cached_tokens)
 
             # FIX: For preempted requests, restore token_ids from the full
@@ -1240,6 +1245,26 @@ class LMCacheConnectorV1Impl:
         drained = dict(completed)
         completed.clear()
         return drained
+
+    def update_connector_output(self, connector_output: Any) -> None:
+        completed = getattr(connector_output, "completed_decode_window_saves", None)
+        if not completed:
+            return
+        for req_id, window_end in completed.items():
+            tracker = self._request_trackers.get(req_id)
+            if tracker is None:
+                continue
+            committed_end = int(window_end)
+            tracker.decode_window_save_committed_end = max(
+                tracker.decode_window_save_committed_end,
+                committed_end,
+            )
+            if _decode_window_save_debug_enabled():
+                logger.warning(
+                    "[DECODE_WINDOW_SAVE] committed req=%s committed_end=%d",
+                    req_id,
+                    tracker.decode_window_save_committed_end,
+                )
 
     def _prune_worker_retrieve_state(self, active_req_ids: set[str]) -> None:
         if not hasattr(self, "_worker_retrieve_state"):
@@ -2379,6 +2404,10 @@ class LMCacheConnectorV1Impl:
         )
         start = max(prompt_chunk_start, saved_chunk_start)
         tracker.decode_window_save_next_start = start
+        tracker.decode_window_save_committed_end = max(
+            tracker.decode_window_save_committed_end,
+            min(start, len(tracker.token_ids)),
+        )
         return start
 
     def _add_decode_window_save_metas(
@@ -2655,12 +2684,17 @@ class LMCacheConnectorV1Impl:
                 lmcache_cached_for_sparse = len(request.prompt_token_ids)
                 if self._decode_window_save_window_size > 0:
                     token_len = len(request_tracker.token_ids)
-                    lmcache_cached_for_sparse = (
+                    current_window_start = (
                         (token_len - 1)
                         // self._decode_window_save_window_size
                         * self._decode_window_save_window_size
                         if token_len > 0
                         else 0
+                    )
+                    lmcache_cached_for_sparse = min(
+                        request_tracker.decode_window_save_committed_end,
+                        current_window_start,
+                        token_len,
                     )
                 load_spec = LoadSpec(
                     vllm_cached_tokens=0,
