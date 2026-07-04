@@ -1227,6 +1227,26 @@ class LMCacheConnectorV1Impl:
             layerwise,
         )
 
+    def _log_decode_window_save_state(
+        self,
+        message: str,
+        request: ReqMeta,
+        **kwargs: Any,
+    ) -> None:
+        if not _decode_window_save_debug_enabled():
+            return
+        details = " ".join(f"{key}={value}" for key, value in kwargs.items())
+        if details:
+            details = " " + details
+        logger.warning(
+            "[DECODE_WINDOW_SAVE] %s req=%s window=[%s,%s)%s",
+            message,
+            request.req_id,
+            getattr(request, "decode_window_start", None),
+            getattr(request, "decode_window_end", None),
+            details,
+        )
+
     def _mark_decode_window_save_completed(self, request: ReqMeta) -> None:
         if not self._is_decode_window_save_request(request):
             return
@@ -1237,6 +1257,11 @@ class LMCacheConnectorV1Impl:
         if completed is None:
             return
         completed[request.req_id] = max(completed.get(request.req_id, 0), window_end)
+        self._log_decode_window_save_state(
+            "worker_completed",
+            request,
+            completed_end=completed[request.req_id],
+        )
 
     def get_completed_decode_window_saves(self) -> dict[str, int]:
         completed = getattr(self, "_completed_decode_window_saves", None)
@@ -1244,6 +1269,8 @@ class LMCacheConnectorV1Impl:
             return {}
         drained = dict(completed)
         completed.clear()
+        if _decode_window_save_debug_enabled():
+            logger.warning("[DECODE_WINDOW_SAVE] worker_drain_completed %s", drained)
         return drained
 
     def update_connector_output(self, connector_output: Any) -> None:
@@ -1933,6 +1960,16 @@ class LMCacheConnectorV1Impl:
             if (
                 save_spec is None or not save_spec.can_save
             ) and self.kv_role != "kv_producer":
+                if self._is_decode_window_save_request(request):
+                    self._log_decode_window_save_state(
+                        "skip_save_kv_layer",
+                        request,
+                        reason="save_spec_disabled",
+                        has_save_spec=save_spec is not None,
+                        can_save=getattr(save_spec, "can_save", None),
+                        kv_role=self.kv_role,
+                        layer=layer_name,
+                    )
                 continue
 
             storer_key = self._layerwise_save_storer_key(request)
@@ -1964,6 +2001,15 @@ class LMCacheConnectorV1Impl:
                     skip_leading_tokens = save_spec.skip_leading_tokens
 
                     if skip_leading_tokens == len(token_ids):
+                        if self._is_decode_window_save_request(request):
+                            self._log_decode_window_save_state(
+                                "skip_save_kv_layer",
+                                request,
+                                reason="skip_leading_equals_token_len",
+                                layer=layer_name,
+                                token_len=len(token_ids),
+                                skip_leading_tokens=skip_leading_tokens,
+                            )
                         continue  # skip this request
                     # Align to lmcache chunk size
                     skip_leading_tokens = (
@@ -2007,12 +2053,47 @@ class LMCacheConnectorV1Impl:
                     cached_ends=request.cached_ends,
                     cached_memory_objs=request.cached_memory_objs,
                     cached_tensors=request.cached_tensors,
+                    decode_window_save=self._is_decode_window_save_request(request),
+                    decode_window_start=getattr(request, "decode_window_start", None),
+                    decode_window_end=getattr(request, "decode_window_end", None),
+                    decode_window_size=getattr(request, "decode_window_size", None),
                 )
                 self._layerwise_save_storers[storer_key] = layerwise_storer
                 if is_first:
                     is_first = False
 
-            next(layerwise_storer)
+            if self._is_decode_window_save_request(request):
+                self._log_decode_window_save_state(
+                    "advance_layer_begin",
+                    request,
+                    layer=layer_name,
+                    storer_exists=layerwise_storer is not None,
+                    total_storers=len(self._layerwise_save_storers),
+                )
+            try:
+                next(layerwise_storer)
+            except Exception:
+                if self._is_decode_window_save_request(request):
+                    self._log_decode_window_save_state(
+                        "advance_layer_failed",
+                        request,
+                        layer=layer_name,
+                    )
+                    logger.exception(
+                        "[DECODE_WINDOW_SAVE] save_kv_layer failed: "
+                        "req=%s window=[%s,%s) layer=%s",
+                        request.req_id,
+                        getattr(request, "decode_window_start", None),
+                        getattr(request, "decode_window_end", None),
+                        layer_name,
+                    )
+                raise
+            if self._is_decode_window_save_request(request):
+                self._log_decode_window_save_state(
+                    "advance_layer_done",
+                    request,
+                    layer=layer_name,
+                )
 
     @_lmcache_nvtx_annotate
     def wait_for_save(self):
@@ -2038,8 +2119,26 @@ class LMCacheConnectorV1Impl:
                 layerwise_storer = self._layerwise_save_storers.pop(
                     self._layerwise_save_storer_key(request), None
                 )
+                if self._is_decode_window_save_request(request):
+                    self._log_decode_window_save_state(
+                        "wait_for_save",
+                        request,
+                        storer_present=layerwise_storer is not None,
+                        remaining_storers=len(self._layerwise_save_storers),
+                    )
                 if layerwise_storer is not None:
-                    next(layerwise_storer)
+                    try:
+                        next(layerwise_storer)
+                    except Exception:
+                        if self._is_decode_window_save_request(request):
+                            logger.exception(
+                                "[DECODE_WINDOW_SAVE] wait_for_save failed: "
+                                "req=%s window=[%s,%s)",
+                                request.req_id,
+                                getattr(request, "decode_window_start", None),
+                                getattr(request, "decode_window_end", None),
+                            )
+                        raise
                     self._mark_decode_window_save_completed(request)
                 self._maybe_lookup_unpin_for_request(request)
             return
