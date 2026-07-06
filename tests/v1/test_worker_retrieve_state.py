@@ -117,6 +117,90 @@ class TestWorkerRetrieveState:
         assert state.shared_request_active is True
         assert state.request_scope_token == "req-1:7:512"
 
+    def test_sparse_decode_index_materialization_policy_for_kv_both(self):
+        impl = _make_impl()
+        impl.config = SimpleNamespace(dsa_two_groups=True)
+        impl.kv_role = "kv_both"
+        impl.lmcache_engine = SimpleNamespace(
+            enable_shared_cpu_cache=True,
+            shared_cpu_materialize_index_on_decode_cold=True,
+        )
+        request = _make_request()
+
+        assert (
+            impl._sparse_decode_requires_index_materialization(
+                request,
+                shared_cpu_enabled=True,
+            )
+            is False
+        )
+
+    def test_sparse_decode_index_materialization_policy_for_consumer(self):
+        impl = _make_impl()
+        impl.config = SimpleNamespace(dsa_two_groups=True)
+        impl.kv_role = "kv_consumer"
+        impl.lmcache_engine = SimpleNamespace(
+            enable_shared_cpu_cache=True,
+            shared_cpu_materialize_index_on_decode_cold=True,
+        )
+        request = _make_request()
+
+        assert (
+            impl._sparse_decode_requires_index_materialization(
+                request,
+                shared_cpu_enabled=True,
+            )
+            is True
+        )
+
+    def test_sparse_decode_index_materialization_policy_for_disagg_request(self):
+        impl = _make_impl()
+        impl.config = SimpleNamespace(dsa_two_groups=True)
+        impl.kv_role = "kv_both"
+        impl.lmcache_engine = SimpleNamespace(
+            enable_shared_cpu_cache=True,
+            shared_cpu_materialize_index_on_decode_cold=True,
+        )
+        request = _make_request()
+        request.disagg_spec = object()
+
+        assert (
+            impl._sparse_decode_requires_index_materialization(
+                request,
+                shared_cpu_enabled=True,
+            )
+            is True
+        )
+
+    def test_bind_allows_skipped_index_for_kv_both_sparse_decode(self):
+        impl = _make_impl()
+        impl.config = SimpleNamespace(dsa_two_groups=True)
+        impl.kv_role = "kv_both"
+        impl.lmcache_engine = SimpleNamespace(
+            enable_shared_cpu_cache=True,
+            shared_cpu_cache_generation=3,
+            shared_cpu_materialize_index_on_decode_cold=True,
+        )
+        request = _make_request()
+        impl._worker_retrieve_state["req-1"] = WorkerRetrieveState(
+            cached_keys=[["layer0-key"]],
+            cached_starts=[0],
+            cached_ends=[256],
+            cached_memory_objs=[["latent-view"]],
+            cached_chunk_ptrs_npu=[torch.tensor([1], dtype=torch.long)],
+            metadata_warm=True,
+            shared_latent_status="present",
+            shared_index_status="skipped",
+            shared_generation=3,
+            pointer_cache_generation=3,
+            shared_request_active=True,
+        )
+
+        impl._bind_worker_retrieve_state_to_request(request)
+
+        assert request.cached_memory_objs == [["latent-view"]]
+        assert request.cached_chunk_ptrs_npu[0].numel() == 1
+
     def test_record_shared_state_preserves_skipped_index_without_index_objs(self):
         impl = _make_impl()
         impl.lmcache_engine = SimpleNamespace(

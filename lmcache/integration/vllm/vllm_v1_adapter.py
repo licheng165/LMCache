@@ -1334,6 +1334,28 @@ class LMCacheConnectorV1Impl:
             )
         )
 
+    def _sparse_decode_requires_index_materialization(
+        self,
+        request: "ReqMeta",
+        shared_cpu_enabled: bool,
+    ) -> bool:
+        """True only for decode paths where the DSA index is not already resident.
+
+        In normal kv_both serving, prefill populated the DSA index cache in vLLM.
+        Sparse decode should not re-scatter selected index chunks after top-k
+        selection because that can overwrite the full-position index cache and
+        corrupt later decode. Disaggregated decode consumers, however, may need
+        cold materialization of the index group.
+        """
+        if not self._is_dsa_two_groups():
+            return False
+        if not self._shared_cpu_materialize_index_on_decode_cold():
+            return False
+        kv_role = getattr(self, "kv_role", "kv_both")
+        if not shared_cpu_enabled:
+            return kv_role == "kv_consumer"
+        return kv_role == "kv_consumer" or request.disagg_spec is not None
+
     @staticmethod
     def _mark_shared_index_skipped(
         state: Optional[WorkerRetrieveState],
@@ -1405,7 +1427,10 @@ class LMCacheConnectorV1Impl:
                 f"missing_layers={missing_latent_pointer_layers}"
             )
         if self._is_dsa_two_groups():
-            materialize_index = self._shared_cpu_materialize_index_on_decode_cold()
+            materialize_index = self._sparse_decode_requires_index_materialization(
+                request,
+                True,
+            )
             allowed = ("present",) if materialize_index else ("present", "skipped")
             if state.shared_index_status not in allowed:
                 raise RuntimeError(
@@ -2760,24 +2785,18 @@ class LMCacheConnectorV1Impl:
                     indexer_skipped = False
                     if dsa_two_groups:
                         indexer_kvcaches = self._kvcaches_for_group(1)
+                        materialize_index = (
+                            self._sparse_decode_requires_index_materialization(
+                                request,
+                                shared_cpu_enabled,
+                            )
+                        )
                         if (
                             shared_cpu_enabled
-                            and not self._shared_cpu_materialize_index_on_decode_cold()
+                            and not materialize_index
                         ):
-                            indexer_retriever = (
-                                self.lmcache_engine.skip_shared_layerwise_retrieve(
-                                    req_id=request.req_id,
-                                    phase=SPARSE_DECODE_SHARED_CPU_PHASE,
-                                    request_ordinal=idx,
-                                    kv_group=1,
-                                    message=(
-                                        "DSA index shared CPU materialization "
-                                        "intentionally skipped by non-strict config"
-                                    ),
-                                    num_tokens=len(retrieve_tokens),
-                                )
-                            )
-                            next(indexer_retriever)
+                            indexer_skipped = True
+                        elif not materialize_index:
                             indexer_skipped = True
                         elif not indexer_kvcaches:
                             if shared_cpu_enabled:
