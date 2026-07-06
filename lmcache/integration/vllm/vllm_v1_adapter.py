@@ -819,12 +819,17 @@ class ReqMeta:
                     block_size,
                 )
             if is_sparse_decode and load_spec is not None and load_spec.can_load:
-                if not tracker.sparse_indexer_slot_mapping:
+                if (
+                    not tracker.sparse_indexer_slot_mapping
+                    or tracker.sparse_indexer_slot_mapping[0].numel()
+                    < load_spec.lmcache_cached_tokens
+                ):
+                    tracker.sparse_indexer_slot_mapping.clear()
                     tracker.sparse_indexer_slot_mapping.append(
                         _build_slot_mapping(
                             tracker.allocated_block_ids_indexer,
                             block_size,
-                            slot_mapping[0].numel(),
+                            load_spec.lmcache_cached_tokens,
                         )
                     )
                 indexer_slot_mapping = tracker.sparse_indexer_slot_mapping
@@ -1716,20 +1721,27 @@ class LMCacheConnectorV1Impl:
         request_indexer_slots: Optional[torch.Tensor] = None,
         strict: bool = False,
     ) -> Optional[torch.Tensor]:
-        """Indexer slots for sparse decode, aligned to the latent sparse window."""
+        """Indexer slots for sparse decode, covering the full LMCache-hit prefix.
+
+        The latent group loads only selected top-k rows into a compact scratch
+        window, but the DSA index group must be fully materialized before top-k
+        selection. Capping index slots to the latent scratch window leaves most
+        prompt index rows stale and degrades sparse decode quality.
+        """
         sparse_len = len(latent_sparse_slots)
+        indexer_len = int(lmcache_cached_tokens)
         if request_indexer_slots is not None and request_indexer_slots.numel() > 0:
             request_indexer_slots = request_indexer_slots.to(
                 device=self.device, dtype=torch.long
             )
-            if request_indexer_slots.numel() >= sparse_len:
-                return request_indexer_slots[:sparse_len]
+            if request_indexer_slots.numel() >= indexer_len:
+                return request_indexer_slots[:indexer_len]
 
         idx_slot = self._indexer_retrieve_slot_mapping(
             attn_metadata, lmcache_cached_tokens
         )
-        if idx_slot is not None and idx_slot.numel() >= sparse_len:
-            return idx_slot[:sparse_len]
+        if idx_slot is not None and idx_slot.numel() >= indexer_len:
+            return idx_slot[:indexer_len]
         if strict:
             request_len = (
                 int(request_indexer_slots.numel())
@@ -1739,10 +1751,11 @@ class LMCacheConnectorV1Impl:
             metadata_len = int(idx_slot.numel()) if idx_slot is not None else 0
             raise RuntimeError(
                 "Shared CPU sparse decode with dsa_two_groups=true could not "
-                "resolve compact DSA index slot mapping. Refusing to fall back "
+                "resolve full DSA index slot mapping. Refusing to fall back "
                 "to latent slots because that can load indexer KV into the "
                 "wrong cache group: "
-                f"sparse_len={sparse_len}, request_indexer_slots={request_len}, "
+                f"indexer_len={indexer_len}, sparse_len={sparse_len}, "
+                f"request_indexer_slots={request_len}, "
                 f"metadata_indexer_slots={metadata_len}, "
                 f"lmcache_cached_tokens={lmcache_cached_tokens}"
             )
@@ -2236,8 +2249,10 @@ class LMCacheConnectorV1Impl:
         if state is None:
             return False
         if request.is_sparse_decode:
-            # Sparse decode retrieves a sliding window (e.g. 2048 tokens) while
-            # warm cache covers the full prompt - window < cached_ends is normal.
+            # Sparse decode keeps metadata for the full LMCache-hit prompt even
+            # though latent transfer later writes only selected top-k rows into
+            # a compact scratch window. A smaller selected-transfer count must
+            # not invalidate full-prefix cached metadata.
             if state.token_count and len(request.token_ids) < state.token_count:
                 return True
             return False

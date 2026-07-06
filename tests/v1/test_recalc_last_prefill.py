@@ -122,7 +122,7 @@ class TestFullHitRecalcLast:
         assert req_meta.indexer_slot_mapping[0].numel() == prompt_len
         assert req_meta.save_spec.can_save is False
 
-    def test_sparse_decode_req_meta_builds_compact_indexer_slots(self) -> None:
+    def test_sparse_decode_req_meta_builds_full_indexer_slots(self) -> None:
         prompt_len = 18879
         block_size = 16
         indexer_block_offset = 1000
@@ -154,9 +154,12 @@ class TestFullHitRecalcLast:
 
         assert req_meta is not None
         assert req_meta.slot_mapping[0].numel() == 2048
-        assert req_meta.indexer_slot_mapping[0].numel() == 2048
+        assert req_meta.indexer_slot_mapping[0].numel() == prompt_len
         assert req_meta.indexer_slot_mapping[0][0].item() == (
             indexer_block_offset * block_size
+        )
+        assert req_meta.indexer_slot_mapping[0][-1].item() == (
+            indexer_block_offset * block_size + prompt_len - 1
         )
         assert not torch.equal(
             req_meta.slot_mapping[0],
@@ -184,19 +187,37 @@ class TestFullHitRecalcLast:
         impl = object.__new__(LMCacheConnectorV1Impl)
         impl.device = "cpu"
         latent_slots = torch.arange(4, dtype=torch.long)
-        request_indexer_slots = torch.arange(100, 104, dtype=torch.long)
-        attn = SimpleNamespace(indexer_slot_mapping=torch.arange(200, 204))
+        request_indexer_slots = torch.arange(100, 108, dtype=torch.long)
+        attn = SimpleNamespace(indexer_slot_mapping=torch.arange(200, 208))
 
         result = LMCacheConnectorV1Impl._sparse_indexer_slot_mapping(
             impl,
             attn,
             latent_slots,
-            lmcache_cached_tokens=4,
+            lmcache_cached_tokens=8,
             request_indexer_slots=request_indexer_slots,
             strict=True,
         )
 
         assert torch.equal(result, request_indexer_slots)
+
+    def test_sparse_indexer_slot_mapping_requires_full_prompt_slots(self) -> None:
+        impl = object.__new__(LMCacheConnectorV1Impl)
+        impl.device = "cpu"
+        latent_slots = torch.arange(4, dtype=torch.long)
+        request_indexer_slots = torch.arange(100, 104, dtype=torch.long)
+        attn = SimpleNamespace(indexer_slot_mapping=torch.arange(200, 208))
+
+        result = LMCacheConnectorV1Impl._sparse_indexer_slot_mapping(
+            impl,
+            attn,
+            latent_slots,
+            lmcache_cached_tokens=8,
+            request_indexer_slots=request_indexer_slots,
+            strict=True,
+        )
+
+        assert torch.equal(result, attn.indexer_slot_mapping)
 
     def test_sparse_indexer_slot_mapping_strict_rejects_latent_fallback(self) -> None:
         impl = object.__new__(LMCacheConnectorV1Impl)
@@ -204,7 +225,7 @@ class TestFullHitRecalcLast:
         latent_slots = torch.arange(4, dtype=torch.long)
         attn = SimpleNamespace(slot_mapping=None, indexer_slot_mapping=None)
 
-        with pytest.raises(RuntimeError, match="compact DSA index slot mapping"):
+        with pytest.raises(RuntimeError, match="full DSA index slot mapping"):
             LMCacheConnectorV1Impl._sparse_indexer_slot_mapping(
                 impl,
                 attn,

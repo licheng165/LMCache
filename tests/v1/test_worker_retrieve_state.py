@@ -1093,7 +1093,7 @@ class TestWorkerRetrieveState:
         )
         assert impl._should_invalidate_worker_retrieve_state(_make_request(), 128)
 
-    def test_sparse_decode_window_does_not_invalidate_full_prompt_cache(self):
+    def test_sparse_decode_selected_transfer_does_not_invalidate_full_prompt_cache(self):
         impl = _make_impl()
         impl._worker_retrieve_state["req-1"] = WorkerRetrieveState(
             cached_keys=[["k"]],
@@ -1104,7 +1104,7 @@ class TestWorkerRetrieveState:
         )
         req = _make_request()
         req.token_ids = [0] * 18879
-        assert not impl._should_invalidate_worker_retrieve_state(req, 2048)
+        assert not impl._should_invalidate_worker_retrieve_state(req, 18879)
 
     def test_sparse_decode_prompt_shrink_invalidates(self):
         impl = _make_impl()
@@ -1117,7 +1117,7 @@ class TestWorkerRetrieveState:
         )
         req = _make_request()
         req.token_ids = [0] * 4096
-        assert impl._should_invalidate_worker_retrieve_state(req, 2048)
+        assert impl._should_invalidate_worker_retrieve_state(req, 4096)
 
     def test_passive_shared_metadata_warm_skips_storage_probe(self):
         ensure_metadata = MagicMock(side_effect=AssertionError("should not probe"))
