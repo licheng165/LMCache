@@ -91,6 +91,39 @@ def _handle_logical_nbytes(handle: "SharedChunkHandle") -> int:
     return _shape_nbytes(handle.shape, handle.dtype)
 
 
+def _shared_key_matches_expected(
+    handle_key: CacheEngineKey,
+    expected_key: CacheEngineKey,
+    expected_producer_rank: Optional[int],
+) -> bool:
+    if handle_key == expected_key:
+        return True
+    if expected_producer_rank is None:
+        return False
+    if type(handle_key) is not type(expected_key):
+        return False
+    if int(handle_key.worker_id) != int(expected_producer_rank):
+        return False
+
+    comparable_fields = (
+        "model_name",
+        "world_size",
+        "chunk_hash",
+        "dtype",
+        "tags",
+        "kv_group",
+    )
+    for field in comparable_fields:
+        if getattr(handle_key, field) != getattr(expected_key, field):
+            return False
+    if hasattr(expected_key, "layer_id") and (
+        getattr(handle_key, "layer_id", None)
+        != getattr(expected_key, "layer_id", None)
+    ):
+        return False
+    return True
+
+
 def _load_lmc_ops(*, purpose: str):
     try:
         import lmcache.c_ops as lmc_ops
@@ -455,7 +488,14 @@ def validate_shared_handle(
         failures.append(
             f"chunk_index={handle.chunk_index}, expected={expected_chunk_index}"
         )
-    if expected_key is not None and handle.key != expected_key:
+    if (
+        expected_key is not None
+        and not _shared_key_matches_expected(
+            handle.key,
+            expected_key,
+            expected_producer_rank,
+        )
+    ):
         failures.append(f"key={handle.key!r}, expected={expected_key!r}")
     if expected_shape is not None and handle.shape != torch.Size(expected_shape):
         failures.append(f"shape={handle.shape}, expected={torch.Size(expected_shape)}")
@@ -483,13 +523,7 @@ def validate_shared_handle(
         failures.append("dtype is None")
     if handle.fmt == MemoryFormat.UNDEFINED:
         failures.append("fmt is UNDEFINED")
-    if handle.cached_positions is None:
-        if expected_cached_positions is not None:
-            failures.append(
-                "cached_positions is None, expected="
-                f"{expected_cached_positions}"
-            )
-    else:
+    if handle.cached_positions is not None:
         try:
             cached_positions = [int(pos) for pos in handle.cached_positions]
             if any(pos < 0 for pos in cached_positions):

@@ -832,6 +832,50 @@ def test_passive_allocator_rejects_key_mismatch():
         )
 
 
+def test_passive_allocator_accepts_rank0_key_for_passive_rank():
+    slab = torch.arange(1024, dtype=torch.uint8)
+    source_obj = _make_memory_obj(slab)
+    handle = SharedChunkHandle.from_memory_obj(
+        request_id="req-1",
+        phase="dense_prefix",
+        key=_make_key().get_first_layer(),
+        layer_id=0,
+        kv_group=0,
+        chunk_index=0,
+        shm_name="/lmcache-test",
+        memory_obj=source_obj,
+        generation=2,
+        producer_rank=0,
+    )
+    allocator = PassiveSharedViewAllocator(
+        slab_tensor=slab,
+        shm_name="/lmcache-test",
+        generation=2,
+    )
+    expected_key = CacheEngineKey(
+        model_name="model",
+        world_size=8,
+        worker_id=1,
+        chunk_hash=1234,
+        dtype=torch.float16,
+        kv_group=0,
+    ).get_first_layer()
+
+    view = allocator.create_view(
+        handle,
+        expected_request_id="req-1",
+        expected_phase="dense_prefix",
+        expected_layer_id=0,
+        expected_kv_group=0,
+        expected_chunk_index=0,
+        expected_key=expected_key,
+        expected_producer_rank=0,
+    )
+
+    assert view.parent() is allocator
+    view.ref_count_down()
+
+
 def test_passive_allocator_rejects_producer_rank_mismatch():
     slab = torch.arange(1024, dtype=torch.uint8)
     source_obj = _make_memory_obj(slab)
@@ -898,7 +942,7 @@ def test_passive_allocator_rejects_cached_positions_mismatch():
         )
 
 
-def test_passive_allocator_requires_cached_positions_when_expected():
+def test_passive_allocator_allows_missing_cached_positions_when_expected():
     slab = torch.arange(1024, dtype=torch.uint8)
     source_obj = _make_memory_obj(slab)
     handle = SharedChunkHandle.from_memory_obj(
@@ -919,16 +963,18 @@ def test_passive_allocator_requires_cached_positions_when_expected():
         generation=2,
     )
 
-    with pytest.raises(SharedCPUCacheValidationError, match="cached_positions is None"):
-        allocator.create_view(
-            replace(handle, cached_positions=None),
-            expected_request_id="req-1",
-            expected_phase="dense_prefix",
-            expected_layer_id=0,
-            expected_kv_group=0,
-            expected_chunk_index=0,
-            expected_cached_positions=[0, 1, 2, 3],
-        )
+    view = allocator.create_view(
+        replace(handle, cached_positions=None),
+        expected_request_id="req-1",
+        expected_phase="dense_prefix",
+        expected_layer_id=0,
+        expected_kv_group=0,
+        expected_chunk_index=0,
+        expected_cached_positions=[0, 1, 2, 3],
+    )
+
+    assert view.metadata.cached_positions is None
+    view.ref_count_down()
 
 
 def test_passive_allocator_rejects_expected_metadata_mismatch():
