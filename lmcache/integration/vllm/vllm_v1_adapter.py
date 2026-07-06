@@ -1006,8 +1006,10 @@ class LMCacheConnectorV1Impl:
         self.async_loading = config.enable_async_loading
         # Each entry is a (primary, secondary) retriever pair. primary is the
         # latent (kv_group=0) retriever; secondary is the indexer (kv_group=1)
-        # retriever for two-group prefix retrieve, or None for sparse decode /
-        # single-group. Both are advanced per layer in wait_for_layer_load.
+        # retriever for two-group prefix/sparse retrieve, or None for
+        # single-group. wait_for_layer_load routes latent and indexer layer
+        # waits to the matching group and advances current_layer after all
+        # required groups for that layer have completed.
         self.layerwise_retrievers: list[
             tuple[Optional[Generator[Optional[torch.Tensor], None, None]],
                   Optional[Generator[Optional[torch.Tensor], None, None]]]
@@ -1015,6 +1017,7 @@ class LMCacheConnectorV1Impl:
         self._layerwise_requests: list[ReqMeta] = []
         self._layerwise_retriever_is_sparse: list[bool] = []
         self._layerwise_sparse_req_ids: list[str] = []
+        self._layerwise_waited_groups: set[int] = set()
         self._layerwise_save_storers: dict[
             Union[str, tuple[str, int]],
             Generator[Optional[torch.Tensor], None, None],
@@ -1305,6 +1308,35 @@ class LMCacheConnectorV1Impl:
     def _is_dsa_two_groups(self) -> bool:
         return bool(getattr(getattr(self, "config", None), "dsa_two_groups", False))
 
+    def _is_indexer_layer_wait(self, layer_name: str) -> bool:
+        if not self._is_dsa_two_groups():
+            return False
+        indexer_names = getattr(self, "_indexer_layer_names", [])
+        return layer_name in indexer_names or "indexer" in layer_name
+
+    def _layerwise_wait_group(self, layer_name: str) -> int:
+        return 1 if self._is_indexer_layer_wait(layer_name) else 0
+
+    def _layerwise_required_wait_groups(self) -> set[int]:
+        required = {0}
+        if self._is_dsa_two_groups() and any(
+            indexer_retriever is not None
+            for _, indexer_retriever in getattr(self, "layerwise_retrievers", [])
+        ):
+            required.add(1)
+        return required
+
+    def _layerwise_wait_should_advance(self, wait_group: int) -> bool:
+        waited_groups = getattr(self, "_layerwise_waited_groups", None)
+        if waited_groups is None:
+            waited_groups = set()
+            self._layerwise_waited_groups = waited_groups
+        waited_groups.add(wait_group)
+        if self._layerwise_required_wait_groups().issubset(waited_groups):
+            waited_groups.clear()
+            return True
+        return False
+
     def _shared_cpu_config_value(self, key: str, default: Any = None) -> Any:
         engine = getattr(self, "lmcache_engine", None)
         if engine is None:
@@ -1339,24 +1371,23 @@ class LMCacheConnectorV1Impl:
         request: "ReqMeta",
         shared_cpu_enabled: bool,
     ) -> bool:
-        """True only for decode paths where the DSA index is not already resident.
+        """True when sparse decode must materialize DSA index from LMCache.
 
-        In normal kv_both serving, prefill populated the DSA index cache in vLLM.
-        Sparse decode should not re-scatter selected index chunks after top-k
-        selection because that can overwrite the full-position index cache and
-        corrupt later decode. Disaggregated decode consumers, however, may need
-        cold materialization of the index group.
+        In the legacy non-shared path, normal kv_both serving can rely on
+        prefill-populated vLLM index cache. In shared-CPU sparse decode,
+        however, the prompt cache hit may bypass that prefill work while still
+        using the indexer for top-k selection, so the index group must be
+        installed along with the latent group.
         """
         if not self._is_dsa_two_groups():
             return False
         if not self._shared_cpu_materialize_index_on_decode_cold():
             return False
         kv_role = getattr(self, "kv_role", "kv_both")
-        # Only a decode consumer is missing the resident DSA index cache and
-        # must cold-materialize it from shared CPU storage. kv_both serving may
-        # still carry prefill-side disagg metadata, but its decode path already
-        # owns the full vLLM index cache from prefill and must not overwrite it
-        # with sparse selected chunks.
+        if shared_cpu_enabled:
+            return True
+        # Outside shared CPU sparse decode, keep the legacy kv_both behavior:
+        # only a decode consumer lacks a resident DSA index cache.
         return kv_role == "kv_consumer"
 
     @staticmethod
@@ -1866,6 +1897,8 @@ class LMCacheConnectorV1Impl:
         self._layerwise_retriever_is_sparse.clear()
         if hasattr(self, "_layerwise_sparse_req_ids"):
             self._layerwise_sparse_req_ids.clear()
+        if hasattr(self, "_layerwise_waited_groups"):
+            self._layerwise_waited_groups.clear()
 
     def _drain_sparse_layerwise_retriever(
         self, retriever: Generator[Any, Any, Any]
@@ -2639,6 +2672,7 @@ class LMCacheConnectorV1Impl:
         self._drain_layerwise_retrievers()
         self._layerwise_requests = []
         self._layerwise_sparse_req_ids = []
+        self._layerwise_waited_groups = set()
 
         load_count = sum(
             1
@@ -3244,6 +3278,8 @@ class LMCacheConnectorV1Impl:
                 else len(selected_tokens)
             )
 
+        wait_group = self._layerwise_wait_group(layer_name)
+
         idx = 0
         decode_row = 0
         for request in layerwise_requests:
@@ -3337,33 +3373,38 @@ class LMCacheConnectorV1Impl:
                                 else _row_select(token_start_index, rows)
                             )
                         )
-                ret_token_mask = layerwise_retriever.send(
+                sparse_payload = (
                     payload
                     if payload is not None
                     else (selected_tokens_per_req, token_start_index_per_req)
                 )
-                if indexer_retriever is not None:
-                    indexer_retriever.send(
-                        payload
-                        if payload is not None
-                        else (selected_tokens_per_req, token_start_index_per_req)
-                    )
+                if wait_group == 1:
+                    if indexer_retriever is not None:
+                        ret_token_mask = indexer_retriever.send(sparse_payload)
+                    else:
+                        ret_token_mask = None
+                else:
+                    ret_token_mask = layerwise_retriever.send(sparse_payload)
                 decode_row += row_count
             else:
-                ret_token_mask = next(layerwise_retriever)
-                # Advance the indexer retriever in lockstep for two-group
-                # prefix retrieve. Its ret_mask is not reported to the
-                # scheduler; only the latent mask is.
-                if indexer_retriever is not None:
-                    next(indexer_retriever)
+                if wait_group == 1:
+                    if indexer_retriever is not None:
+                        next(indexer_retriever)
+                    ret_token_mask = None
+                else:
+                    ret_token_mask = next(layerwise_retriever)
 
-            if self.current_layer == self.num_layers - 1 and not request.is_sparse_decode:
+            if (
+                wait_group == 0
+                and self.current_layer == self.num_layers - 1
+                and not request.is_sparse_decode
+            ):
                 assert ret_token_mask is not None
                 num_retrieved_tokens = ret_token_mask.sum().item()
                 logger.info("Retrieved %d tokens", num_retrieved_tokens)
             idx += 1
 
-        if self.layerwise_retrievers:
+        if self.layerwise_retrievers and self._layerwise_wait_should_advance(wait_group):
             self.current_layer += 1
             if self.current_layer >= self.num_layers:
                 if metadata is None:

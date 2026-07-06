@@ -117,7 +117,7 @@ class TestWorkerRetrieveState:
         assert state.shared_request_active is True
         assert state.request_scope_token == "req-1:7:512"
 
-    def test_sparse_decode_index_materialization_policy_for_kv_both(self):
+    def test_sparse_decode_index_materialization_policy_for_shared_cpu_kv_both(self):
         impl = _make_impl()
         impl.config = SimpleNamespace(dsa_two_groups=True)
         impl.kv_role = "kv_both"
@@ -131,6 +131,24 @@ class TestWorkerRetrieveState:
             impl._sparse_decode_requires_index_materialization(
                 request,
                 shared_cpu_enabled=True,
+            )
+            is True
+        )
+
+    def test_sparse_decode_index_materialization_policy_for_non_shared_kv_both(self):
+        impl = _make_impl()
+        impl.config = SimpleNamespace(dsa_two_groups=True)
+        impl.kv_role = "kv_both"
+        impl.lmcache_engine = SimpleNamespace(
+            enable_shared_cpu_cache=False,
+            shared_cpu_materialize_index_on_decode_cold=True,
+        )
+        request = _make_request()
+
+        assert (
+            impl._sparse_decode_requires_index_materialization(
+                request,
+                shared_cpu_enabled=False,
             )
             is False
         )
@@ -169,10 +187,10 @@ class TestWorkerRetrieveState:
                 request,
                 shared_cpu_enabled=True,
             )
-            is False
+            is True
         )
 
-    def test_bind_allows_skipped_index_for_kv_both_sparse_decode(self):
+    def test_bind_rejects_skipped_index_for_shared_cpu_kv_both_sparse_decode(self):
         impl = _make_impl()
         impl.config = SimpleNamespace(dsa_two_groups=True)
         impl.kv_role = "kv_both"
@@ -196,10 +214,8 @@ class TestWorkerRetrieveState:
             shared_request_active=True,
         )
 
-        impl._bind_worker_retrieve_state_to_request(request)
-
-        assert request.cached_memory_objs == [["latent-view"]]
-        assert request.cached_chunk_ptrs_npu[0].numel() == 1
+        with pytest.raises(RuntimeError, match="invalid DSA index"):
+            impl._bind_worker_retrieve_state_to_request(request)
 
     def test_record_shared_state_preserves_skipped_index_without_index_objs(self):
         impl = _make_impl()
@@ -243,7 +259,7 @@ class TestWorkerRetrieveState:
         assert state.shared_request_active is True
         assert state.pointer_cache_generation == 7
 
-    def test_record_shared_state_ignores_stale_index_objs_when_skipped(self):
+    def test_record_shared_state_rejects_skipped_index_with_index_objs(self):
         impl = _make_impl()
         impl.config = SimpleNamespace(dsa_two_groups=True)
         impl.kv_role = "kv_both"
@@ -262,14 +278,8 @@ class TestWorkerRetrieveState:
         request.cached_shared_handles_indexer = [["stale-index-handle"]]
         request.shared_index_skipped = True
 
-        impl._record_shared_worker_retrieve_state(state, request)
-
-        assert state.shared_index_status == "skipped"
-        assert state.shared_request_active is True
-        assert state.pointer_cache_generation == 7
-        assert state.shared_views_by_group == {0: [["latent-view"]]}
-        assert 1 not in state.shared_views_by_group
-        assert 1 not in state.shared_handles_by_group
+        with pytest.raises(RuntimeError, match="kv_group=1"):
+            impl._record_shared_worker_retrieve_state(state, request)
 
     def test_shared_cpu_config_value_reads_engine_extra_config(self):
         impl = _make_impl()
@@ -754,6 +764,91 @@ class TestWorkerRetrieveState:
         assert torch.equal(target_payload, target_slot_mapping[0])
         assert selected_payload.data_ptr() == selected_tokens.data_ptr()
         assert target_payload.data_ptr() == target_slot_mapping.data_ptr()
+
+    def test_sparse_decode_indexer_wait_does_not_advance_latent_layer(self):
+        req = make_sparse_req_meta("req-1", token_count=4)
+        impl, _, _ = make_worker_connector([req], use_layerwise=True)
+        impl.config.dsa_two_groups = True
+        impl._indexer_layer_names = ["model.layers.0.self_attn.indexer.k_cache"]
+        impl.current_layer = 0
+        impl.num_layers = 2
+        impl._layerwise_retriever_is_sparse = [True]
+        impl._layerwise_sparse_req_ids = ["req-1"]
+
+        captured = []
+
+        def _retriever(label):
+            payload = yield None
+            captured.append((label, payload))
+            yield torch.ones(4, dtype=torch.bool)
+
+        latent = _retriever("latent")
+        indexer = _retriever("indexer")
+        next(latent)
+        next(indexer)
+        impl.layerwise_retrievers = [(latent, indexer)]
+
+        impl.wait_for_layer_load("model.layers.0.self_attn.indexer.k_cache")
+
+        assert captured == [("indexer", (None, 0))]
+        assert impl.current_layer == 0
+
+        selected_tokens = torch.tensor([[10, 11, 12, 13]], dtype=torch.int32)
+        target_slot_mapping = torch.tensor([[900, 901, 902, 903]], dtype=torch.long)
+        impl.wait_for_layer_load(
+            "model.layers.0.self_attn.attn",
+            selected_tokens=selected_tokens,
+            token_start_index=[0],
+            request_ids=["req-1"],
+            target_slot_mapping=target_slot_mapping,
+        )
+
+        assert [label for label, _ in captured] == ["indexer", "latent"]
+        selected_payload, token_start, target_payload = captured[1][1]
+        assert token_start is None
+        assert torch.equal(selected_payload, selected_tokens[0])
+        assert torch.equal(target_payload, target_slot_mapping[0])
+        assert impl.current_layer == 1
+
+    def test_dense_prefix_two_group_wait_advances_after_both_groups(self):
+        req = ReqMeta(
+            req_id="req-1",
+            token_ids=[1, 2, 3, 4],
+            load_spec=LoadSpec(
+                vllm_cached_tokens=0,
+                lmcache_cached_tokens=4,
+                can_load=True,
+            ),
+            is_sparse_decode=False,
+        )
+        impl, _, _ = make_worker_connector([req], use_layerwise=True)
+        impl.config.dsa_two_groups = True
+        impl._indexer_layer_names = ["model.layers.0.self_attn.indexer.k_cache"]
+        impl.current_layer = 0
+        impl.num_layers = 2
+        impl._layerwise_requests = [req]
+        impl._layerwise_retriever_is_sparse = [False]
+
+        captured = []
+
+        def _retriever(label):
+            while True:
+                captured.append(label)
+                yield torch.ones(4, dtype=torch.bool)
+
+        impl.layerwise_retrievers = [
+            (_retriever("latent"), _retriever("indexer"))
+        ]
+
+        impl.wait_for_layer_load("model.layers.0.self_attn.attn")
+
+        assert captured == ["latent"]
+        assert impl.current_layer == 0
+
+        impl.wait_for_layer_load("model.layers.0.self_attn.indexer.k_cache")
+
+        assert captured == ["latent", "indexer"]
+        assert impl.current_layer == 1
 
     def test_bind_rehydrates_scheduler_empty_metadata(self):
         impl = _make_impl()
