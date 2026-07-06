@@ -1352,9 +1352,12 @@ class LMCacheConnectorV1Impl:
         if not self._shared_cpu_materialize_index_on_decode_cold():
             return False
         kv_role = getattr(self, "kv_role", "kv_both")
-        if not shared_cpu_enabled:
-            return kv_role == "kv_consumer"
-        return kv_role == "kv_consumer" or request.disagg_spec is not None
+        # Only a decode consumer is missing the resident DSA index cache and
+        # must cold-materialize it from shared CPU storage. kv_both serving may
+        # still carry prefill-side disagg metadata, but its decode path already
+        # owns the full vLLM index cache from prefill and must not overwrite it
+        # with sparse selected chunks.
+        return kv_role == "kv_consumer"
 
     @staticmethod
     def _mark_shared_index_skipped(

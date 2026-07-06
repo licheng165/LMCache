@@ -153,7 +153,7 @@ class TestWorkerRetrieveState:
             is True
         )
 
-    def test_sparse_decode_index_materialization_policy_for_disagg_request(self):
+    def test_sparse_decode_index_materialization_policy_for_kv_both_disagg_metadata(self):
         impl = _make_impl()
         impl.config = SimpleNamespace(dsa_two_groups=True)
         impl.kv_role = "kv_both"
@@ -169,7 +169,7 @@ class TestWorkerRetrieveState:
                 request,
                 shared_cpu_enabled=True,
             )
-            is True
+            is False
         )
 
     def test_bind_allows_skipped_index_for_kv_both_sparse_decode(self):
