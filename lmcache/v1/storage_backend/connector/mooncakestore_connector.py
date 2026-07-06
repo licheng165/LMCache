@@ -13,7 +13,7 @@ import torch
 from lmcache.logging import init_logger
 from lmcache.utils import CacheEngineKey
 from lmcache.v1.config import LMCacheEngineConfig
-from lmcache.v1.memory_management import MemoryFormat, MemoryObj
+from lmcache.v1.memory_management import MemoryObj
 from lmcache.v1.protocol import RemoteMetadata
 from lmcache.v1.storage_backend.connector.base_connector import RemoteConnector
 from lmcache.v1.storage_backend.local_cpu_backend import LocalCPUBackend
@@ -614,10 +614,9 @@ class MooncakestoreConnector(RemoteConnector):
 
     async def _put_with_metadata(self, key_str: str, memory_obj: MemoryObj):
         """
-        Put metadata and payload as one contiguous registered buffer.
+        Put using put_parts when metadata is stored remotely.
         This is used when save_chunk_meta=True (matches _batch_get_buffer).
         """
-        payload_obj: Optional[MemoryObj] = None
         try:
             # Serialize data and metadata
             kv_bytes = memory_obj.byte_array
@@ -630,52 +629,23 @@ class MooncakestoreConnector(RemoteConnector):
             ).serialize()
             assert len(metadata_bytes) == self.remote_metadata_bytes
 
-            total_size = len(metadata_bytes) + len(kv_bytes)
-            payload_obj = self.local_cpu_backend.allocate(
-                torch.Size([total_size]),
-                torch.uint8,
-                MemoryFormat.BINARY_BUFFER,
-                eviction=False,
-                busy_loop=False,
-            )
-            if payload_obj is None or payload_obj.raw_tensor is None:
-                raise RuntimeError(
-                    "Failed to allocate registered local buffer for "
-                    f"metadata payload: key={key_str}, size={total_size}"
-                )
-
-            payload = payload_obj.raw_tensor
-            payload[: len(metadata_bytes)].copy_(
-                torch.tensor(list(metadata_bytes), dtype=torch.uint8)
-            )
-            payload[len(metadata_bytes) : total_size].copy_(
-                torch.frombuffer(kv_bytes, dtype=torch.uint8)
-            )
-
             await asyncio.wait_for(
                 asyncio.to_thread(
-                    self.store.put_from,
-                    key_str,
-                    payload_obj.data_ptr,
-                    total_size,
-                    self.replica_config,
+                    self.store.put_parts, key_str, metadata_bytes, kv_bytes
                 ),
                 timeout=self.config.transfer_timeout,
             )
         except asyncio.TimeoutError:
             logger.warning(
-                f"Timeout when putting key {key_str} with metadata payload. "
+                f"Timeout when putting key {key_str} using put_parts. "
                 "Decode instance may redo prefill."
             )
         except Exception as e:
             logger.error(
-                f"Failed to put key {key_str} with metadata payload: "
+                f"Failed to put key {key_str} using put_parts: "
                 f"{type(e).__name__}: {str(e)}"
             )
             raise
-        finally:
-            if payload_obj is not None:
-                payload_obj.ref_count_down()
 
     @no_type_check
     async def list(self) -> List[str]:
