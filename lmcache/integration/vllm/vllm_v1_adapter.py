@@ -1976,19 +1976,7 @@ class LMCacheConnectorV1Impl:
                 if is_first:
                     is_first = False
 
-            try:
-                next(layerwise_storer)
-            except Exception:
-                if self._is_decode_window_save_request(request):
-                    logger.exception(
-                        "[DECODE_WINDOW_SAVE] save_kv_layer failed: "
-                        "req=%s window=[%s,%s) layer=%s",
-                        request.req_id,
-                        getattr(request, "decode_window_start", None),
-                        getattr(request, "decode_window_end", None),
-                        layer_name,
-                    )
-                raise
+            next(layerwise_storer)
 
     @_lmcache_nvtx_annotate
     def wait_for_save(self):
@@ -2015,18 +2003,7 @@ class LMCacheConnectorV1Impl:
                     self._layerwise_save_storer_key(request), None
                 )
                 if layerwise_storer is not None:
-                    try:
-                        next(layerwise_storer)
-                    except Exception:
-                        if self._is_decode_window_save_request(request):
-                            logger.exception(
-                                "[DECODE_WINDOW_SAVE] wait_for_save failed: "
-                                "req=%s window=[%s,%s)",
-                                request.req_id,
-                                getattr(request, "decode_window_start", None),
-                                getattr(request, "decode_window_end", None),
-                            )
-                        raise
+                    next(layerwise_storer)
                     self._mark_decode_window_save_completed(request)
                 self._maybe_lookup_unpin_for_request(request)
             return
