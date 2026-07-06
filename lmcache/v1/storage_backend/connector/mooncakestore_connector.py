@@ -145,8 +145,7 @@ class MooncakestoreConnector(RemoteConnector):
                 "Mooncake raw DSA group metadata inference check: inferred=%s "
                 "(source=%s), actual=%s, compared=%s, missing_groups=%s, "
                 "all_matched=%s. "
-                "Inference is diagnostic only and does not affect raw-get "
-                "allocation.",
+                "This comparison is diagnostic; raw-get allocation uses actual.",
                 inferred_dims or None,
                 inferred_dims_source,
                 self._dsa_raw_token_dims,
@@ -334,18 +333,24 @@ class MooncakestoreConnector(RemoteConnector):
             return {}, f"{config_path} is not a JSON object"
         return loaded, config_path
 
+    @staticmethod
+    def _has_complete_dsa_raw_token_dims(dims: dict[int, int]) -> bool:
+        return dims.get(0, 0) > 0 and dims.get(1, 0) > 0
+
     @classmethod
     def _infer_dsa_raw_token_dims_for_log(
         cls,
         config: LMCacheEngineConfig,
         metadata,
+        *,
+        include_diagnostic_override: bool = True,
     ) -> tuple[dict[int, int], str]:
         if not getattr(config, "dsa_two_groups", False):
             return {}, "dsa_two_groups disabled"
 
         extra = config.extra_config or {}
         explicit = extra.get("mooncake_dsa_raw_token_dims_infer")
-        if explicit is not None:
+        if include_diagnostic_override and explicit is not None:
             return (
                 cls._parse_dsa_raw_token_dims(explicit),
                 "extra_config.mooncake_dsa_raw_token_dims_infer",
@@ -408,10 +413,18 @@ class MooncakestoreConnector(RemoteConnector):
                 "extra_config.mooncake_dsa_raw_token_dims",
             )
 
+        inferred, inferred_source = cls._infer_dsa_raw_token_dims_for_log(
+            config,
+            metadata,
+            include_diagnostic_override=False,
+        )
+        if cls._has_complete_dsa_raw_token_dims(inferred):
+            return inferred, f"model config inference: {inferred_source}"
+
         model_name = getattr(metadata, "model_name", "")
         world_size = getattr(metadata, "world_size", None)
         if "GLM-5.1-w4a8" in model_name and world_size == 8:
-            # Verification shortcut for current GLM DSA two-group layout:
+            # Last-resort verification shortcut for current GLM DSA two-group layout:
             # kv_group=0 latent payload is (k=512 + v=64) bf16 elements/token;
             # kv_group=1 indexer payload is 128 bf16 elements/token.
             return {0: 576, 1: 128}, "hardcoded GLM-5.1-w4a8 TP8"
