@@ -2272,8 +2272,18 @@ class LMCacheConnectorV1Impl:
         kv_group: int,
         dsa_two_groups: bool,
     ) -> tuple[Optional[str], bool]:
+        engine = self.lmcache_engine
+        if (
+            engine is not None
+            and getattr(engine, "enable_shared_cpu_cache", False)
+            and getattr(engine, "storage_manager", None) is None
+        ):
+            is_passive_fn = getattr(engine, "_is_passive", None)
+            if callable(is_passive_fn) and is_passive_fn():
+                return None, False
+
         ensure_metadata = getattr(
-            self.lmcache_engine, "_ensure_retrieve_chunk_metadata", None
+            engine, "_ensure_retrieve_chunk_metadata", None
         )
         if ensure_metadata is None:
             return None, False

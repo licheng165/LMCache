@@ -912,6 +912,28 @@ class TestWorkerRetrieveState:
         req.token_ids = [0] * 4096
         assert impl._should_invalidate_worker_retrieve_state(req, 2048)
 
+    def test_passive_shared_metadata_warm_skips_storage_probe(self):
+        ensure_metadata = MagicMock(side_effect=AssertionError("should not probe"))
+        impl = _make_impl()
+        impl.lmcache_engine = SimpleNamespace(
+            enable_shared_cpu_cache=True,
+            storage_manager=None,
+            _is_passive=lambda: True,
+            _ensure_retrieve_chunk_metadata=ensure_metadata,
+        )
+
+        location, metadata_warm = impl._warm_request_retrieve_metadata(
+            _make_request(),
+            torch.tensor([1, 2, 3]),
+            torch.ones(3, dtype=torch.bool),
+            kv_group=0,
+            dsa_two_groups=False,
+        )
+
+        assert location is None
+        assert metadata_warm is False
+        ensure_metadata.assert_not_called()
+
     def test_prune_keeps_metadata_warm_states_until_request_finished(self):
         impl = _make_impl()
         impl._worker_retrieve_state = {
