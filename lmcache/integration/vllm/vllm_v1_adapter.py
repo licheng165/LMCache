@@ -1271,6 +1271,64 @@ class LMCacheConnectorV1Impl:
                 self.lmcache_engine.metadata.kv_layer_groups_manager
             )
             kv_layer_groups_manager.build_kv_layer_groups(self.kv_caches)
+            self._normalize_dsa_kv_layer_groups()
+
+    def _normalize_dsa_kv_layer_groups(self) -> None:
+        """Keep metadata group index aligned with the DSA kv_group contract."""
+        if not self._is_dsa_two_groups() or self.lmcache_engine is None:
+            return
+        manager = self.lmcache_engine.metadata.kv_layer_groups_manager
+        groups = list(manager.kv_layer_groups)
+        if not groups:
+            return
+
+        latent_names = set(getattr(self, "_latent_layer_names", []))
+        indexer_names = set(getattr(self, "_indexer_layer_names", []))
+        if not latent_names and not indexer_names:
+            self._refresh_kvcaches_list()
+            latent_names = set(getattr(self, "_latent_layer_names", []))
+            indexer_names = set(getattr(self, "_indexer_layer_names", []))
+        if not indexer_names:
+            return
+
+        latent_groups = []
+        indexer_groups = []
+        for group in groups:
+            names = set(group.layer_names)
+            has_indexer = bool(names & indexer_names) or any(
+                "indexer" in name for name in names
+            )
+            has_latent = bool(names & latent_names) or not has_indexer
+            if has_indexer and has_latent:
+                raise RuntimeError(
+                    "DSA two-group KV metadata is ambiguous: one metadata "
+                    "group contains both latent and indexer layers. "
+                    f"layer_names={group.layer_names}"
+                )
+            if has_indexer:
+                indexer_groups.append(group)
+            else:
+                latent_groups.append(group)
+
+        if len(latent_groups) != 1 or len(indexer_groups) != 1:
+            raise RuntimeError(
+                "DSA two-group KV metadata requires exactly one latent "
+                "metadata group and one indexer metadata group so kv_group=0 "
+                "maps to latent and kv_group=1 maps to indexer. "
+                f"latent_groups={len(latent_groups)}, "
+                f"indexer_groups={len(indexer_groups)}, "
+                f"groups={groups}"
+            )
+
+        normalized_groups = latent_groups + indexer_groups
+        if manager.kv_layer_groups != normalized_groups:
+            logger.info(
+                "Reordered DSA KV metadata groups to latent/indexer order: "
+                "latent_dtype=%s, indexer_dtype=%s",
+                normalized_groups[0].dtype,
+                normalized_groups[1].dtype,
+            )
+            manager.kv_layer_groups = normalized_groups
 
     def _refresh_kvcaches_list(self) -> None:
         self._latent_layer_names = []
@@ -1779,8 +1837,8 @@ class LMCacheConnectorV1Impl:
                     forward_context.virtual_engine
                 ]
 
-        self._build_kv_layer_groups()
         self._refresh_kvcaches_list()
+        self._build_kv_layer_groups()
 
     ####################
     # Worker side APIs
@@ -2640,8 +2698,8 @@ class LMCacheConnectorV1Impl:
         #  not called, we should consider removing it.
         assert len(self.kv_caches) == 0 and len(kv_caches) > 0
         self.kv_caches = kv_caches
-        self._build_kv_layer_groups()
         self._refresh_kvcaches_list()
+        self._build_kv_layer_groups()
         self._manager.post_init()
 
     @_lmcache_nvtx_annotate

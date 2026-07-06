@@ -17,6 +17,7 @@ from lmcache.integration.vllm.vllm_v1_adapter import (
     RequestTracker,
     WorkerRetrieveState,
 )
+from lmcache.v1.kv_layer_groups import KVLayerGroupsManager
 from tests.v1.connector_test_utils import (
     make_sparse_req_meta,
     make_worker_connector,
@@ -26,6 +27,18 @@ from tests.v1.connector_test_utils import (
 def _make_impl() -> LMCacheConnectorV1Impl:
     impl = object.__new__(LMCacheConnectorV1Impl)
     impl._worker_retrieve_state = {}
+    return impl
+
+
+def _make_group_order_impl(
+    kv_caches: dict[str, torch.Tensor],
+) -> LMCacheConnectorV1Impl:
+    impl = object.__new__(LMCacheConnectorV1Impl)
+    impl.config = SimpleNamespace(dsa_two_groups=True)
+    impl.kv_caches = kv_caches
+    impl.lmcache_engine = SimpleNamespace(
+        metadata=SimpleNamespace(kv_layer_groups_manager=KVLayerGroupsManager())
+    )
     return impl
 
 
@@ -64,6 +77,30 @@ def _make_request(*, resumed: bool = False) -> ReqMeta:
 
 
 class TestWorkerRetrieveState:
+    def test_dsa_kv_metadata_group_order_is_semantic(self):
+        impl = _make_group_order_impl(
+            {
+                "model.layers.0.self_attn.indexer.k_cache": torch.empty(
+                    (1, 8, 4), dtype=torch.uint8
+                ),
+                "model.layers.0.self_attn.attn.k_cache": torch.empty(
+                    (1, 8, 512), dtype=torch.bfloat16
+                ),
+            }
+        )
+
+        impl._refresh_kvcaches_list()
+        impl._build_kv_layer_groups()
+
+        groups = impl.lmcache_engine.metadata.kv_layer_groups_manager.kv_layer_groups
+        assert len(groups) == 2
+        assert groups[0].dtype == torch.bfloat16
+        assert groups[0].layer_names == ["model.layers.0.self_attn.attn.k_cache"]
+        assert groups[1].dtype == torch.uint8
+        assert groups[1].layer_names == [
+            "model.layers.0.self_attn.indexer.k_cache"
+        ]
+
     def test_shared_cpu_cache_state_tracks_skipped_index(self):
         state = WorkerRetrieveState()
         state.shared_handles_by_group[0] = [["latent-handle"]]
