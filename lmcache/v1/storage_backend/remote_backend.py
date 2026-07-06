@@ -58,11 +58,31 @@ class RemoteBackend(StorageBackendInterface):
             config.remote_serde, metadata, config
         )
 
-        # Precompute MLA mode status
-        self._mla_worker_id_as0_mode = (
-            config.get_extra_config_value(
-                "remote_enable_mla_worker_id_as0", metadata.use_mla
+        # Precompute MLA mode status.  When save_only_first_rank is disabled,
+        # workers store distinct per-rank keys, so remote must not collapse
+        # non-zero worker ids to rank 0 or skip their remote writes.
+        save_only_first_rank = (
+            config.get_extra_config_value("save_only_first_rank", metadata.use_mla)
+            and metadata.use_mla
+        )
+        remote_worker_id_as0 = config.get_extra_config_value(
+            "remote_enable_mla_worker_id_as0", save_only_first_rank
+        )
+        if (
+            remote_worker_id_as0
+            and metadata.use_mla
+            and metadata.world_size > 1
+            and not save_only_first_rank
+        ):
+            logger.warning(
+                "remote_enable_mla_worker_id_as0=True with "
+                "save_only_first_rank=False is inconsistent for per-rank "
+                "MLA store/lookup; non-zero rank remote writes will be "
+                "skipped and decoders may miss those ranks."
             )
+
+        self._mla_worker_id_as0_mode = (
+            remote_worker_id_as0
             and metadata.use_mla
             and metadata.world_size > 1
             and metadata.worker_id != 0
