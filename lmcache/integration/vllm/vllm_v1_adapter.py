@@ -2624,15 +2624,32 @@ class LMCacheConnectorV1Impl:
         save_spec: Optional["SaveSpec"],
     ) -> None:
         """Run a full latent store_layer after indexer layers finish (TP>1)."""
+        worker_id = getattr(
+            getattr(self.lmcache_engine, "metadata", None), "worker_id", None
+        )
         if request.req_id not in self._deferred_latent_pending:
             return
         if save_spec is None or not save_spec.can_save_latent:
+            logger.info(
+                "[RANK_STORE_DIAG][flush_deferred_skip_save_spec] "
+                "worker_id=%s req_id=%s has_save_spec=%s can_save_latent=%s",
+                worker_id,
+                request.req_id,
+                save_spec is not None,
+                getattr(save_spec, "can_save_latent", None),
+            )
             self._deferred_latent_pending.discard(request.req_id)
             return
 
         self._refresh_kvcaches_list()
         kvcaches = self._kvcaches_for_group(0)
         if not kvcaches:
+            logger.info(
+                "[RANK_STORE_DIAG][flush_deferred_skip_no_kvcaches] "
+                "worker_id=%s req_id=%s",
+                worker_id,
+                request.req_id,
+            )
             self._deferred_latent_pending.discard(request.req_id)
             return
 
@@ -2655,6 +2672,13 @@ class LMCacheConnectorV1Impl:
         else:
             skip_leading_tokens = save_spec.skip_leading_tokens
             if skip_leading_tokens == len(token_ids):
+                logger.info(
+                    "[RANK_STORE_DIAG][flush_deferred_skip_complete] "
+                    "worker_id=%s req_id=%s total_tokens=%d",
+                    worker_id,
+                    request.req_id,
+                    len(token_ids),
+                )
                 self._deferred_latent_pending.discard(request.req_id)
                 return
             skip_leading_tokens = (
@@ -2675,6 +2699,16 @@ class LMCacheConnectorV1Impl:
         }
 
 
+        logger.info(
+            "[RANK_STORE_DIAG][flush_deferred_create_storer] worker_id=%s "
+            "req_id=%s kv_group=0 skip_leading_tokens=%d total_tokens=%d "
+            "kvcaches=%d",
+            worker_id,
+            request.req_id,
+            skip_leading_tokens,
+            len(token_ids),
+            len(kvcaches),
+        )
         storer = self.lmcache_engine.store_layer(
             token_ids,
             mask=store_mask,
@@ -2686,6 +2720,11 @@ class LMCacheConnectorV1Impl:
             **store_kwargs,
         )
         self._drain_layerwise_storer_fully(storer)
+        logger.info(
+            "[RANK_STORE_DIAG][flush_deferred_done] worker_id=%s req_id=%s",
+            worker_id,
+            request.req_id,
+        )
         self._deferred_latent_pending.discard(request.req_id)
 
 
@@ -2708,6 +2747,9 @@ class LMCacheConnectorV1Impl:
             **kwargs: additional arguments for the save operation.
         """
         assert self.lmcache_engine is not None
+        worker_id = getattr(
+            getattr(self.lmcache_engine, "metadata", None), "worker_id", None
+        )
 
         if not self.use_layerwise:
             return
@@ -2737,6 +2779,14 @@ class LMCacheConnectorV1Impl:
         if not kvcaches:
             # No caches registered for this group (e.g. indexer not
             # registered with the connector); nothing to store.
+            logger.info(
+                "[RANK_STORE_DIAG][save_kv_layer_skip_no_kvcaches] "
+                "worker_id=%s layer_name=%s kv_group=%s dsa_two_groups=%s",
+                worker_id,
+                layer_name,
+                kv_group,
+                dsa_two_groups,
+            )
             return
 
         for request in connector_metadata.requests:
@@ -2744,6 +2794,18 @@ class LMCacheConnectorV1Impl:
             if (
                 save_spec is None or not save_spec.can_save
             ) and self.kv_role != "kv_producer":
+                logger.info(
+                    "[RANK_STORE_DIAG][save_kv_layer_skip_save_spec] "
+                    "worker_id=%s req_id=%s layer_name=%s kv_group=%s "
+                    "has_save_spec=%s can_save=%s kv_role=%s",
+                    worker_id,
+                    request.req_id,
+                    layer_name,
+                    kv_group,
+                    save_spec is not None,
+                    getattr(save_spec, "can_save", None),
+                    self.kv_role,
+                )
                 continue
 
             # Per-group gating: in two-group mode, skip indexer save if
@@ -2751,8 +2813,30 @@ class LMCacheConnectorV1Impl:
             # can_save_latent is False.
             if dsa_two_groups and save_spec is not None:
                 if is_indexer_layer and not save_spec.can_save_indexer:
+                    logger.info(
+                        "[RANK_STORE_DIAG][save_kv_layer_skip_group] "
+                        "worker_id=%s req_id=%s layer_name=%s kv_group=%s "
+                        "can_save_latent=%s can_save_indexer=%s",
+                        worker_id,
+                        request.req_id,
+                        layer_name,
+                        kv_group,
+                        save_spec.can_save_latent,
+                        save_spec.can_save_indexer,
+                    )
                     continue
                 if not is_indexer_layer and not save_spec.can_save_latent:
+                    logger.info(
+                        "[RANK_STORE_DIAG][save_kv_layer_skip_group] "
+                        "worker_id=%s req_id=%s layer_name=%s kv_group=%s "
+                        "can_save_latent=%s can_save_indexer=%s",
+                        worker_id,
+                        request.req_id,
+                        layer_name,
+                        kv_group,
+                        save_spec.can_save_latent,
+                        save_spec.can_save_indexer,
+                    )
                     continue
 
             # TP>1 + dsa_two_groups: skip interleaved latent saves during
@@ -2760,7 +2844,19 @@ class LMCacheConnectorV1Impl:
             # layer (or in wait_for_save as fallback).
             if self._should_defer_latent_save_under_tp() and not is_indexer_layer:
                 if save_spec is not None and save_spec.can_save_latent:
+                    first_defer = request.req_id not in self._deferred_latent_pending
                     self._deferred_latent_pending.add(request.req_id)
+                    if first_defer:
+                        logger.info(
+                            "[RANK_STORE_DIAG][save_kv_layer_defer_latent] "
+                            "worker_id=%s req_id=%s layer_name=%s kv_group=%s "
+                            "pending=%s",
+                            worker_id,
+                            request.req_id,
+                            layer_name,
+                            kv_group,
+                            sorted(self._deferred_latent_pending),
+                        )
                 continue
 
             storer_key = self._save_storer_key(request.req_id, kv_group)
@@ -2785,6 +2881,16 @@ class LMCacheConnectorV1Impl:
                     )
                 )
                 if _first_layer is not None and layer_name == _first_layer:
+                    logger.info(
+                        "[RANK_STORE_DIAG][save_kv_layer_drain_stale] "
+                        "worker_id=%s req_id=%s layer_name=%s kv_group=%s "
+                        "storer_key=%s",
+                        worker_id,
+                        request.req_id,
+                        layer_name,
+                        kv_group,
+                        storer_key,
+                    )
                     try:
                         while True:
                             next(layerwise_storer)
@@ -2845,6 +2951,16 @@ class LMCacheConnectorV1Impl:
                     skip_leading_tokens = save_spec.skip_leading_tokens
 
                     if skip_leading_tokens == len(token_ids):
+                        logger.info(
+                            "[RANK_STORE_DIAG][save_kv_layer_skip_complete] "
+                            "worker_id=%s req_id=%s layer_name=%s kv_group=%s "
+                            "total_tokens=%d",
+                            worker_id,
+                            request.req_id,
+                            layer_name,
+                            kv_group,
+                            len(token_ids),
+                        )
                         continue  # skip this request
                     # Align to lmcache chunk size
                     skip_leading_tokens = (
@@ -2914,6 +3030,25 @@ class LMCacheConnectorV1Impl:
                 sync = layerwise_storer is None and (
                     kv_group == 0
                     or (dsa_two_groups and _world_size > 1)
+                )
+                logger.info(
+                    "[RANK_STORE_DIAG][save_kv_layer_create_storer] "
+                    "worker_id=%s req_id=%s layer_name=%s kv_group=%s "
+                    "storer_key=%s skip_leading_tokens=%d total_tokens=%d "
+                    "store_tokens=%d sync=%s can_save_latent=%s "
+                    "can_save_indexer=%s world_size=%s",
+                    worker_id,
+                    request.req_id,
+                    layer_name,
+                    kv_group,
+                    storer_key,
+                    skip_leading_tokens,
+                    len(token_ids),
+                    len(token_ids) - skip_leading_tokens,
+                    sync,
+                    getattr(save_spec, "can_save_latent", None),
+                    getattr(save_spec, "can_save_indexer", None),
+                    _world_size,
                 )
                 layerwise_storer = self.lmcache_engine.store_layer(
                     token_ids,
