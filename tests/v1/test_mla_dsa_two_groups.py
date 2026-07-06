@@ -6,8 +6,8 @@ Covers the NPU-side changes:
 - CacheEngineKey / LayerCacheEngineKey kv_group field (hash, eq, to/from_string,
   to_dict/from_dict, with_new_worker_id, split_layers)
 - token_database.process_tokens kv_group propagation
-- new config knobs (save_full_chunk_in_decode, save_indexer_only_first_rank,
-  dsa_two_groups)
+- config knobs (save_full_chunk_in_decode, dsa_two_groups)
+- DSA index first-rank storage policy follows save_only_first_rank
 - MemoryFormat new tags (KV_MLA_LATENT_FMT, KV_DSA_INDEX_FMT)
 - Regression: existing key serialization and config defaults unchanged
 
@@ -23,6 +23,7 @@ import torch
 
 # First Party
 from lmcache.utils import CacheEngineKey, LayerCacheEngineKey
+from lmcache.v1.cache_engine import LMCacheEngine
 from lmcache.v1.config import LMCacheEngineConfig
 from lmcache.v1.memory_management import MemoryFormat
 from lmcache.v1.token_database import ChunkedTokenDatabase
@@ -209,9 +210,32 @@ class TestConfigKnobs:
         finally:
             del os.environ["LMCACHE_SAVE_FULL_CHUNK_IN_DECODE"]
 
-    def test_save_indexer_only_first_rank_default_false(self):
-        config = LMCacheEngineConfig.from_defaults()
-        assert config.save_indexer_only_first_rank is False
+    def test_dsa_indexer_policy_follows_save_only_first_rank(self):
+        metadata = dumb_metadata()
+        metadata.use_mla = True
+
+        config = LMCacheEngineConfig.from_defaults(
+            extra_config={"save_only_first_rank": True}
+        )
+        assert LMCacheEngine._resolve_save_indexer_only_first_rank(
+            config,
+            metadata,
+            save_only_first_rank=True,
+            dsa_two_groups=True,
+        ) is True
+
+        legacy_split_config = LMCacheEngineConfig.from_defaults(
+            extra_config={
+                "save_only_first_rank": False,
+                "save_indexer_only_first_rank": True,
+            }
+        )
+        assert LMCacheEngine._resolve_save_indexer_only_first_rank(
+            legacy_split_config,
+            metadata,
+            save_only_first_rank=False,
+            dsa_two_groups=True,
+        ) is False
 
     def test_dsa_two_groups_default_false(self):
         config = LMCacheEngineConfig.from_defaults()

@@ -56,6 +56,11 @@ _DEPRECATED_CONFIGS = {
     "external_backends": (
         "external_backends is deprecated, use storage_plugins instead"
     ),
+    "save_indexer_only_first_rank": (
+        "save_indexer_only_first_rank is deprecated; use "
+        "extra_config.save_only_first_rank to control both MLA latent and "
+        "DSA index first-rank storage policy"
+    ),
 }
 
 # Single configuration definition center - add new config items only here
@@ -285,6 +290,8 @@ _CONFIG_DEFINITIONS: dict[str, dict[str, Any]] = {
         "default": False,
         "env_converter": _to_bool,
     },
+    # Deprecated compatibility only. With dsa_two_groups=true, the DSA index
+    # first-rank policy follows extra_config.save_only_first_rank.
     "save_indexer_only_first_rank": {
         "type": bool,
         "default": False,

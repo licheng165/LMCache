@@ -563,6 +563,9 @@ class ReqMeta:
         default_factory=list
     )
     cached_shared_handles_indexer: list[list[Any]] = field(default_factory=list)
+    # Sparse shared CPU decode only: kv_group=1 was intentionally skipped by
+    # config, so hot-path validation may accept absent DSA index state.
+    shared_index_skipped: bool = False
     # Sparse decode only: shared with RequestTracker, reused across decode steps.
     decode_token_mask: Optional[torch.Tensor] = field(default=None, repr=False)
     decode_ret_mask: Optional[torch.Tensor] = field(default=None, repr=False)
@@ -2065,7 +2068,10 @@ class LMCacheConnectorV1Impl:
                 "present"
                 if layer_has_entries(request.cached_memory_objs_indexer)
                 else "skipped"
-                if state.shared_index_status == "skipped"
+                if (
+                    getattr(request, "shared_index_skipped", False)
+                    or state.shared_index_status == "skipped"
+                )
                 else "missing"
             )
             state.shared_request_active = True
@@ -2761,28 +2767,20 @@ class LMCacheConnectorV1Impl:
                             )
                             next(indexer_retriever)
 
-
-                    self._save_worker_retrieve_state_from_request(
-                        request,
-                        location=location,
-                        metadata_warm=metadata_warm,
-                        token_count=token_count,
-                    )
                     if indexer_skipped:
-                        self._mark_shared_index_skipped(
-                            self._worker_retrieve_state.get(request.req_id)
-                            if hasattr(self, "_worker_retrieve_state")
-                            else None,
+                        request.shared_index_skipped = True
+                    if shared_cpu_enabled:
+                        logger.debug(
+                            "Deferring shared CPU sparse retrieve state save "
+                            "until pointer-cache install completes: req_id=%s",
                             request.req_id,
-                            int(
-                                getattr(
-                                    self.lmcache_engine,
-                                    "shared_cpu_cache_generation",
-                                    0,
-                                )
-                                or 0
-                            ),
-                            token_count,
+                        )
+                    else:
+                        self._save_worker_retrieve_state_from_request(
+                            request,
+                            location=location,
+                            metadata_warm=metadata_warm,
+                            token_count=token_count,
                         )
                     self.layerwise_retrievers.append(
                         (layerwise_retriever, indexer_retriever)

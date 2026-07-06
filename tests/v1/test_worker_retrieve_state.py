@@ -138,6 +138,27 @@ class TestWorkerRetrieveState:
         assert state.shared_views_by_group == {0: [["latent-view"]]}
         assert state.shared_handles_by_group == {0: [["latent-handle"]]}
 
+    def test_record_shared_state_uses_request_skipped_index_marker(self):
+        impl = _make_impl()
+        impl.lmcache_engine = SimpleNamespace(
+            enable_shared_cpu_cache=True,
+            shared_cpu_cache_generation=7,
+            metadata=SimpleNamespace(is_first_rank=lambda: False),
+        )
+        state = WorkerRetrieveState()
+        request = _make_request()
+        request.cached_memory_objs = [["latent-view"]]
+        request.cached_shared_handles = [["latent-handle"]]
+        request.cached_chunk_ptrs_npu = ["latent-ptrs"]
+        request.shared_index_skipped = True
+
+        impl._record_shared_worker_retrieve_state(state, request)
+
+        assert state.shared_latent_status == "present"
+        assert state.shared_index_status == "skipped"
+        assert state.shared_request_active is True
+        assert state.pointer_cache_generation == 7
+
     def test_shared_cpu_config_value_reads_engine_extra_config(self):
         impl = _make_impl()
         impl.lmcache_engine = SimpleNamespace(

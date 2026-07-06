@@ -126,30 +126,14 @@ class LMCacheEngine:
         self.enable_shared_cpu_cache = bool(
             self._get_shared_config_value("enable_shared_cpu_cache", False)
         )
-        configured_indexer_policy = self.config.get_extra_config_value(
-            "save_indexer_only_first_rank",
-            getattr(self.config, "save_indexer_only_first_rank", False),
-        )
-        if self.enable_shared_cpu_cache and self.dsa_two_groups:
-            # In shared-cache mode there is one rank0 ownership policy. Keep
-            # the legacy indexer knob readable for old configs, but do not let
-            # it split MLA latent and DSA index behavior.
-            self.save_indexer_only_first_rank = self.save_only_first_rank
-        else:
-            self.save_indexer_only_first_rank = (
-                bool(configured_indexer_policy) and metadata.use_mla
-            )
-        if (
-            self.enable_shared_cpu_cache
-            and self.dsa_two_groups
-            and configured_indexer_policy != self.save_indexer_only_first_rank
-        ):
-            logger.warning(
-                "Ignoring save_indexer_only_first_rank=%s; dsa_two_groups "
-                "uses save_only_first_rank=%s for both latent and index.",
-                configured_indexer_policy,
+        self.save_indexer_only_first_rank = (
+            self._resolve_save_indexer_only_first_rank(
+                self.config,
+                metadata,
                 self.save_only_first_rank,
+                self.dsa_two_groups,
             )
+        )
 
         self.shared_cpu_cache_strict = bool(
             self._get_shared_config_value("shared_cpu_cache_strict", True)
@@ -278,6 +262,39 @@ class LMCacheEngine:
         if value is not None:
             return value
         return getattr(self.config, key, default)
+
+    @staticmethod
+    def _legacy_indexer_policy_configured(config: LMCacheEngineConfig) -> bool:
+        extra_config = getattr(config, "extra_config", None) or {}
+        user_set_keys = getattr(config, "_user_set_keys", set())
+        return (
+            "save_indexer_only_first_rank" in extra_config
+            or "save_indexer_only_first_rank" in user_set_keys
+        )
+
+    @classmethod
+    def _resolve_save_indexer_only_first_rank(
+        cls,
+        config: LMCacheEngineConfig,
+        metadata: LMCacheMetadata,
+        save_only_first_rank: bool,
+        dsa_two_groups: bool,
+    ) -> bool:
+        legacy_indexer_policy = config.get_extra_config_value(
+            "save_indexer_only_first_rank",
+            getattr(config, "save_indexer_only_first_rank", False),
+        )
+        if dsa_two_groups:
+            if cls._legacy_indexer_policy_configured(config):
+                logger.warning(
+                    "save_indexer_only_first_rank is deprecated for "
+                    "dsa_two_groups=true. Use save_only_first_rank=%s; it "
+                    "controls both MLA latent and DSA index storage policy.",
+                    save_only_first_rank,
+                )
+            return bool(save_only_first_rank)
+
+        return bool(legacy_indexer_policy) and metadata.use_mla
 
     def _shared_cpu_contract_context(self) -> str:
         return (
