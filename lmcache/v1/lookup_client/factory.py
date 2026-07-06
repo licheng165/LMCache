@@ -225,6 +225,17 @@ class LookupClientFactory:
             )
             for rank in ranks
         ]
+        logger.info(
+            "[RANK_LOOKUP_DIAG][lookup_client_transport] engine_id=%s "
+            "scheduler_worker_id=%s rpc_port=%s lookup_ids=%s ranks=%s "
+            "socket_paths=%s",
+            metadata.engine_id,
+            metadata.worker_id,
+            rpc_port,
+            lookup_ids,
+            ranks,
+            [params.socket_path for params in socket_params],
+        )
         return ZmqReqRepClientTransport(
             socket_params=socket_params,
             timeout_ms=config.lookup_timeout_ms,
@@ -245,6 +256,14 @@ class LookupClientFactory:
             "lookup",
             rpc_port,
             metadata.worker_id,
+        )
+        logger.info(
+            "[RANK_LOOKUP_DIAG][lookup_server_transport] engine_id=%s "
+            "worker_id=%s rpc_port=%s socket_path=%s",
+            metadata.engine_id,
+            metadata.worker_id,
+            rpc_port,
+            socket_path,
         )
         return ZmqRouterServerTransport(
             socket_path=socket_path,

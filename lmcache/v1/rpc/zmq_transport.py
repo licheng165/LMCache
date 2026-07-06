@@ -111,24 +111,66 @@ class ZmqReqRepClientTransport(RpcClientTransport):
         try:
             for i in range(self._world_size):
                 failed_rank = i
+                params = self.socket_params[i]
+                logger.info(
+                    "[RANK_LOOKUP_DIAG][transport_send] rank=%s path=%s "
+                    "frames=%d",
+                    params.rank,
+                    params.socket_path,
+                    len(encoded),
+                )
                 self.sockets[i].send_multipart(encoded, copy=False)
 
             for i in range(self._world_size):
                 failed_rank = i
+                params = self.socket_params[i]
                 resp = self.sockets[i].recv()
+                logger.info(
+                    "[RANK_LOOKUP_DIAG][transport_recv] rank=%s path=%s "
+                    "bytes=%d",
+                    params.rank,
+                    params.socket_path,
+                    len(resp),
+                )
                 results.append(resp)
         except zmq.Again as e:
+            params = (
+                self.socket_params[failed_rank]
+                if 0 <= failed_rank < self._world_size
+                else None
+            )
             logger.error(
                 "Timeout occurred for rank %s, recreating all sockets. Error: %s",
                 failed_rank,
                 e,
             )
+            logger.error(
+                "[RANK_LOOKUP_DIAG][transport_timeout] failed_index=%s "
+                "rank=%s path=%s timeout_ms=%s",
+                failed_rank,
+                getattr(params, "rank", None),
+                getattr(params, "socket_path", None),
+                self.timeout_ms,
+            )
             self._recreate_all_sockets()
             return []
         except zmq.ZMQError as e:
+            params = (
+                self.socket_params[failed_rank]
+                if 0 <= failed_rank < self._world_size
+                else None
+            )
             logger.error(
                 "ZMQ error for rank %s: %s, recreating all sockets",
                 failed_rank,
+                e,
+            )
+            logger.error(
+                "[RANK_LOOKUP_DIAG][transport_zmq_error] failed_index=%s "
+                "rank=%s path=%s error=%s",
+                failed_rank,
+                getattr(params, "rank", None),
+                getattr(params, "socket_path", None),
                 e,
             )
             self._recreate_all_sockets()
@@ -176,6 +218,11 @@ class ZmqRouterServerTransport(RpcServerTransport):
         )
         self.socket.setsockopt(zmq.RCVTIMEO, recv_timeout_ms)
         self.socket_path = socket_path
+        logger.info(
+            "[RANK_LOOKUP_DIAG][transport_server_bind] path=%s timeout_ms=%s",
+            socket_path,
+            recv_timeout_ms,
+        )
 
     def recv_request(
         self,
@@ -195,6 +242,13 @@ class ZmqRouterServerTransport(RpcServerTransport):
         identity = frames[0].bytes
         # frames[1] is the empty delimiter from REQ socket
         raw_frames = frames[2:]
+        logger.info(
+            "[RANK_LOOKUP_DIAG][transport_server_recv] path=%s identity_len=%d "
+            "raw_frames=%d",
+            self.socket_path,
+            len(identity),
+            len(raw_frames),
+        )
         if len(raw_frames) < 3:
             logger.warning("Malformed request received: not enough frames.")
             return None
@@ -207,6 +261,13 @@ class ZmqRouterServerTransport(RpcServerTransport):
         response: bytes,
     ) -> None:
         """Send response back via ROUTER socket."""
+        logger.info(
+            "[RANK_LOOKUP_DIAG][transport_server_send] path=%s identity_len=%d "
+            "bytes=%d",
+            self.socket_path,
+            len(identity),
+            len(response),
+        )
         self.socket.send_multipart([identity, b"", response])
 
     def close(self) -> None:
