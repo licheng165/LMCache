@@ -226,6 +226,7 @@ class LMCacheLookupServer:
     ):
         self.transport = transport
         self.lmcache_engine = lmcache_engine
+        self.metadata = metadata
         self.running = True
         self.enable_blending = lmcache_engine.config.enable_blending
 
