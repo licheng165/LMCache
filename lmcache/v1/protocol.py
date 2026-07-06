@@ -103,15 +103,36 @@ class RemoteMetadata:
     dtypes: list[torch.dtype]
     fmt: MemoryFormat
 
+    @staticmethod
+    def _encode_shape(shape: torch.Size) -> list[int]:
+        shape_values = list(shape)
+        if len(shape_values) == 1:
+            return [shape_values[0], -1, 0, 0]
+        if len(shape_values) == 2:
+            return [shape_values[0], shape_values[1], -2, 0]
+        if len(shape_values) == 3:
+            return [shape_values[0], shape_values[1], shape_values[2], -3]
+        if len(shape_values) == 4:
+            return shape_values
+        raise AssertionError(
+            f"Shape dimension should be between 1 and 4, got {len(shape_values)}"
+        )
+
+    @staticmethod
+    def _decode_shape(shape_values: tuple[int, int, int, int]) -> torch.Size:
+        if shape_values[1] == -1:
+            return torch.Size([shape_values[0]])
+        if shape_values[2] == -2:
+            return torch.Size(shape_values[:2])
+        if shape_values[3] == -3:
+            return torch.Size(shape_values[:3])
+        return torch.Size(shape_values)
+
     def _prepare_params(self):
         params = [self.length, int(self.fmt.value)]
         for shape, dtype in zip(self.shapes, self.dtypes, strict=True):
-            assert len(shape) == 4, "Shape dimension should be 4"
             params.append(DTYPE_TO_INT[dtype])
-            params.append(shape[0])
-            params.append(shape[1])
-            params.append(shape[2])
-            params.append(shape[3])
+            params.extend(self._encode_shape(shape))
         return params
 
     def serialize_into(self, buffer):
@@ -135,7 +156,7 @@ class RemoteMetadata:
         shapes = []
         dtypes = []
         for i in range(2, len(result), 5):
-            shapes.append(torch.Size(result[i + 1 : i + 5]))
+            shapes.append(RemoteMetadata._decode_shape(result[i + 1 : i + 5]))
             dtypes.append(INT_TO_DTYPE[result[i]])
 
         return RemoteMetadata(

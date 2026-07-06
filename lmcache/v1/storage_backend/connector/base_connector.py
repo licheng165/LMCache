@@ -136,10 +136,34 @@ class RemoteConnector(metaclass=abc.ABCMeta):
 
         # NOTE: for unfull chunk, we have no way to verify
         shape_list = list(memory_obj.meta.shape)
-        shape_list[2] = bytes_read // self.single_token_size
+        if len(shape_list) == 1:
+            dtype = memory_obj.meta.dtype
+            if dtype is None and memory_obj.meta.dtypes:
+                dtype = memory_obj.meta.dtypes[0]
+            if dtype is None:
+                raise ValueError(
+                    "Cannot reshape 1D partial chunk without dtype metadata"
+                )
+            element_size = torch.empty((), dtype=dtype).element_size()
+            if bytes_read % element_size != 0:
+                raise ValueError(
+                    f"bytes_read: {bytes_read} is not aligned to element size: "
+                    f"{element_size}"
+                )
+            shape_list[0] = bytes_read // element_size
+        else:
+            token_dim = memory_obj.meta.fmt.token_dim()
+            if token_dim >= len(shape_list):
+                raise ValueError(
+                    f"Cannot reshape partial chunk with shape={memory_obj.meta.shape} "
+                    f"and fmt={memory_obj.meta.fmt}"
+                )
+            shape_list[token_dim] = bytes_read // self.single_token_size
         actual_shape = torch.Size(shape_list)
         memory_obj.raw_data = memory_obj.raw_data[:bytes_read]
         memory_obj.meta.shape = actual_shape
+        if memory_obj.meta.shapes:
+            memory_obj.meta.shapes = [actual_shape]
 
         return memory_obj
 
