@@ -149,10 +149,27 @@ class LMCacheLookupClient(LookupClientInterface):
                 request_configs_str,
             ]
 
-        responses = self.transport.send_and_recv_all(msg_buf)
+        try:
+            responses = self.transport.send_and_recv_all(msg_buf)
+        except Exception:
+            logger.exception(
+                "[RANK_LOOKUP_DIAG][client_transport_error] lookup_id=%s "
+                "transport=%s world_size=%s",
+                lookup_id,
+                type(self.transport).__name__,
+                getattr(self.transport, "world_size", None),
+            )
+            raise
 
         # Transport returns empty list on failure
         if not responses:
+            logger.warning(
+                "[RANK_LOOKUP_DIAG][client_no_response] lookup_id=%s "
+                "transport=%s world_size=%s",
+                lookup_id,
+                type(self.transport).__name__,
+                getattr(self.transport, "world_size", None),
+            )
             return 0
 
         results = [int.from_bytes(resp, "big") for resp in responses]
@@ -305,6 +322,11 @@ class LMCacheLookupServer:
                     logger.error(f"Error processing lookup request: {e}")
 
         logger.info("lmcache lookup server started")
+        logger.info(
+            "[RANK_LOOKUP_DIAG][server_started] worker_id=%s transport=%s",
+            self.metadata.worker_id,
+            type(self.transport).__name__,
+        )
         self.thread = threading.Thread(
             target=process_request,
             daemon=True,
