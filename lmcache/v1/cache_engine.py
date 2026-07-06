@@ -441,6 +441,39 @@ class LMCacheEngine:
             size_gb = self.config.max_local_cpu_size
         return int(float(size_gb) * 1024**3)
 
+    def _preflight_shared_cpu_shm_capacity(self) -> None:
+        if (
+            not self.enable_shared_cpu_cache
+            or not self.metadata.is_first_rank()
+            or os.name != "posix"
+        ):
+            return
+        shm_dir = "/dev/shm"
+        if not os.path.isdir(shm_dir):
+            return
+        try:
+            stat = os.statvfs(shm_dir)
+        except OSError as exc:
+            logger.warning(
+                "Shared CPU cache could not stat %s before shm allocation: %s",
+                shm_dir,
+                exc,
+            )
+            return
+        required_bytes = self._effective_shared_cpu_cache_size_bytes()
+        available_bytes = int(stat.f_bavail) * int(stat.f_frsize)
+        if required_bytes > available_bytes:
+            raise ValueError(
+                "Shared CPU cache rank0 slab does not fit in /dev/shm before "
+                "native shm allocation. This would otherwise crash the worker "
+                "with SIGBUS during first_touch. "
+                f"required_bytes={required_bytes}, "
+                f"available_bytes={available_bytes}, "
+                f"shm_name={self.shared_cpu_cache_name!r}. "
+                "Increase /dev/shm or reduce max_local_cpu_size/"
+                "shared_cpu_cache_size_gb."
+            )
+
     def _shared_cpu_dtype_for_kv_group(self, kv_group: int) -> torch.dtype:
         dtypes = self.metadata.get_dtypes()
         if 0 <= kv_group < len(dtypes):
@@ -1905,6 +1938,7 @@ class LMCacheEngine:
             lookup_server_worker_ids = self.config.get_lookup_server_worker_ids(
                 self.metadata.use_mla, self.metadata.world_size
             )
+            self._preflight_shared_cpu_shm_capacity()
             shared_passive_rank = (
                 self.enable_shared_cpu_cache
                 and self._is_passive()

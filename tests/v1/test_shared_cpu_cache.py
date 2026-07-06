@@ -166,6 +166,26 @@ def test_shared_cpu_size_override_wins_over_first_rank_size(monkeypatch):
     assert captured["size"] == 3 * 1024**3
 
 
+def test_shared_cpu_shm_capacity_preflight_reports_sigbus_risk(monkeypatch):
+    engine = object.__new__(LMCacheEngine)
+    engine.enable_shared_cpu_cache = True
+    engine.shared_cpu_cache_name = "/lmcache-too-large"
+    engine.metadata = SimpleNamespace(is_first_rank=lambda: True)
+    engine.config = SimpleNamespace(
+        max_local_cpu_size=2,
+        get_extra_config_value=lambda key, default=None: default,
+    )
+
+    monkeypatch.setattr("os.path.isdir", lambda path: path == "/dev/shm")
+    monkeypatch.setattr(
+        "os.statvfs",
+        lambda _path: SimpleNamespace(f_bavail=1, f_frsize=1024**3),
+    )
+
+    with pytest.raises(ValueError, match="SIGBUS"):
+        engine._preflight_shared_cpu_shm_capacity()
+
+
 class _FakeAddressManager:
     def __init__(self, free_bytes: int):
         self._free_bytes = free_bytes
