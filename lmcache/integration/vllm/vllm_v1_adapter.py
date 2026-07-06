@@ -150,6 +150,13 @@ def _dsa_record_current_stream_event() -> Optional[Any]:
 def _row_select(value: Any, rows: list[int]):
     if hasattr(value, "__getitem__"):
         if isinstance(value, torch.Tensor):
+            if value.dim() == 1:
+                if rows == [0]:
+                    return value
+                raise RuntimeError(
+                    "1D sparse payload can only represent one sparse row; "
+                    f"requested rows={rows}"
+                )
             if len(rows) == 1:
                 row = rows[0]
                 return value[row]
@@ -161,9 +168,94 @@ def _row_select(value: Any, rows: list[int]):
 def _single_row_select(value: Any, row: int):
     if hasattr(value, "__getitem__"):
         if isinstance(value, torch.Tensor):
+            if value.dim() == 1:
+                if row == 0:
+                    return value
+                raise RuntimeError(
+                    "1D sparse payload can only represent one sparse row; "
+                    f"requested row={row}"
+                )
             return value[row]
         return value[row]
     raise TypeError(f"Unsupported row-indexed value type: {type(value)!r}")
+
+
+def _sparse_payload_rows(value: Any) -> int:
+    if isinstance(value, torch.Tensor):
+        if value.dim() == 0:
+            raise ValueError(
+                "Sparse payload tensor must be 1D or 2D, "
+                f"got shape={tuple(value.shape)}"
+            )
+        if value.dim() == 1:
+            return 1
+        return int(value.shape[0])
+    if hasattr(value, "__len__"):
+        return len(value)
+    raise TypeError(f"Unsupported sparse payload type: {type(value)!r}")
+
+
+def _validate_sparse_wait_payload(
+    *,
+    selected_tokens: Any,
+    target_slot_mapping: Any,
+    request_ids: Optional[list],
+    sparse_req_ids: list[str],
+) -> int:
+    if selected_tokens is None:
+        if target_slot_mapping is not None:
+            raise ValueError(
+                "target_slot_mapping requires selected_tokens in sparse decode"
+            )
+        return 0
+
+    selected_rows = _sparse_payload_rows(selected_tokens)
+    expected_rows = len(request_ids) if request_ids is not None else len(sparse_req_ids)
+
+    if request_ids is not None and selected_rows != len(request_ids):
+        raise ValueError(
+            "selected_tokens rows must match request_ids rows: "
+            f"selected_rows={selected_rows} request_ids={len(request_ids)} "
+            f"selected_shape={getattr(selected_tokens, 'shape', None)}"
+        )
+    if request_ids is None and selected_rows != len(sparse_req_ids):
+        raise ValueError(
+            "selected_tokens rows must match sparse decode requests when "
+            "request_ids are not provided: "
+            f"selected_rows={selected_rows} sparse_requests={len(sparse_req_ids)} "
+            f"selected_shape={getattr(selected_tokens, 'shape', None)}"
+        )
+
+    if isinstance(selected_tokens, torch.Tensor) and selected_tokens.dim() == 1:
+        if expected_rows != 1:
+            raise ValueError(
+                "1D selected_tokens can only be used for exactly one sparse "
+                "decode row: "
+                f"selected_shape={tuple(selected_tokens.shape)} "
+                f"expected_rows={expected_rows} request_ids={request_ids}"
+            )
+
+    if target_slot_mapping is not None:
+        target_rows = _sparse_payload_rows(target_slot_mapping)
+        if target_rows != selected_rows:
+            raise ValueError(
+                "target_slot_mapping rows must match selected_tokens rows: "
+                f"target_rows={target_rows} selected_rows={selected_rows} "
+                f"target_shape={getattr(target_slot_mapping, 'shape', None)} "
+                f"selected_shape={getattr(selected_tokens, 'shape', None)}"
+            )
+        if isinstance(selected_tokens, torch.Tensor) and isinstance(
+            target_slot_mapping, torch.Tensor
+        ):
+            if tuple(selected_tokens.shape) != tuple(target_slot_mapping.shape):
+                raise ValueError(
+                    "target_slot_mapping shape must match selected_tokens "
+                    "shape: "
+                    f"target_shape={tuple(target_slot_mapping.shape)} "
+                    f"selected_shape={tuple(selected_tokens.shape)}"
+                )
+
+    return selected_rows
 
 
 def _sparse_payload_value(value: Any):
@@ -2439,20 +2531,28 @@ class LMCacheConnectorV1Impl:
                 if request.load_spec is not None and request.load_spec.can_load
             ]
 
+        sparse_req_ids = getattr(self, "_layerwise_sparse_req_ids", None)
+        if sparse_req_ids is None:
+            if metadata is None:
+                metadata = self._parent._get_connector_metadata()
+                assert isinstance(metadata, LMCacheConnectorMetadata)
+            sparse_req_ids = [
+                request.req_id
+                for request in metadata.requests
+                if request.load_spec is not None
+                and request.load_spec.can_load
+                and request.is_sparse_decode
+            ]
+
+        selected_rows = _validate_sparse_wait_payload(
+            selected_tokens=selected_tokens,
+            target_slot_mapping=target_slot_mapping,
+            request_ids=request_ids,
+            sparse_req_ids=sparse_req_ids,
+        )
+
         rows_of_req = None
         if request_ids is not None:
-            sparse_req_ids = getattr(self, "_layerwise_sparse_req_ids", None)
-            if sparse_req_ids is None:
-                if metadata is None:
-                    metadata = self._parent._get_connector_metadata()
-                    assert isinstance(metadata, LMCacheConnectorMetadata)
-                sparse_req_ids = [
-                    request.req_id
-                    for request in metadata.requests
-                    if request.load_spec is not None
-                    and request.load_spec.can_load
-                    and request.is_sparse_decode
-                ]
             ordered_sparse_rows = (
                 len(request_ids) == len(sparse_req_ids)
                 and request_ids == sparse_req_ids
@@ -2461,15 +2561,6 @@ class LMCacheConnectorV1Impl:
                 rows_of_req = {}
                 for row, rid in enumerate(request_ids):
                     rows_of_req.setdefault(rid, []).append(row)
-
-        selected_rows = None
-        if selected_tokens is not None:
-            selected_rows = (
-                int(selected_tokens.shape[0])
-                if hasattr(selected_tokens, "shape")
-                and len(selected_tokens.shape) > 0
-                else len(selected_tokens)
-            )
 
         idx = 0
         decode_row = 0
