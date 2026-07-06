@@ -1257,6 +1257,11 @@ class LMCacheConnectorV1Impl:
             return False
         if state.cached_ends and token_count < state.cached_ends[-1]:
             return True
+        if (
+            request.load_spec is not None
+            and request.load_spec.lmcache_cached_tokens > state.token_count
+        ):
+            return True
         return False
 
     def _bind_worker_retrieve_state_to_request(
