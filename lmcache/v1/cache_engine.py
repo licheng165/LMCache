@@ -21,7 +21,10 @@ if TYPE_CHECKING:
 # Standard
 import asyncio
 import gc
+import math
 import multiprocessing
+import os
+import socket
 import time
 
 # Third Party
@@ -54,6 +57,12 @@ from lmcache.v1.memory_management import (  # noqa: E501
 )
 from lmcache.v1.metadata import LMCacheMetadata
 from lmcache.v1.pin_monitor import PinMonitor
+from lmcache.v1.shared_cpu_cache import (
+    SharedChunkHandle,
+    SharedCPUCacheError,
+    SharedHandleEnvelope,
+    SharedSlabMapping,
+)
 from lmcache.v1.storage_backend.storage_manager import StorageManager
 from lmcache.v1.system_detection import NUMADetector, NUMAMapping
 from lmcache.v1.token_database import (
@@ -113,16 +122,46 @@ class LMCacheEngine:
             self.config.get_extra_config_value("save_only_first_rank", metadata.use_mla)
             and metadata.use_mla
         )
-        # save_indexer_only_first_rank: same rank-0-only policy for the DSA
-        # indexer group. Defaults to save_only_first_rank when dsa_two_groups
-        # is enabled (indexer is small; per-rank keys waste CPU memory).
         self.dsa_two_groups = getattr(self.config, "dsa_two_groups", False)
-        self.save_indexer_only_first_rank = (
-            self.config.get_extra_config_value(
-                "save_indexer_only_first_rank",
-                self.save_only_first_rank if self.dsa_two_groups else False,
-            )
+        self.enable_shared_cpu_cache = bool(
+            self._get_shared_config_value("enable_shared_cpu_cache", False)
         )
+        configured_indexer_policy = self.config.get_extra_config_value(
+            "save_indexer_only_first_rank",
+            getattr(self.config, "save_indexer_only_first_rank", False),
+        )
+        if self.enable_shared_cpu_cache and self.dsa_two_groups:
+            # In shared-cache mode there is one rank0 ownership policy. Keep
+            # the legacy indexer knob readable for old configs, but do not let
+            # it split MLA latent and DSA index behavior.
+            self.save_indexer_only_first_rank = self.save_only_first_rank
+        else:
+            self.save_indexer_only_first_rank = (
+                bool(configured_indexer_policy) and metadata.use_mla
+            )
+        if (
+            self.enable_shared_cpu_cache
+            and self.dsa_two_groups
+            and configured_indexer_policy != self.save_indexer_only_first_rank
+        ):
+            logger.warning(
+                "Ignoring save_indexer_only_first_rank=%s; dsa_two_groups "
+                "uses save_only_first_rank=%s for both latent and index.",
+                configured_indexer_policy,
+                self.save_only_first_rank,
+            )
+
+        self.shared_cpu_cache_strict = bool(
+            self._get_shared_config_value("shared_cpu_cache_strict", True)
+        )
+        self.shared_cpu_cache_name: Optional[str] = None
+        self.shared_cpu_cache_slab_size: Optional[int] = None
+        self.shared_cpu_cache_generation = 0
+        self.shared_cpu_cache_mapping: Optional[SharedSlabMapping] = None
+        self.shared_cpu_cache_passive_allocator = None
+        self._shared_cpu_active_sparse_requests: dict[str, dict[str, Any]] = {}
+        self._validate_shared_cpu_cache_contract()
+        self._prepare_shared_cpu_cache_name()
 
         if self.save_only_first_rank and self.gpu_connector is not None:
             self.broadcast_stream = (
@@ -204,6 +243,7 @@ class LMCacheEngine:
                 self.fmt = MemoryFormat.KV_T2D
         if metadata.use_mla:
             self.fmt = MemoryFormat.KV_MLA_LATENT_FMT
+        self._report_shared_cpu_sparse_capacity_sanity()
 
         # NOTE(ApostaC): we haven't support lookup-cache yet
         self.lookup_cache: dict[CacheEngineKey, Any] = {}
@@ -232,6 +272,1561 @@ class LMCacheEngine:
 
         # Flag to indicate if initialization failed (irrecoverable error)
         self._init_failed = False
+
+    def _get_shared_config_value(self, key: str, default: Any = None) -> Any:
+        value = self.config.get_extra_config_value(key, None)
+        if value is not None:
+            return value
+        return getattr(self.config, key, default)
+
+    def _shared_cpu_contract_context(self) -> str:
+        return (
+            " shared_cpu_config={"
+            f"enable_shared_cpu_cache={self.enable_shared_cpu_cache}, "
+            f"enable_sparse_attention={self.config.enable_sparse_attention}, "
+            f"save_only_first_rank={self.save_only_first_rank}, "
+            f"use_layerwise={self.config.use_layerwise}, "
+            f"TP/world_size={self.metadata.world_size}, "
+            f"local_cpu={self.config.local_cpu}, "
+            f"max_local_cpu_size={self.config.max_local_cpu_size}, "
+            "shared_cpu_cache_name="
+            f"{self._get_shared_config_value('shared_cpu_cache_name', None)!r}, "
+            "shared_cpu_cache_size_gb="
+            f"{self._get_shared_config_value('shared_cpu_cache_size_gb', None)!r}, "
+            f"shared_cpu_cache_strict={self.shared_cpu_cache_strict}"
+            "}"
+        )
+
+    def _validate_shared_cpu_cache_contract(self) -> None:
+        if not self.metadata.use_mla:
+            return
+
+        tp_gt_one = self.metadata.world_size > 1
+        context = self._shared_cpu_contract_context()
+        needs_dense_layerwise_shared = (
+            self.config.use_layerwise
+            and self.save_only_first_rank
+            and tp_gt_one
+        )
+        needs_sparse_shared = (
+            self.config.enable_sparse_attention
+            and self.save_only_first_rank
+            and tp_gt_one
+        )
+        if needs_dense_layerwise_shared and not self.enable_shared_cpu_cache:
+            raise ValueError(
+                "use_layerwise=true with save_only_first_rank=true and "
+                "TP/world_size>1 requires enable_shared_cpu_cache=true. "
+                "Passive ranks cannot perform dense prefix layerwise load from "
+                "rank0-only MLA/DSA chunks without shared CPU cache handles."
+                + context
+            )
+        if needs_sparse_shared and not self.enable_shared_cpu_cache:
+            raise ValueError(
+                "enable_sparse_attention=true with save_only_first_rank=true "
+                "and TP/world_size>1 requires enable_shared_cpu_cache=true. "
+                "Passive decode ranks cannot read rank0-only MLA/DSA chunks "
+                "without shared CPU cache handles."
+                + context
+            )
+
+        if not self.enable_shared_cpu_cache:
+            return
+
+        if (
+            self.metadata.world_size > 1
+            and not callable(getattr(self, "broadcast_object_fn", None))
+        ):
+            raise ValueError(
+                "enable_shared_cpu_cache with TP/world_size>1 requires a "
+                "callable broadcast_object_fn for ordered shared CPU cache "
+                "startup and per-layer handle envelopes."
+                + context
+            )
+
+        if not self.config.local_cpu or self.config.max_local_cpu_size <= 0:
+            raise ValueError(
+                "enable_shared_cpu_cache requires local_cpu=true and "
+                "max_local_cpu_size > 0 on rank0."
+                + context
+            )
+
+        if (
+            self.config.enable_sparse_attention
+            and self.dsa_two_groups
+            and self.shared_cpu_cache_strict
+            and not bool(
+                self._get_shared_config_value(
+                    "shared_cpu_materialize_index_on_decode_cold",
+                    True,
+                )
+            )
+        ):
+            raise ValueError(
+                "Strict shared-cache sparse decode with dsa_two_groups=true "
+                "must materialize DSA index on decode cold path. "
+                "shared_cpu_materialize_index_on_decode_cold=false is only "
+                "valid for a non-strict debug/proven-resident path."
+                + context
+            )
+
+    def _prepare_shared_cpu_cache_name(self) -> None:
+        if not self.enable_shared_cpu_cache:
+            return
+
+        explicit_name = self._get_shared_config_value("shared_cpu_cache_name", None)
+        legacy_name = self.config.get_extra_config_value("shm_name", None)
+        if explicit_name and legacy_name and explicit_name != legacy_name:
+            raise ValueError(
+                "shared_cpu_cache_name and shm_name must not differ in "
+                "shared CPU cache mode."
+            )
+
+        resolved_name = explicit_name or legacy_name
+        if not resolved_name:
+            def shm_component(value: Any, default: str) -> str:
+                raw = str(value or default)
+                safe = "".join(ch if ch.isalnum() else "_" for ch in raw)
+                return safe[:48] or default
+
+            instance = shm_component(self.config.lmcache_instance_id, "default")
+            role = shm_component(self.metadata.role, "worker")
+            node = shm_component(socket.gethostname(), "node")
+            resolved_name = (
+                f"/lmcache_shared_{instance}_{node}_{role}"
+                f"_tp{self.metadata.world_size}_rank0_{os.getpid()}"
+                f"_{int(time.time() * 1000)}"
+            )
+        elif not str(resolved_name).startswith("/"):
+            resolved_name = "/" + str(resolved_name)
+
+        self.shared_cpu_cache_name = str(resolved_name)
+        if self.config.extra_config is None:
+            self.config.extra_config = {}
+        self.config.extra_config["shared_cpu_cache_resolved_name"] = (
+            self.shared_cpu_cache_name
+        )
+        if self.metadata.is_first_rank():
+            size_gb = self._get_shared_config_value(
+                "shared_cpu_cache_size_gb",
+                None,
+            )
+            if size_gb is not None:
+                self.config.max_local_cpu_size = float(size_gb)
+            self.config.extra_config["shm_name"] = self.shared_cpu_cache_name
+
+    def _effective_shared_cpu_cache_size_bytes(self) -> int:
+        size_gb = self._get_shared_config_value(
+            "shared_cpu_cache_size_gb",
+            None,
+        )
+        if size_gb is None:
+            size_gb = self.config.max_local_cpu_size
+        return int(float(size_gb) * 1024**3)
+
+    def _shared_cpu_dtype_for_kv_group(self, kv_group: int) -> torch.dtype:
+        dtypes = self.metadata.get_dtypes()
+        if 0 <= kv_group < len(dtypes):
+            return dtypes[kv_group]
+        return self.metadata.kv_dtype
+
+    def _shape_numel_without_layer_dim(self, shape: torch.Size) -> int:
+        dims = [int(dim) for dim in shape]
+        if (
+            len(dims) >= 3
+            and self.num_layers > 0
+            and dims[1] == self.num_layers
+        ):
+            dims = dims[:1] + dims[2:]
+        elif (
+            len(dims) >= 3
+            and self.num_layers > 0
+            and dims[0] == self.num_layers
+        ):
+            dims = dims[1:]
+        numel = 1
+        for dim in dims:
+            numel *= dim
+        return numel
+
+    def _estimate_shared_cpu_bytes_per_layer(
+        self,
+        kv_group: int,
+        num_tokens: int,
+    ) -> int:
+        shape: Optional[torch.Size] = None
+        get_shape = getattr(self.gpu_connector, "get_shape", None)
+        if callable(get_shape):
+            try:
+                shape = get_shape(num_tokens, kv_group=kv_group)
+            except TypeError:
+                shape = get_shape(num_tokens)
+            except Exception as exc:
+                logger.warning(
+                    "Unable to query gpu_connector.get_shape for shared CPU "
+                    "capacity estimate: kv_group=%s, error=%s",
+                    kv_group,
+                    exc,
+                )
+
+        if shape is None:
+            shapes = self.metadata.get_shapes(num_tokens)
+            if 0 <= kv_group < len(shapes):
+                shape = shapes[kv_group]
+            else:
+                shape = shapes[0]
+
+        dtype = self._shared_cpu_dtype_for_kv_group(kv_group)
+        return self._shape_numel_without_layer_dim(shape) * dtype.itemsize
+
+    def _expected_shared_cpu_chunk_metadata(
+        self,
+        *,
+        kv_group: int,
+        num_tokens: int,
+    ) -> tuple[torch.Size, torch.dtype, MemoryFormat]:
+        shape: Optional[torch.Size] = None
+        get_shape = getattr(self.gpu_connector, "get_shape", None)
+        if callable(get_shape):
+            try:
+                shape = torch.Size(get_shape(num_tokens, kv_group=kv_group))
+            except TypeError:
+                shape = torch.Size(get_shape(num_tokens))
+        if shape is None:
+            shapes = self.metadata.get_shapes(num_tokens)
+            shape = torch.Size(shapes[kv_group] if kv_group < len(shapes) else shapes[0])
+        return (
+            shape,
+            self._shared_cpu_dtype_for_kv_group(kv_group),
+            self._memory_format_for_kv_group(kv_group),
+        )
+
+    def _estimate_shared_cpu_chunk_bytes_per_layer(self, kv_group: int) -> int:
+        return self._estimate_shared_cpu_bytes_per_layer(
+            kv_group,
+            int(self.config.chunk_size),
+        )
+
+    def _report_shared_cpu_sparse_capacity_sanity(self) -> None:
+        if not (
+            self.config.enable_sparse_attention
+            and self.enable_shared_cpu_cache
+            and self.save_only_first_rank
+            and self.metadata.world_size > 1
+            and self.metadata.is_first_rank()
+        ):
+            return
+
+        max_model_len = self._get_shared_config_value(
+            "vllm_max_model_len",
+            getattr(self.metadata, "max_model_len", None),
+        )
+        if max_model_len is None:
+            logger.warning(
+                "Shared CPU sparse capacity sanity skipped because vLLM "
+                "max_model_len is unavailable."
+            )
+            return
+
+        max_num_seqs = self._get_shared_config_value("vllm_max_num_seqs", None)
+        chunk_size = int(self.config.chunk_size)
+        max_model_len = int(max_model_len)
+        chunks_per_seq = int(math.ceil(max_model_len / chunk_size))
+        kv_groups = [0]
+        materialize_index = bool(
+            self._get_shared_config_value(
+                "shared_cpu_materialize_index_on_decode_cold",
+                True,
+            )
+        )
+        if self.dsa_two_groups and materialize_index:
+            kv_groups.append(1)
+
+        bytes_per_chunk_all_layers = sum(
+            self._estimate_shared_cpu_chunk_bytes_per_layer(kv_group)
+            * self.num_layers
+            for kv_group in kv_groups
+        )
+        one_request_bytes = bytes_per_chunk_all_layers * chunks_per_seq
+        slab_bytes = self._effective_shared_cpu_cache_size_bytes()
+        estimate: dict[str, Any] = {
+            "slab_bytes": slab_bytes,
+            "max_model_len": max_model_len,
+            "max_num_seqs": max_num_seqs,
+            "chunk_size": chunk_size,
+            "chunks_per_seq": chunks_per_seq,
+            "kv_groups": kv_groups,
+            "bytes_per_chunk_all_layers": bytes_per_chunk_all_layers,
+            "one_max_request_bytes": one_request_bytes,
+        }
+        if max_num_seqs is not None:
+            estimate["configured_worst_case_bytes"] = (
+                one_request_bytes * int(max_num_seqs)
+            )
+        if self.config.extra_config is None:
+            self.config.extra_config = {}
+        self.config.extra_config[
+            "shared_cpu_sparse_startup_capacity_estimate"
+        ] = estimate
+
+        if one_request_bytes > slab_bytes:
+            raise ValueError(
+                "Shared CPU sparse capacity preflight failed: one maximum "
+                "request cannot fit in the rank0 shared CPU slab. "
+                f"estimate={estimate}. Increase max_local_cpu_size or "
+                "shared_cpu_cache_size_gb, or reduce max_model_len."
+            )
+        configured_worst_case = estimate.get("configured_worst_case_bytes")
+        if configured_worst_case is not None and configured_worst_case > slab_bytes:
+            logger.warning(
+                "Shared CPU sparse configured worst-case active set exceeds "
+                "the rank0 slab: estimate=%s. Runtime admission uses actual "
+                "active prompt lengths, but this configuration can still hit "
+                "strict capacity failures at decode.",
+                estimate,
+            )
+        else:
+            logger.info(
+                "Shared CPU sparse capacity sanity passed: estimate=%s",
+                estimate,
+            )
+
+    def _shared_cpu_cache_startup_envelope(
+        self,
+        status: str,
+        message: Optional[str] = None,
+    ) -> dict[str, Any]:
+        return {
+            "status": status,
+            "message": message,
+            "shm_name": self.shared_cpu_cache_name,
+            "slab_size": self.shared_cpu_cache_slab_size,
+            "generation": self.shared_cpu_cache_generation,
+            "rank": self.metadata.worker_id,
+        }
+
+    def _post_init_shared_cpu_cache(self) -> None:
+        if not self.enable_shared_cpu_cache or self.metadata.world_size <= 1:
+            return
+
+        if self.metadata.is_first_rank():
+            try:
+                if self.storage_manager is None:
+                    raise ValueError(
+                        "Shared CPU cache rank0 preflight requires StorageManager."
+                    )
+                local_cpu_backend = getattr(
+                    self.storage_manager,
+                    "local_cpu_backend",
+                    None,
+                )
+                if local_cpu_backend is None:
+                    raise ValueError(
+                        "Shared CPU cache rank0 preflight requires "
+                        "LocalCPUBackend."
+                    )
+                allocator = getattr(local_cpu_backend, "memory_allocator", None)
+                allocator_buffer = getattr(allocator, "buffer", None)
+                allocator_shm_name = getattr(allocator, "shm_name", None)
+                if allocator_buffer is None or allocator_shm_name is None:
+                    raise ValueError(
+                        "Shared CPU cache rank0 LocalCPUBackend must be "
+                        "shm-backed and expose buffer/shm_name."
+                    )
+                self.shared_cpu_cache_name = allocator_shm_name
+                self.shared_cpu_cache_slab_size = int(allocator_buffer.numel())
+                self.shared_cpu_cache_generation = int(time.time() * 1000)
+                self.shared_cpu_cache_mapping = (
+                    SharedSlabMapping.from_rank0_allocator(
+                        shm_name=self.shared_cpu_cache_name,
+                        allocator_tensor=allocator_buffer,
+                        generation=self.shared_cpu_cache_generation,
+                    )
+                )
+                if self.shared_cpu_cache_strict:
+                    self.shared_cpu_cache_mapping.preflight_device_ptr()
+                self.broadcast_object_fn(
+                    self._shared_cpu_cache_startup_envelope("ok"),
+                    self.metadata.first_rank,
+                )
+            except Exception as exc:
+                if self.shared_cpu_cache_mapping is not None:
+                    try:
+                        self.shared_cpu_cache_mapping.close()
+                        self.shared_cpu_cache_mapping = None
+                    except Exception:
+                        logger.exception(
+                            "Failed to clean up rank0 shared CPU cache mapping "
+                            "after startup preflight failure"
+                        )
+                try:
+                    self.broadcast_object_fn(
+                        self._shared_cpu_cache_startup_envelope(
+                            "error",
+                            str(exc),
+                        ),
+                        self.metadata.first_rank,
+                    )
+                except Exception:
+                    logger.exception(
+                        "Failed to broadcast shared CPU cache rank0 startup "
+                        "error envelope"
+                    )
+                raise
+            logger.info(
+                "Shared CPU cache rank0 preflight ok: shm_name=%s, "
+                "slab_size=%s, generation=%s",
+                self.shared_cpu_cache_name,
+                self.shared_cpu_cache_slab_size,
+                self.shared_cpu_cache_generation,
+            )
+            return
+
+        envelope = self.broadcast_object_fn(None, self.metadata.first_rank)
+        if not isinstance(envelope, dict):
+            raise ValueError(
+                "Shared CPU cache passive preflight expected dict envelope, "
+                f"got {type(envelope)!r}"
+            )
+        if envelope.get("status") != "ok":
+            raise ValueError(
+                "Shared CPU cache passive preflight failed from rank0: "
+                f"{envelope.get('message')}"
+            )
+        shm_name = envelope.get("shm_name")
+        slab_size = envelope.get("slab_size")
+        generation = envelope.get("generation")
+        if not shm_name or not slab_size or generation is None:
+            raise ValueError(
+                "Shared CPU cache passive preflight envelope missing shm_name, "
+                f"slab_size, or generation: {envelope}"
+            )
+        self.shared_cpu_cache_name = str(shm_name)
+        self.shared_cpu_cache_slab_size = int(slab_size)
+        self.shared_cpu_cache_generation = int(generation)
+        explicit_writable = self._get_shared_config_value(
+            "shared_cpu_cache_passive_writable",
+            None,
+        )
+        writable_attempts = (
+            [bool(explicit_writable)]
+            if explicit_writable is not None
+            else [False, True]
+        )
+        for writable in writable_attempts:
+            mapping = None
+            try:
+                mapping = SharedSlabMapping.attach(
+                    shm_name=self.shared_cpu_cache_name,
+                    size=self.shared_cpu_cache_slab_size,
+                    generation=self.shared_cpu_cache_generation,
+                    writable=writable,
+                )
+                if self.shared_cpu_cache_strict:
+                    mapping.preflight_device_ptr()
+                self.shared_cpu_cache_mapping = mapping
+                if self.config.extra_config is None:
+                    self.config.extra_config = {}
+                self.config.extra_config[
+                    "shared_cpu_cache_passive_writable_resolved"
+                ] = writable
+                break
+            except Exception as exc:
+                if mapping is not None:
+                    try:
+                        mapping.close()
+                    except Exception:
+                        logger.exception(
+                            "Failed to detach shared CPU cache mapping after "
+                            "passive preflight failure"
+                        )
+                if explicit_writable is None and not writable:
+                    logger.warning(
+                        "Shared CPU cache passive read-only attach/preflight "
+                        "failed for shm_name=%s; retrying read-write: %s",
+                        self.shared_cpu_cache_name,
+                        exc,
+                    )
+                    continue
+                raise ValueError(
+                    "Shared CPU cache passive attach/preflight failed: "
+                    f"shm_name={self.shared_cpu_cache_name}, "
+                    f"slab_size={self.shared_cpu_cache_slab_size}, "
+                    f"generation={self.shared_cpu_cache_generation}, "
+                    f"writable={writable}"
+                ) from exc
+        if self.shared_cpu_cache_mapping is None:
+            raise ValueError(
+                "Shared CPU cache passive attach/preflight did not produce "
+                "a usable mapping."
+            )
+        self.shared_cpu_cache_passive_allocator = (
+            self.shared_cpu_cache_mapping.passive_allocator()
+        )
+        logger.info(
+            "Shared CPU cache passive preflight ok: rank=%s, shm_name=%s, "
+            "slab_size=%s, generation=%s",
+            self.metadata.worker_id,
+            self.shared_cpu_cache_name,
+            self.shared_cpu_cache_slab_size,
+            self.shared_cpu_cache_generation,
+        )
+
+    def _should_use_shared_layerwise_retrieve(self, kv_group: int) -> bool:
+        if not self.enable_shared_cpu_cache:
+            return False
+        if not self.use_layerwise or not self.metadata.use_mla:
+            return False
+        if self.metadata.world_size <= 1:
+            return False
+        if kv_group == 1:
+            return self.save_indexer_only_first_rank
+        return self.save_only_first_rank
+
+    def _shared_layerwise_error_envelope(
+        self,
+        *,
+        req_id: str,
+        phase: str,
+        request_ordinal: int,
+        layer_id: int,
+        kv_group: int,
+        message: str,
+        details: Optional[dict[str, Any]] = None,
+    ) -> SharedHandleEnvelope:
+        return SharedHandleEnvelope(
+            request_id=req_id,
+            phase=phase,
+            request_ordinal=request_ordinal,
+            layer_id=layer_id,
+            kv_group=kv_group,
+            status="error",
+            generation=self.shared_cpu_cache_generation,
+            handles=[],
+            message=message,
+            error_details=details,
+        )
+
+    def _broadcast_shared_envelope(self, envelope: SharedHandleEnvelope) -> None:
+        self.broadcast_object_fn(envelope.to_dict(), self.metadata.first_rank)
+
+    def _receive_shared_envelope(self) -> SharedHandleEnvelope:
+        raw = self.broadcast_object_fn(None, self.metadata.first_rank)
+        if not isinstance(raw, dict):
+            raise ValueError(
+                "Shared CPU cache expected dict envelope from rank0, "
+                f"got {type(raw)!r}"
+            )
+        try:
+            return SharedHandleEnvelope.from_dict(raw)
+        except Exception as exc:
+            raise ValueError(
+                "Shared CPU cache received corrupt envelope before view "
+                f"creation: error={exc}, raw={raw!r}"
+            ) from exc
+
+    def _validate_shared_layerwise_envelope(
+        self,
+        envelope: SharedHandleEnvelope,
+        *,
+        req_id: str,
+        phase: str,
+        request_ordinal: int,
+        layer_id: int,
+        kv_group: int,
+    ) -> None:
+        failures = []
+        if envelope.request_id != req_id:
+            failures.append(
+                f"request_id={envelope.request_id!r}, expected={req_id!r}"
+            )
+        if envelope.phase != phase:
+            failures.append(f"phase={envelope.phase!r}, expected={phase!r}")
+        if envelope.request_ordinal != int(request_ordinal):
+            failures.append(
+                f"request_ordinal={envelope.request_ordinal}, "
+                f"expected={int(request_ordinal)}"
+            )
+        if envelope.layer_id != layer_id:
+            failures.append(
+                f"layer_id={envelope.layer_id}, expected={layer_id}"
+            )
+        if envelope.kv_group != kv_group:
+            failures.append(
+                f"kv_group={envelope.kv_group}, expected={kv_group}"
+            )
+        if envelope.generation != self.shared_cpu_cache_generation:
+            failures.append(
+                f"generation={envelope.generation}, "
+                f"expected={self.shared_cpu_cache_generation}"
+            )
+        if failures:
+            raise ValueError(
+                "Invalid shared CPU cache layerwise envelope: "
+                + "; ".join(failures)
+            )
+        if envelope.status == "error":
+            raise ValueError(
+                "Shared CPU cache rank0 error envelope: "
+                f"{envelope.message}; details={envelope.error_details}"
+            )
+        if envelope.status == "miss" and self.shared_cpu_cache_strict:
+            raise ValueError(
+                "Shared CPU cache strict mode received miss envelope before "
+                "view creation: "
+                f"request_id={envelope.request_id}, phase={envelope.phase}, "
+                f"layer_id={envelope.layer_id}, kv_group={envelope.kv_group}, "
+                f"message={envelope.message}, details={envelope.error_details}"
+            )
+        if envelope.status not in ("ok", "miss", "skipped"):
+            raise ValueError(
+                "Shared CPU cache envelope has unsupported status "
+                f"{envelope.status!r}"
+            )
+        if envelope.status == "ok" and not envelope.handles:
+            raise ValueError(
+                "Shared CPU cache ok envelope must carry at least one handle: "
+                f"request_id={envelope.request_id}, phase={envelope.phase}, "
+                f"layer_id={envelope.layer_id}, kv_group={envelope.kv_group}"
+            )
+        if envelope.status in ("miss", "skipped") and envelope.handles:
+            raise ValueError(
+                "Shared CPU cache non-present envelope must not carry handles: "
+                f"status={envelope.status!r}, request_id={envelope.request_id}, "
+                f"phase={envelope.phase}, layer_id={envelope.layer_id}, "
+                f"kv_group={envelope.kv_group}, handles={len(envelope.handles)}"
+            )
+
+    def _make_shared_handles_for_layer(
+        self,
+        *,
+        req_id: str,
+        phase: str,
+        keys_layer: list[CacheEngineKey],
+        mem_objs_layer: list[MemoryObj],
+        layer_id: int,
+        kv_group: int,
+    ) -> list[SharedChunkHandle]:
+        if self.shared_cpu_cache_name is None:
+            raise ValueError("Shared CPU cache name is not initialized")
+        if len(keys_layer) != len(mem_objs_layer):
+            raise ValueError(
+                "Shared CPU cache refuses to publish partial layer handles: "
+                f"request_id={req_id}, phase={phase}, layer_id={layer_id}, "
+                f"kv_group={kv_group}, keys={len(keys_layer)}, "
+                f"memory_objs={len(mem_objs_layer)}"
+            )
+        handles: list[SharedChunkHandle] = []
+        for chunk_index, (key, mem_obj) in enumerate(
+            zip(keys_layer, mem_objs_layer, strict=True)
+        ):
+            self._validate_rank0_shared_mem_obj(
+                mem_obj,
+                req_id=req_id,
+                phase=phase,
+                layer_id=layer_id,
+                kv_group=kv_group,
+                chunk_index=chunk_index,
+            )
+            handles.append(
+                SharedChunkHandle.from_memory_obj(
+                    request_id=req_id,
+                    phase=phase,
+                    key=key,
+                    layer_id=layer_id,
+                    kv_group=kv_group,
+                    chunk_index=chunk_index,
+                    shm_name=self.shared_cpu_cache_name,
+                    memory_obj=mem_obj,
+                    generation=self.shared_cpu_cache_generation,
+                    producer_rank=self.metadata.worker_id,
+                )
+            )
+        return handles
+
+    def _shared_local_cpu_backend(self):
+        if self.storage_manager is None:
+            raise ValueError("StorageManager is required for shared CPU cache")
+        local_cpu_backend = getattr(self.storage_manager, "local_cpu_backend", None)
+        if local_cpu_backend is None:
+            raise ValueError(
+                "Shared CPU cache requires LocalCPUBackend on rank0. "
+                "Check local_cpu=true and enable_shared_cpu_cache=true."
+            )
+        return local_cpu_backend
+
+    def _shared_cpu_capacity_snapshot(self) -> dict[str, Any]:
+        try:
+            local_cpu_backend = self._shared_local_cpu_backend()
+            allocator = getattr(local_cpu_backend, "memory_allocator", None)
+            root_allocator = getattr(allocator, "_allocator", allocator)
+            snapshot: dict[str, Any] = {}
+            buffer = getattr(root_allocator, "buffer", None)
+            if buffer is not None:
+                snapshot["slab_bytes"] = int(buffer.numel())
+            address_manager = getattr(root_allocator, "address_manager", None)
+            if address_manager is not None:
+                get_free_size = getattr(address_manager, "get_free_size", None)
+                if callable(get_free_size):
+                    snapshot["free_bytes"] = int(get_free_size())
+                get_heap_size = getattr(address_manager, "get_heap_size", None)
+                if callable(get_heap_size):
+                    snapshot["heap_bytes"] = int(get_heap_size())
+                snapshot["allocated_bytes"] = int(
+                    getattr(address_manager, "total_allocated_size", 0)
+                )
+            hot_cache = getattr(local_cpu_backend, "hot_cache", {})
+            pinned_bytes = 0
+            evictable_bytes = 0
+            for mem_obj in hot_cache.values():
+                physical_size = self._shared_cpu_mem_obj_physical_size(mem_obj)
+                if getattr(mem_obj, "is_pinned", False):
+                    pinned_bytes += physical_size
+                if getattr(mem_obj, "can_evict", False):
+                    evictable_bytes += physical_size
+            snapshot["pinned_bytes"] = pinned_bytes
+            snapshot["evictable_bytes"] = evictable_bytes
+            snapshot["active_sparse_requests"] = len(
+                self._shared_cpu_active_sparse_requests
+            )
+            return snapshot
+        except Exception as exc:
+            return {"capacity_snapshot_error": str(exc)}
+
+    def register_shared_cpu_sparse_request(
+        self,
+        req_id: str,
+        *,
+        token_count: int = 0,
+        phase: str = "sparse_decode_bootstrap",
+    ) -> None:
+        if not req_id:
+            return
+        self._shared_cpu_active_sparse_requests[req_id] = {
+            "token_count": int(token_count or 0),
+            "phase": phase,
+            "generation": self.shared_cpu_cache_generation,
+            "registered_at": time.time(),
+        }
+
+    def release_shared_cpu_sparse_request(self, req_id: Optional[str]) -> None:
+        if not req_id:
+            return
+        self._shared_cpu_active_sparse_requests.pop(req_id, None)
+
+    def _shared_cpu_estimated_physical_chunk_bytes(
+        self,
+        kv_group: int,
+        num_tokens: Optional[int] = None,
+    ) -> int:
+        logical_bytes = self._estimate_shared_cpu_bytes_per_layer(
+            kv_group,
+            int(num_tokens or self.config.chunk_size),
+        )
+        try:
+            allocator = getattr(
+                self._shared_local_cpu_backend(),
+                "memory_allocator",
+                None,
+            )
+            align_bytes = int(getattr(allocator, "align_bytes", 4096) or 4096)
+        except Exception:
+            align_bytes = 4096
+        return ((logical_bytes + align_bytes - 1) // align_bytes) * align_bytes
+
+    def _shared_cpu_mem_obj_physical_size(self, mem_obj: MemoryObj) -> int:
+        metadata = getattr(mem_obj, "metadata", None)
+        if metadata is not None and getattr(metadata, "phy_size", None) is not None:
+            return int(metadata.phy_size)
+        return int(mem_obj.get_physical_size())
+
+    def _shared_cpu_runtime_capacity_details(
+        self,
+        *,
+        req_id: str,
+        phase: str,
+        kv_group: int,
+        keys_layer_major: list[list[CacheEngineKey]],
+        chunk_locations_layer_major: list[list[str]],
+        token_count: int = 0,
+        chunk_token_lengths: Optional[list[int]] = None,
+    ) -> dict[str, Any]:
+        local_cpu_backend = self._shared_local_cpu_backend()
+        required_local_keys = {
+            key
+            for layer_keys, layer_locations in zip(
+                keys_layer_major,
+                chunk_locations_layer_major,
+                strict=False,
+            )
+            for key, location in zip(layer_keys, layer_locations, strict=False)
+            if location == "LocalCPUBackend"
+        }
+        hot_cache = getattr(local_cpu_backend, "hot_cache", {})
+        cpu_lock = getattr(local_cpu_backend, "cpu_lock", None)
+        lock_cm = cpu_lock if cpu_lock is not None else None
+        rank0_shared_hot_keys = set()
+        non_shm_hot_keys = set()
+        if lock_cm is None:
+            required_local_items = [
+                (key, hot_cache.get(key)) for key in required_local_keys
+            ]
+        else:
+            with lock_cm:
+                required_local_items = [
+                    (key, hot_cache.get(key)) for key in required_local_keys
+                ]
+        for key, mem_obj in required_local_items:
+            if mem_obj is not None and self._is_rank0_shared_mem_obj(mem_obj):
+                rank0_shared_hot_keys.add(key)
+            else:
+                # A LocalCPU hit that is not backed by the resolved shm slab
+                # still needs rank0 rematerialization before handle publication.
+                non_shm_hot_keys.add(key)
+
+        missing_chunk_count = 0
+        required_bytes = 0
+        default_chunk_bytes = self._shared_cpu_estimated_physical_chunk_bytes(
+            kv_group
+        )
+        for layer_keys, layer_locations in zip(
+            keys_layer_major,
+            chunk_locations_layer_major,
+            strict=False,
+        ):
+            for chunk_index, (key, location) in enumerate(
+                zip(layer_keys, layer_locations, strict=False)
+            ):
+                if not location:
+                    continue
+                if (
+                    location == "LocalCPUBackend"
+                    and key in rank0_shared_hot_keys
+                ):
+                    continue
+                missing_chunk_count += 1
+                if (
+                    chunk_token_lengths is not None
+                    and chunk_index < len(chunk_token_lengths)
+                    and chunk_token_lengths[chunk_index] > 0
+                ):
+                    required_bytes += self._shared_cpu_estimated_physical_chunk_bytes(
+                        kv_group,
+                        num_tokens=chunk_token_lengths[chunk_index],
+                    )
+                else:
+                    required_bytes += default_chunk_bytes
+
+        allocator = getattr(local_cpu_backend, "memory_allocator", None)
+        root_allocator = getattr(allocator, "_allocator", allocator)
+        buffer = getattr(root_allocator, "buffer", None)
+        slab_size = int(buffer.numel()) if buffer is not None else None
+        free_bytes = 0
+        address_manager = getattr(root_allocator, "address_manager", None)
+        if address_manager is not None:
+            get_free_size = getattr(address_manager, "get_free_size", None)
+            if callable(get_free_size):
+                free_bytes = int(get_free_size())
+
+        evictable_bytes = 0
+        pinned_bytes = 0
+        protected_hot_bytes = 0
+        if lock_cm is None:
+            cache_items = list(hot_cache.items())
+        else:
+            with lock_cm:
+                cache_items = list(hot_cache.items())
+        for key, mem_obj in cache_items:
+            is_shared_hot_obj = self._is_rank0_shared_mem_obj(mem_obj)
+            physical_size = self._shared_cpu_mem_obj_physical_size(mem_obj)
+            if is_shared_hot_obj and getattr(mem_obj, "is_pinned", False):
+                pinned_bytes += physical_size
+            if key in rank0_shared_hot_keys:
+                protected_hot_bytes += physical_size
+                continue
+            if is_shared_hot_obj and getattr(mem_obj, "can_evict", False):
+                evictable_bytes += physical_size
+
+        available_after_eviction = free_bytes + evictable_bytes
+        active_sparse_requests = set(self._shared_cpu_active_sparse_requests)
+        if req_id:
+            active_sparse_requests.add(req_id)
+        details = {
+            "request_id": req_id,
+            "phase": phase,
+            "kv_group": kv_group,
+            "token_count": int(token_count or 0),
+            "chunk_count": sum(len(layer) for layer in keys_layer_major),
+            "missing_chunk_count": missing_chunk_count,
+            "hot_chunk_count": len(rank0_shared_hot_keys),
+            "non_shm_hot_chunk_count": len(non_shm_hot_keys),
+            "required_bytes": required_bytes,
+            "per_chunk_physical_bytes_estimate": default_chunk_bytes,
+            "available_after_eviction": available_after_eviction,
+            "free_bytes": free_bytes,
+            "evictable_bytes": evictable_bytes,
+            "pinned_bytes": pinned_bytes,
+            "protected_hot_bytes": protected_hot_bytes,
+            "active_sparse_requests": len(active_sparse_requests),
+            "slab_size": slab_size,
+            "fits": required_bytes <= available_after_eviction,
+        }
+        return details
+
+    def _is_rank0_shared_mem_obj(self, mem_obj: MemoryObj) -> bool:
+        try:
+            local_cpu_backend = self._shared_local_cpu_backend()
+            allocator = getattr(local_cpu_backend, "memory_allocator", None)
+            if allocator is None:
+                return False
+            if getattr(allocator, "shm_name", None) != self.shared_cpu_cache_name:
+                return False
+            expected_parent = getattr(allocator, "pin_allocator", None)
+            if mem_obj.parent() is not expected_parent:
+                return False
+            buffer = getattr(allocator, "buffer", None)
+            if buffer is None:
+                return False
+            offset = int(mem_obj.metadata.address)
+            physical_size = int(mem_obj.metadata.phy_size)
+            return (
+                offset >= 0
+                and physical_size > 0
+                and offset + physical_size <= int(buffer.numel())
+            )
+        except Exception:
+            return False
+
+    def _copy_memory_obj_bytes(
+        self,
+        dst: MemoryObj,
+        src: MemoryObj,
+    ) -> None:
+        dst_tensor = dst.tensor
+        src_tensor = src.tensor
+        if dst_tensor is not None and src_tensor is not None:
+            dst_tensor.copy_(src_tensor, non_blocking=True)
+            return
+        dst_view = dst.byte_array
+        src_view = src.byte_array
+        logical_size = int(src.get_size())
+        dst_view[:logical_size] = src_view[:logical_size]
+
+    def _materialize_shared_rank0_copy(
+        self,
+        *,
+        key: CacheEngineKey,
+        src_obj: MemoryObj,
+        req_id: str,
+        phase: str,
+        layer_id: int,
+        kv_group: int,
+        chunk_index: int,
+    ) -> MemoryObj:
+        local_cpu_backend = self._shared_local_cpu_backend()
+        hot_obj = local_cpu_backend.get_blocking(key)
+        if hot_obj is not None:
+            if self._is_rank0_shared_mem_obj(hot_obj):
+                return hot_obj
+            hot_obj.ref_count_down()
+            local_cpu_backend.remove(key, force=True)
+
+        materialized = local_cpu_backend.allocate(
+            src_obj.get_shapes(),
+            src_obj.get_dtypes(),
+            fmt=src_obj.get_memory_format(),
+            eviction=True,
+            busy_loop=False,
+        )
+        if materialized is None:
+            raise ValueError(
+                "Shared CPU cache capacity error while materializing fetched "
+                "chunk into rank0 shm-backed LocalCPU: "
+                f"request_id={req_id}, phase={phase}, layer_id={layer_id}, "
+                f"kv_group={kv_group}, chunk_index={chunk_index}, "
+                f"key={key}, capacity={self._shared_cpu_capacity_snapshot()}"
+            )
+
+        try:
+            self._copy_memory_obj_bytes(materialized, src_obj)
+            local_cpu_backend.submit_put_task(key, materialized)
+            hot_obj = local_cpu_backend.get_blocking(key)
+            materialized.ref_count_down()
+            if hot_obj is None:
+                raise ValueError(
+                    "Shared CPU cache failed to install materialized chunk "
+                    "into rank0 hot cache: "
+                    f"request_id={req_id}, phase={phase}, layer_id={layer_id}, "
+                    f"kv_group={kv_group}, chunk_index={chunk_index}, key={key}"
+                )
+            if not self._is_rank0_shared_mem_obj(hot_obj):
+                hot_obj.ref_count_down()
+                raise ValueError(
+                    "Shared CPU cache materialized chunk is not shm-backed "
+                    "after LocalCPU install: "
+                    f"request_id={req_id}, phase={phase}, layer_id={layer_id}, "
+                    f"kv_group={kv_group}, chunk_index={chunk_index}, key={key}"
+                )
+            return hot_obj
+        except Exception:
+            try:
+                local_cpu_backend.remove(key, force=True)
+            except Exception:
+                logger.debug(
+                    "Failed to remove materialized shared CPU cache key after "
+                    "copy/install error",
+                    exc_info=True,
+                )
+            if materialized.is_valid():
+                materialized.ref_count_down()
+            raise
+
+    def _validate_rank0_shared_mem_obj(
+        self,
+        mem_obj: MemoryObj,
+        *,
+        req_id: str,
+        phase: str,
+        layer_id: int,
+        kv_group: int,
+        chunk_index: int,
+    ) -> None:
+        local_cpu_backend = self._shared_local_cpu_backend()
+        allocator = getattr(local_cpu_backend, "memory_allocator", None)
+        if allocator is None:
+            raise ValueError("LocalCPUBackend has no memory allocator")
+        if getattr(allocator, "shm_name", None) != self.shared_cpu_cache_name:
+            raise ValueError(
+                "Shared CPU cache object is not backed by the resolved shm slab: "
+                f"request_id={req_id}, phase={phase}, layer_id={layer_id}, "
+                f"kv_group={kv_group}, chunk_index={chunk_index}, "
+                f"allocator_shm={getattr(allocator, 'shm_name', None)!r}, "
+                f"expected={self.shared_cpu_cache_name!r}"
+            )
+        expected_parent = getattr(allocator, "pin_allocator", None)
+        if mem_obj.parent() is not expected_parent:
+            raise ValueError(
+                "Shared CPU cache object does not belong to rank0's shm-backed "
+                "LocalCPUBackend allocator: "
+                f"request_id={req_id}, phase={phase}, layer_id={layer_id}, "
+                f"kv_group={kv_group}, chunk_index={chunk_index}"
+            )
+        if mem_obj.get_dtype() is None:
+            raise ValueError(
+                "Shared CPU cache cannot publish dtype-less MemoryObj: "
+                f"request_id={req_id}, phase={phase}, layer_id={layer_id}, "
+                f"kv_group={kv_group}, chunk_index={chunk_index}"
+            )
+        if mem_obj.get_memory_format() == MemoryFormat.UNDEFINED:
+            raise ValueError(
+                "Shared CPU cache cannot publish MemoryObj with undefined format: "
+                f"request_id={req_id}, phase={phase}, layer_id={layer_id}, "
+                f"kv_group={kv_group}, chunk_index={chunk_index}"
+            )
+        slab_size = int(getattr(allocator, "buffer").numel())
+        offset = int(mem_obj.metadata.address)
+        physical_size = int(mem_obj.metadata.phy_size)
+        logical_size = int(mem_obj.get_size())
+        if (
+            offset < 0
+            or physical_size <= 0
+            or logical_size <= 0
+            or logical_size > physical_size
+            or offset + physical_size > slab_size
+        ):
+            raise ValueError(
+                "Shared CPU cache object has invalid slab bounds: "
+                f"request_id={req_id}, phase={phase}, layer_id={layer_id}, "
+                f"kv_group={kv_group}, chunk_index={chunk_index}, "
+                f"offset={offset}, logical_size={logical_size}, "
+                f"physical_size={physical_size}, slab_size={slab_size}"
+            )
+        if not mem_obj.is_pinned:
+            raise ValueError(
+                "Shared CPU cache object must be pinned before handle publication: "
+                f"request_id={req_id}, phase={phase}, layer_id={layer_id}, "
+                f"kv_group={kv_group}, chunk_index={chunk_index}"
+            )
+
+    def _find_shared_rank0_chunk_location(
+        self,
+        key: CacheEngineKey,
+    ) -> Optional[str]:
+        assert self.storage_manager is not None
+        local_cpu_backend = self._shared_local_cpu_backend()
+        if local_cpu_backend.contains(key):
+            return "LocalCPUBackend"
+        return self.storage_manager.contains(key, self.retrieve_locations)
+
+    def _resolve_shared_rank0_layer_mem_objs(
+        self,
+        *,
+        req_id: str,
+        phase: str,
+        layer_id: int,
+        kv_group: int,
+        keys_layer: list[CacheEngineKey],
+        chunk_locations: list[str],
+    ) -> list[MemoryObj]:
+        """Resolve one layer into rank0 shm-backed LocalCPU MemoryObjs.
+
+        The resolver is intentionally rank0-only. It checks LocalCPU hot_cache
+        first for every chunk, and only asks StorageManager for misses. The
+        returned objects each carry one caller reference and one request pin.
+        """
+        assert self.storage_manager is not None
+        local_cpu_backend = self._shared_local_cpu_backend()
+        if len(keys_layer) != len(chunk_locations):
+            raise ValueError(
+                "Shared CPU cache location metadata length mismatch: "
+                f"layer_id={layer_id}, kv_group={kv_group}, "
+                f"keys={len(keys_layer)}, locations={len(chunk_locations)}"
+            )
+
+        resolved: list[Optional[MemoryObj]] = [None] * len(keys_layer)
+        grouped_positions: dict[str, list[int]] = defaultdict(list)
+        acquired: list[MemoryObj] = []
+        pinned: list[MemoryObj] = []
+
+        try:
+            for chunk_index, (key, planned_location) in enumerate(
+                zip(keys_layer, chunk_locations, strict=True)
+            ):
+                hot_obj = local_cpu_backend.get_blocking(key)
+                if hot_obj is not None:
+                    if self._is_rank0_shared_mem_obj(hot_obj):
+                        logger.debug(
+                            "[req_id=%s kv_group=%s layer=%s chunk=%s] "
+                            "Shared CPU rank0 hot-cache hit",
+                            req_id,
+                            kv_group,
+                            layer_id,
+                            chunk_index,
+                        )
+                        resolved[chunk_index] = hot_obj
+                        acquired.append(hot_obj)
+                    else:
+                        logger.warning(
+                            "[req_id=%s kv_group=%s layer=%s chunk=%s] "
+                            "Shared CPU rank0 hot-cache object is not "
+                            "shm-backed; rematerializing into the shared "
+                            "LocalCPU slab before handle publication.",
+                            req_id,
+                            kv_group,
+                            layer_id,
+                            chunk_index,
+                        )
+                        try:
+                            materialized_obj = (
+                                self._materialize_shared_rank0_copy(
+                                    key=key,
+                                    src_obj=hot_obj,
+                                    req_id=req_id,
+                                    phase=phase,
+                                    layer_id=layer_id,
+                                    kv_group=kv_group,
+                                    chunk_index=chunk_index,
+                                )
+                            )
+                        finally:
+                            hot_obj.ref_count_down()
+                        resolved[chunk_index] = materialized_obj
+                        acquired.append(materialized_obj)
+                    continue
+                grouped_positions[planned_location].append(chunk_index)
+
+            for location, positions in grouped_positions.items():
+                if location == "LocalCPUBackend":
+                    raise ValueError(
+                        "Shared CPU cache hot-cache metadata was stale: "
+                        f"request_id={req_id}, phase={phase}, layer_id={layer_id}, "
+                        f"kv_group={kv_group}, positions={positions}"
+                    )
+                fetch_keys = [keys_layer[pos] for pos in positions]
+                fetched = self.storage_manager.batched_get(
+                    fetch_keys,
+                    location=location,
+                )
+                if len(fetched) != len(fetch_keys):
+                    raise ValueError(
+                        "Shared CPU cache backend returned unexpected result count: "
+                        f"request_id={req_id}, phase={phase}, layer_id={layer_id}, "
+                        f"kv_group={kv_group}, location={location}, "
+                        f"expected={len(fetch_keys)}, got={len(fetched)}"
+                    )
+                missing_positions: list[int] = []
+                for pos, fetched_obj in zip(positions, fetched, strict=True):
+                    key = keys_layer[pos]
+                    if fetched_obj is None:
+                        missing_positions.append(pos)
+                        continue
+
+                    hot_obj = local_cpu_backend.get_blocking(key)
+                    if hot_obj is not None and self._is_rank0_shared_mem_obj(hot_obj):
+                        acquired.append(hot_obj)
+                        fetched_obj.ref_count_down()
+                        resolved[pos] = hot_obj
+                    else:
+                        if hot_obj is not None:
+                            hot_obj.ref_count_down()
+                        materialized_obj = self._materialize_shared_rank0_copy(
+                            key=key,
+                            src_obj=fetched_obj,
+                            req_id=req_id,
+                            phase=phase,
+                            layer_id=layer_id,
+                            kv_group=kv_group,
+                            chunk_index=pos,
+                        )
+                        fetched_obj.ref_count_down()
+                        acquired.append(materialized_obj)
+                        resolved[pos] = materialized_obj
+
+                if missing_positions:
+                    raise ValueError(
+                        "Shared CPU cache missing required chunks during rank0 "
+                        "materialization. The chunks were absent from the "
+                        "requested backend or could not be staged into the "
+                        "shared LocalCPU slab under current capacity/eviction "
+                        "state: "
+                        f"request_id={req_id}, phase={phase}, layer_id={layer_id}, "
+                        f"kv_group={kv_group}, location={location}, "
+                        f"positions={missing_positions}, "
+                        f"capacity={self._shared_cpu_capacity_snapshot()}"
+                    )
+
+            mem_objs = [obj for obj in resolved if obj is not None]
+            if len(mem_objs) != len(keys_layer):
+                missing = [
+                    i for i, obj in enumerate(resolved)
+                    if obj is None
+                ]
+                raise ValueError(
+                    "Shared CPU cache failed to resolve all required chunks: "
+                    f"request_id={req_id}, phase={phase}, layer_id={layer_id}, "
+                    f"kv_group={kv_group}, missing_positions={missing}, "
+                    f"capacity={self._shared_cpu_capacity_snapshot()}"
+                )
+
+            for chunk_index, mem_obj in enumerate(mem_objs):
+                mem_obj.pin()
+                pinned.append(mem_obj)
+                self._validate_rank0_shared_mem_obj(
+                    mem_obj,
+                    req_id=req_id,
+                    phase=phase,
+                    layer_id=layer_id,
+                    kv_group=kv_group,
+                    chunk_index=chunk_index,
+                )
+            return mem_objs
+        except Exception:
+            for mem_obj in reversed(pinned):
+                mem_obj.unpin()
+            for mem_obj in reversed(acquired):
+                mem_obj.ref_count_down()
+            raise
+
+    def _retrieve_layer_shared_rank0(
+        self,
+        *,
+        starts: list[int],
+        ends: list[int],
+        keys_layer_major: list[list[CacheEngineKey]],
+        chunk_locations_layer_major: list[list[str]],
+        location: Optional[str],
+        ret_mask: torch.Tensor,
+        monitor_req_id: int,
+        req_id: str,
+        kv_group: int,
+        kwargs: dict[str, Any],
+    ) -> Generator[Optional[torch.Tensor], None, None]:
+        assert self.storage_manager is not None
+        assert self.gpu_connector is not None
+
+        phase = kwargs.get("shared_cpu_phase", "dense_prefix")
+        request_ordinal = int(kwargs.get("shared_cpu_request_ordinal", 0))
+        if not keys_layer_major:
+            for layer_id in range(self.num_layers):
+                self._broadcast_shared_envelope(
+                    SharedHandleEnvelope(
+                        request_id=req_id,
+                        phase=phase,
+                        request_ordinal=request_ordinal,
+                        layer_id=layer_id,
+                        kv_group=kv_group,
+                        status="skipped",
+                        generation=self.shared_cpu_cache_generation,
+                        handles=[],
+                        message="no dense prefix shared CPU cache chunks selected",
+                    )
+                )
+                yield None
+            yield None
+            self.stats_monitor.on_retrieve_finished(monitor_req_id, 0)
+            yield ret_mask
+            return
+
+        assert_layerwise_gpu_connector(self.gpu_connector)
+        mem_obj_consumer = self.gpu_connector.batched_to_gpu(starts, ends, **kwargs)
+        next(mem_obj_consumer)
+
+        to_release: list[MemoryObj] = []
+        to_unpin: list[MemoryObj] = []
+        try:
+            for layer_id in range(self.num_layers):
+                try:
+                    mem_objs_layer = self._resolve_shared_rank0_layer_mem_objs(
+                        req_id=req_id,
+                        phase=phase,
+                        layer_id=layer_id,
+                        kv_group=kv_group,
+                        keys_layer=keys_layer_major[layer_id],
+                        chunk_locations=chunk_locations_layer_major[layer_id],
+                    )
+                except Exception as exc:
+                    message = (
+                        "Shared CPU cache rank0 materialization failed before "
+                        "handle publication."
+                    )
+                    self._broadcast_shared_envelope(
+                        self._shared_layerwise_error_envelope(
+                            req_id=req_id,
+                            phase=phase,
+                            request_ordinal=request_ordinal,
+                            layer_id=layer_id,
+                            kv_group=kv_group,
+                            message=message,
+                            details={
+                                "error": str(exc),
+                                "location": location,
+                            },
+                        )
+                    )
+                    raise
+                to_unpin.extend(mem_objs_layer)
+                to_release.extend(mem_objs_layer)
+
+                handles = self._make_shared_handles_for_layer(
+                    req_id=req_id,
+                    phase=phase,
+                    keys_layer=keys_layer_major[layer_id],
+                    mem_objs_layer=mem_objs_layer,
+                    layer_id=layer_id,
+                    kv_group=kv_group,
+                )
+                self._broadcast_shared_envelope(
+                    SharedHandleEnvelope(
+                        request_id=req_id,
+                        phase=phase,
+                        request_ordinal=request_ordinal,
+                        layer_id=layer_id,
+                        kv_group=kv_group,
+                        status="ok",
+                        generation=self.shared_cpu_cache_generation,
+                        handles=handles,
+                    )
+                )
+
+                if layer_id == 0:
+                    yield torch.sum(ret_mask)
+                else:
+                    yield None
+
+                mem_obj_consumer.send(mem_objs_layer)
+
+            next(mem_obj_consumer)
+            retrieved_tokens = torch.sum(ret_mask)
+            self.stats_monitor.on_retrieve_finished(
+                monitor_req_id,
+                retrieved_tokens,
+            )
+            logger.info(
+                "[req_id=%s kv_group=%s] Shared CPU rank0 retrieved %d tokens",
+                req_id,
+                kv_group,
+                retrieved_tokens,
+            )
+            yield ret_mask
+        finally:
+            for mem_obj in to_unpin:
+                if getattr(mem_obj, "is_pinned", False):
+                    mem_obj.unpin()
+            for mem_obj in to_release:
+                mem_obj.ref_count_down()
+
+    def _retrieve_layer_shared_passive(
+        self,
+        *,
+        starts_all: list[int],
+        ends_all: list[int],
+        keys_layer_major: list[list[CacheEngineKey]],
+        ret_mask: torch.Tensor,
+        monitor_req_id: int,
+        req_id: str,
+        kv_group: int,
+        kwargs: dict[str, Any],
+    ) -> Generator[Optional[torch.Tensor], None, None]:
+        assert self.gpu_connector is not None
+        if self.shared_cpu_cache_passive_allocator is None:
+            raise ValueError(
+                "Shared CPU cache passive allocator is not initialized. "
+                "Startup preflight did not complete."
+            )
+
+        phase = kwargs.get("shared_cpu_phase", "dense_prefix")
+        request_ordinal = int(kwargs.get("shared_cpu_request_ordinal", 0))
+        assert_layerwise_gpu_connector(self.gpu_connector)
+        mem_obj_consumer = None
+        to_release: list[MemoryObj] = []
+        expected_handle_count: Optional[int] = None
+
+        try:
+            for layer_id in range(self.num_layers):
+                envelope = self._receive_shared_envelope()
+                self._validate_shared_layerwise_envelope(
+                    envelope,
+                    req_id=req_id,
+                    phase=phase,
+                    request_ordinal=request_ordinal,
+                    layer_id=layer_id,
+                    kv_group=kv_group,
+                )
+
+                if envelope.status in ("miss", "skipped"):
+                    if layer_id == 0:
+                        yield torch.sum(ret_mask)
+                    else:
+                        yield None
+                    continue
+
+                if expected_handle_count is None:
+                    expected_handle_count = len(envelope.handles)
+                    starts = starts_all[:expected_handle_count]
+                    ends = ends_all[:expected_handle_count]
+                    for start, end in zip(starts, ends, strict=False):
+                        ret_mask[start:end] = True
+                    mem_obj_consumer = self.gpu_connector.batched_to_gpu(
+                        starts,
+                        ends,
+                        **kwargs,
+                    )
+                    next(mem_obj_consumer)
+                elif len(envelope.handles) != expected_handle_count:
+                    raise ValueError(
+                        "Shared CPU cache passive received inconsistent handle "
+                        f"count at layer {layer_id}: {len(envelope.handles)} != "
+                        f"{expected_handle_count}"
+                    )
+
+                mem_objs_layer: list[MemoryObj] = []
+                for chunk_index, handle in enumerate(envelope.handles):
+                    expected_shape, expected_dtype, expected_fmt = (
+                        self._expected_shared_cpu_chunk_metadata(
+                            kv_group=kv_group,
+                            num_tokens=int(
+                                ends_all[chunk_index] - starts_all[chunk_index]
+                            ),
+                        )
+                    )
+                    mem_obj = self.shared_cpu_cache_passive_allocator.create_view(
+                        handle,
+                        expected_request_id=req_id,
+                        expected_phase=phase,
+                        expected_layer_id=layer_id,
+                        expected_kv_group=kv_group,
+                        expected_chunk_index=chunk_index,
+                        expected_key=keys_layer_major[layer_id][chunk_index],
+                        expected_shape=expected_shape,
+                        expected_dtype=expected_dtype,
+                        expected_fmt=expected_fmt,
+                        expected_cached_positions=list(
+                            range(
+                                int(starts_all[chunk_index]),
+                                int(ends_all[chunk_index]),
+                            )
+                        ),
+                        expected_producer_rank=self.metadata.first_rank,
+                    )
+                    mem_objs_layer.append(mem_obj)
+                    to_release.append(mem_obj)
+
+                if layer_id == 0:
+                    yield torch.sum(ret_mask)
+                else:
+                    yield None
+
+                assert mem_obj_consumer is not None
+                mem_obj_consumer.send(mem_objs_layer)
+
+            if mem_obj_consumer is not None:
+                next(mem_obj_consumer)
+
+            retrieved_tokens = torch.sum(ret_mask)
+            self.stats_monitor.on_retrieve_finished(monitor_req_id, retrieved_tokens)
+            logger.info(
+                "[req_id=%s kv_group=%s] Shared CPU passive retrieved %d tokens",
+                req_id,
+                kv_group,
+                retrieved_tokens,
+            )
+            yield ret_mask
+        finally:
+            for mem_obj in to_release:
+                if mem_obj.is_valid():
+                    mem_obj.ref_count_down()
+
+    def skip_shared_layerwise_retrieve(
+        self,
+        *,
+        req_id: str,
+        phase: str,
+        request_ordinal: int = 0,
+        kv_group: int,
+        message: str,
+        num_tokens: int = 0,
+    ) -> Generator[Optional[torch.Tensor], Any, None]:
+        """Ordered no-op shared retrieve for intentionally skipped groups."""
+        ret_mask = torch.zeros(num_tokens, dtype=torch.bool, device="cpu")
+        if not self.enable_shared_cpu_cache or self.metadata.world_size <= 1:
+            for _ in range(self.num_layers):
+                yield ret_mask
+            yield ret_mask
+            return
+
+        for layer_id in range(self.num_layers):
+            yield ret_mask
+            if self.metadata.is_first_rank():
+                self._broadcast_shared_envelope(
+                    SharedHandleEnvelope(
+                        request_id=req_id,
+                        phase=phase,
+                        request_ordinal=int(request_ordinal),
+                        layer_id=layer_id,
+                        kv_group=kv_group,
+                        status="skipped",
+                        generation=self.shared_cpu_cache_generation,
+                        handles=[],
+                        message=message,
+                    )
+                )
+            else:
+                envelope = self._receive_shared_envelope()
+                self._validate_shared_layerwise_envelope(
+                    envelope,
+                    req_id=req_id,
+                    phase=phase,
+                    request_ordinal=int(request_ordinal),
+                    layer_id=layer_id,
+                    kv_group=kv_group,
+                )
+                if envelope.status != "skipped":
+                    raise ValueError(
+                        "Shared CPU cache expected skipped envelope for "
+                        f"req_id={req_id}, phase={phase}, layer_id={layer_id}, "
+                        f"kv_group={kv_group}, got status={envelope.status!r}"
+                    )
+        yield ret_mask
 
     def set_health_monitor(self, health_monitor: "HealthMonitor") -> None:
         """
@@ -292,9 +1887,15 @@ class LMCacheEngine:
             lookup_server_worker_ids = self.config.get_lookup_server_worker_ids(
                 self.metadata.use_mla, self.metadata.world_size
             )
+            shared_passive_rank = (
+                self.enable_shared_cpu_cache
+                and self._is_passive()
+                and self.metadata.world_size > 1
+            )
+            need_layerwise_storage = self.use_layerwise and not shared_passive_rank
             if (
                 self.lmcache_worker is not None
-                or self.use_layerwise
+                or need_layerwise_storage
                 or not self.save_only_first_rank
                 or self.metadata.is_first_rank()
                 or len(lookup_server_worker_ids) == 0
@@ -306,13 +1907,38 @@ class LMCacheEngine:
                     f"save only first rank: {self.save_only_first_rank}"
                 )
                 async_lookup_server = kwargs.get("async_lookup_server", None)
-                self.storage_manager = StorageManager(
-                    self.config,
-                    self.metadata,
-                    event_manager=self.event_manager,
-                    lmcache_worker=self.lmcache_worker,
-                    async_lookup_server=async_lookup_server,
-                )
+                try:
+                    self.storage_manager = StorageManager(
+                        self.config,
+                        self.metadata,
+                        event_manager=self.event_manager,
+                        lmcache_worker=self.lmcache_worker,
+                        async_lookup_server=async_lookup_server,
+                    )
+                except Exception as exc:
+                    if (
+                        self.enable_shared_cpu_cache
+                        and self.metadata.world_size > 1
+                        and self.metadata.is_first_rank()
+                        and callable(getattr(self, "broadcast_object_fn", None))
+                    ):
+                        try:
+                            self.broadcast_object_fn(
+                                self._shared_cpu_cache_startup_envelope(
+                                    "error",
+                                    "Shared CPU cache rank0 failed while "
+                                    "initializing shm-backed StorageManager: "
+                                    f"{exc}",
+                                ),
+                                self.metadata.first_rank,
+                            )
+                        except Exception:
+                            logger.exception(
+                                "Failed to broadcast shared CPU cache startup "
+                                "error after rank0 StorageManager failure"
+                            )
+                    raise
+            self._post_init_shared_cpu_cache()
             self.post_inited = True
 
     def freeze(self, enabled: bool) -> None:
@@ -607,7 +2233,7 @@ class LMCacheEngine:
             return
 
         # Passive rank guard: when save_only_first_rank is enabled, only rank 0
-        # stores. This closes the known TODO at cache_engine.py:160-165 —
+        # stores. This closes the known TODO at cache_engine.py:160-165 -
         # previously store_layer had no _is_passive() check, causing duplicate
         # stores on non-rank-0 workers under MLA + layerwise.
         if self._is_passive():
@@ -968,7 +2594,12 @@ class LMCacheEngine:
             yield torch.zeros(len(tokens), dtype=torch.bool)
             return
 
-        assert self.storage_manager is not None
+        kv_group = kwargs.get("kv_group", 0)
+        shared_layerwise_retrieve = self._should_use_shared_layerwise_retrieve(
+            kv_group
+        )
+        if not (shared_layerwise_retrieve and self._is_passive()):
+            assert self.storage_manager is not None
         assert self.gpu_connector is not None, (
             "gpu_connector is required for retrieve_layer operation"
         )
@@ -993,7 +2624,139 @@ class LMCacheEngine:
             assert isinstance(request_configs, dict)
 
         location = None
-        kv_group = kwargs.get("kv_group", 0)
+        if shared_layerwise_retrieve and self._is_passive():
+            for start, end, key in self.token_database.process_tokens(
+                tokens=tokens,
+                mask=mask,
+                request_configs=request_configs,
+                kv_group=kv_group,
+            ):
+                assert isinstance(key, CacheEngineKey)
+                starts.append(start)
+                ends.append(end)
+                keys.append(key.split_layers(self.num_layers))
+
+            yield from self._retrieve_layer_shared_passive(
+                starts_all=starts,
+                ends_all=ends,
+                keys_layer_major=[list(row) for row in zip(*keys, strict=False)]
+                if keys
+                else [],
+                ret_mask=ret_mask,
+                monitor_req_id=monitor_req_id,
+                req_id=req_id,
+                kv_group=kv_group,
+                kwargs=kwargs,
+            )
+            return
+
+        if shared_layerwise_retrieve:
+            chunk_locations: list[list[str]] = []
+            missing_shared_chunks: list[dict[str, Any]] = []
+            phase = kwargs.get("shared_cpu_phase", "dense_prefix")
+            request_ordinal = int(kwargs.get("shared_cpu_request_ordinal", 0))
+            for start, end, key in self.token_database.process_tokens(
+                tokens=tokens,
+                mask=mask,
+                request_configs=request_configs,
+                kv_group=kv_group,
+            ):
+                assert isinstance(key, CacheEngineKey)
+
+                keys_multi_layer = key.split_layers(self.num_layers)
+                locations_multi_layer: list[str] = []
+                missing_layer = False
+                for layer_idx, layer_key in enumerate(keys_multi_layer):
+                    current_location = self._find_shared_rank0_chunk_location(
+                        layer_key
+                    )
+                    if current_location is None:
+                        # A missing layer0 is the normal dense-prefix miss
+                        # boundary. If layer0 exists but a later layer is
+                        # absent, the selected chunk is inconsistent and must
+                        # fail before handle publication in strict mode.
+                        if layer_idx != 0:
+                            missing_shared_chunks.append(
+                                {
+                                    "chunk_index": len(keys),
+                                    "layer_id": layer_idx,
+                                    "start": int(start),
+                                    "end": int(end),
+                                    "key": repr(layer_key),
+                                }
+                            )
+                        missing_layer = True
+                        break
+                    locations_multi_layer.append(current_location)
+                if missing_layer:
+                    break
+
+                starts.append(start)
+                ends.append(end)
+                keys.append(keys_multi_layer)
+                chunk_locations.append(locations_multi_layer)
+                ret_mask[start:end] = True
+
+            keys_layer_major = (
+                [list(row) for row in zip(*keys, strict=False)]
+                if keys
+                else []
+            )
+            chunk_locations_layer_major = (
+                [list(row) for row in zip(*chunk_locations, strict=False)]
+                if chunk_locations
+                else []
+            )
+            unique_locations = {
+                location
+                for locations_multi_layer in chunk_locations
+                for location in locations_multi_layer
+            }
+            location = (
+                next(iter(unique_locations))
+                if len(unique_locations) == 1
+                else "mixed"
+                if unique_locations
+                else None
+            )
+            if missing_shared_chunks and self.shared_cpu_cache_strict:
+                message = (
+                    "Shared CPU dense prefix layerwise retrieve missing required "
+                    "chunks before rank0 handle publication."
+                )
+                self._broadcast_shared_envelope(
+                    self._shared_layerwise_error_envelope(
+                        req_id=req_id,
+                        phase=phase,
+                        request_ordinal=request_ordinal,
+                        layer_id=0,
+                        kv_group=kv_group,
+                        message=message,
+                        details={
+                            "missing_chunks": missing_shared_chunks,
+                            "resolved_chunk_count": len(keys),
+                            "token_count": len(tokens),
+                        },
+                    )
+                )
+                raise ValueError(
+                    f"{message} req_id={req_id}, kv_group={kv_group}, "
+                    f"missing_chunks={missing_shared_chunks}"
+                )
+            yield from self._retrieve_layer_shared_rank0(
+                starts=starts,
+                ends=ends,
+                keys_layer_major=keys_layer_major,
+                chunk_locations_layer_major=chunk_locations_layer_major,
+                location=location,
+                ret_mask=ret_mask,
+                monitor_req_id=monitor_req_id,
+                req_id=req_id,
+                kv_group=kv_group,
+                kwargs=kwargs,
+            )
+            return
+
         for start, end, key in self.token_database.process_tokens(
             tokens=tokens,
             mask=mask,
@@ -1571,6 +3334,13 @@ class LMCacheEngine:
         except Exception as e:
             logger.error(f"Error closing storage_manager: {e}")
 
+        try:
+            if self.shared_cpu_cache_mapping is not None:
+                self.shared_cpu_cache_mapping.close()
+                self.shared_cpu_cache_mapping = None
+        except Exception as e:
+            logger.error(f"Error closing shared CPU cache mapping: {e}")
+
         logger.info("LMCacheEngine closed.")
 
     def _async_process_tokens_internal(
@@ -1963,20 +3733,36 @@ class LMCacheEngineBuilder:
         if save_only_first_rank and metadata.is_first_rank():
             # Only the first rank will save the cache,
             # so we need to set it lager than other ranks
-            first_rank_max_local_cpu_size = (
-                config.extra_config.get(
-                    "first_rank_max_local_cpu_size", max_local_cpu_size
+            shared_cpu_size_gb = (
+                config.get_extra_config_value(
+                    "shared_cpu_cache_size_gb",
+                    getattr(config, "shared_cpu_cache_size_gb", None),
                 )
-                if config.extra_config
-                else max_local_cpu_size
+                if config.get_extra_config_value(
+                    "enable_shared_cpu_cache",
+                    getattr(config, "enable_shared_cpu_cache", False),
+                )
+                else None
             )
+            if shared_cpu_size_gb is not None:
+                first_rank_max_local_cpu_size = float(shared_cpu_size_gb)
+            else:
+                first_rank_max_local_cpu_size = (
+                    config.extra_config.get(
+                        "first_rank_max_local_cpu_size", max_local_cpu_size
+                    )
+                    if config.extra_config
+                    else max_local_cpu_size
+                )
             return MixedMemoryAllocator(
                 int(first_rank_max_local_cpu_size * 1024**3),
                 numa_mapping=numa_mapping,
+                config=config,
             )
         return MixedMemoryAllocator(
             int(max_local_cpu_size * 1024**3),
             numa_mapping=numa_mapping,
+            config=config,
         )
 
     @staticmethod

@@ -576,6 +576,7 @@ class TestLocalCPUBackendAllocatorAlignment:
             kwargs = captured["kwargs"]
             assert isinstance(kwargs, dict)
             assert kwargs.get("align_bytes") == 4096
+            assert kwargs.get("config") is config
         finally:
             backend.memory_allocator.close()
 
@@ -584,6 +585,7 @@ class TestLocalCPUBackendAllocatorAlignment:
         config.max_local_cpu_size = 0.01
         config.extra_config = {
             "local_cpu.pinned_align_bytes": 4096,
+            "shm_name": "/lmcache-shared-align-test",
             "rust_raw_block.device_path": "/tmp/dev.bin",
             "rust_raw_block.use_odirect": False,
         }
@@ -611,5 +613,6 @@ class TestLocalCPUBackendAllocatorAlignment:
             kwargs = captured["kwargs"]
             assert isinstance(kwargs, dict)
             assert kwargs.get("align_bytes") == 4096
+            assert kwargs.get("config") is config
         finally:
             backend.memory_allocator.close()

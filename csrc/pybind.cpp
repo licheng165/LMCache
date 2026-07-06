@@ -66,8 +66,14 @@ PYBIND11_MODULE(c_ops, m) {
   m.def("free_numa_ptr", &free_numa_ptr);
   m.def("alloc_shm_pinned_ptr", &alloc_shm_pinned_ptr,
         py::call_guard<py::gil_scoped_release>());
+  m.def("attach_shm_pinned_ptr", &attach_shm_pinned_ptr,
+        py::arg("size"), py::arg("shm_name"), py::arg("writable") = true,
+        py::call_guard<py::gil_scoped_release>());
   m.def("free_shm_pinned_ptr", &free_shm_pinned_ptr,
         py::call_guard<py::gil_scoped_release>());
+  m.def("detach_shm_pinned_ptr", &detach_shm_pinned_ptr,
+        py::call_guard<py::gil_scoped_release>());
+  m.def("unlink_shm", &unlink_shm, py::call_guard<py::gil_scoped_release>());
   m.def("get_gpu_pci_bus_id", &get_gpu_pci_bus_id);
   m.def("multi_layer_block_kv_transfer", &multi_layer_block_kv_transfer,
         py::arg("paged_buffer_ptrs_tensor"), py::arg("lmcache_objects_ptrs"),

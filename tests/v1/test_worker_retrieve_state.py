@@ -14,6 +14,7 @@ from lmcache.integration.vllm.vllm_v1_adapter import (
     LMCacheConnectorV1Impl,
     LoadSpec,
     ReqMeta,
+    RequestTracker,
     WorkerRetrieveState,
 )
 from tests.v1.connector_test_utils import (
@@ -63,6 +64,487 @@ def _make_request(*, resumed: bool = False) -> ReqMeta:
 
 
 class TestWorkerRetrieveState:
+    def test_shared_cpu_cache_state_tracks_skipped_index(self):
+        state = WorkerRetrieveState()
+        state.shared_handles_by_group[0] = [["latent-handle"]]
+        state.shared_views_by_group[0] = [["latent-view"]]
+        state.shared_chunk_ptrs_npu_by_group[0] = [None]
+        state.shared_latent_status = "present"
+        state.shared_index_status = "skipped"
+        state.shared_generation = 3
+        state.pointer_cache_generation = 3
+        state.shared_request_active = True
+        state.request_scope_token = "req-1:3"
+
+        assert state.shared_latent_status == "present"
+        assert state.shared_index_status == "skipped"
+        assert state.shared_generation == 3
+        assert state.pointer_cache_generation == 3
+        assert state.shared_request_active is True
+        assert state.request_scope_token == "req-1:3"
+
+    def test_mark_shared_index_skipped_waits_for_latent_before_active(self):
+        state = WorkerRetrieveState()
+
+        LMCacheConnectorV1Impl._mark_shared_index_skipped(
+            state,
+            "req-1",
+            generation=7,
+            token_count=512,
+        )
+
+        assert state.shared_index_status == "skipped"
+        assert state.shared_latent_status == "missing"
+        assert state.shared_generation == 7
+        assert state.pointer_cache_generation == 0
+        assert state.shared_request_active is False
+        assert state.request_scope_token is None
+
+    def test_mark_shared_index_skipped_keeps_active_latent_state(self):
+        state = WorkerRetrieveState(shared_latent_status="present")
+
+        LMCacheConnectorV1Impl._mark_shared_index_skipped(
+            state,
+            "req-1",
+            generation=7,
+            token_count=512,
+        )
+
+        assert state.shared_index_status == "skipped"
+        assert state.shared_latent_status == "present"
+        assert state.shared_generation == 7
+        assert state.pointer_cache_generation == 7
+        assert state.shared_request_active is True
+        assert state.request_scope_token == "req-1:7:512"
+
+    def test_record_shared_state_preserves_skipped_index_without_index_objs(self):
+        impl = _make_impl()
+        impl.lmcache_engine = SimpleNamespace(
+            enable_shared_cpu_cache=True,
+            shared_cpu_cache_generation=7,
+            metadata=SimpleNamespace(is_first_rank=lambda: False),
+        )
+        state = WorkerRetrieveState(shared_index_status="skipped")
+        request = _make_request()
+        request.cached_memory_objs = [["latent-view"]]
+        request.cached_shared_handles = [["latent-handle"]]
+        request.cached_chunk_ptrs_npu = ["latent-ptrs"]
+
+        impl._record_shared_worker_retrieve_state(state, request)
+
+        assert state.shared_latent_status == "present"
+        assert state.shared_index_status == "skipped"
+        assert state.pointer_cache_generation == 7
+        assert state.shared_views_by_group == {0: [["latent-view"]]}
+        assert state.shared_handles_by_group == {0: [["latent-handle"]]}
+
+    def test_shared_cpu_config_value_reads_engine_extra_config(self):
+        impl = _make_impl()
+        impl.lmcache_engine = SimpleNamespace(
+            config=SimpleNamespace(
+                extra_config={
+                    "shared_cpu_materialize_index_on_decode_cold": False,
+                }
+            )
+        )
+
+        assert impl._shared_cpu_materialize_index_on_decode_cold() is False
+
+    def test_apply_extra_config_refreshes_vllm_capacity_hints(self):
+        impl = _make_impl()
+        config = SimpleNamespace(
+            extra_config={
+                "vllm_max_model_len": 1,
+                "vllm_max_num_seqs": 2,
+                "vllm_max_num_batched_tokens": 3,
+            }
+        )
+        vllm_config = SimpleNamespace(
+            kv_transfer_config=SimpleNamespace(kv_connector_extra_config={}),
+            model_config=SimpleNamespace(max_model_len=20000),
+            scheduler_config=SimpleNamespace(
+                max_num_seqs=32,
+                max_num_batched_tokens=4096,
+            ),
+        )
+
+        impl._apply_extra_config(config, vllm_config)
+
+        assert config.extra_config["vllm_max_model_len"] == 20000
+        assert config.extra_config["vllm_max_num_seqs"] == 32
+        assert config.extra_config["vllm_max_num_batched_tokens"] == 4096
+
+    def test_release_shared_cpu_cache_state_invalidates_request_scope(self):
+        class FakeMemObj:
+            def __init__(self, pinned: bool = False):
+                self.released = 0
+                self.unpinned = 0
+                self.is_pinned = pinned
+
+            def ref_count_down(self):
+                self.released += 1
+
+            def unpin(self):
+                self.unpinned += 1
+                self.is_pinned = False
+
+        passive_view = FakeMemObj()
+        backing_obj = FakeMemObj(pinned=True)
+        state = WorkerRetrieveState(
+            shared_views_by_group={0: [[passive_view]]},
+            cached_shared_handles=[["handle"]],
+            rank0_backing_objs_by_group={0: [[backing_obj]]},
+            shared_chunk_ptrs_npu_by_group={0: [None]},
+            shared_latent_status="present",
+            shared_index_status="skipped",
+            shared_request_active=True,
+            request_scope_token="req-1:4",
+        )
+
+        LMCacheConnectorV1Impl._release_shared_worker_retrieve_state(state)
+
+        assert passive_view.released == 1
+        assert backing_obj.unpinned == 1
+        assert state.shared_views_by_group == {}
+        assert state.cached_shared_handles == []
+        assert state.rank0_backing_objs_by_group == {}
+        assert state.shared_index_status == "missing"
+        assert state.shared_generation == 0
+        assert state.pointer_cache_generation == 0
+        assert state.shared_request_active is False
+        assert state.request_scope_token is None
+        assert state.cached_memory_objs == []
+        assert state.cached_tensors == []
+
+    def test_release_shared_cpu_cache_state_unregisters_engine_request(self):
+        state = WorkerRetrieveState(
+            req_id="req-1",
+            shared_request_active=True,
+            request_scope_token="req-1:4",
+        )
+        engine = SimpleNamespace(
+            release_shared_cpu_sparse_request=MagicMock(),
+        )
+
+        LMCacheConnectorV1Impl._release_shared_worker_retrieve_state(
+            state,
+            engine,
+        )
+
+        engine.release_shared_cpu_sparse_request.assert_called_once_with("req-1")
+        assert state.shared_request_active is False
+
+    def test_save_transfers_active_shared_state_without_releasing(self):
+        class FakeMemObj:
+            def __init__(self):
+                self.released = 0
+
+            def ref_count_down(self):
+                self.released += 1
+
+        impl = _make_impl()
+        impl.lmcache_engine = SimpleNamespace(enable_shared_cpu_cache=False)
+        view = FakeMemObj()
+        impl._worker_retrieve_state["req-1"] = WorkerRetrieveState(
+            cached_keys=[["old-k"]],
+            cached_starts=[0],
+            cached_ends=[256],
+            shared_views_by_group={0: [[view]]},
+            shared_latent_status="present",
+            shared_generation=8,
+            pointer_cache_generation=8,
+            shared_request_active=True,
+            request_scope_token="req-1:8:256",
+        )
+        request = _make_request()
+        request.cached_keys = [["new-k"]]
+        request.cached_starts = [0]
+        request.cached_ends = [256]
+
+        impl._save_worker_retrieve_state_from_request(
+            request,
+            location="LocalCPUBackend",
+            metadata_warm=True,
+            token_count=256,
+        )
+
+        state = impl._worker_retrieve_state["req-1"]
+        assert view.released == 0
+        assert state.shared_views_by_group == {0: [[view]]}
+        assert state.shared_request_active is True
+        assert state.pointer_cache_generation == 8
+        assert state.request_scope_token == "req-1:8:256"
+
+    def test_save_records_rank0_shared_backing_objs_for_cleanup(self):
+        class FakeMemObj:
+            def __init__(self):
+                self.released = 0
+                self.unpinned = 0
+                self.is_pinned = True
+
+            def ref_count_down(self):
+                self.released += 1
+
+            def unpin(self):
+                self.unpinned += 1
+                self.is_pinned = False
+
+        impl = _make_impl()
+        impl.lmcache_engine = SimpleNamespace(
+            enable_shared_cpu_cache=True,
+            shared_cpu_cache_generation=9,
+            metadata=SimpleNamespace(is_first_rank=lambda: True),
+        )
+        backing_obj = FakeMemObj()
+        request = _make_request()
+        request.cached_keys = [["k"]]
+        request.cached_starts = [0]
+        request.cached_ends = [256]
+        request.cached_memory_objs = [[backing_obj]]
+        request.cached_tensors = [["tensor"]]
+        request.cached_chunk_ptrs_npu = ["latent-ptrs"]
+        request.cached_shared_handles = [["handle"]]
+
+        impl._save_worker_retrieve_state_from_request(
+            request,
+            location="mixed",
+            metadata_warm=True,
+            token_count=256,
+        )
+
+        state = impl._worker_retrieve_state["req-1"]
+        assert state.shared_handles_by_group == {0: [["handle"]]}
+        assert state.cached_shared_handles == [["handle"]]
+        assert state.rank0_backing_objs_by_group == {0: [[backing_obj]]}
+        assert state.shared_latent_status == "present"
+        assert state.shared_generation == 9
+        assert state.pointer_cache_generation == 9
+        assert state.shared_request_active is True
+
+        LMCacheConnectorV1Impl._release_shared_worker_retrieve_state(state)
+        assert backing_obj.unpinned == 1
+        assert backing_obj.released == 1
+        assert state.cached_memory_objs == []
+
+    def test_save_records_rank0_shared_request_in_engine_registry(self):
+        class FakeMemObj:
+            is_pinned = True
+
+            def ref_count_down(self):
+                pass
+
+            def unpin(self):
+                pass
+
+        register = MagicMock()
+        impl = _make_impl()
+        impl.lmcache_engine = SimpleNamespace(
+            enable_shared_cpu_cache=True,
+            shared_cpu_cache_generation=9,
+            metadata=SimpleNamespace(is_first_rank=lambda: True),
+            register_shared_cpu_sparse_request=register,
+        )
+        request = _make_request()
+        request.token_ids = [1] * 512
+        request.cached_keys = [["k"]]
+        request.cached_starts = [0]
+        request.cached_ends = [256]
+        request.cached_memory_objs = [[FakeMemObj()]]
+        request.cached_chunk_ptrs_npu = ["latent-ptrs"]
+        request.cached_shared_handles = [["handle"]]
+
+        impl._save_worker_retrieve_state_from_request(
+            request,
+            location="mixed",
+            metadata_warm=True,
+            token_count=256,
+        )
+
+        register.assert_called_once_with(
+            "req-1",
+            token_count=512,
+            phase="sparse_decode_bootstrap",
+        )
+
+    def test_register_failure_releases_unstored_rank0_shared_objects(self):
+        class FakeMemObj:
+            def __init__(self):
+                self.released = 0
+                self.unpinned = 0
+                self.is_pinned = True
+
+            def ref_count_down(self):
+                self.released += 1
+
+            def unpin(self):
+                self.unpinned += 1
+                self.is_pinned = False
+
+        def fail_register(*_args, **_kwargs):
+            raise RuntimeError("capacity registry failed")
+
+        impl = _make_impl()
+        impl.lmcache_engine = SimpleNamespace(
+            enable_shared_cpu_cache=True,
+            shared_cpu_cache_generation=9,
+            metadata=SimpleNamespace(is_first_rank=lambda: True),
+            register_shared_cpu_sparse_request=fail_register,
+        )
+        backing_obj = FakeMemObj()
+        request = _make_request()
+        request.cached_keys = [["k"]]
+        request.cached_starts = [0]
+        request.cached_ends = [256]
+        request.cached_memory_objs = [[backing_obj]]
+        request.cached_chunk_ptrs_npu = ["latent-ptrs"]
+        request.cached_shared_handles = [["handle"]]
+
+        with pytest.raises(RuntimeError, match="capacity registry failed"):
+            impl._save_worker_retrieve_state_from_request(
+                request,
+                location="mixed",
+                metadata_warm=True,
+                token_count=256,
+            )
+
+        assert impl._worker_retrieve_state == {}
+        assert backing_obj.unpinned == 1
+        assert backing_obj.released == 1
+
+    def test_record_shared_state_rejects_missing_pointer_cache(self):
+        class FakeMemObj:
+            def __init__(self):
+                self.released = 0
+
+            def ref_count_down(self):
+                self.released += 1
+
+        impl = _make_impl()
+        impl.lmcache_engine = SimpleNamespace(
+            enable_shared_cpu_cache=True,
+            shared_cpu_cache_generation=9,
+            metadata=SimpleNamespace(is_first_rank=lambda: False),
+        )
+        passive_view = FakeMemObj()
+        request = _make_request()
+        request.cached_memory_objs = [[passive_view]]
+        request.cached_shared_handles = [["handle"]]
+
+        with pytest.raises(RuntimeError, match="pointer-cache install"):
+            impl._save_worker_retrieve_state_from_request(
+                request,
+                location="mixed",
+                metadata_warm=True,
+                token_count=256,
+            )
+        assert impl._worker_retrieve_state == {}
+        assert passive_view.released == 1
+
+    def test_save_failure_releases_unstored_rank0_shared_objects(self):
+        class FakeMemObj:
+            def __init__(self):
+                self.released = 0
+                self.unpinned = 0
+                self.is_pinned = True
+
+            def ref_count_down(self):
+                self.released += 1
+
+            def unpin(self):
+                self.unpinned += 1
+                self.is_pinned = False
+
+        impl = _make_impl()
+        impl.lmcache_engine = SimpleNamespace(
+            enable_shared_cpu_cache=True,
+            shared_cpu_cache_generation=9,
+            metadata=SimpleNamespace(is_first_rank=lambda: True),
+        )
+        backing_obj = FakeMemObj()
+        request = _make_request()
+        request.cached_keys = [["k"]]
+        request.cached_starts = [0]
+        request.cached_ends = [256]
+        request.cached_memory_objs = [[backing_obj]]
+        request.cached_shared_handles = [["handle"]]
+
+        with pytest.raises(RuntimeError, match="pointer-cache install"):
+            impl._save_worker_retrieve_state_from_request(
+                request,
+                location="mixed",
+                metadata_warm=True,
+                token_count=256,
+            )
+
+        assert "req-1" not in impl._worker_retrieve_state
+        assert backing_obj.unpinned == 1
+        assert backing_obj.released == 1
+
+    def test_save_failure_does_not_mutate_old_shared_state(self):
+        class FakeMemObj:
+            def __init__(self):
+                self.released = 0
+
+            def ref_count_down(self):
+                self.released += 1
+
+        impl = _make_impl()
+        impl.lmcache_engine = SimpleNamespace(
+            enable_shared_cpu_cache=True,
+            shared_cpu_cache_generation=9,
+            metadata=SimpleNamespace(is_first_rank=lambda: False),
+        )
+        old_view = FakeMemObj()
+        old_state = WorkerRetrieveState(
+            cached_keys=[["old-k"]],
+            cached_starts=[0],
+            cached_ends=[256],
+            shared_views_by_group={0: [[old_view]]},
+            shared_latent_status="present",
+            shared_generation=8,
+            pointer_cache_generation=8,
+            shared_request_active=True,
+            request_scope_token="req-1:8:256",
+        )
+        impl._worker_retrieve_state["req-1"] = old_state
+        new_view = FakeMemObj()
+        request = _make_request()
+        request.cached_keys = [["new-k"]]
+        request.cached_starts = [0]
+        request.cached_ends = [256]
+        request.cached_memory_objs = [[new_view]]
+        request.cached_shared_handles = [["new-handle"]]
+
+        with pytest.raises(RuntimeError, match="pointer-cache install"):
+            impl._save_worker_retrieve_state_from_request(
+                request,
+                location="mixed",
+                metadata_warm=True,
+                token_count=256,
+            )
+
+        assert impl._worker_retrieve_state["req-1"] is old_state
+        assert old_state.shared_views_by_group == {0: [[old_view]]}
+        assert old_state.pointer_cache_generation == 8
+        assert old_view.released == 0
+        assert new_view.released == 1
+
+    def test_dense_prefix_prime_interleaves_latent_and_indexer(self):
+        order = []
+
+        def _retriever(label):
+            order.append(f"{label}0")
+            yield None
+            order.append(f"{label}1")
+            yield None
+
+        latent = _retriever("latent")
+        index = _retriever("index")
+
+        LMCacheConnectorV1Impl._prime_dense_prefix_retrievers(latent, index)
+
+        assert order == ["latent0", "index0", "latent1", "index1"]
+
     def test_wait_for_layer_load_forwards_target_slot_row_by_request_id(self):
         req = make_sparse_req_meta("req-1", token_count=4)
         impl, _, _ = make_worker_connector([req], use_layerwise=True)
@@ -142,6 +624,8 @@ class TestWorkerRetrieveState:
 
     def test_bind_rehydrates_scheduler_empty_metadata(self):
         impl = _make_impl()
+        impl.config = SimpleNamespace(dsa_two_groups=False)
+        impl.lmcache_engine = SimpleNamespace(enable_shared_cpu_cache=False)
         request = _make_request()
         assert request.cached_keys == []
 
@@ -160,12 +644,104 @@ class TestWorkerRetrieveState:
         assert request.cached_starts == [0]
         assert request.cached_ends == [256]
 
+    def test_bind_rejects_stale_shared_generation(self):
+        impl = _make_impl()
+        impl.config = SimpleNamespace(dsa_two_groups=False)
+        impl.lmcache_engine = SimpleNamespace(
+            enable_shared_cpu_cache=True,
+            shared_cpu_cache_generation=2,
+        )
+        request = _make_request()
+        impl._worker_retrieve_state["req-1"] = WorkerRetrieveState(
+            cached_keys=[["layer0-key"]],
+            cached_starts=[0],
+            cached_ends=[256],
+            metadata_warm=True,
+            shared_latent_status="present",
+            shared_generation=1,
+            shared_request_active=True,
+        )
+
+        with pytest.raises(RuntimeError, match="generation mismatch"):
+            impl._bind_worker_retrieve_state_to_request(request)
+
+    def test_bind_rejects_stale_pointer_cache_generation(self):
+        impl = _make_impl()
+        impl.config = SimpleNamespace(dsa_two_groups=False)
+        impl.lmcache_engine = SimpleNamespace(
+            enable_shared_cpu_cache=True,
+            shared_cpu_cache_generation=2,
+        )
+        request = _make_request()
+        impl._worker_retrieve_state["req-1"] = WorkerRetrieveState(
+            cached_keys=[["layer0-key"]],
+            cached_starts=[0],
+            cached_ends=[256],
+            metadata_warm=True,
+            shared_latent_status="present",
+            shared_generation=2,
+            pointer_cache_generation=1,
+            shared_request_active=True,
+        )
+
+        with pytest.raises(RuntimeError, match="pointer-cache generation"):
+            impl._bind_worker_retrieve_state_to_request(request)
+
+    def test_bind_rejects_missing_shared_pointer_cache(self):
+        impl = _make_impl()
+        impl.config = SimpleNamespace(dsa_two_groups=False)
+        impl.lmcache_engine = SimpleNamespace(
+            enable_shared_cpu_cache=True,
+            shared_cpu_cache_generation=2,
+        )
+        request = _make_request()
+        impl._worker_retrieve_state["req-1"] = WorkerRetrieveState(
+            cached_keys=[["layer0-key"]],
+            cached_starts=[0],
+            cached_ends=[256],
+            cached_memory_objs=[["latent-view"]],
+            metadata_warm=True,
+            shared_latent_status="present",
+            shared_generation=2,
+            pointer_cache_generation=2,
+            shared_request_active=True,
+        )
+
+        with pytest.raises(RuntimeError, match="missing MLA latent"):
+            impl._bind_worker_retrieve_state_to_request(request)
+
+    def test_bind_rejects_missing_strict_shared_index(self):
+        impl = _make_impl()
+        impl.config = SimpleNamespace(dsa_two_groups=True)
+        impl.lmcache_engine = SimpleNamespace(
+            enable_shared_cpu_cache=True,
+            shared_cpu_cache_generation=3,
+            shared_cpu_materialize_index_on_decode_cold=True,
+        )
+        request = _make_request()
+        impl._worker_retrieve_state["req-1"] = WorkerRetrieveState(
+            cached_keys=[["layer0-key"]],
+            cached_starts=[0],
+            cached_ends=[256],
+            metadata_warm=True,
+            shared_latent_status="present",
+            shared_index_status="missing",
+            shared_generation=3,
+            shared_request_active=True,
+        )
+
+        with pytest.raises(RuntimeError, match="invalid DSA index"):
+            impl._bind_worker_retrieve_state_to_request(request)
+
     def test_save_then_bind_round_trip(self):
         impl = _make_impl()
+        impl.config = SimpleNamespace(dsa_two_groups=False)
+        impl.lmcache_engine = SimpleNamespace(enable_shared_cpu_cache=False)
         request = _make_request()
         request.cached_keys = [["k"]]
         request.cached_starts = [0]
         request.cached_ends = [256]
+        request.cached_shared_handles = [["handle"]]
 
         impl._save_worker_retrieve_state_from_request(
             request,
@@ -178,6 +754,42 @@ class TestWorkerRetrieveState:
         assert fresh.cached_keys == []
         impl._bind_worker_retrieve_state_to_request(fresh)
         assert fresh.cached_keys == [["k"]]
+        assert fresh.cached_shared_handles == [["handle"]]
+
+    def test_request_tracker_round_trip_preserves_shared_handles(self):
+        tracker = RequestTracker(
+            req_id="req-1",
+            prompt_len=512,
+            token_ids=list(range(512)),
+            allocated_block_ids=list(range(4)),
+            allocated_block_ids_indexer=list(range(4)),
+        )
+        tracker.cached_keys = [["latent-k"]]
+        tracker.cached_starts = [0]
+        tracker.cached_ends = [256]
+        tracker.cached_memory_objs = [["latent-mem"]]
+        tracker.cached_shared_handles = [["latent-handle"]]
+        tracker.cached_keys_indexer = [["index-k"]]
+        tracker.cached_starts_indexer = [0]
+        tracker.cached_ends_indexer = [256]
+        tracker.cached_memory_objs_indexer = [["index-mem"]]
+        tracker.cached_shared_handles_indexer = [["index-handle"]]
+
+        req_meta = ReqMeta.from_request_tracker(
+            tracker,
+            block_size=128,
+            lmcache_chunk_size=256,
+            load_spec=LoadSpec(
+                vllm_cached_tokens=0,
+                lmcache_cached_tokens=256,
+                can_load=True,
+            ),
+            dsa_two_groups=True,
+        )
+
+        assert req_meta is not None
+        assert req_meta.cached_shared_handles == [["latent-handle"]]
+        assert req_meta.cached_shared_handles_indexer == [["index-handle"]]
 
     def test_store_seed_merges_chunked_prefill_hot_cache(self):
         impl = _make_impl()
@@ -204,6 +816,8 @@ class TestWorkerRetrieveState:
             key="k1",
             tensor="t1",
         )
+        first.cached_shared_handles = [["h0"]]
+        second.cached_shared_handles = [["h1"]]
 
         impl._maybe_seed_worker_retrieve_state_from_store(first)
         impl._maybe_seed_worker_retrieve_state_from_store(second)
@@ -213,6 +827,7 @@ class TestWorkerRetrieveState:
         assert state.cached_ends == [4096, 8192]
         assert state.cached_keys == [["k0", "k1"]]
         assert state.cached_tensors == [["t0", "t1"]]
+        assert state.cached_shared_handles == [["h0", "h1"]]
         assert state.token_count == 8192
 
     def test_warm_kwargs_only_when_prefix_unchanged(self):

@@ -118,19 +118,23 @@ def alloc_shm_pinned_ptr(size: int, shm_name: str = "") -> int:
     """Non-CUDA equivalent of allocating shared memory pinned pointer.
     Uses multiprocessing.shared_memory for cross-platform POSIX shm."""
 
+    if size <= 0:
+        raise ValueError(
+            f"alloc_shm_pinned_ptr requires size > 0, got {size}"
+        )
+    if not shm_name:
+        raise ValueError("shm_name is required for alloc_shm_pinned_ptr")
+
     # Strip leading '/' for SharedMemory name
-    name = shm_name.lstrip("/") if shm_name else None
+    name = shm_name.lstrip("/")
 
-    # Clean up stale shm segment if it exists
-    if name:
-        try:
-            stale = shared_memory.SharedMemory(name=name, create=False)
-            stale.close()
-            stale.unlink()
-        except FileNotFoundError:
-            pass
-
-    shm = shared_memory.SharedMemory(name=name, create=True, size=size)
+    try:
+        shm = shared_memory.SharedMemory(name=name, create=True, size=size)
+    except FileExistsError as exc:
+        raise FileExistsError(
+            "shared CPU cache shm segment already exists; choose a unique "
+            f"shared_cpu_cache_name or clean up stale segment name={name!r}"
+        ) from exc
 
     array_type = ctypes.c_uint8 * size
     buf = array_type.from_buffer(shm.buf)
@@ -144,9 +148,44 @@ def alloc_shm_pinned_ptr(size: int, shm_name: str = "") -> int:
     return ptr
 
 
+def attach_shm_pinned_ptr(
+    size: int, shm_name: str = "", writable: bool = True
+) -> int:
+    """Attach to an existing shared-memory segment without unlink ownership."""
+
+    if size <= 0:
+        raise ValueError(
+            f"attach_shm_pinned_ptr requires size > 0, got {size}"
+        )
+    name = shm_name.lstrip("/") if shm_name else None
+    if not name:
+        raise ValueError("shm_name is required for attach_shm_pinned_ptr")
+
+    shm = shared_memory.SharedMemory(name=name, create=False)
+    if size > shm.size:
+        shm.close()
+        raise ValueError(
+            f"Requested attach size {size} exceeds shm segment {name} "
+            f"size {shm.size}"
+        )
+
+    array_type = ctypes.c_uint8 * size
+    buf = array_type.from_buffer(shm.buf)
+    ptr = ctypes.addressof(buf)
+
+    tensor = torch.frombuffer(buf, dtype=torch.uint8)
+    _tensor_registry[ptr] = tensor
+    _buf_registry[ptr] = buf
+    _shm_registry[ptr] = shm
+    return ptr
+
+
 def free_shm_pinned_ptr(ptr: int, size: int = 0, shm_name: str = "") -> None:
     """Non-CUDA equivalent of freeing a shared memory
     pinned pointer."""
+
+    if ptr == 0:
+        raise ValueError("free_shm_pinned_ptr requires non-null ptr")
 
     # Release in order: tensor -> ctypes buf -> shm
     _tensor_registry.pop(ptr, None)
@@ -155,3 +194,30 @@ def free_shm_pinned_ptr(ptr: int, size: int = 0, shm_name: str = "") -> None:
     if shm is not None:
         shm.close()
         shm.unlink()
+
+
+def detach_shm_pinned_ptr(ptr: int, size: int = 0) -> None:
+    """Detach from shared memory without unlinking the segment."""
+
+    if ptr == 0:
+        raise ValueError("detach_shm_pinned_ptr requires non-null ptr")
+
+    _tensor_registry.pop(ptr, None)
+    _buf_registry.pop(ptr, None)
+    shm = _shm_registry.pop(ptr, None)
+    if shm is not None:
+        shm.close()
+
+
+def unlink_shm(shm_name: str) -> None:
+    """Unlink an existing shared-memory segment by name."""
+
+    name = shm_name.lstrip("/") if shm_name else None
+    if not name:
+        raise ValueError("shm_name is required for unlink_shm")
+    try:
+        shm = shared_memory.SharedMemory(name=name, create=False)
+    except FileNotFoundError:
+        return
+    shm.close()
+    shm.unlink()

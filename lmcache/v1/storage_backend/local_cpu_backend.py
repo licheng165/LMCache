@@ -430,6 +430,7 @@ class LocalCPUBackend(AllocatorBackendInterface):
                     cpu_size_bytes,
                     numa_mapping=numa_mapping,
                     align_bytes=allocator_align_bytes,
+                    config=config,
                 )
             return MixedMemoryAllocator(
                 cpu_size_bytes,
