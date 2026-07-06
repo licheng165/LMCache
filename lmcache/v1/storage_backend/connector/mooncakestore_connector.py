@@ -13,7 +13,7 @@ import torch
 from lmcache.logging import init_logger
 from lmcache.utils import CacheEngineKey
 from lmcache.v1.config import LMCacheEngineConfig
-from lmcache.v1.memory_management import MemoryObj
+from lmcache.v1.memory_management import MemoryFormat, MemoryObj
 from lmcache.v1.protocol import RemoteMetadata
 from lmcache.v1.storage_backend.connector.base_connector import RemoteConnector
 from lmcache.v1.storage_backend.local_cpu_backend import LocalCPUBackend
@@ -108,6 +108,15 @@ class MooncakestoreConnector(RemoteConnector):
             self.save_chunk_meta,
             self.meta_shapes,
         )
+        self._dsa_raw_token_dims = self._resolve_dsa_raw_token_dims(
+            local_cpu_backend.config,
+            local_cpu_backend.metadata,
+        )
+        if self._dsa_raw_token_dims:
+            logger.info(
+                "Mooncake raw DSA group metadata override enabled: %s",
+                self._dsa_raw_token_dims,
+            )
 
         try:
             # Third Party
@@ -233,6 +242,125 @@ class MooncakestoreConnector(RemoteConnector):
         self._register_cpu_buffer()
 
         logger.info("MooncakeConnector initialized successfully.")
+
+    @staticmethod
+    def _resolve_dsa_raw_token_dims(
+        config: LMCacheEngineConfig,
+        metadata,
+    ) -> dict[int, int]:
+        if not getattr(config, "dsa_two_groups", False):
+            return {}
+        extra = config.extra_config or {}
+        override = extra.get("mooncake_dsa_raw_token_dims")
+        if override is not None:
+            if isinstance(override, str):
+                try:
+                    parsed = json.loads(override)
+                except json.JSONDecodeError:
+                    parsed = dict(
+                        item.split(":", 1) for item in override.split(",") if item
+                    )
+            else:
+                parsed = override
+            if isinstance(parsed, dict):
+                return {int(k): int(v) for k, v in parsed.items()}
+            if isinstance(parsed, (list, tuple)) and len(parsed) >= 2:
+                return {0: int(parsed[0]), 1: int(parsed[1])}
+            raise ValueError(
+                "mooncake_dsa_raw_token_dims must be a dict, list, or "
+                "'0:latent,1:indexer' string"
+            )
+
+        model_name = getattr(metadata, "model_name", "")
+        world_size = getattr(metadata, "world_size", None)
+        if "GLM-5.1-w4a8" in model_name and world_size == 8:
+            # Verification shortcut for current GLM DSA two-group layout:
+            # kv_group=0 latent payload is 536 bf16 elements/token;
+            # kv_group=1 indexer payload is 120 bf16 elements/token.
+            return {0: 536, 1: 120}
+        return {}
+
+    def _metadata_for_raw_key(
+        self,
+        key: CacheEngineKey,
+    ) -> tuple[list[torch.Size], list[torch.dtype], MemoryFormat, int]:
+        token_dims = self._dsa_raw_token_dims.get(key.kv_group)
+        if token_dims is None:
+            return (
+                self.meta_shapes,
+                self.meta_dtypes,
+                self.meta_fmt,
+                self.single_token_size,
+            )
+
+        dtype = self.meta_dtypes[0]
+        element_size = torch.empty((), dtype=dtype).element_size()
+        chunk_size = self.local_cpu_backend.metadata.chunk_size
+        fmt = (
+            MemoryFormat.KV_DSA_INDEX_FMT
+            if key.kv_group == 1
+            else MemoryFormat.KV_MLA_LATENT_FMT
+        )
+        return (
+            [torch.Size([chunk_size * token_dims])],
+            [dtype],
+            fmt,
+            token_dims * element_size,
+        )
+
+    @staticmethod
+    def _reshape_partial_chunk_with_token_size(
+        memory_obj: MemoryObj,
+        bytes_read: int,
+        single_token_size: int,
+    ) -> MemoryObj:
+        full_chunk_size = memory_obj.get_size()
+        if (
+            bytes_read == 0
+            or bytes_read % single_token_size != 0
+            or bytes_read > full_chunk_size
+        ):
+            raise ValueError(
+                f"bytes_read: {bytes_read} is illegal, "
+                f"single_token_size: {single_token_size}, "
+                f"full_chunk_size: {full_chunk_size}"
+            )
+
+        if bytes_read == full_chunk_size:
+            return memory_obj
+
+        shape_list = list(memory_obj.meta.shape)
+        if len(shape_list) == 1:
+            dtype = memory_obj.meta.dtype
+            if dtype is None and memory_obj.meta.dtypes:
+                dtype = memory_obj.meta.dtypes[0]
+            if dtype is None:
+                raise ValueError(
+                    "Cannot reshape 1D partial chunk without dtype metadata"
+                )
+            element_size = torch.empty((), dtype=dtype).element_size()
+            if bytes_read % element_size != 0:
+                raise ValueError(
+                    f"bytes_read: {bytes_read} is not aligned to element size: "
+                    f"{element_size}"
+                )
+            shape_list[0] = bytes_read // element_size
+        else:
+            token_dim = memory_obj.meta.fmt.token_dim()
+            if token_dim >= len(shape_list):
+                raise ValueError(
+                    f"Cannot reshape partial chunk with shape={memory_obj.meta.shape} "
+                    f"and fmt={memory_obj.meta.fmt}"
+                )
+            shape_list[token_dim] = bytes_read // single_token_size
+
+        actual_shape = torch.Size(shape_list)
+        memory_obj.raw_data = memory_obj.raw_data[:bytes_read]
+        memory_obj.meta.shape = actual_shape
+        if memory_obj.meta.shapes:
+            memory_obj.meta.shapes = [actual_shape]
+
+        return memory_obj
 
     def _register_cpu_buffer(self):
         """Register CPU buffer for zero-copy operations."""
@@ -375,16 +503,21 @@ class MooncakestoreConnector(RemoteConnector):
         buffer_ptrs: list[int] = []
         buffer_sizes: list[int] = []
 
-        for i, _ in enumerate(keys):
+        single_token_sizes: dict[int, int] = {}
+        for i, key in enumerate(keys):
+            meta_shapes, meta_dtypes, meta_fmt, single_token_size = (
+                self._metadata_for_raw_key(key)
+            )
             obj = self.local_cpu_backend.allocate(
-                self.meta_shapes, self.meta_dtypes, self.meta_fmt
+                meta_shapes, meta_dtypes, meta_fmt
             )
             memory_objs.append(obj)
             if obj is not None and obj.raw_tensor is not None:
                 valid_idx.append(i)
+                single_token_sizes[i] = single_token_size
 
                 # Prepare the argument lists for the C++ call
-                key_strs.append(keys[i].to_string())
+                key_strs.append(key.to_string())
                 buffer_ptrs.append(obj.data_ptr)
                 buffer_sizes.append(obj.get_size())
 
@@ -412,9 +545,10 @@ class MooncakestoreConnector(RemoteConnector):
                     continue
 
                 try:
-                    results[i] = self.reshape_partial_chunk(
+                    results[i] = self._reshape_partial_chunk_with_token_size(
                         memory_objs[i],  # type: ignore
                         n_read,
+                        single_token_sizes[i],
                     )
                 except Exception as exc:
                     logger.error(f"Reshape failed for key {keys[i]}: {exc}")
