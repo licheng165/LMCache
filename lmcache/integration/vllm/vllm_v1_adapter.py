@@ -1303,7 +1303,7 @@ class LMCacheConnectorV1Impl:
         return len(self._kvcaches_for_group(kv_group))
 
     def _is_dsa_two_groups(self) -> bool:
-        return bool(getattr(self.config, "dsa_two_groups", False))
+        return bool(getattr(getattr(self, "config", None), "dsa_two_groups", False))
 
     def _shared_cpu_config_value(self, key: str, default: Any = None) -> Any:
         engine = getattr(self, "lmcache_engine", None)
@@ -1372,6 +1372,17 @@ class LMCacheConnectorV1Impl:
             state.shared_request_active = True
             state.pointer_cache_generation = generation
             state.request_scope_token = f"{req_id}:{generation}:{token_count}"
+
+    @staticmethod
+    def _clear_request_indexer_cache(request: ReqMeta) -> None:
+        request.cached_keys_indexer.clear()
+        request.cached_starts_indexer.clear()
+        request.cached_ends_indexer.clear()
+        request.cached_memory_objs_indexer.clear()
+        request.cached_tensors_indexer.clear()
+        request.cached_chunk_dev_ptrs_indexer.clear()
+        request.cached_chunk_ptrs_npu_indexer.clear()
+        request.cached_shared_handles_indexer.clear()
 
     def _validate_shared_worker_retrieve_state(
         self,
@@ -2083,11 +2094,19 @@ class LMCacheConnectorV1Impl:
         pending_views_by_group: dict[int, list[list[Any]]] = {}
         pending_backing_by_group: dict[int, list[list[Any]]] = {}
         pending_chunk_ptrs_by_group: dict[int, list[Optional[torch.Tensor]]] = {}
+        materialize_index = (
+            self._is_dsa_two_groups()
+            and self._sparse_decode_requires_index_materialization(
+                request,
+                True,
+            )
+        )
+        skip_index_hot_state = self._is_dsa_two_groups() and not materialize_index
 
         groups: list[tuple[int, list[list], list[list]]] = [
             (0, request.cached_memory_objs, request.cached_shared_handles),
         ]
-        if request.cached_memory_objs_indexer:
+        if materialize_index and request.cached_memory_objs_indexer:
             groups.append(
                 (
                     1,
@@ -2146,11 +2165,15 @@ class LMCacheConnectorV1Impl:
             )
             state.shared_index_status = (
                 "present"
-                if layer_has_entries(request.cached_memory_objs_indexer)
+                if (
+                    materialize_index
+                    and layer_has_entries(request.cached_memory_objs_indexer)
+                )
                 else "skipped"
                 if (
                     getattr(request, "shared_index_skipped", False)
                     or state.shared_index_status == "skipped"
+                    or skip_index_hot_state
                 )
                 else "missing"
             )
@@ -2874,6 +2897,7 @@ class LMCacheConnectorV1Impl:
 
                     if indexer_skipped:
                         request.shared_index_skipped = True
+                        self._clear_request_indexer_cache(request)
                     if shared_cpu_enabled:
                         logger.debug(
                             "Deferring shared CPU sparse retrieve state save "
