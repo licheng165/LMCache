@@ -210,6 +210,12 @@ class TokenDatabase(metaclass=abc.ABCMeta):
         kv_group: int = 0,
     ):
         assert self.metadata is not None
+        dtypes = self.metadata.get_dtypes()
+        kv_dtype = (
+            dtypes[kv_group]
+            if 0 <= kv_group < len(dtypes)
+            else self.metadata.kv_dtype
+        )
         # When save_only_first_rank is enabled (for MLA), we deliberately
         # collapse the CacheEngineKey.world_size to 1 so that cache keys
         # become world-size agnostic across compatible deployments.
@@ -218,7 +224,7 @@ class TokenDatabase(metaclass=abc.ABCMeta):
             self.metadata.world_size if not self.save_only_first_rank else 1,
             self.metadata.worker_id,
             chunk_hash,
-            self.metadata.kv_dtype,
+            kv_dtype,
             request_configs,
             kv_group=kv_group,
         )
@@ -534,7 +540,9 @@ class SegmentTokenDatabase(TokenDatabase):
                             start_idx,
                             end_idx,
                             self._make_key_by_hash(
-                                self._hash_tokens(token_chunk), request_configs
+                                self._hash_tokens(token_chunk),
+                                request_configs,
+                                kv_group=kv_group,
                             ),
                         )
                     else:

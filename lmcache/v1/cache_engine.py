@@ -480,6 +480,28 @@ class LMCacheEngine:
             return dtypes[kv_group]
         return self.metadata.kv_dtype
 
+    def _metadata_shapes_dtypes_for_kv_group(
+        self,
+        *,
+        kv_group: int,
+        num_tokens: int,
+    ):
+        shapes = self.metadata.get_shapes(num_tokens)
+        dtypes = self.metadata.get_dtypes()
+        if len(shapes) <= 1:
+            return shapes, dtypes
+        if kv_group < 0 or kv_group >= len(shapes):
+            raise ValueError(
+                "KV group is out of range for LMCache metadata shapes: "
+                f"kv_group={kv_group}, num_groups={len(shapes)}"
+            )
+        if kv_group >= len(dtypes):
+            raise ValueError(
+                "KV group is out of range for LMCache metadata dtypes: "
+                f"kv_group={kv_group}, num_dtypes={len(dtypes)}"
+            )
+        return shapes[kv_group], dtypes[kv_group]
+
     def _shape_numel_without_layer_dim(self, shape: torch.Size) -> int:
         dims = [int(dim) for dim in shape]
         if (
@@ -1368,11 +1390,27 @@ class LMCacheEngine:
                 f"request_id={req_id}, phase={phase}, layer_id={layer_id}, "
                 f"kv_group={kv_group}, chunk_index={chunk_index}"
             )
+        expected_dtype = self._shared_cpu_dtype_for_kv_group(kv_group)
+        if mem_obj.get_dtype() != expected_dtype:
+            raise ValueError(
+                "Shared CPU cache object dtype does not match KV group: "
+                f"request_id={req_id}, phase={phase}, layer_id={layer_id}, "
+                f"kv_group={kv_group}, chunk_index={chunk_index}, "
+                f"dtype={mem_obj.get_dtype()}, expected={expected_dtype}"
+            )
+        expected_fmt = self._memory_format_for_kv_group(kv_group)
         if mem_obj.get_memory_format() == MemoryFormat.UNDEFINED:
             raise ValueError(
                 "Shared CPU cache cannot publish MemoryObj with undefined format: "
                 f"request_id={req_id}, phase={phase}, layer_id={layer_id}, "
                 f"kv_group={kv_group}, chunk_index={chunk_index}"
+            )
+        if mem_obj.get_memory_format() != expected_fmt:
+            raise ValueError(
+                "Shared CPU cache object format does not match KV group: "
+                f"request_id={req_id}, phase={phase}, layer_id={layer_id}, "
+                f"kv_group={kv_group}, chunk_index={chunk_index}, "
+                f"fmt={mem_obj.get_memory_format()}, expected={expected_fmt}"
             )
         slab_size = int(getattr(allocator, "buffer").numel())
         offset = int(mem_obj.metadata.address)
@@ -2156,8 +2194,10 @@ class LMCacheEngine:
                 assert isinstance(key, CacheEngineKey)
                 # Allocate the memory object
                 num_tokens = end - start
-                kv_shapes = self.metadata.get_shapes(num_tokens)
-                kv_dtypes = self.metadata.get_dtypes()
+                kv_shapes, kv_dtypes = self._metadata_shapes_dtypes_for_kv_group(
+                    kv_group=kv_group,
+                    num_tokens=num_tokens,
+                )
 
                 # TODO (Jiayi): should be batched in the future
                 memory_obj = self.storage_manager.allocate(
@@ -2344,13 +2384,13 @@ class LMCacheEngine:
         keys = []
         memory_objs = []
         tot_token_num = 0
-        kv_dtype = self.metadata.kv_dtype
         request_configs = kwargs.get("request_configs")
         if request_configs is not None and len(request_configs) != 0:
             assert isinstance(request_configs, dict)
 
         prev_key = 0
         kv_group = kwargs.get("kv_group", 0)
+        kv_dtype = self._shared_cpu_dtype_for_kv_group(kv_group)
         store_fmt = self._memory_format_for_kv_group(kv_group)
         for start, end, key in self.token_database.process_tokens(
             tokens=tokens, mask=mask, request_configs=request_configs,
