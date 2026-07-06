@@ -2,6 +2,7 @@
 # Standard
 from collections.abc import Iterable
 from dataclasses import dataclass, field
+from types import SimpleNamespace
 from typing import TYPE_CHECKING, Any, Generator, Optional, Union
 import os
 
@@ -1124,6 +1125,15 @@ class LMCacheConnectorV1Impl:
     def lmcache_engine(self) -> Optional[LMCacheEngine]:
         """Get the LMCache engine instance from manager."""
         return self._manager.lmcache_engine
+
+    @lmcache_engine.setter
+    def lmcache_engine(self, value: Optional[LMCacheEngine]) -> None:
+        """Set the LMCache engine instance on manager-backed adapters."""
+        manager = getattr(self, "_manager", None)
+        if manager is None:
+            self._manager = SimpleNamespace(lmcache_engine=value)
+            return
+        manager.lmcache_engine = value
 
     @property
     def lmcache_engine_metadata(self):

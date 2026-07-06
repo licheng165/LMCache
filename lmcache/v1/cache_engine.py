@@ -650,9 +650,10 @@ class LMCacheEngine:
                     self.metadata.first_rank,
                 )
             except Exception as exc:
-                if self.shared_cpu_cache_mapping is not None:
+                mapping = getattr(self, "shared_cpu_cache_mapping", None)
+                if mapping is not None:
                     try:
-                        self.shared_cpu_cache_mapping.close()
+                        mapping.close()
                         self.shared_cpu_cache_mapping = None
                     except Exception:
                         logger.exception(

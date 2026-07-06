@@ -39,43 +39,47 @@ def check_extra_config(config: "LMCacheEngineConfig"):
 
 def test_shared_cpu_cache_requires_local_cpu():
     with pytest.raises(ValueError, match="requires local_cpu=true") as exc_info:
-        LMCacheEngineConfig.from_defaults(
+        config = LMCacheEngineConfig.from_defaults(
             local_cpu=False,
             extra_config={"enable_shared_cpu_cache": True},
         )
+        config.validate()
     assert "max_local_cpu_size" in str(exc_info.value)
     assert "shared_cpu_cache_size_gb" in str(exc_info.value)
 
 
 def test_shared_cpu_cache_requires_positive_rank0_cpu_size():
     with pytest.raises(ValueError, match="max_local_cpu_size > 0") as exc_info:
-        LMCacheEngineConfig.from_defaults(
+        config = LMCacheEngineConfig.from_defaults(
             max_local_cpu_size=0,
             extra_config={"enable_shared_cpu_cache": True},
         )
+        config.validate()
     assert "local_cpu" in str(exc_info.value)
     assert "enable_shared_cpu_cache" in str(exc_info.value)
 
 
 def test_shared_cpu_cache_rejects_non_positive_size_override():
     with pytest.raises(ValueError, match="shared_cpu_cache_size_gb"):
-        LMCacheEngineConfig.from_defaults(
+        config = LMCacheEngineConfig.from_defaults(
             extra_config={
                 "enable_shared_cpu_cache": True,
                 "shared_cpu_cache_size_gb": 0,
             },
         )
+        config.validate()
 
 
 def test_shared_cpu_cache_rejects_conflicting_names():
     with pytest.raises(ValueError, match="must not conflict"):
-        LMCacheEngineConfig.from_defaults(
+        config = LMCacheEngineConfig.from_defaults(
             extra_config={
                 "enable_shared_cpu_cache": True,
                 "shared_cpu_cache_name": "/shared-a",
                 "shm_name": "/shared-b",
             },
         )
+        config.validate()
 
 
 def test_shared_cpu_cache_dense_layerwise_contract_is_engine_level():

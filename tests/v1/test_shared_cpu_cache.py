@@ -123,6 +123,7 @@ def _make_engine_for_sparse_capacity(*, max_local_cpu_size: float):
     return engine
 
 
+@pytest.mark.no_shared_allocator
 def test_shared_cpu_size_override_wins_over_first_rank_size(monkeypatch):
     captured = {}
 
@@ -155,7 +156,11 @@ def test_shared_cpu_size_override_wins_over_first_rank_size(monkeypatch):
     )
     metadata = SimpleNamespace(use_mla=True, is_first_rank=lambda: True)
 
-    allocator = LMCacheEngineBuilder._Create_memory_allocator(config, metadata)
+    allocator = LMCacheEngineBuilder._Create_memory_allocator(
+        config,
+        metadata,
+        None,
+    )
 
     assert isinstance(allocator, DummyMixedMemoryAllocator)
     assert captured["size"] == 3 * 1024**3
@@ -1018,13 +1023,22 @@ def test_shared_slab_preflight_reports_null_device_ptr(monkeypatch):
 
 
 def test_shared_slab_attach_falls_back_to_non_cuda_equivalents(monkeypatch):
+    import lmcache
+
+    fallback_ops = SimpleNamespace(
+        attach_shm_pinned_ptr=lambda size, name, writable: 4321,
+    )
     monkeypatch.delitem(sys.modules, "lmcache.c_ops", raising=False)
     monkeypatch.setitem(
         sys.modules,
         "lmcache.non_cuda_equivalents",
-        SimpleNamespace(
-            attach_shm_pinned_ptr=lambda size, name, writable: 4321,
-        ),
+        fallback_ops,
+    )
+    monkeypatch.setattr(
+        lmcache,
+        "non_cuda_equivalents",
+        fallback_ops,
+        raising=False,
     )
     monkeypatch.setattr(
         SharedSlabMapping,
