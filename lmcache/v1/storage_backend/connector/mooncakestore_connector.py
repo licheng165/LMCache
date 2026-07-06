@@ -275,9 +275,9 @@ class MooncakestoreConnector(RemoteConnector):
         world_size = getattr(metadata, "world_size", None)
         if "GLM-5.1-w4a8" in model_name and world_size == 8:
             # Verification shortcut for current GLM DSA two-group layout:
-            # kv_group=0 latent payload is 536 bf16 elements/token;
-            # kv_group=1 indexer payload is 120 bf16 elements/token.
-            return {0: 536, 1: 120}
+            # kv_group=0 latent payload is (k=512 + v=64) bf16 elements/token;
+            # kv_group=1 indexer payload is 128 bf16 elements/token.
+            return {0: 576, 1: 128}
         return {}
 
     def _metadata_for_raw_key(
