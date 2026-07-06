@@ -326,6 +326,9 @@ class RequestTracker:
     sparse_token_ids: list[int] = field(default_factory=list, repr=False)
     # Sparse decode only: single-element list holding CPU then NPU slot_mapping.
     sparse_slot_mapping: list[torch.Tensor] = field(default_factory=list, repr=False)
+    sparse_indexer_slot_mapping: list[torch.Tensor] = field(
+        default_factory=list, repr=False
+    )
     # Sparse decode only: reused across decode steps to avoid per-step allocation.
     sparse_decode_token_mask: Optional[torch.Tensor] = field(default=None, repr=False)
     sparse_decode_ret_mask: Optional[torch.Tensor] = field(default=None, repr=False)
@@ -419,6 +422,7 @@ class RequestTracker:
             )
             self.sparse_token_ids.clear()
             self.sparse_slot_mapping.clear()
+            self.sparse_indexer_slot_mapping.clear()
             self.sparse_decode_token_mask = None
             self.sparse_decode_ret_mask = None
             self.cached_keys.clear()
@@ -815,13 +819,15 @@ class ReqMeta:
                     block_size,
                 )
             if is_sparse_decode and load_spec is not None and load_spec.can_load:
-                indexer_slot_mapping = [
-                    _build_slot_mapping(
-                        tracker.allocated_block_ids_indexer,
-                        block_size,
-                        slot_mapping[0].numel(),
+                if not tracker.sparse_indexer_slot_mapping:
+                    tracker.sparse_indexer_slot_mapping.append(
+                        _build_slot_mapping(
+                            tracker.allocated_block_ids_indexer,
+                            block_size,
+                            slot_mapping[0].numel(),
+                        )
                     )
-                ]
+                indexer_slot_mapping = tracker.sparse_indexer_slot_mapping
             elif not is_sparse_decode:
                 indexer_slot_mapping = [
                     _build_slot_mapping(
@@ -1615,6 +1621,22 @@ class LMCacheConnectorV1Impl:
         if lmcache_cached_tokens < len(idx_slot):
             idx_slot = idx_slot[:lmcache_cached_tokens]
         return idx_slot
+
+    def _indexer_save_slot_mapping(
+        self,
+        request: "ReqMeta",
+        attn_metadata,
+        layer_name: Optional[str],
+        token_count: int,
+    ) -> Optional[torch.Tensor]:
+        """Return indexer save slots, preferring scheduler request metadata."""
+        if request.indexer_slot_mapping:
+            candidate = request.indexer_slot_mapping[0]
+            if len(candidate) >= token_count:
+                return candidate
+        return self._indexer_slot_mapping_from_attn_metadata(
+            attn_metadata, layer_name
+        )
 
     def _sparse_indexer_slot_mapping(
         self,
@@ -2775,6 +2797,19 @@ class LMCacheConnectorV1Impl:
                                 if request.indexer_slot_mapping
                                 else None
                             )
+                            if (
+                                request_indexer_slots is not None
+                                and request_indexer_slots.device.type
+                                != torch.device(self.device).type
+                            ):
+                                request.indexer_slot_mapping[0] = (
+                                    request_indexer_slots.to(
+                                        device=self.device, dtype=torch.long
+                                    )
+                                )
+                                request_indexer_slots = (
+                                    request.indexer_slot_mapping[0]
+                                )
                             idx_slot = self._sparse_indexer_slot_mapping(
                                 attn_metadata,
                                 latent_sparse_slots,
@@ -3507,16 +3542,20 @@ class LMCacheConnectorV1Impl:
                     )
 
                 # Latent save matches dev-qzy: use scheduler request.slot_mapping
-                # (cumulative across chunked-prefill steps). Indexer save still
-                # uses per-layer attn metadata + chunk-local padding below.
+                # (cumulative across chunked-prefill steps). Indexer save should
+                # prefer the scheduler request.indexer_slot_mapping for symmetry
+                # with retrieve, then fall back to per-layer attention metadata.
 
                 # Two-group DSA: for indexer layers, use the indexer group's
                 # slot mapping. vLLM may pass a per-layer metadata dict; the
                 # indexer metadata stores this as "slot_mapping", while the
                 # latent metadata stores it as "indexer_slot_mapping".
                 if is_indexer_layer:
-                    idx_slot = self._indexer_slot_mapping_from_attn_metadata(
-                        attn_metadata, layer_name
+                    idx_slot = self._indexer_save_slot_mapping(
+                        request,
+                        attn_metadata,
+                        layer_name,
+                        len(token_ids),
                     )
                     if idx_slot is not None:
                         slot_mapping = idx_slot.to(

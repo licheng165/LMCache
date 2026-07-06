@@ -162,6 +162,23 @@ class TestFullHitRecalcLast:
             req_meta.slot_mapping[0],
             req_meta.indexer_slot_mapping[0],
         )
+        first_indexer_slots = req_meta.indexer_slot_mapping[0]
+
+        req_meta_again = ReqMeta.from_request_tracker(
+            tracker,
+            block_size=block_size,
+            lmcache_chunk_size=256,
+            load_spec=LoadSpec(
+                vllm_cached_tokens=0,
+                lmcache_cached_tokens=prompt_len,
+                can_load=True,
+            ),
+            dsa_two_groups=True,
+            is_sparse_decode=True,
+        )
+
+        assert req_meta_again is not None
+        assert req_meta_again.indexer_slot_mapping[0] is first_indexer_slots
 
     def test_sparse_indexer_slot_mapping_prefers_request_slots(self) -> None:
         impl = object.__new__(LMCacheConnectorV1Impl)
@@ -195,3 +212,35 @@ class TestFullHitRecalcLast:
                 lmcache_cached_tokens=4,
                 strict=True,
             )
+
+    def test_indexer_save_slot_mapping_prefers_request_slots(self) -> None:
+        impl = object.__new__(LMCacheConnectorV1Impl)
+        request = _make_prefill_req(prompt_len=8)
+        request.indexer_slot_mapping = [torch.arange(100, 108)]
+        attn = SimpleNamespace(indexer_slot_mapping=torch.arange(200, 208))
+
+        result = LMCacheConnectorV1Impl._indexer_save_slot_mapping(
+            impl,
+            request,
+            attn,
+            layer_name=None,
+            token_count=8,
+        )
+
+        assert torch.equal(result, request.indexer_slot_mapping[0])
+
+    def test_indexer_save_slot_mapping_falls_back_to_metadata(self) -> None:
+        impl = object.__new__(LMCacheConnectorV1Impl)
+        request = _make_prefill_req(prompt_len=8)
+        request.indexer_slot_mapping = [torch.arange(4)]
+        attn = SimpleNamespace(indexer_slot_mapping=torch.arange(200, 208))
+
+        result = LMCacheConnectorV1Impl._indexer_save_slot_mapping(
+            impl,
+            request,
+            attn,
+            layer_name=None,
+            token_count=8,
+        )
+
+        assert torch.equal(result, attn.indexer_slot_mapping)
