@@ -80,8 +80,8 @@ class TestWorkerRetrieveState:
     def test_dsa_kv_metadata_group_order_is_semantic(self):
         impl = _make_group_order_impl(
             {
-                "model.layers.0.self_attn.indexer.k_cache": torch.empty(
-                    (1, 8, 4), dtype=torch.uint8
+                "model.layers.0.self_attn.indexer.k_cache": (
+                    torch.empty((1, 8, 1, 4), dtype=torch.uint8),
                 ),
                 "model.layers.0.self_attn.attn.k_cache": torch.empty(
                     (1, 8, 512), dtype=torch.bfloat16
