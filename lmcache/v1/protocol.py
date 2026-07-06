@@ -96,6 +96,12 @@ def get_remote_metadata_bytes():
     return REMOTE_METADATA_BYTES
 
 
+def _get_remote_metadata_num_groups() -> int:
+    global REMOTE_METADATA_FMT
+    assert REMOTE_METADATA_FMT is not None
+    return (len(REMOTE_METADATA_FMT) - 2) // 5
+
+
 @dataclass
 class RemoteMetadata:
     length: int
@@ -130,9 +136,22 @@ class RemoteMetadata:
 
     def _prepare_params(self):
         params = [self.length, int(self.fmt.value)]
+        num_groups = _get_remote_metadata_num_groups()
+        if len(self.shapes) != len(self.dtypes):
+            raise AssertionError(
+                f"Remote metadata shapes/dtypes mismatch: "
+                f"{len(self.shapes)} shapes, {len(self.dtypes)} dtypes"
+            )
+        if len(self.shapes) > num_groups:
+            raise AssertionError(
+                f"Remote metadata has {len(self.shapes)} groups, "
+                f"but protocol is initialized for {num_groups}"
+            )
         for shape, dtype in zip(self.shapes, self.dtypes, strict=True):
             params.append(DTYPE_TO_INT[dtype])
             params.extend(self._encode_shape(shape))
+        for _ in range(num_groups - len(self.shapes)):
+            params.extend([DTYPE_TO_INT[None], 0, 0, 0, 0])
         return params
 
     def serialize_into(self, buffer):
@@ -156,8 +175,11 @@ class RemoteMetadata:
         shapes = []
         dtypes = []
         for i in range(2, len(result), 5):
+            dtype = INT_TO_DTYPE[result[i]]
+            if dtype is None:
+                continue
             shapes.append(RemoteMetadata._decode_shape(result[i + 1 : i + 5]))
-            dtypes.append(INT_TO_DTYPE[result[i]])
+            dtypes.append(dtype)
 
         return RemoteMetadata(
             length,

@@ -68,3 +68,22 @@ def test_serialize_and_deserialize_variable_rank_shapes():
     assert origin_metadata.shapes == new_metadata.shapes
     assert origin_metadata.dtypes == new_metadata.dtypes
     assert origin_metadata.fmt == new_metadata.fmt
+
+
+def test_serialize_single_group_payload_with_two_group_protocol():
+    init_remote_metadata_info(2)
+
+    origin_metadata = RemoteMetadata(
+        1024,
+        [torch.Size([512])],
+        [torch.bfloat16],
+        MemoryFormat.KV_DSA_INDEX_FMT,
+    )
+
+    meta_bytes = origin_metadata.serialize()
+    assert len(meta_bytes) == get_remote_metadata_bytes()
+    new_metadata = RemoteMetadata.deserialize(meta_bytes)
+    assert origin_metadata.length == new_metadata.length
+    assert origin_metadata.shapes == new_metadata.shapes
+    assert origin_metadata.dtypes == new_metadata.dtypes
+    assert origin_metadata.fmt == new_metadata.fmt
