@@ -5,6 +5,7 @@
 from types import SimpleNamespace
 
 # Third Party
+import pytest
 import torch
 
 # First Party
@@ -120,3 +121,77 @@ class TestFullHitRecalcLast:
         assert req_meta.slot_mapping[0].numel() == prompt_len
         assert req_meta.indexer_slot_mapping[0].numel() == prompt_len
         assert req_meta.save_spec.can_save is False
+
+    def test_sparse_decode_req_meta_builds_compact_indexer_slots(self) -> None:
+        prompt_len = 18879
+        block_size = 16
+        indexer_block_offset = 1000
+        tracker = RequestTracker(
+            req_id="req-sparse-hit",
+            prompt_len=prompt_len,
+            token_ids=list(range(prompt_len)),
+            allocated_block_ids=_block_ids(prompt_len, block_size),
+            allocated_block_ids_indexer=[
+                block_id + indexer_block_offset
+                for block_id in _block_ids(prompt_len, block_size)
+            ],
+            num_saved_tokens=prompt_len,
+        )
+        tracker.is_decode_phase = True
+
+        req_meta = ReqMeta.from_request_tracker(
+            tracker,
+            block_size=block_size,
+            lmcache_chunk_size=256,
+            load_spec=LoadSpec(
+                vllm_cached_tokens=0,
+                lmcache_cached_tokens=prompt_len,
+                can_load=True,
+            ),
+            dsa_two_groups=True,
+            is_sparse_decode=True,
+        )
+
+        assert req_meta is not None
+        assert req_meta.slot_mapping[0].numel() == 2048
+        assert req_meta.indexer_slot_mapping[0].numel() == 2048
+        assert req_meta.indexer_slot_mapping[0][0].item() == (
+            indexer_block_offset * block_size
+        )
+        assert not torch.equal(
+            req_meta.slot_mapping[0],
+            req_meta.indexer_slot_mapping[0],
+        )
+
+    def test_sparse_indexer_slot_mapping_prefers_request_slots(self) -> None:
+        impl = object.__new__(LMCacheConnectorV1Impl)
+        impl.device = "cpu"
+        latent_slots = torch.arange(4, dtype=torch.long)
+        request_indexer_slots = torch.arange(100, 104, dtype=torch.long)
+        attn = SimpleNamespace(indexer_slot_mapping=torch.arange(200, 204))
+
+        result = LMCacheConnectorV1Impl._sparse_indexer_slot_mapping(
+            impl,
+            attn,
+            latent_slots,
+            lmcache_cached_tokens=4,
+            request_indexer_slots=request_indexer_slots,
+            strict=True,
+        )
+
+        assert torch.equal(result, request_indexer_slots)
+
+    def test_sparse_indexer_slot_mapping_strict_rejects_latent_fallback(self) -> None:
+        impl = object.__new__(LMCacheConnectorV1Impl)
+        impl.device = "cpu"
+        latent_slots = torch.arange(4, dtype=torch.long)
+        attn = SimpleNamespace(slot_mapping=None, indexer_slot_mapping=None)
+
+        with pytest.raises(RuntimeError, match="compact DSA index slot mapping"):
+            LMCacheConnectorV1Impl._sparse_indexer_slot_mapping(
+                impl,
+                attn,
+                latent_slots,
+                lmcache_cached_tokens=4,
+                strict=True,
+            )

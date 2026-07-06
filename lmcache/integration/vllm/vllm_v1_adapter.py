@@ -814,7 +814,15 @@ class ReqMeta:
                     indexer_num_blocks,
                     block_size,
                 )
-            if not is_sparse_decode:
+            if is_sparse_decode and load_spec is not None and load_spec.can_load:
+                indexer_slot_mapping = [
+                    _build_slot_mapping(
+                        tracker.allocated_block_ids_indexer,
+                        block_size,
+                        slot_mapping[0].numel(),
+                    )
+                ]
+            elif not is_sparse_decode:
                 indexer_slot_mapping = [
                     _build_slot_mapping(
                         tracker.allocated_block_ids_indexer,
@@ -1613,16 +1621,41 @@ class LMCacheConnectorV1Impl:
         attn_metadata,
         latent_sparse_slots: torch.Tensor,
         lmcache_cached_tokens: int,
-    ) -> torch.Tensor:
+        request_indexer_slots: Optional[torch.Tensor] = None,
+        strict: bool = False,
+    ) -> Optional[torch.Tensor]:
         """Indexer slots for sparse decode, aligned to the latent sparse window."""
         sparse_len = len(latent_sparse_slots)
+        if request_indexer_slots is not None and request_indexer_slots.numel() > 0:
+            request_indexer_slots = request_indexer_slots.to(
+                device=self.device, dtype=torch.long
+            )
+            if request_indexer_slots.numel() >= sparse_len:
+                return request_indexer_slots[:sparse_len]
+
         idx_slot = self._indexer_retrieve_slot_mapping(
             attn_metadata, lmcache_cached_tokens
         )
+        if idx_slot is not None and idx_slot.numel() >= sparse_len:
+            return idx_slot[:sparse_len]
+        if strict:
+            request_len = (
+                int(request_indexer_slots.numel())
+                if request_indexer_slots is not None
+                else 0
+            )
+            metadata_len = int(idx_slot.numel()) if idx_slot is not None else 0
+            raise RuntimeError(
+                "Shared CPU sparse decode with dsa_two_groups=true could not "
+                "resolve compact DSA index slot mapping. Refusing to fall back "
+                "to latent slots because that can load indexer KV into the "
+                "wrong cache group: "
+                f"sparse_len={sparse_len}, request_indexer_slots={request_len}, "
+                f"metadata_indexer_slots={metadata_len}, "
+                f"lmcache_cached_tokens={lmcache_cached_tokens}"
+            )
         if idx_slot is None or idx_slot.numel() == 0:
             return latent_sparse_slots
-        if idx_slot.numel() >= sparse_len:
-            return idx_slot[:sparse_len]
         return idx_slot
 
     # TODO(chunxiaozheng): in the latest lmcache_connector, we use `register_kv_caches`
@@ -2737,11 +2770,19 @@ class LMCacheConnectorV1Impl:
                                 if isinstance(slot_mapping, list)
                                 else slot_mapping
                             )
+                            request_indexer_slots = (
+                                request.indexer_slot_mapping[0]
+                                if request.indexer_slot_mapping
+                                else None
+                            )
                             idx_slot = self._sparse_indexer_slot_mapping(
                                 attn_metadata,
                                 latent_sparse_slots,
                                 request.load_spec.lmcache_cached_tokens,
+                                request_indexer_slots=request_indexer_slots,
+                                strict=shared_cpu_enabled,
                             )
+                            assert idx_slot is not None
                             indexer_cache = _retrieve_cache_kwargs(
                                 request,
                                 kv_group=1,
