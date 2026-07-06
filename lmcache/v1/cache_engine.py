@@ -1698,6 +1698,7 @@ class LMCacheEngine:
                 kv_group,
                 retrieved_tokens,
             )
+            yield None
             yield ret_mask
         finally:
             for mem_obj in to_unpin:
@@ -1821,6 +1822,7 @@ class LMCacheEngine:
                 kv_group,
                 retrieved_tokens,
             )
+            yield None
             yield ret_mask
         finally:
             for mem_obj in to_release:
