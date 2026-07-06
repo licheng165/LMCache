@@ -478,6 +478,11 @@ class LMCacheEngine:
         dtypes = self.metadata.get_dtypes()
         if 0 <= kv_group < len(dtypes):
             return dtypes[kv_group]
+        if kv_group != 0:
+            raise ValueError(
+                "KV group dtype metadata is unavailable: "
+                f"kv_group={kv_group}, num_dtypes={len(dtypes)}"
+            )
         return self.metadata.kv_dtype
 
     def _metadata_shapes_dtypes_for_kv_group(
@@ -489,6 +494,11 @@ class LMCacheEngine:
         shapes = self.metadata.get_shapes(num_tokens)
         dtypes = self.metadata.get_dtypes()
         if len(shapes) <= 1:
+            if kv_group != 0:
+                raise ValueError(
+                    "KV group shape metadata is unavailable: "
+                    f"kv_group={kv_group}, num_groups={len(shapes)}"
+                )
             return shapes, dtypes
         if kv_group < 0 or kv_group >= len(shapes):
             raise ValueError(

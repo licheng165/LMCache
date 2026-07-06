@@ -216,6 +216,11 @@ class TokenDatabase(metaclass=abc.ABCMeta):
             if 0 <= kv_group < len(dtypes)
             else self.metadata.kv_dtype
         )
+        if kv_group != 0 and kv_group >= len(dtypes):
+            raise ValueError(
+                "KV group dtype metadata is unavailable for cache key: "
+                f"kv_group={kv_group}, num_dtypes={len(dtypes)}"
+            )
         # When save_only_first_rank is enabled (for MLA), we deliberately
         # collapse the CacheEngineKey.world_size to 1 so that cache keys
         # become world-size agnostic across compatible deployments.
