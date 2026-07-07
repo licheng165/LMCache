@@ -949,6 +949,7 @@ class LMCacheConnectorV1Impl:
             Union[str, tuple[str, int]],
             Generator[Optional[torch.Tensor], None, None],
         ] = {}
+        self._layerwise_save_storer_diag: dict[Union[str, tuple[str, int]], dict] = {}
         # Under dsa_two_groups + TP>1, latent store_layer is deferred until
         # after all indexer layers in a forward to avoid interleaved latent/
         # indexer GPU transfers on store_stream (MTE OOB on chunk 2+).
@@ -2753,15 +2754,39 @@ class LMCacheConnectorV1Impl:
         world_size = getattr(meta, "world_size", 1) if meta else 1
         return world_size > 1
 
-    @staticmethod
-    def _drain_layerwise_storer_fully(storer) -> None:
+    def _drain_layerwise_storer_fully(
+        self,
+        storer,
+        *,
+        worker_id: Any = None,
+        req_id: Optional[str] = None,
+        kv_group: Optional[int] = None,
+        storer_key: Optional[Union[str, tuple[str, int]]] = None,
+        reason: str = "unknown",
+    ) -> None:
         if storer is None:
             return
+        drained_steps = 0
         try:
             while True:
                 next(storer)
+                drained_steps += 1
         except StopIteration:
             pass
+        if storer_key is not None:
+            logger.info(
+                "[RANK_STORE_DIAG][drain_layerwise_storer_done] "
+                "worker_id=%s req_id=%s kv_group=%s storer_key=%s "
+                "reason=%s drained_steps=%d diag=%s active_keys=%s",
+                worker_id,
+                req_id,
+                kv_group,
+                storer_key,
+                reason,
+                drained_steps,
+                self._layerwise_save_storer_diag.get(storer_key),
+                list(self._layerwise_save_storers.keys()),
+            )
 
     def _flush_deferred_latent_store(
         self,
@@ -3030,19 +3055,25 @@ class LMCacheConnectorV1Impl:
                     logger.info(
                         "[RANK_STORE_DIAG][save_kv_layer_drain_stale] "
                         "worker_id=%s req_id=%s layer_name=%s kv_group=%s "
-                        "storer_key=%s",
+                        "storer_key=%s diag=%s active_keys=%s",
                         worker_id,
                         request.req_id,
                         layer_name,
                         kv_group,
                         storer_key,
+                        self._layerwise_save_storer_diag.get(storer_key),
+                        list(self._layerwise_save_storers.keys()),
                     )
-                    try:
-                        while True:
-                            next(layerwise_storer)
-                    except StopIteration:
-                        pass
+                    self._drain_layerwise_storer_fully(
+                        layerwise_storer,
+                        worker_id=worker_id,
+                        req_id=request.req_id,
+                        kv_group=kv_group,
+                        storer_key=storer_key,
+                        reason="save_kv_layer_drain_stale",
+                    )
                     self._layerwise_save_storers.pop(storer_key, None)
+                    self._layerwise_save_storer_diag.pop(storer_key, None)
                     layerwise_storer = None
             if layerwise_storer is None:
                 # Refresh from the live kv_caches dict before creating a new
@@ -3210,8 +3241,84 @@ class LMCacheConnectorV1Impl:
                     **store_kwargs,
                 )
                 self._layerwise_save_storers[storer_key] = layerwise_storer
+                self._layerwise_save_storer_diag[storer_key] = {
+                    "req_id": request.req_id,
+                    "kv_group": kv_group,
+                    "created_layer_name": layer_name,
+                    "skip_leading_tokens": skip_leading_tokens,
+                    "total_tokens": len(token_ids),
+                    "store_tokens": len(token_ids) - skip_leading_tokens,
+                    "group_layers": len(kvcaches),
+                    "expected_layers": self.num_layers,
+                    "advances": 0,
+                }
+                logger.info(
+                    "[RANK_STORE_DIAG][save_kv_layer_storer_registered] "
+                    "worker_id=%s req_id=%s layer_name=%s kv_group=%s "
+                    "storer_key=%s diag=%s active_keys=%s",
+                    worker_id,
+                    request.req_id,
+                    layer_name,
+                    kv_group,
+                    storer_key,
+                    self._layerwise_save_storer_diag.get(storer_key),
+                    list(self._layerwise_save_storers.keys()),
+                )
 
-            next(layerwise_storer)
+            layer_idx = self._layer_index_from_name(layer_name)
+            group_first = (
+                layer_name == self._indexer_layer_names[0]
+                if kv_group == 1 and self._indexer_layer_names
+                else layer_name == self._latent_layer_names[0]
+                if self._latent_layer_names
+                else False
+            )
+            group_last = (
+                layer_name == self._indexer_layer_names[-1]
+                if kv_group == 1 and self._indexer_layer_names
+                else layer_name == self._latent_layer_names[-1]
+                if self._latent_layer_names
+                else False
+            )
+            try:
+                next(layerwise_storer)
+            except StopIteration:
+                logger.error(
+                    "[RANK_STORE_DIAG][save_kv_layer_next_stop] "
+                    "worker_id=%s req_id=%s layer_name=%s layer_idx=%s "
+                    "kv_group=%s storer_key=%s diag=%s active_keys=%s",
+                    worker_id,
+                    request.req_id,
+                    layer_name,
+                    layer_idx,
+                    kv_group,
+                    storer_key,
+                    self._layerwise_save_storer_diag.get(storer_key),
+                    list(self._layerwise_save_storers.keys()),
+                )
+                raise
+            diag = self._layerwise_save_storer_diag.get(storer_key)
+            if diag is not None:
+                diag["advances"] = int(diag.get("advances", 0)) + 1
+                diag["last_layer_name"] = layer_name
+                diag["last_layer_idx"] = layer_idx
+            if kv_group == 1 and (group_first or group_last):
+                logger.info(
+                    "[RANK_STORE_DIAG][save_kv_layer_next_done] "
+                    "worker_id=%s req_id=%s layer_name=%s layer_idx=%s "
+                    "kv_group=%s storer_key=%s group_first=%s group_last=%s "
+                    "diag=%s active_keys=%s",
+                    worker_id,
+                    request.req_id,
+                    layer_name,
+                    layer_idx,
+                    kv_group,
+                    storer_key,
+                    group_first,
+                    group_last,
+                    diag,
+                    list(self._layerwise_save_storers.keys()),
+                )
 
             if (
                 is_indexer_layer
@@ -3241,6 +3348,17 @@ class LMCacheConnectorV1Impl:
             return
 
         if self.use_layerwise:
+            worker_id = getattr(
+                getattr(self.lmcache_engine, "metadata", None), "worker_id", None
+            )
+            logger.info(
+                "[RANK_STORE_DIAG][wait_for_save_begin] worker_id=%s "
+                "requests=%s active_keys=%s deferred_latent_pending=%s",
+                worker_id,
+                [request.req_id for request in connector_metadata.requests],
+                list(self._layerwise_save_storers.keys()),
+                sorted(self._deferred_latent_pending),
+            )
             if self._should_defer_latent_save_under_tp():
                 for request in connector_metadata.requests:
                     if request.req_id in self._deferred_latent_pending:
@@ -3251,11 +3369,30 @@ class LMCacheConnectorV1Impl:
                 # Drain both the latent (kv_group=0) and indexer (kv_group=1)
                 # storers for this request.
                 for _kv_group in (0, 1):
-                    layerwise_storer = self._layerwise_save_storers.pop(
-                        self._save_storer_key(request.req_id, _kv_group), None
+                    storer_key = self._save_storer_key(request.req_id, _kv_group)
+                    logger.info(
+                        "[RANK_STORE_DIAG][wait_for_save_storer] worker_id=%s "
+                        "req_id=%s kv_group=%s storer_key=%s found=%s "
+                        "diag=%s active_keys_before=%s",
+                        worker_id,
+                        request.req_id,
+                        _kv_group,
+                        storer_key,
+                        storer_key in self._layerwise_save_storers,
+                        self._layerwise_save_storer_diag.get(storer_key),
+                        list(self._layerwise_save_storers.keys()),
                     )
+                    layerwise_storer = self._layerwise_save_storers.pop(storer_key, None)
                     if layerwise_storer is not None:
-                        self._drain_layerwise_storer_fully(layerwise_storer)
+                        self._drain_layerwise_storer_fully(
+                            layerwise_storer,
+                            worker_id=worker_id,
+                            req_id=request.req_id,
+                            kv_group=_kv_group,
+                            storer_key=storer_key,
+                            reason="wait_for_save",
+                        )
+                        self._layerwise_save_storer_diag.pop(storer_key, None)
                 self._maybe_seed_worker_retrieve_state_from_store(request)
                 self._maybe_lookup_unpin_for_request(request)
             return
@@ -3867,10 +4004,28 @@ class LMCacheConnectorV1Impl:
         if getattr(self, "use_layerwise", False) and hasattr(
             self, "_layerwise_save_storers"
         ):
+            worker_id = getattr(
+                getattr(self.lmcache_engine, "metadata", None), "worker_id", None
+            )
             for _kv_group in (0, 1):
-                self._layerwise_save_storers.pop(
-                    self._save_storer_key(request.request_id, _kv_group), None
+                storer_key = self._save_storer_key(request.request_id, _kv_group)
+                found = storer_key in self._layerwise_save_storers
+                diag = self._layerwise_save_storer_diag.get(storer_key)
+                logger.info(
+                    "[RANK_STORE_DIAG][request_finished_drop_storer] "
+                    "worker_id=%s req_id=%s kv_group=%s storer_key=%s "
+                    "found=%s status=%s diag=%s active_keys_before=%s",
+                    worker_id,
+                    request.request_id,
+                    _kv_group,
+                    storer_key,
+                    found,
+                    request.status,
+                    diag,
+                    list(self._layerwise_save_storers.keys()),
                 )
+                self._layerwise_save_storers.pop(storer_key, None)
+                self._layerwise_save_storer_diag.pop(storer_key, None)
 
         self._drop_worker_retrieve_state(request.request_id)
 
