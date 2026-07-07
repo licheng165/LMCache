@@ -1385,11 +1385,17 @@ class LMCacheConnectorV1Impl:
 
     def _layerwise_required_wait_groups(self) -> set[int]:
         required = {0}
-        if self._is_dsa_two_groups() and any(
-            indexer_retriever is not None
-            for _, indexer_retriever in getattr(self, "layerwise_retrievers", [])
-        ):
-            required.add(1)
+        if self._is_dsa_two_groups():
+            for idx, (_, indexer_retriever) in enumerate(
+                getattr(self, "layerwise_retrievers", [])
+            ):
+                is_sparse = (
+                    idx < len(getattr(self, "_layerwise_retriever_is_sparse", []))
+                    and self._layerwise_retriever_is_sparse[idx]
+                )
+                if indexer_retriever is not None and not is_sparse:
+                    required.add(1)
+                    break
         return required
 
     def _layerwise_wait_should_advance(self, wait_group: int) -> bool:
@@ -3521,12 +3527,17 @@ class LMCacheConnectorV1Impl:
                     else (selected_tokens_per_req, token_start_index_per_req)
                 )
                 if wait_group == 1:
-                    if indexer_retriever is not None:
-                        ret_token_mask = indexer_retriever.send(sparse_payload)
-                    else:
-                        ret_token_mask = None
+                    # Sparse decode index materialization is driven by the
+                    # attention-layer wait below. Some Ascend stacks do not
+                    # issue a separate indexer wait callback; sending here as
+                    # well would advance kv_group=1 twice.
+                    ret_token_mask = None
                 else:
                     ret_token_mask = layerwise_retriever.send(sparse_payload)
+                    if indexer_retriever is not None:
+                        indexer_ret_mask = indexer_retriever.send(sparse_payload)
+                        if ret_token_mask is None:
+                            ret_token_mask = indexer_ret_mask
                 decode_row += row_count
             else:
                 if wait_group == 1:
