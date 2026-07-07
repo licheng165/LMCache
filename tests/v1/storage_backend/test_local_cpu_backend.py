@@ -11,7 +11,7 @@ from lmcache.observability import LMCStatsMonitor
 from lmcache.utils import CacheEngineKey
 from lmcache.v1.cache_controller.message import BatchedKVOperationMsg, OpType
 from lmcache.v1.config import LMCacheEngineConfig
-from lmcache.v1.memory_management import MemoryFormat, MemoryObj
+from lmcache.v1.memory_management import MemoryFormat, MemoryObj, MixedMemoryAllocator
 from lmcache.v1.metadata import LMCacheMetadata
 from lmcache.v1.pin_monitor import PinMonitor
 from lmcache.v1.storage_backend.local_cpu_backend import LocalCPUBackend
@@ -444,6 +444,39 @@ class TestLocalCPUBackend:
             assert memory_obj.metadata.dtype == dtype
 
         local_cpu_backend.memory_allocator.close()
+
+    def test_batched_allocate_layerwise_eviction_releases_backend_refs(self):
+        """Layerwise eviction must drop hot-cache refs through MemoryObj APIs."""
+        config = create_test_config(use_layerwise=True)
+        PinMonitor.GetOrCreate(config)
+        allocator = MixedMemoryAllocator(8192)
+        backend = LocalCPUBackend(config=config, memory_allocator=allocator)
+        shape = torch.Size([1024])
+        dtype = torch.uint8
+        batch_size = 2
+        fmt = MemoryFormat.KV_T2D
+
+        try:
+            old_objs = backend.batched_allocate(shape, dtype, batch_size, fmt=fmt)
+            assert old_objs is not None
+            keys = create_test_key("layerwise_evict").split_layers(batch_size)
+            for key, old_obj in zip(keys, old_objs, strict=True):
+                backend.submit_put_task(key, old_obj)
+                old_obj.ref_count_down()
+                assert old_obj.get_ref_count() == 1
+
+            new_objs = backend.batched_allocate(shape, dtype, batch_size, fmt=fmt)
+
+            assert new_objs is not None
+            assert all(key not in backend.hot_cache for key in keys)
+            assert all(old_obj.get_ref_count() == 0 for old_obj in old_objs)
+            assert all(not old_obj.is_valid() for old_obj in old_objs)
+
+            for new_obj in new_objs:
+                new_obj.ref_count_down()
+        finally:
+            allocator.close()
+            PinMonitor.DestroyInstance()
 
     def test_get_keys(self, local_cpu_backend):
         """Test get_keys()."""

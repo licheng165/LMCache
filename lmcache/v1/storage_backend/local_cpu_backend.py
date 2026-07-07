@@ -672,7 +672,8 @@ class LocalCPUBackend(AllocatorBackendInterface):
                                 self.cache_policy.update_on_force_evict(key)
                                 self.hot_cache.pop(key, None)
 
-                            self.memory_allocator.batched_free(old_mem_objs)
+                            for old_mem_obj in old_mem_objs:
+                                old_mem_obj.ref_count_down()
 
                             logger.debug(
                                 f"Evicting {len(old_mem_objs)} chunks from cpu memory"
