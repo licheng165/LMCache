@@ -506,6 +506,54 @@ class TestWorkerRetrieveState:
         assert backing_obj.released == 1
         assert state.cached_memory_objs == []
 
+    def test_save_releases_replaced_passive_shared_views(self):
+        class FakeMemObj:
+            def __init__(self):
+                self.released = 0
+
+            def ref_count_down(self):
+                self.released += 1
+
+        impl = _make_impl()
+        impl.lmcache_engine = SimpleNamespace(
+            enable_shared_cpu_cache=True,
+            shared_cpu_cache_generation=10,
+            metadata=SimpleNamespace(is_first_rank=lambda: False),
+        )
+        old_view = FakeMemObj()
+        impl._worker_retrieve_state["req-1"] = WorkerRetrieveState(
+            cached_keys=[["old-k"]],
+            cached_starts=[0],
+            cached_ends=[256],
+            shared_views_by_group={0: [[old_view]]},
+            shared_latent_status="present",
+            shared_generation=9,
+            pointer_cache_generation=9,
+            shared_request_active=True,
+            request_scope_token="req-1:9:256",
+        )
+        new_view = FakeMemObj()
+        request = _make_request()
+        request.cached_keys = [["new-k"]]
+        request.cached_starts = [0]
+        request.cached_ends = [256]
+        request.cached_memory_objs = [[new_view]]
+        request.cached_chunk_ptrs_npu = ["latent-ptrs"]
+        request.cached_shared_handles = [["new-handle"]]
+
+        impl._save_worker_retrieve_state_from_request(
+            request,
+            location="mixed",
+            metadata_warm=True,
+            token_count=256,
+        )
+
+        state = impl._worker_retrieve_state["req-1"]
+        assert old_view.released == 1
+        assert new_view.released == 0
+        assert state.shared_views_by_group == {0: [[new_view]]}
+        assert state.shared_generation == 10
+
     def test_save_records_rank0_shared_request_in_engine_registry(self):
         class FakeMemObj:
             is_pinned = True

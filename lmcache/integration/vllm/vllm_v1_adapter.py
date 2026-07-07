@@ -2094,6 +2094,51 @@ class LMCacheConnectorV1Impl:
         state.req_id = None
 
     @staticmethod
+    def _release_replaced_shared_layer_objs(
+        old_layers: list[list[Any]],
+        new_layers: list[list[Any]],
+        *,
+        rank0_backing: bool,
+    ) -> None:
+        new_ids = {
+            id(mem_obj)
+            for layer_objs in (new_layers or [])
+            for mem_obj in layer_objs
+        }
+        for layer_objs in old_layers or []:
+            for mem_obj in layer_objs:
+                if id(mem_obj) in new_ids:
+                    continue
+                try:
+                    if rank0_backing and getattr(mem_obj, "is_pinned", False):
+                        mem_obj.unpin()
+                    mem_obj.ref_count_down()
+                except Exception as exc:
+                    logger.warning(
+                        "Failed to release replaced shared CPU %s object: %s",
+                        "rank0 backing" if rank0_backing else "passive view",
+                        exc,
+                    )
+
+    @classmethod
+    def _release_replaced_shared_groups(
+        cls,
+        old_by_group: dict[int, list[list[Any]]],
+        new_by_group: dict[int, list[list[Any]]],
+        *,
+        rank0_backing: bool,
+    ) -> None:
+        for kv_group, new_layers in new_by_group.items():
+            old_layers = old_by_group.get(kv_group)
+            if old_layers is None:
+                continue
+            cls._release_replaced_shared_layer_objs(
+                old_layers,
+                new_layers,
+                rank0_backing=rank0_backing,
+            )
+
+    @staticmethod
     def _missing_shared_pointer_cache_layers(
         layers: list[list[Any]],
         chunk_ptrs: list[Optional[torch.Tensor]],
@@ -2257,6 +2302,16 @@ class LMCacheConnectorV1Impl:
             pending_views_by_group or pending_backing_by_group
         )
         if has_shared_request:
+            replaced_views_by_group = {
+                kv_group: state.shared_views_by_group[kv_group]
+                for kv_group in pending_views_by_group
+                if kv_group in state.shared_views_by_group
+            }
+            replaced_backing_by_group = {
+                kv_group: state.rank0_backing_objs_by_group[kv_group]
+                for kv_group in pending_backing_by_group
+                if kv_group in state.rank0_backing_objs_by_group
+            }
             state.shared_handles_by_group.update(pending_handles_by_group)
             state.shared_views_by_group.update(pending_views_by_group)
             state.rank0_backing_objs_by_group.update(pending_backing_by_group)
@@ -2300,6 +2355,16 @@ class LMCacheConnectorV1Impl:
                         token_count=len(request.token_ids),
                         phase=SPARSE_DECODE_SHARED_CPU_PHASE,
                     )
+            self._release_replaced_shared_groups(
+                replaced_views_by_group,
+                pending_views_by_group,
+                rank0_backing=False,
+            )
+            self._release_replaced_shared_groups(
+                replaced_backing_by_group,
+                pending_backing_by_group,
+                rank0_backing=True,
+            )
 
     def _should_invalidate_worker_retrieve_state(
         self, request: ReqMeta, token_count: int
