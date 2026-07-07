@@ -2985,6 +2985,7 @@ class LMCacheConnectorV1Impl:
                         "sync": sync,
                         "kv_group": 0,
                         "req_id": request.req_id,
+                        "request_configs": request.request_configs,
                         "shared_cpu_phase": SPARSE_DECODE_SHARED_CPU_PHASE,
                         "shared_cpu_request_ordinal": idx,
                         **latent_cache,
@@ -3085,6 +3086,7 @@ class LMCacheConnectorV1Impl:
                                 "sync": sync,
                                 "kv_group": 1,
                                 "req_id": request.req_id,
+                                "request_configs": request.request_configs,
                                 "shared_cpu_phase": SPARSE_DECODE_SHARED_CPU_PHASE,
                                 "shared_cpu_request_ordinal": idx,
                                 **indexer_cache,
@@ -3142,6 +3144,7 @@ class LMCacheConnectorV1Impl:
                         sync=sync,
                         kv_group=0,
                         req_id=request.req_id,
+                        request_configs=request.request_configs,
                         shared_cpu_request_ordinal=idx,
                     )
 
@@ -3211,6 +3214,7 @@ class LMCacheConnectorV1Impl:
                                 sync=sync,
                                 kv_group=1,
                                 req_id=request.req_id,
+                                request_configs=request.request_configs,
                                 shared_cpu_request_ordinal=idx,
                             )
 
@@ -3703,6 +3707,7 @@ class LMCacheConnectorV1Impl:
             "cached_ends": request.cached_ends,
             "cached_memory_objs": request.cached_memory_objs,
             "cached_tensors": request.cached_tensors,
+            "request_configs": request.request_configs,
         }
 
 
@@ -3922,14 +3927,16 @@ class LMCacheConnectorV1Impl:
 
                 # TODO (Jiayi): need to make layerwise storing
                 # compatible with disagg spec
-                # dev-qzy passes only the core cached_* fields to store_layer.
-                # Indexer-only sparse ptr fields stay on the latent/sparse path.
+                # Keep store_layer kwargs minimal: shared cached_* state plus
+                # request_configs for cache-key salting. Indexer-only sparse
+                # ptr fields stay on the latent/sparse path.
                 store_kwargs: dict[str, Any] = {
                     "cached_keys": request.cached_keys,
                     "cached_starts": request.cached_starts,
                     "cached_ends": request.cached_ends,
                     "cached_memory_objs": request.cached_memory_objs,
                     "cached_tensors": request.cached_tensors,
+                    "request_configs": request.request_configs,
                 }
                 # Indexer-only extras. Latent (kv_group=0) matches dev-qzy and
                 # does not pass kv_group or indexer cached_* fields.

@@ -320,19 +320,32 @@ def parse_cache_key(key_str: str) -> Union[CacheEngineKey, LayerCacheEngineKey]:
     Args:
     key_str: String in format:
         CacheEngineKey:
-            model_name@world_size@worker_id@chunk_hash@dtype[@tag%value...]
+            model_name@world_size@worker_id@chunk_hash@dtype[@kv_group][@tag%value...]
         LayerCacheEngineKey:
-            model_name@world_size@worker_id@chunk_hash@dtype@layer_id[@tag%value...]
+            model_name@world_size@worker_id@chunk_hash@dtype@kv_group@layer_id[@tag%value...]
 
     Returns:
         CacheEngineKey if no layer_id, LayerCacheEngineKey if valid layer_id
     """
     parts = key_str.strip().split("@")
-    # parts[0]=model, [1]=world_size, [2]=worker_id, [3]=chunk_hash, [4]=dtype
-    # parts[5]=layer_id OR tag%value
-    # If parts[5] exists and is a digit (not containing '%'), it's a LayerCacheEngineKey
-    if len(parts) >= 6 and parts[5].isdigit():
+    if len(parts) < 6 or "%" in parts[5]:
+        return CacheEngineKey.from_string(key_str)
+
+    # New LayerCacheEngineKey format has an explicit kv_group and layer_id.
+    # This disambiguates it from a CacheEngineKey carrying kv_group and tags.
+    if len(parts) >= 7 and "%" not in parts[6]:
         return LayerCacheEngineKey.from_string(key_str)
+
+    # Six-field keys are ambiguous between old layer keys and new kv_group
+    # chunk keys. In this branch kv_group is 0/1, so preserve the hot runtime
+    # path and treat those values as CacheEngineKey. Larger values remain
+    # backward-compatible old layer ids.
+    if parts[5] in ("0", "1"):
+        return CacheEngineKey.from_string(key_str)
+
+    if parts[5].isdigit():
+        return LayerCacheEngineKey.from_string(key_str)
+
     return CacheEngineKey.from_string(key_str)
 
 
@@ -361,8 +374,9 @@ class CacheEngineKey:
         if self.dtype not in TORCH_DTYPE_TO_STR_DTYPE:
             raise ValueError(f"Unsupported dtype in CacheEngineKey: {self.dtype}")
         self._dtype_str = TORCH_DTYPE_TO_STR_DTYPE[self.dtype]
-        # use tuple to save tags
-        self.tags = None if tag_list is None else tuple(tag_list)
+        # Canonicalize tags so logically identical request_configs produce the
+        # same cache key even if dict insertion order differs across paths.
+        self.tags = None if tag_list is None else tuple(sorted(tag_list))
 
     def __hash__(self):
         return hash(
@@ -477,9 +491,9 @@ class CacheEngineKey:
             "dtype": self._dtype_str,
             "kv_group": self.kv_group,
         }
-        if self.request_configs is not None and len(self.request_configs) != 0:
+        if self.tags is not None and len(self.tags) != 0:
             msg["request_configs"] = [
-                f"{k}%{v}" for k, v in self.request_configs.items()
+                f"lmcache.tag.{k}%{v}" for k, v in self.tags
             ]
         return msg
 

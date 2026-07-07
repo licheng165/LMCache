@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 
+from collections import defaultdict
 from dataclasses import replace
 from contextlib import nullcontext
 from types import SimpleNamespace
@@ -34,6 +35,281 @@ def _make_key(kv_group: int = 0) -> CacheEngineKey:
         dtype=torch.float16,
         kv_group=kv_group,
     )
+
+
+class _FakeLayerwiseStorageManager:
+    def __init__(
+        self,
+        present,
+        block_mapping=None,
+        remove_count=None,
+        expose_local_cpu_backend=False,
+    ):
+        self.present = set(present)
+        self.block_mapping = block_mapping
+        self.remove_count = remove_count
+        self.removed = []
+        self.pinned = []
+        self.unpinned = []
+        self.storage_backends = (
+            {"LocalCPUBackend": self} if expose_local_cpu_backend else {}
+        )
+
+    def contains(self, key, pin=False):
+        return key in self.present
+
+    def batched_contains(self, keys, search_range=None, pin=False):
+        if self.block_mapping is not None:
+            if pin:
+                self.pinned.extend(keys)
+            return len(keys), self.block_mapping
+        hit = 0
+        for key in keys:
+            if key not in self.present:
+                break
+            hit += 1
+        if pin:
+            self.pinned.extend(keys[:hit])
+        return hit, {"LocalCPUBackend": keys[:hit]} if hit else {}
+
+    def batched_remove(self, keys, locations=None):
+        self.removed.append((list(keys), locations))
+        removed = sum(1 for key in keys if key in self.present)
+        for key in keys:
+            self.present.discard(key)
+        return removed if self.remove_count is None else self.remove_count
+
+    def batched_unpin(self, keys, locations=None):
+        self.unpinned.append((list(keys), locations))
+
+
+def test_layerwise_chunk_fully_stored_repairs_partial_cache() -> None:
+    engine = object.__new__(LMCacheEngine)
+    engine.retrieve_locations = ["LocalCPUBackend"]
+    keys = _make_key().split_layers(4)
+
+    engine.storage_manager = _FakeLayerwiseStorageManager(keys)
+    assert (
+        engine._layerwise_chunk_location_if_fully_stored(
+            keys, req_id="req", kv_group=0, start=0, end=256
+        )
+        == "LocalCPUBackend"
+    )
+    assert engine._layerwise_chunk_fully_stored(
+        keys, req_id="req", kv_group=0, start=0, end=256
+    )
+    assert engine.storage_manager.removed == []
+
+    engine.storage_manager = _FakeLayerwiseStorageManager([])
+    assert (
+        engine._layerwise_chunk_location_if_fully_stored(
+            keys, req_id="req", kv_group=0, start=0, end=256
+        )
+        is None
+    )
+    assert not engine._layerwise_chunk_fully_stored(
+        keys, req_id="req", kv_group=0, start=0, end=256
+    )
+    assert engine.storage_manager.removed == []
+
+    engine.storage_manager = _FakeLayerwiseStorageManager(
+        keys[2:],
+        expose_local_cpu_backend=True,
+    )
+    assert (
+        engine._layerwise_chunk_location_if_fully_stored(
+            keys, req_id="req", kv_group=0, start=0, end=256
+        )
+        is None
+    )
+    assert engine.storage_manager.removed == []
+    assert not engine._layerwise_chunk_fully_stored(
+        keys, req_id="req", kv_group=0, start=0, end=256
+    )
+    assert engine.storage_manager.removed == [(keys, None)]
+    assert engine.storage_manager.present == set()
+
+    engine.storage_manager = _FakeLayerwiseStorageManager(keys[:1])
+    assert (
+        engine._layerwise_chunk_location_if_fully_stored(
+            keys, req_id="req", kv_group=0, start=0, end=256
+        )
+        is None
+    )
+    assert engine.storage_manager.removed == []
+    assert not engine._layerwise_chunk_fully_stored(
+        keys, req_id="req", kv_group=0, start=0, end=256
+    )
+    assert engine.storage_manager.removed == [(keys, ["LocalCPUBackend"])]
+
+    engine.storage_manager = _FakeLayerwiseStorageManager(
+        keys,
+        block_mapping={
+            "LocalCPUBackend": keys[:2],
+            "LocalDiskBackend": keys[2:],
+        },
+    )
+    assert (
+        engine._layerwise_chunk_location_if_fully_stored(
+            keys, req_id="req", kv_group=0, start=0, end=256
+        )
+        is None
+    )
+    assert engine.storage_manager.removed == []
+    assert not engine._layerwise_chunk_fully_stored(
+        keys, req_id="req", kv_group=0, start=0, end=256
+    )
+    assert engine.storage_manager.removed == [(keys, ["LocalCPUBackend"])]
+
+    engine.storage_manager = _FakeLayerwiseStorageManager(
+        keys[:1],
+        remove_count=0,
+    )
+    with pytest.raises(ValueError, match="could not remove all existing layers"):
+        engine._layerwise_chunk_fully_stored(
+            keys, req_id="req", kv_group=0, start=0, end=256
+        )
+
+
+class _FakeLookupTokenDatabase:
+    def process_tokens(
+        self,
+        tokens=None,
+        hashes=None,
+        offsets=None,
+        request_configs=None,
+    ):
+        if tokens is not None:
+            end = len(tokens)
+        else:
+            end = offsets[0]
+        yield (
+            0,
+            end,
+            self._make_key_by_hash(
+                0xABC,
+                request_configs,
+                kv_group=0,
+            ),
+        )
+
+    def _make_key_by_hash(self, chunk_hash, request_configs=None, kv_group=0):
+        return CacheEngineKey(
+            model_name="model",
+            world_size=1,
+            worker_id=0,
+            chunk_hash=chunk_hash,
+            dtype=torch.float16,
+            request_configs=request_configs,
+            kv_group=kv_group,
+        )
+
+
+class _FakeLookupStatsMonitor:
+    def on_lookup_request(self, _num_tokens):
+        return object()
+
+    def on_lookup_finished(self, _stats, _result):
+        return None
+
+
+def _make_dsa_lookup_engine(present):
+    engine = object.__new__(LMCacheEngine)
+    engine._init_failed = False
+    engine._health_monitor = None
+    engine.storage_manager = _FakeLayerwiseStorageManager(present)
+    engine.token_database = _FakeLookupTokenDatabase()
+    engine.stats_monitor = _FakeLookupStatsMonitor()
+    engine.retrieve_locations = ["LocalCPUBackend"]
+    engine.lookup_pins = defaultdict(lambda: defaultdict(list))
+    engine.use_layerwise = True
+    engine.num_layers = 2
+    engine.config = SimpleNamespace(dsa_two_groups=True)
+    return engine
+
+
+def test_layerwise_lookup_requires_dsa_index_group_before_hit() -> None:
+    token_db = _FakeLookupTokenDatabase()
+    latent_layers = token_db._make_key_by_hash(0xABC, kv_group=0).split_layers(2)
+    index_layers = token_db._make_key_by_hash(0xABC, kv_group=1).split_layers(2)
+
+    engine = _make_dsa_lookup_engine(latent_layers)
+    assert engine.lookup([1, 2, 3], lookup_id="req", pin=True) == 0
+    assert engine.lookup_pins["req"]["LocalCPUBackend"] == []
+    assert engine.storage_manager.pinned == []
+
+    engine = _make_dsa_lookup_engine([*latent_layers, *index_layers[:1]])
+    assert engine.lookup([1, 2, 3], lookup_id="req", pin=True) == 0
+    assert engine.lookup_pins["req"]["LocalCPUBackend"] == []
+    assert engine.storage_manager.pinned == []
+
+    engine = _make_dsa_lookup_engine([*latent_layers, *index_layers])
+    assert engine.lookup([1, 2, 3], lookup_id="req", pin=True) == 3
+    assert engine.lookup_pins["req"]["LocalCPUBackend"] == [
+        *latent_layers,
+        *index_layers,
+    ]
+
+
+class _RaceLayerwiseStorageManager:
+    def __init__(self, full_latent, partial_index):
+        self.full_latent = list(full_latent)
+        self.partial_index = list(partial_index)
+        self.unpinned = []
+
+    def batched_contains(self, keys, search_range=None, pin=False):
+        if not pin:
+            return len(keys), {"LocalCPUBackend": list(keys)}
+        kv_group = keys[0].kv_group if keys else 0
+        if kv_group == 0:
+            return len(keys), {"LocalCPUBackend": self.full_latent}
+        return len(self.partial_index), {"LocalCPUBackend": self.partial_index}
+
+    def batched_unpin(self, keys, locations=None):
+        self.unpinned.append((list(keys), locations))
+
+
+def test_layerwise_lookup_unpins_current_partial_group_on_pin_race() -> None:
+    token_db = _FakeLookupTokenDatabase()
+    latent_layers = token_db._make_key_by_hash(0xABC, kv_group=0).split_layers(2)
+    index_layers = token_db._make_key_by_hash(0xABC, kv_group=1).split_layers(2)
+    engine = _make_dsa_lookup_engine([])
+    engine.storage_manager = _RaceLayerwiseStorageManager(
+        latent_layers,
+        index_layers[:1],
+    )
+
+    assert engine.lookup([1, 2, 3], lookup_id="req", pin=True) == 0
+    assert engine.lookup_pins["req"]["LocalCPUBackend"] == []
+    assert engine.storage_manager.unpinned == [
+        (index_layers[:1], ["LocalCPUBackend"]),
+        (latent_layers, ["LocalCPUBackend"]),
+    ]
+
+
+def test_async_lookup_prefetch_layerwise_fails_closed_with_zero_hit() -> None:
+    class _FakeAsyncLookupServer:
+        def __init__(self):
+            self.responses = []
+
+        def send_response_to_scheduler(self, lookup_id, num_hit_tokens):
+            self.responses.append((lookup_id, num_hit_tokens))
+
+    engine = object.__new__(LMCacheEngine)
+    async_lookup_server = _FakeAsyncLookupServer()
+    engine.storage_manager = SimpleNamespace(
+        async_lookup_server=async_lookup_server
+    )
+    engine.use_layerwise = True
+
+    engine.async_lookup_and_prefetch(
+        lookup_id="req",
+        hashes=[123],
+        offsets=[3],
+        pin=True,
+    )
+
+    assert async_lookup_server.responses == [("req", 0)]
 
 
 def _make_memory_obj(

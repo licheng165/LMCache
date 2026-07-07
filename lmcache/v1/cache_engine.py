@@ -1035,6 +1035,174 @@ class LMCacheEngine:
             )
         return handles
 
+    def _layerwise_chunk_location_if_fully_stored(
+        self,
+        keys_multi_layer: list[CacheEngineKey],
+        *,
+        req_id: str,
+        kv_group: int,
+        start: int,
+        end: int,
+        repair_partial: bool = False,
+    ) -> Optional[str]:
+        """Return the backend location only when all layers already exist."""
+        assert self.storage_manager is not None
+        hit_layers, block_mapping = self.storage_manager.batched_contains(
+            keys_multi_layer,
+            self.retrieve_locations,
+        )
+
+        if hit_layers == len(keys_multi_layer) and len(block_mapping) == 1:
+            return next(iter(block_mapping.keys()))
+        if hit_layers == 0 and repair_partial:
+            local_removed = self._remove_local_cpu_nonprefix_layerwise_hits(
+                keys_multi_layer,
+                req_id=req_id,
+                kv_group=kv_group,
+                start=start,
+                end=end,
+            )
+            if local_removed > 0:
+                return None
+        if hit_layers > 0:
+            present_layers = list(range(hit_layers))
+            missing_layers = list(range(hit_layers, len(keys_multi_layer)))
+            action = "removing existing layers before re-store" if repair_partial else (
+                "treating chunk as a miss"
+            )
+            logger.warning(
+                "Layerwise cache found incomplete or mixed-location chunk; "
+                "%s: "
+                "req_id=%s, kv_group=%s, start=%d, end=%d, "
+                "present_layers=%s, missing_layers=%s, locations=%s",
+                action,
+                req_id,
+                kv_group,
+                start,
+                end,
+                present_layers,
+                missing_layers,
+                list(block_mapping.keys()),
+            )
+            if repair_partial:
+                removed = self.storage_manager.batched_remove(
+                    keys_multi_layer,
+                    locations=self.retrieve_locations,
+                )
+                if removed < hit_layers:
+                    raise ValueError(
+                        "Layerwise cache found partial or mixed-location "
+                        "chunk but could not remove all existing layers "
+                        "before re-store. Clear the stale backend cache or "
+                        "use a fresh lmcache.tag.* namespace: "
+                        f"req_id={req_id}, kv_group={kv_group}, "
+                        f"start={start}, end={end}, hit_layers={hit_layers}, "
+                        f"removed_layers={removed}, "
+                        f"locations={list(block_mapping.keys())}"
+                    )
+        return None
+
+    def _remove_local_cpu_nonprefix_layerwise_hits(
+        self,
+        keys_multi_layer: list[CacheEngineKey],
+        *,
+        req_id: str,
+        kv_group: int,
+        start: int,
+        end: int,
+    ) -> int:
+        """Remove stale LocalCPU layer keys when layer0 is absent.
+
+        StorageManager.batched_contains intentionally reports prefix hits only.
+        That is correct for retrieve, but store must not leave stale later-layer
+        hot-cache entries because LocalCPU put skips keys that already exist.
+        """
+        assert self.storage_manager is not None
+        if (
+            self.retrieve_locations is not None
+            and "LocalCPUBackend" not in self.retrieve_locations
+        ):
+            return 0
+
+        storage_backends = getattr(self.storage_manager, "storage_backends", {})
+        local_cpu_backend = storage_backends.get("LocalCPUBackend")
+        if local_cpu_backend is None:
+            return 0
+
+        present_layers = []
+        for layer_id, key in enumerate(keys_multi_layer):
+            if local_cpu_backend.contains(key):
+                present_layers.append(layer_id)
+        if not present_layers:
+            return 0
+
+        logger.warning(
+            "Layerwise cache found non-prefix LocalCPU stale layers; "
+            "removing before re-store: req_id=%s, kv_group=%s, "
+            "start=%d, end=%d, present_layers=%s",
+            req_id,
+            kv_group,
+            start,
+            end,
+            present_layers,
+        )
+        removed = local_cpu_backend.batched_remove(keys_multi_layer)
+        if removed < len(present_layers):
+            raise ValueError(
+                "Layerwise cache found non-prefix LocalCPU stale layers but "
+                "could not remove all of them before re-store. Clear the "
+                "stale local CPU cache or use a fresh lmcache.tag.* namespace: "
+                f"req_id={req_id}, kv_group={kv_group}, start={start}, "
+                f"end={end}, present_layers={present_layers}, "
+                f"removed_layers={removed}"
+            )
+        return removed
+
+    def _layerwise_chunk_fully_stored(
+        self,
+        keys_multi_layer: list[CacheEngineKey],
+        *,
+        req_id: str,
+        kv_group: int,
+        start: int,
+        end: int,
+    ) -> bool:
+        return (
+            self._layerwise_chunk_location_if_fully_stored(
+                keys_multi_layer,
+                req_id=req_id,
+                kv_group=kv_group,
+                start=start,
+                end=end,
+                repair_partial=True,
+            )
+            is not None
+        )
+
+    def _layerwise_lookup_kv_groups(self) -> list[int]:
+        if (
+            getattr(self, "use_layerwise", False)
+            and getattr(self.config, "dsa_two_groups", False)
+        ):
+            return [0, 1]
+        return [0]
+
+    def _lookup_key_for_kv_group(
+        self,
+        base_key: CacheEngineKey,
+        *,
+        kv_group: int,
+        request_configs: Optional[dict],
+    ) -> CacheEngineKey:
+        if kv_group == base_key.kv_group:
+            return base_key
+        make_key = getattr(self.token_database, "_make_key_by_hash")
+        return make_key(
+            base_key.chunk_hash,
+            request_configs,
+            kv_group=kv_group,
+        )
+
     def _shared_local_cpu_backend(self):
         if self.storage_manager is None:
             raise ValueError("StorageManager is required for shared CPU cache")
@@ -2417,9 +2585,12 @@ class LMCacheEngine:
             assert isinstance(key, CacheEngineKey)
 
             keys_multi_layer = key.split_layers(self.num_layers)
-            # Only check the first layer
-            if self.storage_manager.contains(
-                keys_multi_layer[0], self.retrieve_locations
+            if self._layerwise_chunk_fully_stored(
+                keys_multi_layer,
+                req_id=req_id,
+                kv_group=kv_group,
+                start=start,
+                end=end,
             ):
                 continue
 
@@ -2879,10 +3050,14 @@ class LMCacheEngine:
 
             keys_multi_layer = key.split_layers(self.num_layers)
 
-            # NOTE: Only check the first layer
-            if current_location := self.storage_manager.contains(
-                keys_multi_layer[0], self.retrieve_locations
-            ):
+            current_location = self._layerwise_chunk_location_if_fully_stored(
+                keys_multi_layer,
+                req_id=req_id,
+                kv_group=kv_group,
+                start=start,
+                end=end,
+            )
+            if current_location is not None:
                 if location is None:
                     location = current_location
                 else:
@@ -3026,30 +3201,79 @@ class LMCacheEngine:
 
             # TODO: support batched_contains when layerwise is enabled
             if self.use_layerwise:
+                lookup_kv_groups = self._layerwise_lookup_kv_groups()
                 for start, end, key in chunk_info_iterator:
                     assert isinstance(key, CacheEngineKey)
 
-                    # TODO(Jiayi): Optimize by checking only the existence of the key
-                    # of one layer
-                    key_all_layers = key.split_layers(self.num_layers)
-
-                    hit_chunks, block_mapping = self.storage_manager.batched_contains(
-                        key_all_layers,  # type: ignore
-                        search_range,
-                        pin,
-                    )
-                    # Only all layers are hit and hit in one location,
-                    # we consider this key as a hit
-                    if hit_chunks == self.num_layers and len(block_mapping) == 1:
-                        if pin:
-                            assert lookup_id is not None, (
-                                "lookup_id is required when pin is True"
+                    chunk_group_layers: list[list[CacheEngineKey]] = []
+                    for kv_group in lookup_kv_groups:
+                        group_key = self._lookup_key_for_kv_group(
+                            key,
+                            kv_group=kv_group,
+                            request_configs=request_configs,
+                        )
+                        key_all_layers = group_key.split_layers(self.num_layers)
+                        hit_chunks, block_mapping = (
+                            self.storage_manager.batched_contains(
+                                key_all_layers,  # type: ignore
+                                search_range,
+                                False,
                             )
-                            location = next(iter(block_mapping.keys()))
-                            self.lookup_pins[lookup_id][location].extend(key_all_layers)
-                        res = end
-                        continue
-                    return res
+                        )
+                        # Only all layers are hit and hit in one location,
+                        # we consider this group complete for the chunk.
+                        if (
+                            hit_chunks != self.num_layers
+                            or len(block_mapping) != 1
+                        ):
+                            return res
+                        chunk_group_layers.append(key_all_layers)
+
+                    if pin:
+                        assert lookup_id is not None, (
+                            "lookup_id is required when pin is True"
+                        )
+                        pinned_mappings: list[tuple[str, list[CacheEngineKey]]] = []
+                        try:
+                            for key_all_layers in chunk_group_layers:
+                                hit_chunks, block_mapping = (
+                                    self.storage_manager.batched_contains(
+                                        key_all_layers,  # type: ignore
+                                        search_range,
+                                        True,
+                                    )
+                                )
+                                if (
+                                    hit_chunks != self.num_layers
+                                    or len(block_mapping) != 1
+                                ):
+                                    for location, pinned_keys in block_mapping.items():
+                                        self.storage_manager.batched_unpin(
+                                            pinned_keys,
+                                            [location],
+                                        )
+                                    for location, pinned_keys in pinned_mappings:
+                                        self.storage_manager.batched_unpin(
+                                            pinned_keys,
+                                            [location],
+                                        )
+                                    return res
+                                location = next(iter(block_mapping.keys()))
+                                pinned_keys = block_mapping[location]
+                                pinned_mappings.append((location, pinned_keys))
+                            for location, pinned_keys in pinned_mappings:
+                                self.lookup_pins[lookup_id][location].extend(
+                                    pinned_keys
+                                )
+                        except Exception:
+                            for location, pinned_keys in pinned_mappings:
+                                self.storage_manager.batched_unpin(
+                                    pinned_keys,
+                                    [location],
+                                )
+                            raise
+                    res = end
+                    continue
             else:
                 chunk_info_list = []
                 keys = []
@@ -3172,6 +3396,22 @@ class LMCacheEngine:
         (3) async lookup + async retrieval (e.g., p2p)
         """
         assert self.storage_manager is not None
+
+        if self.use_layerwise:
+            message = (
+                "Async lookup/prefetch is not supported with layerwise cache "
+                "keys. Falling back to recompute for this request instead of "
+                "admitting a potentially incomplete layerwise hit."
+            )
+            logger.error("%s lookup_id=%s", message, lookup_id)
+            async_lookup_server = getattr(
+                self.storage_manager,
+                "async_lookup_server",
+                None,
+            )
+            if async_lookup_server is not None:
+                async_lookup_server.send_response_to_scheduler(lookup_id, 0)
+            return
 
         keys: list[CacheEngineKey] = []
         cum_chunk_lengths = [0]

@@ -54,7 +54,11 @@ class _FakeManager:
         self.lmcache_engine = engine
 
 
-def _make_req(req_id: str, can_save: bool = True):
+def _make_req(
+    req_id: str,
+    can_save: bool = True,
+    request_configs: dict | None = None,
+):
     return SimpleNamespace(
         req_id=req_id,
         token_ids=[1, 2, 3, 4],
@@ -67,6 +71,7 @@ def _make_req(req_id: str, can_save: bool = True):
         cached_ends=[],
         cached_memory_objs=[],
         cached_tensors=[],
+        request_configs=request_configs,
     )
 
 
@@ -181,6 +186,18 @@ def test_layerwise_save_kv_producer_ignores_can_save_flag() -> None:
     connector.wait_for_save()
     assert engine.store_steps["req-1"] == 2
     assert connector._layerwise_save_storers == {}
+
+
+def test_layerwise_save_passes_request_configs() -> None:
+    request_configs = {"lmcache.tag.schema": "dsa-index-save-v2"}
+    connector, _, engine = _make_connector(
+        [_make_req("req-1", request_configs=request_configs)]
+    )
+
+    connector.save_kv_layer("layer0", torch.zeros(1), None)
+
+    assert engine.store_calls == ["req-1"]
+    assert engine.store_kwargs[0]["request_configs"] == request_configs
 
 
 def test_indexer_save_uses_layer_metadata_slots_not_request_slots() -> None:

@@ -26,7 +26,12 @@ from lmcache.utils import CacheEngineKey, LayerCacheEngineKey
 from lmcache.v1.cache_engine import LMCacheEngine
 from lmcache.v1.config import LMCacheEngineConfig
 from lmcache.v1.memory_management import MemoryFormat
-from lmcache.v1.token_database import ChunkedTokenDatabase
+from lmcache.v1.protocol import MAX_KEY_LENGTH
+from lmcache.v1.token_database import (
+    DSA_INDEX_CACHE_SCHEMA,
+    DSA_INDEX_CACHE_SCHEMA_TAG,
+    ChunkedTokenDatabase,
+)
 
 # Local
 from .utils import dumb_metadata, generate_tokens
@@ -315,6 +320,83 @@ class TestTokenDatabaseKvGroup:
         assert len(layer_keys) == 4
         for lk in layer_keys:
             assert lk.kv_group == 1
+
+    def test_dsa_index_group_uses_internal_schema_tag(self):
+        cfg = LMCacheEngineConfig.from_legacy(
+            chunk_size=64,
+            backend="cpu",
+            dsa_two_groups=True,
+        )
+        metadata = dumb_metadata()
+        tokens = generate_tokens(64, "cpu")
+        db = ChunkedTokenDatabase(cfg, metadata)
+
+        key0 = list(db.process_tokens(tokens=tokens, kv_group=0))[0][2]
+        key1 = list(db.process_tokens(tokens=tokens, kv_group=1))[0][2]
+
+        assert DSA_INDEX_CACHE_SCHEMA_TAG not in (key0.request_configs or {})
+        assert key1.request_configs[DSA_INDEX_CACHE_SCHEMA_TAG] == (
+            DSA_INDEX_CACHE_SCHEMA
+        )
+        assert key0 != key1
+
+    def test_dsa_index_group_accepts_single_dtype_metadata(self):
+        cfg = LMCacheEngineConfig.from_legacy(
+            chunk_size=64,
+            backend="cpu",
+            dsa_two_groups=True,
+        )
+        metadata = dumb_metadata()
+        assert len(metadata.get_dtypes()) == 1
+        tokens = generate_tokens(64, "cpu")
+        db = ChunkedTokenDatabase(cfg, metadata)
+
+        _, _, key = list(db.process_tokens(tokens=tokens, kv_group=1))[0]
+
+        assert key.dtype == metadata.kv_dtype
+        assert key.request_configs[DSA_INDEX_CACHE_SCHEMA_TAG] == (
+            DSA_INDEX_CACHE_SCHEMA
+        )
+
+    def test_dsa_index_schema_tag_preserves_user_tags(self):
+        cfg = LMCacheEngineConfig.from_legacy(
+            chunk_size=64,
+            backend="cpu",
+            dsa_two_groups=True,
+        )
+        metadata = dumb_metadata()
+        tokens = generate_tokens(64, "cpu")
+        db = ChunkedTokenDatabase(cfg, metadata)
+
+        _, _, key = list(
+            db.process_tokens(
+                tokens=tokens,
+                kv_group=1,
+                request_configs={"lmcache.tag.user": "alice"},
+            )
+        )[0]
+
+        assert key.request_configs["lmcache.tag.user"] == "alice"
+        assert key.request_configs[DSA_INDEX_CACHE_SCHEMA_TAG] == (
+            DSA_INDEX_CACHE_SCHEMA
+        )
+
+    def test_dsa_index_schema_tag_keeps_glm_path_keys_under_protocol_limit(self):
+        cfg = LMCacheEngineConfig.from_legacy(
+            chunk_size=64,
+            backend="cpu",
+            dsa_two_groups=True,
+        )
+        metadata = dumb_metadata()
+        metadata.model_name = "/workspace/models/GLM-5.1-w4a8"
+        tokens = generate_tokens(64, "cpu")
+        db = ChunkedTokenDatabase(cfg, metadata)
+
+        _, _, key = list(db.process_tokens(tokens=tokens, kv_group=1))[0]
+
+        assert len(key.to_string()) <= MAX_KEY_LENGTH
+        for layer_key in key.split_layers(96):
+            assert len(layer_key.to_string()) <= MAX_KEY_LENGTH
 
 
 # ---------------------------------------------------------------------------
