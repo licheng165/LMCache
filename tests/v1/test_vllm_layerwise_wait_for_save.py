@@ -13,6 +13,7 @@ pytest.importorskip("vllm")
 from lmcache.integration.vllm.vllm_v1_adapter import (
     LMCacheConnectorMetadata,
     LMCacheConnectorV1Impl,
+    LoadSpec,
     ReqMeta,
     RequestTracker,
     SaveSpec,
@@ -254,6 +255,33 @@ def test_decode_window_reqmeta_saves_latent_and_indexer() -> None:
     assert req_meta.save_spec.can_save_indexer is True
     assert len(req_meta.indexer_slot_mapping) == 1
     assert req_meta.indexer_slot_mapping[0].tolist() == list(range(8, 16))
+
+
+def test_sparse_decode_reqmeta_extends_tokens_to_lmcache_hit() -> None:
+    tracker = RequestTracker(
+        req_id="req-sparse",
+        prompt_len=5,
+        token_ids=list(range(8)),
+        allocated_block_ids=[0, 1],
+    )
+    tracker.is_decode_phase = True
+
+    req_meta = ReqMeta.from_request_tracker(
+        tracker,
+        block_size=4,
+        lmcache_chunk_size=4,
+        load_spec=LoadSpec(
+            vllm_cached_tokens=0,
+            lmcache_cached_tokens=8,
+            can_load=True,
+        ),
+        is_sparse_decode=True,
+    )
+
+    assert req_meta is not None
+    assert req_meta.token_ids == list(range(8))
+    assert tracker.sparse_token_ids == list(range(8))
+    assert req_meta.slot_mapping[0].tolist() == list(range(8))
 
 
 def test_layerwise_save_skips_requests_that_cannot_save() -> None:

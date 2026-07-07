@@ -555,27 +555,33 @@ class RequestTracker:
         if len(new_token_ids) == 1:
             self.is_decode_phase = True
 
-    def seed_sparse_decode_tokens(self, token_ids: list[int]) -> None:
-        """Seed full prompt token ids used to build sparse decode chunk keys."""
-        prompt_tokens = token_ids[: self.prompt_len]
-        if len(prompt_tokens) < self.prompt_len:
+    def seed_sparse_decode_tokens(
+        self,
+        token_ids: list[int],
+        token_count: Optional[int] = None,
+    ) -> None:
+        """Seed token ids used to build sparse decode chunk keys."""
+        target_count = self.prompt_len if token_count is None else token_count
+        sparse_tokens = token_ids[:target_count]
+        if len(sparse_tokens) < target_count:
             logger.warning(
-                "Request %s sparse decode token source is shorter than prompt: "
-                "source_tokens=%d prompt_len=%d",
+                "Request %s sparse decode token source is shorter than target: "
+                "source_tokens=%d target_tokens=%d prompt_len=%d",
                 self.req_id,
-                len(prompt_tokens),
+                len(sparse_tokens),
+                target_count,
                 self.prompt_len,
             )
         if self.mm_hashes:
-            token_ids_tensor = torch.tensor(prompt_tokens)
+            token_ids_tensor = torch.tensor(sparse_tokens)
             assert self.mm_positions is not None, (
                 "tracker got mm_hashes but no mm_positions"
             )
             apply_mm_hashes_to_token_ids(
                 token_ids_tensor, self.mm_hashes, self.mm_positions
             )
-            prompt_tokens = token_ids_tensor.tolist()
-        self.sparse_token_ids = prompt_tokens
+            sparse_tokens = token_ids_tensor.tolist()
+        self.sparse_token_ids = sparse_tokens
 
 
 @dataclass
@@ -878,12 +884,17 @@ class ReqMeta:
 
         # Calculate the token ids and slot mappings for load and save
         if is_sparse_decode and load_spec is not None and skip_save:
+            sparse_token_count = min(
+                load_spec.lmcache_cached_tokens,
+                len(input_token_ids),
+            )
             if (
                 not tracker.sparse_token_ids
-                or len(tracker.sparse_token_ids) < load_spec.lmcache_cached_tokens
+                or len(tracker.sparse_token_ids) != sparse_token_count
             ):
                 tracker.seed_sparse_decode_tokens(
-                    input_token_ids[: load_spec.lmcache_cached_tokens]
+                    input_token_ids,
+                    token_count=sparse_token_count,
                 )
             token_ids = tracker.sparse_token_ids
             if len(token_ids) < load_spec.lmcache_cached_tokens:
