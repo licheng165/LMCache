@@ -96,17 +96,6 @@ class VllmServiceFactory(BaseServiceFactory):
 
         num_layer = model_config.get_num_layers(parallel_config)
         num_draft_layers = calculate_draft_layers(self.vllm_config)
-        speculative_config = getattr(self.vllm_config, "speculative_config", None)
-        speculative_method = getattr(speculative_config, "method", None)
-        if (
-            getattr(self.lmcache_config, "enable_sparse_attention", False)
-            and speculative_method in ("deepseek_mtp", "mtp")
-        ):
-            logger.info(
-                "Ignoring %d MTP draft layer(s) for LMCache sparse metadata",
-                num_draft_layers,
-            )
-            num_draft_layers = 0
         num_layer += num_draft_layers
         chunk_size = self.lmcache_config.chunk_size
         num_kv_head = model_config.get_num_kv_heads(parallel_config)

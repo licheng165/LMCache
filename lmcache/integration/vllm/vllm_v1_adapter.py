@@ -30,6 +30,7 @@ from lmcache import utils
 from lmcache.integration.vllm.utils import (
     ENGINE_NAME,
     apply_mm_hashes_to_token_ids,
+    calculate_draft_layers,
     extract_mm_features,
     lmcache_get_or_create_config,
 )
@@ -1243,8 +1244,17 @@ class LMCacheConnectorV1Impl:
             "skip_last_n_tokens", 0
         )
 
-        self.num_layers = vllm_config.model_config.get_num_layers(
+        base_num_layers = vllm_config.model_config.get_num_layers(
             vllm_config.parallel_config
+        )
+        metadata_kv_shape = getattr(self.lmcache_engine_metadata, "kv_shape", None)
+        metadata_num_layers = (
+            metadata_kv_shape[0]
+            if metadata_kv_shape is not None and len(metadata_kv_shape) > 0
+            else None
+        )
+        self.num_layers = metadata_num_layers or (
+            base_num_layers + calculate_draft_layers(vllm_config)
         )
         self.current_layer = 0
 
@@ -3440,6 +3450,12 @@ class LMCacheConnectorV1Impl:
                 )
                 self._layerwise_save_storers[storer_key] = layerwise_storer
 
+            indexer_group_last = (
+                is_indexer_layer
+                and self._indexer_layer_names
+                and layer_name == self._indexer_layer_names[-1]
+            )
+
             try:
                 next(layerwise_storer)
             except StopIteration:
@@ -3459,11 +3475,14 @@ class LMCacheConnectorV1Impl:
                 )
                 raise
 
+            if indexer_group_last:
+                self._drain_layerwise_storer_fully(layerwise_storer)
+                self._layerwise_save_storers.pop(storer_key, None)
+                layerwise_storer = None
+
             if (
-                is_indexer_layer
+                indexer_group_last
                 and self._should_defer_latent_save_under_tp()
-                and self._indexer_layer_names
-                and layer_name == self._indexer_layer_names[-1]
             ):
                 self._flush_deferred_latent_store(request, save_spec)
 
