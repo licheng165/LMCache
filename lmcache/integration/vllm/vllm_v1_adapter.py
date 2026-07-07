@@ -3768,8 +3768,7 @@ class LMCacheConnectorV1Impl:
         if storer is None:
             return
         try:
-            while True:
-                next(storer)
+            next(storer)
         except StopIteration:
             pass
 
@@ -3928,8 +3927,8 @@ class LMCacheConnectorV1Impl:
             # consecutive forwards (e.g. chunked prefill), which would leave the
             # previous forward's storer in place and cause the next forward's
             # save_kv_layer calls to exhaust it (StopIteration). When we see the
-            # group's first layer again while a storer still exists, drain the
-            # old storer fully and create a fresh one for the new forward.
+            # group's first layer again while a storer still exists, finalize the
+            # old storer once and create a fresh one for the new forward.
             if layerwise_storer is not None:
                 _first_layer = (
                     self._indexer_layer_names[0]
@@ -4127,7 +4126,7 @@ class LMCacheConnectorV1Impl:
                             request, request.save_spec
                         )
             for request in connector_metadata.requests:
-                # Drain both the latent (kv_group=0) and indexer (kv_group=1)
+                # Finalize both the latent (kv_group=0) and indexer (kv_group=1)
                 # storers for this request.
                 for _kv_group in (0, 1):
                     layerwise_storer = self._layerwise_save_storers.pop(
