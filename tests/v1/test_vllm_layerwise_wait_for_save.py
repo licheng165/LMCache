@@ -186,6 +186,7 @@ def test_decode_window_save_storer_is_scoped_by_kv_group() -> None:
     request.decode_window_end = 512
     request.decode_window_size = 256
     request.save_spec.can_save_indexer = True
+    request.indexer_slot_mapping = [torch.arange(4, 8, dtype=torch.long)]
     connector, _, engine = _make_connector([request])
     connector.config.dsa_two_groups = True
     connector.kv_caches = {
@@ -197,11 +198,12 @@ def test_decode_window_save_storer_is_scoped_by_kv_group() -> None:
     connector.save_kv_layer(
         "layer0.indexer.k_cache",
         torch.zeros(1),
-        SimpleNamespace(slot_mapping=torch.arange(4, dtype=torch.long)),
+        SimpleNamespace(slot_mapping=torch.arange(1, dtype=torch.long)),
     )
 
     assert len(engine.store_calls) == 2
     assert [kwargs.get("kv_group", 0) for kwargs in engine.store_kwargs] == [0, 1]
+    assert engine.store_kwargs[1]["slot_mapping"].tolist() == [4, 5, 6, 7]
     assert len(connector._layerwise_save_storers) == 2
 
     connector.wait_for_save()
@@ -229,7 +231,7 @@ def test_decode_window_save_completion_follows_actual_latent_path() -> None:
     assert connector.get_completed_decode_window_saves() == {"req-window": 512}
 
 
-def test_decode_window_reqmeta_is_latent_only_by_default() -> None:
+def test_decode_window_reqmeta_saves_latent_and_indexer() -> None:
     tracker = RequestTracker(
         req_id="req-window",
         prompt_len=0,
@@ -249,8 +251,9 @@ def test_decode_window_reqmeta_is_latent_only_by_default() -> None:
     assert req_meta is not None
     assert req_meta.save_spec is not None
     assert req_meta.save_spec.can_save_latent is True
-    assert req_meta.save_spec.can_save_indexer is False
-    assert req_meta.indexer_slot_mapping == []
+    assert req_meta.save_spec.can_save_indexer is True
+    assert len(req_meta.indexer_slot_mapping) == 1
+    assert req_meta.indexer_slot_mapping[0].tolist() == list(range(8, 16))
 
 
 def test_layerwise_save_skips_requests_that_cannot_save() -> None:

@@ -702,6 +702,26 @@ class ReqMeta:
             )
             return None
 
+        indexer_slot_mapping: list[torch.Tensor] = []
+        if tracker.allocated_block_ids_indexer:
+            indexer_num_blocks = len(tracker.allocated_block_ids_indexer)
+            if window_end > indexer_num_blocks * block_size:
+                logger.warning(
+                    "Skipping decode window indexer save for request %s: "
+                    "window_end=%d exceeds indexer slot capacity %d",
+                    tracker.req_id,
+                    window_end,
+                    indexer_num_blocks * block_size,
+                )
+            else:
+                indexer_slot_mapping = [
+                    _build_slot_mapping(
+                        tracker.allocated_block_ids_indexer,
+                        block_size,
+                        len(token_ids),
+                    )
+                ]
+
         return ReqMeta(
             req_id=tracker.req_id,
             token_ids=token_ids,
@@ -715,8 +735,9 @@ class ReqMeta:
                 window_start,
                 True,
                 can_save_latent=True,
-                can_save_indexer=False,
+                can_save_indexer=bool(indexer_slot_mapping),
             ),
+            indexer_slot_mapping=indexer_slot_mapping,
             load_spec=None,
             disagg_spec=None,
             request_configs=tracker.request_configs,
@@ -3108,7 +3129,13 @@ class LMCacheConnectorV1Impl:
         )
         self._drain_layerwise_storer_fully(storer)
         self._deferred_latent_pending.discard(pending_key)
-        self._mark_decode_window_save_completed(request)
+        indexer_required = (
+            self._is_decode_window_save_request(request)
+            and getattr(save_spec, "can_save_indexer", False)
+            and getattr(self.config, "dsa_two_groups", False)
+        )
+        if not indexer_required:
+            self._mark_decode_window_save_completed(request)
 
 
     @_lmcache_nvtx_annotate
@@ -3257,9 +3284,16 @@ class LMCacheConnectorV1Impl:
                 # indexer metadata stores this as "slot_mapping", while the
                 # latent metadata stores it as "indexer_slot_mapping".
                 if is_indexer_layer:
-                    idx_slot = self._indexer_slot_mapping_from_attn_metadata(
-                        attn_metadata, layer_name
-                    )
+                    idx_slot = None
+                    if (
+                        self._is_decode_window_save_request(request)
+                        and request.indexer_slot_mapping
+                    ):
+                        idx_slot = request.indexer_slot_mapping[0]
+                    if idx_slot is None:
+                        idx_slot = self._indexer_slot_mapping_from_attn_metadata(
+                            attn_metadata, layer_name
+                        )
                     if idx_slot is not None:
                         slot_mapping = idx_slot.to(
                             device=self.device, dtype=torch.long
@@ -3359,6 +3393,25 @@ class LMCacheConnectorV1Impl:
                     kv_group == 0
                     or (dsa_two_groups and _world_size > 1)
                 )
+                logger.debug(
+                    "Creating layerwise save storer: req_id=%s key=%s "
+                    "layer=%s kv_group=%s decode_window=%s "
+                    "range=[%s,%s) tokens=%d skip=%d slot_mapping_len=%d "
+                    "kvcaches=%d can_save_latent=%s can_save_indexer=%s",
+                    request.req_id,
+                    storer_key,
+                    layer_name,
+                    kv_group,
+                    self._is_decode_window_save_request(request),
+                    getattr(request, "decode_window_start", None),
+                    getattr(request, "decode_window_end", None),
+                    len(token_ids),
+                    skip_leading_tokens,
+                    len(slot_mapping),
+                    len(kvcaches),
+                    getattr(save_spec, "can_save_latent", None),
+                    getattr(save_spec, "can_save_indexer", None),
+                )
                 layerwise_storer = self.lmcache_engine.store_layer(
                     token_ids,
                     mask=store_mask,
@@ -3371,7 +3424,24 @@ class LMCacheConnectorV1Impl:
                 )
                 self._layerwise_save_storers[storer_key] = layerwise_storer
 
-            next(layerwise_storer)
+            try:
+                next(layerwise_storer)
+            except StopIteration:
+                logger.error(
+                    "Layerwise save storer exhausted early: req_id=%s key=%s "
+                    "layer=%s kv_group=%s decode_window=%s range=[%s,%s) "
+                    "active_storer_keys=%s deferred_latent_pending=%s",
+                    request.req_id,
+                    storer_key,
+                    layer_name,
+                    kv_group,
+                    self._is_decode_window_save_request(request),
+                    getattr(request, "decode_window_start", None),
+                    getattr(request, "decode_window_end", None),
+                    list(self._layerwise_save_storers.keys()),
+                    list(getattr(self, "_deferred_latent_pending", set())),
+                )
+                raise
 
             if (
                 is_indexer_layer
