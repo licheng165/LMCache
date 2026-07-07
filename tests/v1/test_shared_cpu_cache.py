@@ -362,6 +362,12 @@ def test_sparse_capacity_preflight_records_startup_estimate():
     )
 
 
+def test_shared_cpu_index_group_dtype_uses_single_dtype_metadata():
+    engine = _make_engine_for_sparse_capacity(max_local_cpu_size=1)
+
+    assert engine._shared_cpu_dtype_for_kv_group(1) is torch.float16
+
+
 def test_sparse_capacity_shape_helper_keeps_two_dim_token_shape():
     engine = _make_engine_for_sparse_capacity(max_local_cpu_size=1)
     engine.num_layers = 256

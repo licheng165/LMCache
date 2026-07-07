@@ -479,6 +479,11 @@ class LMCacheEngine:
         if 0 <= kv_group < len(dtypes):
             return dtypes[kv_group]
         if kv_group != 0:
+            if (
+                len(dtypes) == 1
+                and getattr(self, "dsa_two_groups", False)
+            ):
+                return dtypes[0]
             raise ValueError(
                 "KV group dtype metadata is unavailable: "
                 f"kv_group={kv_group}, num_dtypes={len(dtypes)}"
