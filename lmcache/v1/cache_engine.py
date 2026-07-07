@@ -258,7 +258,8 @@ class LMCacheEngine:
         self._init_failed = False
 
     def _get_shared_config_value(self, key: str, default: Any = None) -> Any:
-        value = self.config.get_extra_config_value(key, None)
+        get_extra = getattr(self.config, "get_extra_config_value", None)
+        value = get_extra(key, None) if callable(get_extra) else None
         if value is not None:
             return value
         return getattr(self.config, key, default)
@@ -438,7 +439,7 @@ class LMCacheEngine:
             None,
         )
         if size_gb is None:
-            size_gb = self.config.max_local_cpu_size
+            size_gb = self._get_shared_config_value("max_local_cpu_size", 0)
         return int(float(size_gb) * 1024**3)
 
     def _preflight_shared_cpu_shm_capacity(self) -> None:

@@ -217,11 +217,7 @@ class TokenDatabase(metaclass=abc.ABCMeta):
         dtypes = self.metadata.get_dtypes()
         if 0 <= kv_group < len(dtypes):
             kv_dtype = dtypes[kv_group]
-        elif (
-            kv_group == 1
-            and len(dtypes) == 1
-            and bool(getattr(config, "dsa_two_groups", False))
-        ):
+        elif len(dtypes) == 1:
             kv_dtype = dtypes[0]
         else:
             raise ValueError(

@@ -82,6 +82,9 @@ class _FakeLayerwiseStorageManager:
     def batched_unpin(self, keys, locations=None):
         self.unpinned.append((list(keys), locations))
 
+    def touch_cache(self):
+        return None
+
 
 def test_layerwise_chunk_fully_stored_repairs_partial_cache() -> None:
     engine = object.__new__(LMCacheEngine)
@@ -267,6 +270,9 @@ class _RaceLayerwiseStorageManager:
 
     def batched_unpin(self, keys, locations=None):
         self.unpinned.append((list(keys), locations))
+
+    def touch_cache(self):
+        return None
 
 
 def test_layerwise_lookup_unpins_current_partial_group_on_pin_race() -> None:
