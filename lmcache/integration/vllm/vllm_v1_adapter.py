@@ -3320,6 +3320,19 @@ class LMCacheConnectorV1Impl:
                     list(self._layerwise_save_storers.keys()),
                 )
 
+            if kv_group == 1 and group_last:
+                self._drain_layerwise_storer_fully(
+                    layerwise_storer,
+                    worker_id=worker_id,
+                    req_id=request.req_id,
+                    kv_group=kv_group,
+                    storer_key=storer_key,
+                    reason="save_kv_layer_group_last",
+                )
+                self._layerwise_save_storers.pop(storer_key, None)
+                self._layerwise_save_storer_diag.pop(storer_key, None)
+                layerwise_storer = None
+
             if (
                 is_indexer_layer
                 and self._should_defer_latent_save_under_tp()
