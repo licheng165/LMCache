@@ -1398,6 +1398,10 @@ class LMCacheConnectorV1Impl:
         return int(layer_name[start:end])
 
     def _layerwise_required_wait_groups(self) -> set[int]:
+        cached = getattr(self, "_layerwise_required_wait_groups_cache", None)
+        if cached is not None:
+            return cached
+
         required = {0}
         if self._is_dsa_two_groups():
             for idx, (_, indexer_retriever) in enumerate(
@@ -1410,6 +1414,7 @@ class LMCacheConnectorV1Impl:
                 if indexer_retriever is not None and not is_sparse:
                     required.add(1)
                     break
+        self._layerwise_required_wait_groups_cache = required
         return required
 
     def _layerwise_wait_should_advance(self, wait_group: int) -> bool:
@@ -1459,21 +1464,20 @@ class LMCacheConnectorV1Impl:
     ) -> bool:
         """True when sparse decode must materialize DSA index from LMCache.
 
-        In the legacy non-shared path, normal kv_both serving can rely on
-        prefill-populated vLLM index cache. In shared-CPU sparse decode,
-        however, the prompt cache hit may bypass that prefill work while still
-        using the indexer for top-k selection, so the index group must be
-        installed along with the latent group.
+        In normal kv_both serving, prefill populated the resident DSA index
+        cache in vLLM. Reloading the full index group on the sparse decode
+        path is expensive and can overwrite that resident state. Decode
+        consumers, however, do not own that prefill-side resident index cache,
+        so they must cold-materialize it.
         """
         if not self._is_dsa_two_groups():
             return False
         if not self._shared_cpu_materialize_index_on_decode_cold():
             return False
         kv_role = getattr(self, "kv_role", "kv_both")
-        if shared_cpu_enabled:
-            return True
-        # Outside shared CPU sparse decode, keep the legacy kv_both behavior:
-        # only a decode consumer lacks a resident DSA index cache.
+        # Keep kv_both on the resident-index fast path even when shared CPU is
+        # enabled. The shared CPU path still materializes the index for the
+        # disaggregated decode-consumer role.
         return kv_role == "kv_consumer"
 
     @staticmethod
@@ -1995,6 +1999,7 @@ class LMCacheConnectorV1Impl:
             self._layerwise_waited_groups.clear()
         if hasattr(self, "_layerwise_sparse_indexer_sent_layers"):
             self._layerwise_sparse_indexer_sent_layers.clear()
+        self._layerwise_required_wait_groups_cache = None
 
     def _drain_sparse_layerwise_retriever(
         self, retriever: Generator[Any, Any, Any]
@@ -2838,6 +2843,7 @@ class LMCacheConnectorV1Impl:
         self._layerwise_sparse_req_ids = []
         self._layerwise_waited_groups = set()
         self._layerwise_sparse_indexer_sent_layers = set()
+        self._layerwise_required_wait_groups_cache = None
 
         load_count = sum(
             1
@@ -3444,13 +3450,9 @@ class LMCacheConnectorV1Impl:
             )
 
         wait_group = self._layerwise_wait_group(layer_name)
-        parsed_layer_id = self._layerwise_layer_id_from_name(layer_name)
-        sparse_indexer_sent_layers = getattr(
-            self, "_layerwise_sparse_indexer_sent_layers", None
-        )
-        if sparse_indexer_sent_layers is None:
-            sparse_indexer_sent_layers = set()
-            self._layerwise_sparse_indexer_sent_layers = sparse_indexer_sent_layers
+        parsed_layer_id = None
+        parsed_layer_id_loaded = False
+        sparse_indexer_sent_layers = None
 
         idx = 0
         decode_row = 0
@@ -3550,11 +3552,33 @@ class LMCacheConnectorV1Impl:
                     if payload is not None
                     else (selected_tokens_per_req, token_start_index_per_req)
                 )
-                indexer_sent_key = (request.req_id, self.current_layer)
+                indexer_sent_key = (
+                    (request.req_id, self.current_layer)
+                    if indexer_retriever is not None
+                    else None
+                )
+                if indexer_retriever is not None:
+                    if not parsed_layer_id_loaded:
+                        parsed_layer_id = self._layerwise_layer_id_from_name(
+                            layer_name
+                        )
+                        parsed_layer_id_loaded = True
+                    if sparse_indexer_sent_layers is None:
+                        sparse_indexer_sent_layers = getattr(
+                            self,
+                            "_layerwise_sparse_indexer_sent_layers",
+                            None,
+                        )
+                        if sparse_indexer_sent_layers is None:
+                            sparse_indexer_sent_layers = set()
+                            self._layerwise_sparse_indexer_sent_layers = (
+                                sparse_indexer_sent_layers
+                            )
                 if wait_group == 1:
                     ret_token_mask = None
                     if (
                         indexer_retriever is not None
+                        and sparse_indexer_sent_layers is not None
                         and (
                             parsed_layer_id is None
                             or parsed_layer_id == self.current_layer
@@ -3567,6 +3591,7 @@ class LMCacheConnectorV1Impl:
                     ret_token_mask = layerwise_retriever.send(sparse_payload)
                     if (
                         indexer_retriever is not None
+                        and sparse_indexer_sent_layers is not None
                         and indexer_sent_key not in sparse_indexer_sent_layers
                     ):
                         indexer_ret_mask = indexer_retriever.send((None, 0))

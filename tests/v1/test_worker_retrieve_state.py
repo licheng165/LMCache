@@ -169,7 +169,7 @@ class TestWorkerRetrieveState:
                 request,
                 shared_cpu_enabled=True,
             )
-            is True
+            is False
         )
 
     def test_sparse_decode_index_materialization_policy_for_non_shared_kv_both(self):
@@ -224,10 +224,10 @@ class TestWorkerRetrieveState:
                 request,
                 shared_cpu_enabled=True,
             )
-            is True
+            is False
         )
 
-    def test_bind_rejects_skipped_index_for_shared_cpu_kv_both_sparse_decode(self):
+    def test_bind_allows_skipped_index_for_shared_cpu_kv_both_sparse_decode(self):
         impl = _make_impl()
         impl.config = SimpleNamespace(dsa_two_groups=True)
         impl.kv_role = "kv_both"
@@ -251,8 +251,7 @@ class TestWorkerRetrieveState:
             shared_request_active=True,
         )
 
-        with pytest.raises(RuntimeError, match="invalid DSA index"):
-            impl._bind_worker_retrieve_state_to_request(request)
+        assert impl._bind_worker_retrieve_state_to_request(request) is not None
 
     def test_record_shared_state_preserves_skipped_index_without_index_objs(self):
         impl = _make_impl()
