@@ -2039,6 +2039,11 @@ class LMCacheConnectorV1Impl:
         if state is None:
             return False
         if request.is_sparse_decode:
+            if (
+                request.load_spec is not None
+                and request.load_spec.lmcache_cached_tokens > state.token_count
+            ):
+                return True
             # Sparse decode retrieves a sliding window (e.g. 2048 tokens) while
             # warm cache covers the full prompt — window < cached_ends is normal.
             if state.token_count and len(request.token_ids) < state.token_count:

@@ -263,6 +263,25 @@ class TestWorkerRetrieveState:
         req.token_ids = [0] * 18879
         assert not impl._should_invalidate_worker_retrieve_state(req, 2048)
 
+    def test_sparse_decode_lmcache_hit_growth_invalidates(self):
+        impl = _make_impl()
+        impl._worker_retrieve_state["req-1"] = WorkerRetrieveState(
+            cached_keys=[["k"]],
+            cached_starts=[0],
+            cached_ends=[256],
+            metadata_warm=True,
+            token_count=256,
+        )
+        req = _make_request()
+        req.token_ids = [0] * 512
+        req.load_spec = LoadSpec(
+            vllm_cached_tokens=0,
+            lmcache_cached_tokens=512,
+            can_load=True,
+        )
+
+        assert impl._should_invalidate_worker_retrieve_state(req, 2048)
+
     def test_sparse_decode_prompt_shrink_invalidates(self):
         impl = _make_impl()
         impl._worker_retrieve_state["req-1"] = WorkerRetrieveState(
