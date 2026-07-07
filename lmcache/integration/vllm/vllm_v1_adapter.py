@@ -1383,6 +1383,20 @@ class LMCacheConnectorV1Impl:
     def _layerwise_wait_group(self, layer_name: str) -> int:
         return 1 if self._is_indexer_layer_wait(layer_name) else 0
 
+    @staticmethod
+    def _layerwise_layer_id_from_name(layer_name: str) -> Optional[int]:
+        marker = "layers."
+        marker_idx = layer_name.find(marker)
+        if marker_idx < 0:
+            return None
+        start = marker_idx + len(marker)
+        end = start
+        while end < len(layer_name) and layer_name[end].isdigit():
+            end += 1
+        if end == start:
+            return None
+        return int(layer_name[start:end])
+
     def _layerwise_required_wait_groups(self) -> set[int]:
         required = {0}
         if self._is_dsa_two_groups():
@@ -1979,6 +1993,8 @@ class LMCacheConnectorV1Impl:
             self._layerwise_sparse_req_ids.clear()
         if hasattr(self, "_layerwise_waited_groups"):
             self._layerwise_waited_groups.clear()
+        if hasattr(self, "_layerwise_sparse_indexer_sent_layers"):
+            self._layerwise_sparse_indexer_sent_layers.clear()
 
     def _drain_sparse_layerwise_retriever(
         self, retriever: Generator[Any, Any, Any]
@@ -2821,6 +2837,7 @@ class LMCacheConnectorV1Impl:
         self._layerwise_requests = []
         self._layerwise_sparse_req_ids = []
         self._layerwise_waited_groups = set()
+        self._layerwise_sparse_indexer_sent_layers = set()
 
         load_count = sum(
             1
@@ -3427,6 +3444,13 @@ class LMCacheConnectorV1Impl:
             )
 
         wait_group = self._layerwise_wait_group(layer_name)
+        parsed_layer_id = self._layerwise_layer_id_from_name(layer_name)
+        sparse_indexer_sent_layers = getattr(
+            self, "_layerwise_sparse_indexer_sent_layers", None
+        )
+        if sparse_indexer_sent_layers is None:
+            sparse_indexer_sent_layers = set()
+            self._layerwise_sparse_indexer_sent_layers = sparse_indexer_sent_layers
 
         idx = 0
         decode_row = 0
@@ -3526,16 +3550,27 @@ class LMCacheConnectorV1Impl:
                     if payload is not None
                     else (selected_tokens_per_req, token_start_index_per_req)
                 )
+                indexer_sent_key = (request.req_id, self.current_layer)
                 if wait_group == 1:
-                    # Sparse decode index materialization is driven by the
-                    # attention-layer wait below. Some Ascend stacks do not
-                    # issue a separate indexer wait callback; sending here as
-                    # well would advance kv_group=1 twice.
                     ret_token_mask = None
+                    if (
+                        indexer_retriever is not None
+                        and (
+                            parsed_layer_id is None
+                            or parsed_layer_id == self.current_layer
+                        )
+                        and indexer_sent_key not in sparse_indexer_sent_layers
+                    ):
+                        indexer_retriever.send((None, 0))
+                        sparse_indexer_sent_layers.add(indexer_sent_key)
                 else:
                     ret_token_mask = layerwise_retriever.send(sparse_payload)
-                    if indexer_retriever is not None:
-                        indexer_ret_mask = indexer_retriever.send(sparse_payload)
+                    if (
+                        indexer_retriever is not None
+                        and indexer_sent_key not in sparse_indexer_sent_layers
+                    ):
+                        indexer_ret_mask = indexer_retriever.send((None, 0))
+                        sparse_indexer_sent_layers.add(indexer_sent_key)
                         if ret_token_mask is None:
                             ret_token_mask = indexer_ret_mask
                 decode_row += row_count

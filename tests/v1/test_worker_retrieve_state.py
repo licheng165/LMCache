@@ -884,16 +884,62 @@ class TestWorkerRetrieveState:
         )
 
         assert [label for label, _ in captured] == ["latent", "indexer"]
-        for _, captured_payload in captured:
-            selected_payload, token_start, target_payload = captured_payload
-            assert token_start is None
-            assert torch.equal(selected_payload, selected_tokens[0])
-            assert torch.equal(target_payload, target_slot_mapping[0])
+        selected_payload, token_start, target_payload = captured[0][1]
+        assert token_start is None
+        assert torch.equal(selected_payload, selected_tokens[0])
+        assert torch.equal(target_payload, target_slot_mapping[0])
+        assert captured[1][1] == (None, 0)
         assert impl.current_layer == 1
 
         impl.wait_for_layer_load("model.layers.0.self_attn.indexer.k_cache")
 
         assert [label for label, _ in captured] == ["latent", "indexer"]
+        assert impl.current_layer == 1
+
+    def test_sparse_decode_indexer_wait_can_prime_before_attn(self):
+        req = make_sparse_req_meta("req-1", token_count=4)
+        impl, _, _ = make_worker_connector([req], use_layerwise=True)
+        impl.config.dsa_two_groups = True
+        impl._indexer_layer_names = ["model.layers.0.self_attn.indexer.k_cache"]
+        impl.current_layer = 0
+        impl.num_layers = 2
+        impl._layerwise_retriever_is_sparse = [True]
+        impl._layerwise_sparse_req_ids = ["req-1"]
+        impl._layerwise_sparse_indexer_sent_layers = set()
+
+        captured = []
+
+        def _retriever(label):
+            payload = yield None
+            captured.append((label, payload))
+            yield torch.ones(4, dtype=torch.bool)
+
+        latent = _retriever("latent")
+        indexer = _retriever("indexer")
+        next(latent)
+        next(indexer)
+        impl.layerwise_retrievers = [(latent, indexer)]
+
+        impl.wait_for_layer_load("model.layers.0.self_attn.indexer.k_cache")
+
+        assert captured == [("indexer", (None, 0))]
+        assert impl.current_layer == 0
+
+        selected_tokens = torch.tensor([[10, 11, 12, 13]], dtype=torch.int32)
+        target_slot_mapping = torch.tensor([[900, 901, 902, 903]], dtype=torch.long)
+        impl.wait_for_layer_load(
+            "model.layers.0.self_attn.attn",
+            selected_tokens=selected_tokens,
+            token_start_index=[0],
+            request_ids=["req-1"],
+            target_slot_mapping=target_slot_mapping,
+        )
+
+        assert [label for label, _ in captured] == ["indexer", "latent"]
+        selected_payload, token_start, target_payload = captured[1][1]
+        assert token_start is None
+        assert torch.equal(selected_payload, selected_tokens[0])
+        assert torch.equal(target_payload, target_slot_mapping[0])
         assert impl.current_layer == 1
 
     def test_dense_prefix_two_group_wait_advances_after_both_groups(self):
