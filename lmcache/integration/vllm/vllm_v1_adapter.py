@@ -1789,11 +1789,15 @@ class LMCacheConnectorV1Impl:
         layer_name: Optional[str],
         token_count: int,
     ) -> Optional[torch.Tensor]:
-        """Return indexer save slots, preferring scheduler request metadata."""
-        if request.indexer_slot_mapping:
-            candidate = request.indexer_slot_mapping[0]
-            if len(candidate) >= token_count:
-                return candidate
+        """Return indexer save slots from the active layer metadata.
+
+        DSA indexer save is reading the current indexer-layer KV buffer, so the
+        source slots must come from the attention metadata for that layer. The
+        request-level indexer_slot_mapping may be a full/cumulative scheduler
+        destination used by retrieve; using it for save can publish cache chunks
+        that differ from the cold prefill state.
+        """
+        _ = (request, token_count)
         return self._indexer_slot_mapping_from_attn_metadata(
             attn_metadata, layer_name
         )
@@ -3842,9 +3846,10 @@ class LMCacheConnectorV1Impl:
                     )
 
                 # Latent save matches dev-qzy: use scheduler request.slot_mapping
-                # (cumulative across chunked-prefill steps). Indexer save should
-                # prefer the scheduler request.indexer_slot_mapping for symmetry
-                # with retrieve, then fall back to per-layer attention metadata.
+                # (cumulative across chunked-prefill steps). Indexer save must
+                # use the active layer's attention metadata because it is the
+                # source view for the indexer KV buffer. Retrieve can use the
+                # request-level mapping as its destination view.
 
                 # Two-group DSA: for indexer layers, use the indexer group's
                 # slot mapping. vLLM may pass a per-layer metadata dict; the

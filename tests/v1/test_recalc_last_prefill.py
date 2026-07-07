@@ -234,7 +234,7 @@ class TestFullHitRecalcLast:
                 strict=True,
             )
 
-    def test_indexer_save_slot_mapping_prefers_request_slots(self) -> None:
+    def test_indexer_save_slot_mapping_prefers_layer_metadata(self) -> None:
         impl = object.__new__(LMCacheConnectorV1Impl)
         request = _make_prefill_req(prompt_len=8)
         request.indexer_slot_mapping = [torch.arange(100, 108)]
@@ -248,9 +248,9 @@ class TestFullHitRecalcLast:
             token_count=8,
         )
 
-        assert torch.equal(result, request.indexer_slot_mapping[0])
+        assert torch.equal(result, attn.indexer_slot_mapping)
 
-    def test_indexer_save_slot_mapping_falls_back_to_metadata(self) -> None:
+    def test_indexer_save_slot_mapping_ignores_short_request_slots(self) -> None:
         impl = object.__new__(LMCacheConnectorV1Impl)
         request = _make_prefill_req(prompt_len=8)
         request.indexer_slot_mapping = [torch.arange(4)]
@@ -265,3 +265,21 @@ class TestFullHitRecalcLast:
         )
 
         assert torch.equal(result, attn.indexer_slot_mapping)
+
+    def test_indexer_save_slot_mapping_does_not_fallback_to_request_slots(
+        self,
+    ) -> None:
+        impl = object.__new__(LMCacheConnectorV1Impl)
+        request = _make_prefill_req(prompt_len=8)
+        request.indexer_slot_mapping = [torch.arange(100, 108)]
+        attn = SimpleNamespace(indexer_slot_mapping=None, slot_mapping=None)
+
+        result = LMCacheConnectorV1Impl._indexer_save_slot_mapping(
+            impl,
+            request,
+            attn,
+            layer_name=None,
+            token_count=8,
+        )
+
+        assert result is None
