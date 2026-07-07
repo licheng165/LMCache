@@ -86,6 +86,7 @@ def _make_connector(requests):
     connector._wait_for_save_done = True
     connector._finished_req_ids_waiting_for_save = set()
     connector._late_finished_sending = set()
+    connector._completed_decode_window_saves = {}
     return connector, metadata, engine
 
 
@@ -140,6 +141,22 @@ def test_multi_layer_save_and_finalize() -> None:
     assert engine.store_steps["req-1"] == num_layers + 1
     assert engine.store_steps["req-2"] == num_layers + 1
     assert connector._layerwise_save_storers == {}
+
+
+def test_decode_window_save_completion_is_drained_after_wait() -> None:
+    request = _make_req("req-window")
+    request.is_decode_window_save = True
+    request.decode_window_start = 256
+    request.decode_window_end = 512
+    request.decode_window_size = 256
+    connector, _, _ = _make_connector([request])
+
+    connector.save_kv_layer("layer0", torch.zeros(1), None)
+    assert connector.get_completed_decode_window_saves() == {}
+
+    connector.wait_for_save()
+    assert connector.get_completed_decode_window_saves() == {"req-window": 512}
+    assert connector.get_completed_decode_window_saves() == {}
 
 
 def test_layerwise_save_skips_requests_that_cannot_save() -> None:

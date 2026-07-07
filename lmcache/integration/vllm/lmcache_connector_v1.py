@@ -1,6 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
 
-# Standard
 from typing import TYPE_CHECKING, Any, Optional
 
 # Third Party
@@ -22,6 +21,7 @@ if TYPE_CHECKING:
     from vllm.attention.backends.abstract import AttentionMetadata
     from vllm.forward_context import ForwardContext
     from vllm.v1.core.kv_cache_manager import KVCacheBlocks
+    from vllm.v1.outputs import KVConnectorOutput
     from vllm.v1.request import Request
 
 logger = init_logger(__name__)
@@ -159,6 +159,9 @@ class LMCacheConnectorV1Dynamic(KVConnectorBase_V1):
         """Return block IDs that failed to load during the last interval."""
         return self._lmcache_engine.get_block_ids_with_load_errors()
 
+    def get_completed_decode_window_saves(self) -> dict[str, int]:
+        return self._lmcache_engine.get_completed_decode_window_saves()
+
     def shutdown(self):
         """
         Shutdown the connector. This is called when the worker process
@@ -213,6 +216,12 @@ class LMCacheConnectorV1Dynamic(KVConnectorBase_V1):
             scheduler_output (SchedulerOutput): the scheduler output object.
         """
         return self._lmcache_engine.build_connector_meta(scheduler_output)
+
+    def update_connector_output(self, connector_output: "KVConnectorOutput"):
+        """
+        Update scheduler-side LMCache state from worker-side connector output.
+        """
+        self._lmcache_engine.update_connector_output(connector_output)
 
     def request_finished(
         self,
