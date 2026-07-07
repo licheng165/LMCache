@@ -2689,6 +2689,12 @@ class LMCacheEngine:
             # Transpose the keys and memory objects into layer major format
             memory_objs = [list(row) for row in zip(*memory_objs, strict=False)]
             keys = [list(row) for row in zip(*keys, strict=False)]
+            pending_store_release: dict[int, MemoryObj] = {
+                id(mem_obj): mem_obj
+                for layer_objs in memory_objs
+                for mem_obj in layer_objs
+            }
+            mem_obj_generator = None
 
             # Calculate total KV size for logging
             tot_kv_size = sum(
@@ -2697,32 +2703,49 @@ class LMCacheEngine:
 
             assert_layerwise_gpu_connector(self.gpu_connector)
 
-            t_start = time.perf_counter()
-            mem_obj_generator = self.gpu_connector.batched_from_gpu(
-                memory_objs, starts, ends, **kwargs
-            )
-
-            next(mem_obj_generator)
-
-            for layer_id in range(self.num_layers):
-                yield
-                next(mem_obj_generator)
-                self.storage_manager.batched_put(
-                    keys[layer_id], memory_objs[layer_id], location=self.store_location
+            try:
+                t_start = time.perf_counter()
+                mem_obj_generator = self.gpu_connector.batched_from_gpu(
+                    memory_objs, starts, ends, **kwargs
                 )
 
-            tot_time = time.perf_counter() - t_start
-            logger.info(
-                "[req_id=%s kv_group=%s] Stored %d out of total %d tokens. "
-                "size: %.4f GB, cost %.4f ms, throughput: %.4f GB/s",
-                req_id,
-                kv_group,
-                tot_token_num,
-                len(tokens),
-                tot_kv_size / 1024**3,
-                tot_time * 1000,
-                tot_kv_size / tot_time / 1024**3 if tot_time > 0 else 0,
-            )
+                next(mem_obj_generator)
+
+                for layer_id in range(self.num_layers):
+                    yield
+                    next(mem_obj_generator)
+                    self.storage_manager.batched_put(
+                        keys[layer_id],
+                        memory_objs[layer_id],
+                        location=self.store_location,
+                    )
+                    for mem_obj in memory_objs[layer_id]:
+                        pending_store_release.pop(id(mem_obj), None)
+
+                tot_time = time.perf_counter() - t_start
+                logger.info(
+                    "[req_id=%s kv_group=%s] Stored %d out of total %d tokens. "
+                    "size: %.4f GB, cost %.4f ms, throughput: %.4f GB/s",
+                    req_id,
+                    kv_group,
+                    tot_token_num,
+                    len(tokens),
+                    tot_kv_size / 1024**3,
+                    tot_time * 1000,
+                    tot_kv_size / tot_time / 1024**3 if tot_time > 0 else 0,
+                )
+            finally:
+                if mem_obj_generator is not None:
+                    close_fn = getattr(mem_obj_generator, "close", None)
+                    if close_fn is not None:
+                        try:
+                            close_fn()
+                        except (GeneratorExit, RuntimeError, ValueError):
+                            pass
+                for mem_obj in list(pending_store_release.values()):
+                    if mem_obj.is_valid():
+                        mem_obj.ref_count_down()
+                pending_store_release.clear()
         else:
             # If no cache are found, we still need to yield to avoid
             # `StopIteration`

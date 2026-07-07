@@ -3772,6 +3772,15 @@ class LMCacheConnectorV1Impl:
         except StopIteration:
             pass
 
+    @staticmethod
+    def _close_layerwise_storer(storer) -> None:
+        if storer is None:
+            return
+        try:
+            storer.close()
+        except (GeneratorExit, RuntimeError, ValueError):
+            pass
+
     def _flush_deferred_latent_store(
         self,
         request: "ReqMeta",
@@ -3841,6 +3850,7 @@ class LMCacheConnectorV1Impl:
             **store_kwargs,
         )
         self._drain_layerwise_storer_fully(storer)
+        self._close_layerwise_storer(storer)
         self._deferred_latent_pending.discard(request.req_id)
 
 
@@ -3940,11 +3950,8 @@ class LMCacheConnectorV1Impl:
                     )
                 )
                 if _first_layer is not None and layer_name == _first_layer:
-                    try:
-                        while True:
-                            next(layerwise_storer)
-                    except StopIteration:
-                        pass
+                    self._drain_layerwise_storer_fully(layerwise_storer)
+                    self._close_layerwise_storer(layerwise_storer)
                     self._layerwise_save_storers.pop(storer_key, None)
                     layerwise_storer = None
             if layerwise_storer is None:
@@ -4134,6 +4141,7 @@ class LMCacheConnectorV1Impl:
                     )
                     if layerwise_storer is not None:
                         self._drain_layerwise_storer_fully(layerwise_storer)
+                        self._close_layerwise_storer(layerwise_storer)
                 self._maybe_seed_worker_retrieve_state_from_store(request)
                 self._maybe_lookup_unpin_for_request(request)
             return
@@ -4746,9 +4754,10 @@ class LMCacheConnectorV1Impl:
             self, "_layerwise_save_storers"
         ):
             for _kv_group in (0, 1):
-                self._layerwise_save_storers.pop(
+                layerwise_storer = self._layerwise_save_storers.pop(
                     self._save_storer_key(request.request_id, _kv_group), None
                 )
+                self._close_layerwise_storer(layerwise_storer)
 
         self._drop_worker_retrieve_state(request.request_id)
 
