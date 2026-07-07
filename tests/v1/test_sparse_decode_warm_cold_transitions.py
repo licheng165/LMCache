@@ -110,8 +110,9 @@ class TestConnectorWarmColdInvalidate:
 class TestAscendEngineWarmColdMetadata:
     def test_has_retrieve_data_cache_cold_vs_warm(self) -> None:
         assert not AscendLMCacheEngine._has_retrieve_data_cache(None, None, 2)
-        # Empty per-layer lists still mean the tensor cache structure exists.
-        assert AscendLMCacheEngine._has_retrieve_data_cache([[], []], None, 2)
+        # Empty per-layer lists describe shape only; they do not prove data is
+        # ready for warm reuse.
+        assert not AscendLMCacheEngine._has_retrieve_data_cache([[], []], None, 2)
 
         cached_tensors = [torch.zeros(1), torch.zeros(1)]
         assert AscendLMCacheEngine._has_retrieve_data_cache(cached_tensors, None, 2)

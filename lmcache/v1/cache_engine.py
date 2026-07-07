@@ -856,15 +856,18 @@ class LMCacheEngine:
         )
 
     def _should_use_shared_layerwise_retrieve(self, kv_group: int) -> bool:
-        if not self.enable_shared_cpu_cache:
+        if not getattr(self, "enable_shared_cpu_cache", False):
             return False
-        if not self.use_layerwise or not self.metadata.use_mla:
+        if not getattr(self, "use_layerwise", False):
             return False
-        if self.metadata.world_size <= 1:
+        metadata = getattr(self, "metadata", None)
+        if not getattr(metadata, "use_mla", False):
+            return False
+        if getattr(metadata, "world_size", 1) <= 1:
             return False
         if kv_group == 1:
-            return self.save_indexer_only_first_rank
-        return self.save_only_first_rank
+            return bool(getattr(self, "save_indexer_only_first_rank", False))
+        return bool(getattr(self, "save_only_first_rank", False))
 
     def _shared_layerwise_error_envelope(
         self,

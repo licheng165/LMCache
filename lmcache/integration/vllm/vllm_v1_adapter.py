@@ -1149,7 +1149,10 @@ class LMCacheConnectorV1Impl:
     @property
     def lmcache_engine(self) -> Optional[LMCacheEngine]:
         """Get the LMCache engine instance from manager."""
-        return self._manager.lmcache_engine
+        manager = getattr(self, "_manager", None)
+        if manager is None:
+            return None
+        return manager.lmcache_engine
 
     @lmcache_engine.setter
     def lmcache_engine(self, value: Optional[LMCacheEngine]) -> None:
@@ -2307,11 +2310,12 @@ class LMCacheConnectorV1Impl:
         if state is None:
             return False
         if request.is_sparse_decode:
-            # Sparse decode keeps metadata for the full LMCache-hit prompt even
-            # though latent transfer later writes only selected top-k rows into
-            # a compact scratch window. A smaller selected-transfer count must
-            # not invalidate full-prefix cached metadata.
-            if state.token_count and len(request.token_ids) < state.token_count:
+            # Sparse decode metadata is keyed by the full LMCache-hit prefix.
+            # A shorter current prefix means the cached request state is stale.
+            if state.token_count and (
+                token_count < state.token_count
+                or len(request.token_ids) < state.token_count
+            ):
                 return True
             return False
         if state.cached_ends and token_count < state.cached_ends[-1]:
