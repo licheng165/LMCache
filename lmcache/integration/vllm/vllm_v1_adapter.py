@@ -711,7 +711,12 @@ class ReqMeta:
                 )
             ],
             is_last_prefill=True,
-            save_spec=SaveSpec(window_start, True),
+            save_spec=SaveSpec(
+                window_start,
+                True,
+                can_save_latent=True,
+                can_save_indexer=False,
+            ),
             load_spec=None,
             disagg_spec=None,
             request_configs=tracker.request_configs,
@@ -1147,7 +1152,7 @@ class LMCacheConnectorV1Impl:
         # Under dsa_two_groups + TP>1, latent store_layer is deferred until
         # after all indexer layers in a forward to avoid interleaved latent/
         # indexer GPU transfers on store_stream (MTE OOB on chunk 2+).
-        self._deferred_latent_pending: set[str] = set()
+        self._deferred_latent_pending: set[Any] = set()
         self._stats_monitor = LMCStatsMonitor.GetOrCreate()
         self.enable_sparse_attention = config.enable_sparse_attention
 
@@ -1852,25 +1857,76 @@ class LMCacheConnectorV1Impl:
     def _is_decode_window_save_request(request: ReqMeta) -> bool:
         return bool(getattr(request, "is_decode_window_save", False))
 
-    @staticmethod
-    def _layerwise_save_storer_key(request: ReqMeta) -> Any:
-        if not LMCacheConnectorV1Impl._is_decode_window_save_request(request):
-            return request.req_id
+    def _layerwise_save_range(self, request: ReqMeta) -> tuple[int, int]:
+        if self._is_decode_window_save_request(request):
+            return (
+                int(getattr(request, "decode_window_start", 0) or 0),
+                int(getattr(request, "decode_window_end", len(request.token_ids))),
+            )
+
+        start = 0
+        save_spec = request.save_spec
+        if self.kv_role != "kv_producer" and save_spec is not None:
+            start = save_spec.skip_leading_tokens
+            start = start // self._lmcache_chunk_size * self._lmcache_chunk_size
+        return start, len(request.token_ids)
+
+    def _layerwise_save_storer_key(
+        self, request: ReqMeta, kv_group: int = 0
+    ) -> Any:
+        start, end = self._layerwise_save_range(request)
+        if not self._is_decode_window_save_request(request):
+            return (request.req_id, "normal_save", kv_group, start, end)
         return (
             request.req_id,
             "decode_window_save",
-            getattr(request, "decode_window_start", None),
-            getattr(request, "decode_window_end", None),
+            kv_group,
+            start,
+            end,
         )
 
+    @staticmethod
+    def _storer_key_matches_req_group(
+        storer_key: Any, req_id: str, kv_group: int
+    ) -> bool:
+        if storer_key == req_id:
+            return kv_group == 0
+        if not isinstance(storer_key, tuple) or not storer_key:
+            return False
+        if storer_key[0] != req_id:
+            return False
+        if len(storer_key) >= 3 and storer_key[1] in (
+            "normal_save",
+            "decode_window_save",
+        ):
+            return storer_key[2] == kv_group
+        if len(storer_key) >= 2 and isinstance(storer_key[1], int):
+            return storer_key[1] == kv_group
+        return False
+
     def _drop_layerwise_save_storers(self, req_id: str) -> None:
-        if not hasattr(self, "_layerwise_save_storers"):
-            return
-        for storer_key in list(self._layerwise_save_storers):
-            if storer_key == req_id:
-                self._layerwise_save_storers.pop(storer_key, None)
-            elif isinstance(storer_key, tuple) and storer_key and storer_key[0] == req_id:
-                self._layerwise_save_storers.pop(storer_key, None)
+        if hasattr(self, "_layerwise_save_storers"):
+            for storer_key in list(self._layerwise_save_storers):
+                if storer_key == req_id:
+                    self._layerwise_save_storers.pop(storer_key, None)
+                elif (
+                    isinstance(storer_key, tuple)
+                    and storer_key
+                    and storer_key[0] == req_id
+                ):
+                    self._layerwise_save_storers.pop(storer_key, None)
+
+        pending = getattr(self, "_deferred_latent_pending", None)
+        if pending is not None:
+            for pending_key in list(pending):
+                if pending_key == req_id:
+                    pending.discard(pending_key)
+                elif (
+                    isinstance(pending_key, tuple)
+                    and pending_key
+                    and pending_key[0] == req_id
+                ):
+                    pending.discard(pending_key)
 
     def _release_request_lookup_pins(self, req_id: str) -> None:
         manager = getattr(self, "_manager", None)
@@ -2981,16 +3037,17 @@ class LMCacheConnectorV1Impl:
         save_spec: Optional["SaveSpec"],
     ) -> None:
         """Run a full latent store_layer after indexer layers finish (TP>1)."""
-        if request.req_id not in self._deferred_latent_pending:
+        pending_key = self._layerwise_save_storer_key(request, 0)
+        if pending_key not in self._deferred_latent_pending:
             return
         if save_spec is None or not save_spec.can_save_latent:
-            self._deferred_latent_pending.discard(request.req_id)
+            self._deferred_latent_pending.discard(pending_key)
             return
 
         self._refresh_kvcaches_list()
         kvcaches = self._kvcaches_for_group(0)
         if not kvcaches:
-            self._deferred_latent_pending.discard(request.req_id)
+            self._deferred_latent_pending.discard(pending_key)
             return
 
         token_ids = request.token_ids
@@ -3007,12 +3064,15 @@ class LMCacheConnectorV1Impl:
                 device=self.device, dtype=torch.long
             )
 
-        if self.kv_role == "kv_producer":
+        if (
+            self.kv_role == "kv_producer"
+            and not self._is_decode_window_save_request(request)
+        ):
             skip_leading_tokens = 0
         else:
             skip_leading_tokens = save_spec.skip_leading_tokens
             if skip_leading_tokens == len(token_ids):
-                self._deferred_latent_pending.discard(request.req_id)
+                self._deferred_latent_pending.discard(pending_key)
                 return
             skip_leading_tokens = (
                 skip_leading_tokens
@@ -3029,6 +3089,10 @@ class LMCacheConnectorV1Impl:
             "cached_ends": request.cached_ends,
             "cached_memory_objs": request.cached_memory_objs,
             "cached_tensors": request.cached_tensors,
+            "decode_window_save": self._is_decode_window_save_request(request),
+            "decode_window_start": getattr(request, "decode_window_start", None),
+            "decode_window_end": getattr(request, "decode_window_end", None),
+            "decode_window_size": getattr(request, "decode_window_size", None),
         }
 
 
@@ -3043,7 +3107,8 @@ class LMCacheConnectorV1Impl:
             **store_kwargs,
         )
         self._drain_layerwise_storer_fully(storer)
-        self._deferred_latent_pending.discard(request.req_id)
+        self._deferred_latent_pending.discard(pending_key)
+        self._mark_decode_window_save_completed(request)
 
 
     @_lmcache_nvtx_annotate
@@ -3117,13 +3182,12 @@ class LMCacheConnectorV1Impl:
             # layer (or in wait_for_save as fallback).
             if self._should_defer_latent_save_under_tp() and not is_indexer_layer:
                 if save_spec is not None and save_spec.can_save_latent:
-                    self._deferred_latent_pending.add(request.req_id)
+                    self._deferred_latent_pending.add(
+                        self._layerwise_save_storer_key(request, 0)
+                    )
                 continue
 
-            if self._is_decode_window_save_request(request):
-                storer_key = self._layerwise_save_storer_key(request)
-            else:
-                storer_key = self._save_storer_key(request.req_id, kv_group)
+            storer_key = self._layerwise_save_storer_key(request, kv_group)
             layerwise_storer = self._layerwise_save_storers.get(storer_key)
             # Forward-boundary recovery: the store_layer generator is sized for
             # exactly one forward (num_layers layer yields + 1 drain yield). It
@@ -3134,23 +3198,33 @@ class LMCacheConnectorV1Impl:
             # save_kv_layer calls to exhaust it (StopIteration). When we see the
             # group's first layer again while a storer still exists, drain the
             # old storer fully and create a fresh one for the new forward.
-            if layerwise_storer is not None:
-                _first_layer = (
-                    self._indexer_layer_names[0]
-                    if kv_group == 1 and self._indexer_layer_names
-                    else (
-                        self._latent_layer_names[0]
-                        if self._latent_layer_names
-                        else None
-                    )
+            _first_layer = (
+                self._indexer_layer_names[0]
+                if kv_group == 1 and self._indexer_layer_names
+                else (
+                    self._latent_layer_names[0]
+                    if self._latent_layer_names
+                    else None
                 )
-                if _first_layer is not None and layer_name == _first_layer:
-                    try:
-                        while True:
-                            next(layerwise_storer)
-                    except StopIteration:
-                        pass
-                    self._layerwise_save_storers.pop(storer_key, None)
+            )
+            if _first_layer is not None and layer_name == _first_layer:
+                active_keys = {
+                    self._layerwise_save_storer_key(req, kv_group)
+                    for req in connector_metadata.requests
+                }
+                stale_keys = [
+                    key
+                    for key in list(self._layerwise_save_storers)
+                    if self._storer_key_matches_req_group(
+                        key, request.req_id, kv_group
+                    )
+                    and (key == storer_key or key not in active_keys)
+                ]
+                for stale_key in stale_keys:
+                    self._drain_layerwise_storer_fully(
+                        self._layerwise_save_storers.pop(stale_key)
+                    )
+                if stale_keys:
                     layerwise_storer = None
             if layerwise_storer is None:
                 # Refresh from the live kv_caches dict before creating a new
@@ -3329,21 +3403,21 @@ class LMCacheConnectorV1Impl:
         if self.use_layerwise:
             if self._should_defer_latent_save_under_tp():
                 for request in connector_metadata.requests:
-                    if request.req_id in self._deferred_latent_pending:
+                    if (
+                        self._layerwise_save_storer_key(request, 0)
+                        in self._deferred_latent_pending
+                    ):
                         self._flush_deferred_latent_store(
                             request, request.save_spec
                         )
             for request in connector_metadata.requests:
-                if self._is_decode_window_save_request(request):
-                    storer_keys = [self._layerwise_save_storer_key(request)]
-                else:
-                    # Drain both the latent (kv_group=0) and indexer (kv_group=1)
-                    # storers for this request.
-                    storer_keys = [
-                        self._save_storer_key(request.req_id, _kv_group)
-                        for _kv_group in (0, 1)
-                    ]
-                for storer_key in storer_keys:
+                # Drain both possible groups for this request. Missing storers
+                # are fine; the actual save path decides which groups exist.
+                storer_items = [
+                    (_kv_group, self._layerwise_save_storer_key(request, _kv_group))
+                    for _kv_group in (0, 1)
+                ]
+                for _kv_group, storer_key in storer_items:
                     layerwise_storer = self._layerwise_save_storers.pop(
                         storer_key, None
                     )
