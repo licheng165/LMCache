@@ -94,19 +94,9 @@ class VllmServiceFactory(BaseServiceFactory):
         use_mla = mla_enabled(model_config)
         validate_mla_config(self.lmcache_config, use_mla)
 
-        num_layer = model_config.get_num_layers(parallel_config)
+        base_num_layer = model_config.get_num_layers(parallel_config)
+        num_layer = base_num_layer
         num_draft_layers = calculate_draft_layers(self.vllm_config)
-        speculative_config = getattr(self.vllm_config, "speculative_config", None)
-        speculative_method = getattr(speculative_config, "method", None)
-        if (
-            getattr(self.lmcache_config, "enable_sparse_attention", False)
-            and speculative_method in ("deepseek_mtp", "mtp")
-        ):
-            logger.info(
-                "Ignoring %d MTP draft layer(s) for LMCache sparse metadata",
-                num_draft_layers,
-            )
-            num_draft_layers = 0
         num_layer += num_draft_layers
         chunk_size = self.lmcache_config.chunk_size
         num_kv_head = model_config.get_num_kv_heads(parallel_config)
@@ -122,7 +112,8 @@ class VllmServiceFactory(BaseServiceFactory):
         logger.info(
             "num_layer: %d, chunk_size: %d, num_kv_head (per gpu): %d, "
             "head_size: %d, hidden_dim (D) for KV (per gpu): %d, "
-            "use mla: %s, kv shape: %s, num_draft_layers: %d",
+            "use mla: %s, kv shape: %s, base_num_layer: %d, "
+            "num_draft_layers: %d",
             num_layer,
             chunk_size,
             num_kv_head,
@@ -130,6 +121,7 @@ class VllmServiceFactory(BaseServiceFactory):
             num_kv_head * head_size,
             use_mla,
             kv_shape,
+            base_num_layer,
             num_draft_layers,
         )
 

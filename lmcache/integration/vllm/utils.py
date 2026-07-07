@@ -238,11 +238,21 @@ def create_lmcache_metadata(
     use_mla = mla_enabled(model_cfg)
 
     # Construct KV shape (for memory pool)
-    num_layer = model_cfg.get_num_layers(parallel_cfg)
+    base_num_layer = model_cfg.get_num_layers(parallel_cfg)
+    num_draft_layers = calculate_draft_layers(vllm_config) if vllm_config else 0
+    num_layer = base_num_layer + num_draft_layers
     chunk_size = config.chunk_size
     num_kv_head = model_cfg.get_num_kv_heads(parallel_cfg)
     head_size = model_cfg.get_head_size()
     kv_shape = (num_layer, 1 if use_mla else 2, chunk_size, num_kv_head, head_size)
+    logger.info(
+        "LMCache metadata KV shape: base_num_layer=%d num_draft_layers=%d "
+        "effective_num_layer=%d kv_shape=%s",
+        base_num_layer,
+        num_draft_layers,
+        num_layer,
+        kv_shape,
+    )
 
     # Extract engine_id and kv_connector_extra_config from vllm_config if available
     engine_id = None

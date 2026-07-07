@@ -30,6 +30,7 @@ from lmcache import utils
 from lmcache.integration.vllm.utils import (
     ENGINE_NAME,
     apply_mm_hashes_to_token_ids,
+    calculate_draft_layers,
     extract_mm_features,
     lmcache_get_or_create_config,
 )
@@ -1007,10 +1008,31 @@ class LMCacheConnectorV1Impl:
             "skip_last_n_tokens", 0
         )
 
-        self.num_layers = vllm_config.model_config.get_num_layers(
+        self.base_num_layers = vllm_config.model_config.get_num_layers(
             vllm_config.parallel_config
         )
+        self.num_draft_layers = calculate_draft_layers(vllm_config)
+        metadata = self.lmcache_engine_metadata
+        metadata_kv_shape = getattr(metadata, "kv_shape", None)
+        metadata_num_layers = (
+            metadata_kv_shape[0] if metadata_kv_shape is not None else None
+        )
+        self.num_layers = metadata_num_layers or (
+            self.base_num_layers + self.num_draft_layers
+        )
         self.current_layer = 0
+        self._last_kvcache_group_signature: Optional[tuple[Any, ...]] = None
+
+        logger.info(
+            "[MTP_KV_DIAG][effective_layers] base_num_layers=%d "
+            "num_draft_layers=%d metadata_num_layers=%s "
+            "effective_num_layers=%d metadata_kv_shape=%s",
+            self.base_num_layers,
+            self.num_draft_layers,
+            metadata_num_layers,
+            self.num_layers,
+            metadata_kv_shape,
+        )
 
         self.force_skip_save = bool(os.environ.get("LMCACHE_FORCE_SKIP_SAVE", False))
         self._requests_priority: dict[str, int] = {}
@@ -1184,6 +1206,56 @@ class LMCacheConnectorV1Impl:
             )
             kv_layer_groups_manager.build_kv_layer_groups(self.kv_caches)
 
+    @staticmethod
+    def _kv_cache_shape_summary(kv_cache: Any) -> Any:
+        if isinstance(kv_cache, torch.Tensor):
+            return list(kv_cache.shape)
+        if isinstance(kv_cache, (list, tuple)):
+            return [
+                LMCacheConnectorV1Impl._kv_cache_shape_summary(item)
+                for item in kv_cache
+            ]
+        return type(kv_cache).__name__
+
+    @staticmethod
+    def _layer_index_from_name(layer_name: str) -> Optional[int]:
+        marker = "model.layers."
+        marker_pos = layer_name.find(marker)
+        if marker_pos < 0:
+            return None
+        suffix = layer_name[marker_pos + len(marker) :]
+        layer_part = suffix.split(".", 1)[0]
+        try:
+            return int(layer_part)
+        except ValueError:
+            return None
+
+    def _is_mtp_layer_name(self, layer_name: str) -> bool:
+        layer_idx = self._layer_index_from_name(layer_name)
+        return (
+            layer_idx is not None
+            and self.num_draft_layers > 0
+            and layer_idx >= self.base_num_layers
+        )
+
+    def _kvcache_group_summary(
+        self, names: list[str], kvcaches: list[torch.Tensor]
+    ) -> dict[str, Any]:
+        mtp_names = [name for name in names if self._is_mtp_layer_name(name)]
+        return {
+            "count": len(names),
+            "first": names[0] if names else None,
+            "last": names[-1] if names else None,
+            "mtp_count": len(mtp_names),
+            "mtp_tail": mtp_names[-4:],
+            "first_shape": self._kv_cache_shape_summary(kvcaches[0])
+            if kvcaches
+            else None,
+            "last_shape": self._kv_cache_shape_summary(kvcaches[-1])
+            if kvcaches
+            else None,
+        }
+
     def _refresh_kvcaches_list(self) -> None:
         self._latent_layer_names = []
         self._indexer_layer_names = []
@@ -1199,6 +1271,71 @@ class LMCacheConnectorV1Impl:
                 self._latent_kvcaches.append(kv_cache)
         # Backward-compatible flat list = latent group (the default group).
         self._kvcaches_list = self._latent_kvcaches
+        latent_summary = self._kvcache_group_summary(
+            self._latent_layer_names, self._latent_kvcaches
+        )
+        indexer_summary = self._kvcache_group_summary(
+            self._indexer_layer_names, self._indexer_kvcaches
+        )
+        signature = (
+            self.num_layers,
+            len(self.kv_caches),
+            latent_summary["count"],
+            indexer_summary["count"],
+            latent_summary["last"],
+            indexer_summary["last"],
+            str(latent_summary["last_shape"]),
+            str(indexer_summary["last_shape"]),
+        )
+        if signature != self._last_kvcache_group_signature:
+            logger.info(
+                "[MTP_KV_DIAG][kvcache_groups] expected_num_layers=%s "
+                "total_registered=%d dsa_two_groups=%s latent_layers=%d "
+                "indexer_layers=%d latent_mtp=%d indexer_mtp=%d "
+                "latent_first=%s latent_last=%s latent_mtp_tail=%s "
+                "latent_first_shape=%s latent_last_shape=%s indexer_first=%s "
+                "indexer_last=%s indexer_mtp_tail=%s indexer_first_shape=%s "
+                "indexer_last_shape=%s",
+                self.num_layers,
+                len(self.kv_caches),
+                dsa_two_groups,
+                latent_summary["count"],
+                indexer_summary["count"],
+                latent_summary["mtp_count"],
+                indexer_summary["mtp_count"],
+                latent_summary["first"],
+                latent_summary["last"],
+                latent_summary["mtp_tail"],
+                latent_summary["first_shape"],
+                latent_summary["last_shape"],
+                indexer_summary["first"],
+                indexer_summary["last"],
+                indexer_summary["mtp_tail"],
+                indexer_summary["first_shape"],
+                indexer_summary["last_shape"],
+            )
+            if (
+                dsa_two_groups
+                and self.num_draft_layers > 0
+                and len(self.kv_caches) > 0
+                and (
+                    latent_summary["count"] != self.num_layers
+                    or indexer_summary["count"] != self.num_layers
+                )
+                and getattr(self, "_role", None) != KVConnectorRole.SCHEDULER
+            ):
+                logger.warning(
+                    "[MTP_KV_DIAG][layer_count_mismatch] expected_per_group=%d "
+                    "latent_layers=%d indexer_layers=%d total_registered=%d "
+                    "base_num_layers=%d num_draft_layers=%d",
+                    self.num_layers,
+                    latent_summary["count"],
+                    indexer_summary["count"],
+                    len(self.kv_caches),
+                    self.base_num_layers,
+                    self.num_draft_layers,
+                )
+            self._last_kvcache_group_signature = signature
         if (
             dsa_two_groups
             and len(self._indexer_kvcaches) == 0
@@ -1962,6 +2099,14 @@ class LMCacheConnectorV1Impl:
         #  not called, we should consider removing it.
         assert len(self.kv_caches) == 0 and len(kv_caches) > 0
         self.kv_caches = kv_caches
+        logger.info(
+            "[MTP_KV_DIAG][adapter_register] registered=%d "
+            "expected_num_layers=%d base_num_layers=%d num_draft_layers=%d",
+            len(kv_caches),
+            self.num_layers,
+            self.base_num_layers,
+            self.num_draft_layers,
+        )
         self._build_kv_layer_groups()
         self._refresh_kvcaches_list()
         self._manager.post_init()
@@ -2702,12 +2847,13 @@ class LMCacheConnectorV1Impl:
         logger.info(
             "[RANK_STORE_DIAG][flush_deferred_create_storer] worker_id=%s "
             "req_id=%s kv_group=0 skip_leading_tokens=%d total_tokens=%d "
-            "kvcaches=%d",
+            "kvcaches=%d expected_layers=%d",
             worker_id,
             request.req_id,
             skip_leading_tokens,
             len(token_ids),
             len(kvcaches),
+            self.num_layers,
         )
         storer = self.lmcache_engine.store_layer(
             token_ids,
@@ -3036,7 +3182,8 @@ class LMCacheConnectorV1Impl:
                     "worker_id=%s req_id=%s layer_name=%s kv_group=%s "
                     "storer_key=%s skip_leading_tokens=%d total_tokens=%d "
                     "store_tokens=%d sync=%s can_save_latent=%s "
-                    "can_save_indexer=%s world_size=%s",
+                    "can_save_indexer=%s world_size=%s group_layers=%d "
+                    "expected_layers=%d",
                     worker_id,
                     request.req_id,
                     layer_name,
@@ -3049,6 +3196,8 @@ class LMCacheConnectorV1Impl:
                     getattr(save_spec, "can_save_latent", None),
                     getattr(save_spec, "can_save_indexer", None),
                     _world_size,
+                    len(kvcaches),
+                    self.num_layers,
                 )
                 layerwise_storer = self.lmcache_engine.store_layer(
                     token_ids,
