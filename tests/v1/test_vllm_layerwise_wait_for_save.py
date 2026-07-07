@@ -229,6 +229,37 @@ def test_request_finished_closes_abandoned_layerwise_storer() -> None:
     assert engine.unpinned == ["req-1"]
 
 
+def test_deferred_latent_flush_drains_full_store_layer() -> None:
+    request = _make_req("req-1")
+    request.save_spec.can_save_latent = True
+    connector, _, engine = _make_connector([request])
+    connector.kv_role = "kv_both"
+    connector._deferred_latent_pending.add("req-1")
+    connector._latent_kvcaches = [torch.zeros(1)]
+    connector._kvcaches_for_group = lambda _kv_group: [torch.zeros(1)]
+    connector._refresh_kvcaches_list = lambda: None
+    engine.num_layers = 4
+    engine.store_steps["req-1"] = 0
+
+    def _finite_store_layer(_token_ids, **kwargs):
+        engine.store_calls.append(kwargs["req_id"])
+
+        def _storer():
+            for _ in range(engine.num_layers + 1):
+                engine.store_steps["req-1"] += 1
+                yield None
+
+        return _storer()
+
+    engine.store_layer = _finite_store_layer
+
+    connector._flush_deferred_latent_store(request, request.save_spec)
+
+    assert engine.store_calls == ["req-1"]
+    assert engine.store_steps["req-1"] == engine.num_layers + 1
+    assert "req-1" not in connector._deferred_latent_pending
+
+
 def test_indexer_save_uses_layer_metadata_slots_not_request_slots() -> None:
     request = _make_req("req-1")
     request.save_spec = SaveSpec(

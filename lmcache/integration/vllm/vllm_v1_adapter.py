@@ -3764,13 +3764,34 @@ class LMCacheConnectorV1Impl:
         return world_size > 1
 
     @staticmethod
-    def _drain_layerwise_storer_fully(storer) -> None:
+    def _advance_layerwise_storer_once(storer) -> None:
         if storer is None:
             return
         try:
             next(storer)
         except StopIteration:
             pass
+
+    def _layerwise_storer_drain_limit(self) -> int:
+        engine = getattr(self, "lmcache_engine", None)
+        num_layers = int(getattr(engine, "num_layers", 0) or 0)
+        if num_layers <= 0:
+            num_layers = len(getattr(self, "_latent_layer_names", []) or [])
+        if num_layers <= 0:
+            num_layers = len(getattr(self, "kv_caches", {}) or {})
+        return max(num_layers + 2, 2)
+
+    def _drain_layerwise_storer_fully(self, storer) -> None:
+        if storer is None:
+            return
+        for _ in range(self._layerwise_storer_drain_limit()):
+            try:
+                next(storer)
+            except StopIteration:
+                return
+        logger.warning(
+            "Layerwise storer did not finish after bounded drain; closing it"
+        )
 
     @staticmethod
     def _close_layerwise_storer(storer) -> None:
@@ -4140,7 +4161,7 @@ class LMCacheConnectorV1Impl:
                         self._save_storer_key(request.req_id, _kv_group), None
                     )
                     if layerwise_storer is not None:
-                        self._drain_layerwise_storer_fully(layerwise_storer)
+                        self._advance_layerwise_storer_once(layerwise_storer)
                         self._close_layerwise_storer(layerwise_storer)
                 self._maybe_seed_worker_retrieve_state_from_store(request)
                 self._maybe_lookup_unpin_for_request(request)
