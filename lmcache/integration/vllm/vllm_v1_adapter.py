@@ -1464,20 +1464,18 @@ class LMCacheConnectorV1Impl:
     ) -> bool:
         """True when sparse decode must materialize DSA index from LMCache.
 
-        In normal kv_both serving, prefill populated the resident DSA index
-        cache in vLLM. Reloading the full index group on the sparse decode
-        path is expensive and can overwrite that resident state. Decode
-        consumers, however, do not own that prefill-side resident index cache,
-        so they must cold-materialize it.
+        In the non-shared kv_both path, prefill may populate the resident DSA
+        index cache in vLLM. A shared-CPU sparse decode hit, however, can skip
+        prompt prefill entirely, so it must materialize the index group from
+        LMCache instead of assuming resident index state is valid.
         """
         if not self._is_dsa_two_groups():
             return False
         if not self._shared_cpu_materialize_index_on_decode_cold():
             return False
+        if shared_cpu_enabled:
+            return True
         kv_role = getattr(self, "kv_role", "kv_both")
-        # Keep kv_both on the resident-index fast path even when shared CPU is
-        # enabled. The shared CPU path still materializes the index for the
-        # disaggregated decode-consumer role.
         return kv_role == "kv_consumer"
 
     @staticmethod
@@ -1496,6 +1494,35 @@ class LMCacheConnectorV1Impl:
             state.shared_request_active = True
             state.pointer_cache_generation = generation
             state.request_scope_token = f"{req_id}:{generation}:{token_count}"
+
+    @staticmethod
+    def _shared_request_scope_token(
+        req_id: str,
+        generation: int,
+        token_count: int,
+    ) -> str:
+        return f"{req_id}:{generation}:{token_count}"
+
+    @staticmethod
+    def _shared_retrieve_token_count_for_request(
+        request: ReqMeta,
+    ) -> int:
+        token_count = len(request.token_ids)
+        if request.is_sparse_decode and request.load_spec is not None:
+            token_count = int(request.load_spec.lmcache_cached_tokens)
+        return token_count
+
+    @classmethod
+    def _shared_request_scope_token_for_request(
+        cls,
+        request: ReqMeta,
+        generation: int,
+    ) -> str:
+        return cls._shared_request_scope_token(
+            request.req_id,
+            generation,
+            cls._shared_retrieve_token_count_for_request(request),
+        )
 
     @staticmethod
     def _clear_request_indexer_cache(request: ReqMeta) -> None:
@@ -1544,11 +1571,35 @@ class LMCacheConnectorV1Impl:
                 f"req_id={request.req_id}, pointer_cache_generation="
                 f"{pointer_generation}, current_generation={current_generation}"
             )
+        expected_scope_token = self._shared_request_scope_token_for_request(
+            request,
+            current_generation,
+        )
+        if state.request_scope_token != expected_scope_token:
+            raise RuntimeError(
+                "Shared CPU sparse decode request scope mismatch before "
+                "hot-path reuse: "
+                f"req_id={request.req_id}, request_scope_token="
+                f"{state.request_scope_token!r}, expected="
+                f"{expected_scope_token!r}"
+            )
         if state.shared_latent_status != "present":
             raise RuntimeError(
                 "Shared CPU sparse decode hot path requires MLA latent "
                 "state before transfer: "
                 f"req_id={request.req_id}, status={state.shared_latent_status!r}"
+            )
+        expected_layers = int(getattr(self, "num_layers", 0) or 0)
+        missing_latent_layers = self._missing_required_shared_layers(
+            state.cached_memory_objs,
+            expected_layers,
+        )
+        if missing_latent_layers:
+            raise RuntimeError(
+                "Shared CPU sparse decode hot path has incomplete MLA "
+                "latent state before transfer: "
+                f"req_id={request.req_id}, kv_group=0, "
+                f"missing_layers={missing_latent_layers}"
             )
         missing_latent_pointer_layers = self._missing_shared_pointer_cache_layers(
             state.cached_memory_objs,
@@ -1576,6 +1627,17 @@ class LMCacheConnectorV1Impl:
                     f"{materialize_index}"
                 )
             if state.shared_index_status == "present":
+                missing_index_layers = self._missing_required_shared_layers(
+                    state.cached_memory_objs_indexer,
+                    expected_layers,
+                )
+                if missing_index_layers:
+                    raise RuntimeError(
+                        "Shared CPU sparse decode hot path has incomplete "
+                        "DSA index state before transfer: "
+                        f"req_id={request.req_id}, kv_group=1, "
+                        f"missing_layers={missing_index_layers}"
+                    )
                 missing_index_pointer_layers = (
                     self._missing_shared_pointer_cache_layers(
                         state.cached_memory_objs_indexer,
@@ -2183,6 +2245,19 @@ class LMCacheConnectorV1Impl:
         return missing
 
     @staticmethod
+    def _missing_required_shared_layers(
+        layers: list[list[Any]],
+        expected_layers: int,
+    ) -> list[int]:
+        if expected_layers <= 0:
+            return []
+        missing = []
+        for layer_id in range(expected_layers):
+            if layer_id >= len(layers) or not layers[layer_id]:
+                missing.append(layer_id)
+        return missing
+
+    @staticmethod
     def _copy_shared_layer_map(
         layer_map: dict[int, list[list[Any]]],
     ) -> dict[int, list[list[Any]]]:
@@ -2276,6 +2351,8 @@ class LMCacheConnectorV1Impl:
         def layer_has_entries(layers: list[list]) -> bool:
             return bool(layers and any(layer for layer in layers))
 
+        expected_layers = int(getattr(self, "num_layers", 0) or 0)
+
         pending_handles_by_group: dict[int, list[list[Any]]] = {}
         pending_views_by_group: dict[int, list[list[Any]]] = {}
         pending_backing_by_group: dict[int, list[list[Any]]] = {}
@@ -2292,6 +2369,28 @@ class LMCacheConnectorV1Impl:
         groups: list[tuple[int, list[list], list[list]]] = [
             (0, request.cached_memory_objs, request.cached_shared_handles),
         ]
+        missing_latent_layers = self._missing_required_shared_layers(
+            request.cached_memory_objs,
+            expected_layers,
+        )
+        if missing_latent_layers:
+            raise RuntimeError(
+                "Shared CPU sparse decode cannot mark request state "
+                "hot-reusable with incomplete MLA latent state: "
+                f"req_id={request.req_id}, kv_group=0, "
+                f"missing_layers={missing_latent_layers}"
+            )
+        missing_index_layers = self._missing_required_shared_layers(
+            request.cached_memory_objs_indexer,
+            expected_layers,
+        )
+        if materialize_index and missing_index_layers:
+            raise RuntimeError(
+                "Shared CPU sparse decode cannot mark request state "
+                "hot-reusable without complete materialized DSA index state: "
+                f"req_id={request.req_id}, kv_group=1, "
+                f"missing_layers={missing_index_layers}"
+            )
         if materialize_index and request.cached_memory_objs_indexer:
             groups.append(
                 (
@@ -2333,6 +2432,10 @@ class LMCacheConnectorV1Impl:
             pending_views_by_group or pending_backing_by_group
         )
         if has_shared_request:
+            if state.token_count <= 0:
+                state.token_count = self._shared_retrieve_token_count_for_request(
+                    request
+                )
             replaced_views_by_group = {
                 kv_group: state.shared_views_by_group[kv_group]
                 for kv_group in pending_views_by_group
@@ -2352,8 +2455,10 @@ class LMCacheConnectorV1Impl:
             state.req_id = request.req_id
             state.shared_generation = generation
             state.pointer_cache_generation = generation
-            state.request_scope_token = (
-                f"{request.req_id}:{generation}:{len(request.token_ids)}"
+            state.request_scope_token = self._shared_request_scope_token(
+                request.req_id,
+                generation,
+                state.token_count,
             )
             state.shared_latent_status = (
                 "present" if layer_has_entries(request.cached_memory_objs)
@@ -2383,7 +2488,7 @@ class LMCacheConnectorV1Impl:
                 if callable(register_fn):
                     register_fn(
                         request.req_id,
-                        token_count=len(request.token_ids),
+                        token_count=state.token_count,
                         phase=SPARSE_DECODE_SHARED_CPU_PHASE,
                     )
             self._release_replaced_shared_groups(
@@ -2406,6 +2511,18 @@ class LMCacheConnectorV1Impl:
         if state is None:
             return False
         if request.is_sparse_decode:
+            if state.shared_request_active:
+                engine = getattr(self, "lmcache_engine", None)
+                generation = int(
+                    getattr(engine, "shared_cpu_cache_generation", 0) or 0
+                )
+                expected_scope_token = self._shared_request_scope_token(
+                    request.req_id,
+                    generation,
+                    token_count,
+                )
+                if state.request_scope_token != expected_scope_token:
+                    return True
             # Sparse decode metadata is keyed by the full LMCache-hit prefix.
             # A shorter current prefix means the cached request state is stale.
             if state.token_count and (
@@ -2751,11 +2868,14 @@ class LMCacheConnectorV1Impl:
             metadata_warm = (
                 existing.metadata_warm if existing is not None else True
             )
+            token_count = len(request.token_ids)
+            if request.load_spec is not None:
+                token_count = int(request.load_spec.lmcache_cached_tokens)
             self._save_worker_retrieve_state_from_request(
                 request,
                 location=location,
                 metadata_warm=metadata_warm or bool(request.cached_keys),
-                token_count=len(request.token_ids),
+                token_count=token_count,
             )
 
     def _sparse_decode_retrieve_warm_kwargs(

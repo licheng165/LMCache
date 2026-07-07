@@ -169,7 +169,7 @@ class TestWorkerRetrieveState:
                 request,
                 shared_cpu_enabled=True,
             )
-            is False
+            is True
         )
 
     def test_sparse_decode_index_materialization_policy_for_non_shared_kv_both(self):
@@ -224,10 +224,10 @@ class TestWorkerRetrieveState:
                 request,
                 shared_cpu_enabled=True,
             )
-            is False
+            is True
         )
 
-    def test_bind_allows_skipped_index_for_shared_cpu_kv_both_sparse_decode(self):
+    def test_bind_rejects_skipped_index_for_shared_cpu_kv_both_sparse_decode(self):
         impl = _make_impl()
         impl.config = SimpleNamespace(dsa_two_groups=True)
         impl.kv_role = "kv_both"
@@ -249,9 +249,11 @@ class TestWorkerRetrieveState:
             shared_generation=3,
             pointer_cache_generation=3,
             shared_request_active=True,
+            request_scope_token="req-1:3:3",
         )
 
-        assert impl._bind_worker_retrieve_state_to_request(request) is not None
+        with pytest.raises(RuntimeError, match="invalid DSA index"):
+            impl._bind_worker_retrieve_state_to_request(request)
 
     def test_record_shared_state_preserves_skipped_index_without_index_objs(self):
         impl = _make_impl()
@@ -283,9 +285,18 @@ class TestWorkerRetrieveState:
         )
         state = WorkerRetrieveState()
         request = _make_request()
-        request.cached_memory_objs = [["latent-view"]]
-        request.cached_shared_handles = [["latent-handle"]]
-        request.cached_chunk_ptrs_npu = ["latent-ptrs"]
+        request.cached_memory_objs = [
+            ["latent-view-layer0"],
+            ["latent-view-layer1"],
+        ]
+        request.cached_shared_handles = [
+            ["latent-handle-layer0"],
+            ["latent-handle-layer1"],
+        ]
+        request.cached_chunk_ptrs_npu = [
+            "latent-ptrs-layer0",
+            "latent-ptrs-layer1",
+        ]
         request.shared_index_skipped = True
 
         impl._record_shared_worker_retrieve_state(state, request)
@@ -316,6 +327,141 @@ class TestWorkerRetrieveState:
 
         with pytest.raises(RuntimeError, match="kv_group=1"):
             impl._record_shared_worker_retrieve_state(state, request)
+
+    def test_record_shared_state_rejects_missing_required_index_group(self):
+        impl = _make_impl()
+        impl.num_layers = 2
+        impl.config = SimpleNamespace(dsa_two_groups=True)
+        impl.kv_role = "kv_both"
+        impl.lmcache_engine = SimpleNamespace(
+            enable_shared_cpu_cache=True,
+            shared_cpu_cache_generation=7,
+            shared_cpu_materialize_index_on_decode_cold=True,
+            metadata=SimpleNamespace(is_first_rank=lambda: False),
+        )
+        state = WorkerRetrieveState()
+        request = _make_request()
+        request.cached_memory_objs = [
+            ["latent-view-layer0"],
+            ["latent-view-layer1"],
+        ]
+        request.cached_shared_handles = [
+            ["latent-handle-layer0"],
+            ["latent-handle-layer1"],
+        ]
+        request.cached_chunk_ptrs_npu = [
+            "latent-ptrs-layer0",
+            "latent-ptrs-layer1",
+        ]
+        request.shared_index_skipped = True
+
+        with pytest.raises(RuntimeError, match="materialized DSA index"):
+            impl._record_shared_worker_retrieve_state(state, request)
+
+    def test_record_shared_state_rejects_partial_latent_group(self):
+        impl = _make_impl()
+        impl.num_layers = 2
+        impl.config = SimpleNamespace(dsa_two_groups=False)
+        impl.kv_role = "kv_both"
+        impl.lmcache_engine = SimpleNamespace(
+            enable_shared_cpu_cache=True,
+            shared_cpu_cache_generation=7,
+            metadata=SimpleNamespace(is_first_rank=lambda: False),
+        )
+        state = WorkerRetrieveState()
+        request = _make_request()
+        request.cached_memory_objs = [["latent-view-layer0"], []]
+        request.cached_shared_handles = [["latent-handle-layer0"], []]
+        request.cached_chunk_ptrs_npu = ["latent-ptrs-layer0", None]
+
+        with pytest.raises(RuntimeError, match="incomplete MLA latent"):
+            impl._record_shared_worker_retrieve_state(state, request)
+
+    def test_record_shared_state_rejects_partial_required_index_group(self):
+        impl = _make_impl()
+        impl.num_layers = 2
+        impl.config = SimpleNamespace(dsa_two_groups=True)
+        impl.kv_role = "kv_both"
+        impl.lmcache_engine = SimpleNamespace(
+            enable_shared_cpu_cache=True,
+            shared_cpu_cache_generation=7,
+            shared_cpu_materialize_index_on_decode_cold=True,
+            metadata=SimpleNamespace(is_first_rank=lambda: False),
+        )
+        state = WorkerRetrieveState()
+        request = _make_request()
+        request.cached_memory_objs = [
+            ["latent-view-layer0"],
+            ["latent-view-layer1"],
+        ]
+        request.cached_shared_handles = [
+            ["latent-handle-layer0"],
+            ["latent-handle-layer1"],
+        ]
+        request.cached_chunk_ptrs_npu = [
+            "latent-ptrs-layer0",
+            "latent-ptrs-layer1",
+        ]
+        request.cached_memory_objs_indexer = [["index-view-layer0"], []]
+        request.cached_shared_handles_indexer = [["index-handle-layer0"], []]
+        request.cached_chunk_ptrs_npu_indexer = ["index-ptrs-layer0", None]
+
+        with pytest.raises(RuntimeError, match="complete materialized DSA index"):
+            impl._record_shared_worker_retrieve_state(state, request)
+
+    def test_record_shared_state_accepts_complete_required_index_group(self):
+        impl = _make_impl()
+        impl.num_layers = 2
+        impl.config = SimpleNamespace(dsa_two_groups=True)
+        impl.kv_role = "kv_both"
+        impl.lmcache_engine = SimpleNamespace(
+            enable_shared_cpu_cache=True,
+            shared_cpu_cache_generation=7,
+            shared_cpu_materialize_index_on_decode_cold=True,
+            metadata=SimpleNamespace(is_first_rank=lambda: False),
+        )
+        state = WorkerRetrieveState()
+        request = _make_request()
+        request.cached_memory_objs = [
+            ["latent-view-layer0"],
+            ["latent-view-layer1"],
+        ]
+        request.cached_shared_handles = [
+            ["latent-handle-layer0"],
+            ["latent-handle-layer1"],
+        ]
+        request.cached_chunk_ptrs_npu = [
+            "latent-ptrs-layer0",
+            "latent-ptrs-layer1",
+        ]
+        request.cached_memory_objs_indexer = [
+            ["index-view-layer0"],
+            ["index-view-layer1"],
+        ]
+        request.cached_shared_handles_indexer = [
+            ["index-handle-layer0"],
+            ["index-handle-layer1"],
+        ]
+        request.cached_chunk_ptrs_npu_indexer = [
+            "index-ptrs-layer0",
+            "index-ptrs-layer1",
+        ]
+
+        impl._record_shared_worker_retrieve_state(state, request)
+
+        assert state.shared_latent_status == "present"
+        assert state.shared_index_status == "present"
+        assert state.shared_request_active is True
+        assert state.token_count == request.load_spec.lmcache_cached_tokens
+        assert state.request_scope_token == "req-1:7:3"
+        assert state.shared_views_by_group == {
+            0: request.cached_memory_objs,
+            1: request.cached_memory_objs_indexer,
+        }
+        assert state.shared_handles_by_group == {
+            0: request.cached_shared_handles,
+            1: request.cached_shared_handles_indexer,
+        }
 
     def test_shared_cpu_config_value_reads_engine_extra_config(self):
         impl = _make_impl()
@@ -589,7 +735,7 @@ class TestWorkerRetrieveState:
 
         register.assert_called_once_with(
             "req-1",
-            token_count=512,
+            token_count=256,
             phase="sparse_decode_bootstrap",
         )
 
@@ -1064,9 +1210,87 @@ class TestWorkerRetrieveState:
             shared_generation=2,
             pointer_cache_generation=2,
             shared_request_active=True,
+            request_scope_token="req-1:2:3",
         )
 
         with pytest.raises(RuntimeError, match="missing MLA latent"):
+            impl._bind_worker_retrieve_state_to_request(request)
+
+    def test_bind_rejects_shared_request_scope_mismatch(self):
+        impl = _make_impl()
+        impl.config = SimpleNamespace(dsa_two_groups=False)
+        impl.lmcache_engine = SimpleNamespace(
+            enable_shared_cpu_cache=True,
+            shared_cpu_cache_generation=2,
+        )
+        request = _make_request()
+        impl._worker_retrieve_state["req-1"] = WorkerRetrieveState(
+            cached_keys=[["layer0-key"]],
+            cached_starts=[0],
+            cached_ends=[256],
+            cached_memory_objs=[["latent-view"]],
+            cached_chunk_ptrs_npu=["latent-ptrs"],
+            metadata_warm=True,
+            shared_latent_status="present",
+            shared_generation=2,
+            pointer_cache_generation=2,
+            shared_request_active=True,
+            request_scope_token="req-1:2:2",
+        )
+
+        with pytest.raises(RuntimeError, match="request scope mismatch"):
+            impl._bind_worker_retrieve_state_to_request(request)
+
+    def test_bind_shared_scope_uses_lmcache_hit_tokens(self):
+        impl = _make_impl()
+        impl.config = SimpleNamespace(dsa_two_groups=False)
+        impl.lmcache_engine = SimpleNamespace(
+            enable_shared_cpu_cache=True,
+            shared_cpu_cache_generation=2,
+        )
+        request = _make_request()
+        request.token_ids = [1, 2, 3, 4]
+        request.load_spec.lmcache_cached_tokens = 3
+        impl._worker_retrieve_state["req-1"] = WorkerRetrieveState(
+            cached_keys=[["layer0-key"]],
+            cached_starts=[0],
+            cached_ends=[256],
+            cached_memory_objs=[["latent-view"]],
+            cached_chunk_ptrs_npu=["latent-ptrs"],
+            metadata_warm=True,
+            shared_latent_status="present",
+            shared_generation=2,
+            pointer_cache_generation=2,
+            shared_request_active=True,
+            request_scope_token="req-1:2:3",
+        )
+
+        assert impl._bind_worker_retrieve_state_to_request(request) is not None
+
+    def test_bind_rejects_incomplete_shared_latent_state(self):
+        impl = _make_impl()
+        impl.num_layers = 2
+        impl.config = SimpleNamespace(dsa_two_groups=False)
+        impl.lmcache_engine = SimpleNamespace(
+            enable_shared_cpu_cache=True,
+            shared_cpu_cache_generation=2,
+        )
+        request = _make_request()
+        impl._worker_retrieve_state["req-1"] = WorkerRetrieveState(
+            cached_keys=[["layer0-key"]],
+            cached_starts=[0],
+            cached_ends=[256],
+            cached_memory_objs=[["latent-view-layer0"], []],
+            cached_chunk_ptrs_npu=["latent-ptrs-layer0", None],
+            metadata_warm=True,
+            shared_latent_status="present",
+            shared_generation=2,
+            pointer_cache_generation=2,
+            shared_request_active=True,
+            request_scope_token="req-1:2:3",
+        )
+
+        with pytest.raises(RuntimeError, match="incomplete MLA latent"):
             impl._bind_worker_retrieve_state_to_request(request)
 
     def test_bind_rejects_missing_strict_shared_index(self):
@@ -1087,9 +1311,47 @@ class TestWorkerRetrieveState:
             shared_index_status="missing",
             shared_generation=3,
             shared_request_active=True,
+            request_scope_token="req-1:3:3",
         )
 
         with pytest.raises(RuntimeError, match="invalid DSA index"):
+            impl._bind_worker_retrieve_state_to_request(request)
+
+    def test_bind_rejects_incomplete_strict_shared_index_state(self):
+        impl = _make_impl()
+        impl.num_layers = 2
+        impl.config = SimpleNamespace(dsa_two_groups=True)
+        impl.kv_role = "kv_both"
+        impl.lmcache_engine = SimpleNamespace(
+            enable_shared_cpu_cache=True,
+            shared_cpu_cache_generation=3,
+            shared_cpu_materialize_index_on_decode_cold=True,
+        )
+        request = _make_request()
+        impl._worker_retrieve_state["req-1"] = WorkerRetrieveState(
+            cached_keys=[["layer0-key"], ["layer1-key"]],
+            cached_starts=[0],
+            cached_ends=[256],
+            cached_memory_objs=[
+                ["latent-view-layer0"],
+                ["latent-view-layer1"],
+            ],
+            cached_chunk_ptrs_npu=[
+                "latent-ptrs-layer0",
+                "latent-ptrs-layer1",
+            ],
+            cached_memory_objs_indexer=[["index-view-layer0"], []],
+            cached_chunk_ptrs_npu_indexer=["index-ptrs-layer0", None],
+            metadata_warm=True,
+            shared_latent_status="present",
+            shared_index_status="present",
+            shared_generation=3,
+            pointer_cache_generation=3,
+            shared_request_active=True,
+            request_scope_token="req-1:3:3",
+        )
+
+        with pytest.raises(RuntimeError, match="incomplete DSA index"):
             impl._bind_worker_retrieve_state_to_request(request)
 
     def test_save_then_bind_round_trip(self):
@@ -1114,6 +1376,29 @@ class TestWorkerRetrieveState:
         impl._bind_worker_retrieve_state_to_request(fresh)
         assert fresh.cached_keys == [["k"]]
         assert fresh.cached_shared_handles == [["handle"]]
+
+    def test_finalize_sparse_state_uses_lmcache_hit_token_count(self):
+        impl = _make_impl()
+        captured = {}
+
+        def capture_save(request, *, location, metadata_warm, token_count):
+            captured["request"] = request
+            captured["location"] = location
+            captured["metadata_warm"] = metadata_warm
+            captured["token_count"] = token_count
+
+        impl._save_worker_retrieve_state_from_request = capture_save
+        request = _make_request()
+        request.token_ids = [1, 2, 3, 4]
+        request.load_spec.lmcache_cached_tokens = 3
+        request.cached_keys = [["k"]]
+
+        impl._finalize_worker_retrieve_state_from_metadata(
+            SimpleNamespace(requests=[request])
+        )
+
+        assert captured["request"] is request
+        assert captured["token_count"] == 3
 
     def test_request_tracker_round_trip_preserves_shared_handles(self):
         tracker = RequestTracker(
@@ -1249,6 +1534,40 @@ class TestWorkerRetrieveState:
         req = _make_request()
         req.token_ids = [0] * 4096
         assert impl._should_invalidate_worker_retrieve_state(req, 4096)
+
+    def test_sparse_decode_shared_scope_mismatch_invalidates(self):
+        impl = _make_impl()
+        impl.lmcache_engine = SimpleNamespace(shared_cpu_cache_generation=5)
+        impl._worker_retrieve_state["req-1"] = WorkerRetrieveState(
+            cached_keys=[["k"]],
+            cached_starts=[0],
+            cached_ends=[18879],
+            metadata_warm=True,
+            token_count=18879,
+            shared_request_active=True,
+            request_scope_token="req-1:5:18879",
+        )
+        req = _make_request()
+        req.token_ids = [0] * 18880
+
+        assert impl._should_invalidate_worker_retrieve_state(req, 18880)
+
+    def test_sparse_decode_shared_scope_invalidation_uses_retrieve_tokens(self):
+        impl = _make_impl()
+        impl.lmcache_engine = SimpleNamespace(shared_cpu_cache_generation=5)
+        impl._worker_retrieve_state["req-1"] = WorkerRetrieveState(
+            cached_keys=[["k"]],
+            cached_starts=[0],
+            cached_ends=[18879],
+            metadata_warm=True,
+            token_count=18879,
+            shared_request_active=True,
+            request_scope_token="req-1:5:18879",
+        )
+        req = _make_request()
+        req.token_ids = [0] * 18880
+
+        assert not impl._should_invalidate_worker_retrieve_state(req, 18879)
 
     def test_passive_shared_metadata_warm_skips_storage_probe(self):
         ensure_metadata = MagicMock(side_effect=AssertionError("should not probe"))

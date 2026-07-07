@@ -536,18 +536,33 @@ class LMCacheEngine:
             numel *= dim
         return numel
 
+    def _metadata_shape_for_kv_group(
+        self,
+        kv_group: int,
+        num_tokens: int,
+    ) -> Optional[torch.Size]:
+        shapes = self.metadata.get_shapes(num_tokens)
+        if 0 <= kv_group < len(shapes):
+            return torch.Size(shapes[kv_group])
+        if kv_group == 0 and shapes:
+            return torch.Size(shapes[0])
+        return None
+
     def _estimate_shared_cpu_bytes_per_layer(
         self,
         kv_group: int,
         num_tokens: int,
     ) -> int:
         shape: Optional[torch.Size] = None
+        if kv_group != 0:
+            shape = self._metadata_shape_for_kv_group(kv_group, num_tokens)
         get_shape = getattr(self.gpu_connector, "get_shape", None)
-        if callable(get_shape):
+        if shape is None and callable(get_shape):
             try:
                 shape = get_shape(num_tokens, kv_group=kv_group)
             except TypeError:
-                shape = get_shape(num_tokens)
+                if kv_group == 0:
+                    shape = get_shape(num_tokens)
             except Exception as exc:
                 logger.warning(
                     "Unable to query gpu_connector.get_shape for shared CPU "
@@ -557,11 +572,14 @@ class LMCacheEngine:
                 )
 
         if shape is None:
-            shapes = self.metadata.get_shapes(num_tokens)
-            if 0 <= kv_group < len(shapes):
-                shape = shapes[kv_group]
-            else:
-                shape = shapes[0]
+            shape = self._metadata_shape_for_kv_group(kv_group, num_tokens)
+            if shape is None:
+                raise ValueError(
+                    "KV group shape metadata is unavailable for shared CPU "
+                    "capacity estimate: "
+                    f"kv_group={kv_group}, "
+                    f"num_shapes={len(self.metadata.get_shapes(num_tokens))}"
+                )
 
         dtype = self._shared_cpu_dtype_for_kv_group(kv_group)
         return self._shape_numel_without_layer_dim(shape) * dtype.itemsize
@@ -573,15 +591,24 @@ class LMCacheEngine:
         num_tokens: int,
     ) -> tuple[torch.Size, torch.dtype, MemoryFormat]:
         shape: Optional[torch.Size] = None
+        if kv_group != 0:
+            shape = self._metadata_shape_for_kv_group(kv_group, num_tokens)
         get_shape = getattr(self.gpu_connector, "get_shape", None)
-        if callable(get_shape):
+        if shape is None and callable(get_shape):
             try:
                 shape = torch.Size(get_shape(num_tokens, kv_group=kv_group))
             except TypeError:
-                shape = torch.Size(get_shape(num_tokens))
+                if kv_group == 0:
+                    shape = torch.Size(get_shape(num_tokens))
         if shape is None:
-            shapes = self.metadata.get_shapes(num_tokens)
-            shape = torch.Size(shapes[kv_group] if kv_group < len(shapes) else shapes[0])
+            shape = self._metadata_shape_for_kv_group(kv_group, num_tokens)
+            if shape is None:
+                raise ValueError(
+                    "KV group shape metadata is unavailable for shared CPU "
+                    "chunk metadata: "
+                    f"kv_group={kv_group}, "
+                    f"num_shapes={len(self.metadata.get_shapes(num_tokens))}"
+                )
         return (
             shape,
             self._shared_cpu_dtype_for_kv_group(kv_group),
@@ -2376,6 +2403,7 @@ class LMCacheEngine:
                 offsets,
                 mask,
                 request_configs=request_configs,
+                kv_group=kv_group,
             ):
                 assert isinstance(key, CacheEngineKey)
                 # Allocate the memory object
@@ -2596,7 +2624,19 @@ class LMCacheEngine:
 
             # Allocate the memory object
             num_tokens = end - start
-            kv_shape_single_layer = self.gpu_connector.get_shape(num_tokens)
+            try:
+                kv_shape_single_layer = self.gpu_connector.get_shape(
+                    num_tokens,
+                    kv_group=kv_group,
+                )
+            except TypeError as exc:
+                if kv_group != 0:
+                    raise TypeError(
+                        "Layerwise store for kv_group=1 requires "
+                        "gpu_connector.get_shape(num_tokens, kv_group=...) "
+                        "or an engine-specific store_layer override."
+                    ) from exc
+                kv_shape_single_layer = self.gpu_connector.get_shape(num_tokens)
 
             memory_objs_multi_layer = self.storage_manager.batched_allocate(
                 kv_shape_single_layer,
@@ -3715,6 +3755,7 @@ class LMCacheEngine:
         request_configs = kwargs.get("request_configs")
         if request_configs is not None and len(request_configs) != 0:
             assert isinstance(request_configs, dict)
+        kv_group = kwargs.get("kv_group", 0)
 
         tot_kv_size = 0
         chunks: List[ProcessedChunk] = []
@@ -3741,6 +3782,7 @@ class LMCacheEngine:
             tokens=tokens,
             mask=mask,
             request_configs=request_configs,
+            kv_group=kv_group,
         ):
             assert isinstance(key, CacheEngineKey)
             memory_obj = memory_obj_map.get(key)
@@ -3784,12 +3826,14 @@ class LMCacheEngine:
         request_configs = kwargs.get("request_configs")
         if request_configs is not None and len(request_configs) != 0:
             assert isinstance(request_configs, dict)
+        kv_group = kwargs.get("kv_group", 0)
 
         chunk_infos = []
         for start, end, key in self.token_database.process_tokens(
             tokens=tokens,
             mask=mask,
             request_configs=request_configs,
+            kv_group=kv_group,
         ):
             assert isinstance(key, CacheEngineKey)
             chunk_infos.append((key, start, end))

@@ -312,6 +312,89 @@ def test_async_lookup_prefetch_layerwise_fails_closed_with_zero_hit() -> None:
     assert async_lookup_server.responses == [("req", 0)]
 
 
+class _CaptureTokenDatabase:
+    def __init__(self):
+        self.calls = []
+
+    def process_tokens(self, *args, **kwargs):
+        self.calls.append(kwargs.get("kv_group", 0))
+        return iter(())
+
+
+class _NoopStoreStats:
+    def profile_process_tokens(self):
+        return nullcontext()
+
+
+class _NoopStatsMonitor:
+    def on_store_request(self, _num_tokens):
+        return _NoopStoreStats()
+
+
+def test_base_non_layerwise_paths_pass_kv_group_to_key_generation() -> None:
+    engine = object.__new__(LMCacheEngine)
+    token_database = _CaptureTokenDatabase()
+    engine.token_database = token_database
+    engine.gpu_connector = object()
+    engine.storage_manager = object()
+    engine.stats_monitor = _NoopStatsMonitor()
+    engine.is_healthy = lambda: True
+    engine._is_passive = lambda: False
+    engine.is_frozen = lambda: False
+    engine._get_req_id = lambda _kwargs: "req"
+    engine._log_kvcache_for_check = lambda **_kwargs: None
+
+    list(
+        engine.store(
+            [1, 2, 3],
+            kv_group=1,
+            request_configs={"lmcache.tag.case": "base-store"},
+        )
+        or []
+    )
+
+    assert token_database.calls == [1]
+
+    token_database.calls.clear()
+    engine.storage_manager = SimpleNamespace(
+        get_block_mapping=lambda _chunk_infos: {},
+    )
+    ret_mask = torch.zeros(3, dtype=torch.bool, device="cpu")
+    chunks, size = engine._process_tokens_internal(
+        [1, 2, 3],
+        None,
+        ret_mask,
+        kv_group=1,
+        request_configs={"lmcache.tag.case": "base-retrieve"},
+    )
+
+    assert chunks == []
+    assert size == 0
+    assert token_database.calls == [1]
+
+    token_database.calls.clear()
+
+    class _Future:
+        def result(self):
+            return []
+
+    engine.event_manager = SimpleNamespace(
+        get_event_future=lambda _event_type, _req_id: _Future(),
+    )
+    chunks, size = engine._async_process_tokens_internal(
+        [1, 2, 3],
+        None,
+        ret_mask,
+        req_id="req",
+        kv_group=1,
+        request_configs={"lmcache.tag.case": "base-async-retrieve"},
+    )
+
+    assert chunks == []
+    assert size == 0
+    assert token_database.calls == [1]
+
+
 def _make_memory_obj(
     backing: torch.Tensor,
     *,
@@ -365,6 +448,17 @@ class _FakeSharedShapeConnector:
         return torch.Size([num_tokens, hidden])
 
 
+class _LegacyShapeConnector:
+    def get_shape(self, num_tokens: int) -> torch.Size:
+        return torch.Size([num_tokens, 1024])
+
+
+class _MisleadingGroupShapeConnector:
+    def get_shape(self, num_tokens: int, kv_group: int = 0) -> torch.Size:
+        hidden = 1024 if kv_group == 0 else 4096
+        return torch.Size([num_tokens, hidden])
+
+
 def _make_engine_for_sparse_capacity(*, max_local_cpu_size: float):
     engine = object.__new__(LMCacheEngine)
     extra_config = {
@@ -397,6 +491,67 @@ def _make_engine_for_sparse_capacity(*, max_local_cpu_size: float):
     engine.gpu_connector = _FakeSharedShapeConnector()
     engine._shared_cpu_active_sparse_requests = {}
     return engine
+
+
+def test_shared_cpu_group1_shape_uses_metadata_when_connector_lacks_kv_group():
+    engine = object.__new__(LMCacheEngine)
+    engine.config = SimpleNamespace(dsa_two_groups=True)
+    engine.gpu_connector = _LegacyShapeConnector()
+    engine.metadata = SimpleNamespace(
+        use_mla=True,
+        get_dtypes=lambda: [torch.float16, torch.uint8],
+        get_shapes=lambda num_tokens: [
+            torch.Size([num_tokens, 1024]),
+            torch.Size([num_tokens, 128]),
+        ],
+    )
+
+    shape, dtype, fmt = engine._expected_shared_cpu_chunk_metadata(
+        kv_group=1,
+        num_tokens=17,
+    )
+
+    assert shape == torch.Size([17, 128])
+    assert dtype == torch.uint8
+    assert fmt == MemoryFormat.KV_DSA_INDEX_FMT
+
+
+def test_shared_cpu_group1_shape_prefers_metadata_over_connector():
+    engine = object.__new__(LMCacheEngine)
+    engine.config = SimpleNamespace(dsa_two_groups=True)
+    engine.gpu_connector = _MisleadingGroupShapeConnector()
+    engine.metadata = SimpleNamespace(
+        use_mla=True,
+        get_dtypes=lambda: [torch.float16, torch.uint8],
+        get_shapes=lambda num_tokens: [
+            torch.Size([num_tokens, 1024]),
+            torch.Size([num_tokens, 128]),
+        ],
+    )
+
+    shape, _, _ = engine._expected_shared_cpu_chunk_metadata(
+        kv_group=1,
+        num_tokens=17,
+    )
+
+    assert shape == torch.Size([17, 128])
+
+
+def test_shared_cpu_group1_shape_missing_metadata_fails_loudly():
+    engine = object.__new__(LMCacheEngine)
+    engine.config = SimpleNamespace(dsa_two_groups=True)
+    engine.gpu_connector = _LegacyShapeConnector()
+    engine.metadata = SimpleNamespace(
+        use_mla=True,
+        get_dtypes=lambda: [torch.float16],
+        get_shapes=lambda num_tokens: [torch.Size([num_tokens, 1024])],
+    )
+
+    with pytest.raises(ValueError, match="KV group shape metadata"):
+        engine._expected_shared_cpu_chunk_metadata(
+            kv_group=1,
+            num_tokens=17,
+        )
 
 
 @pytest.mark.no_shared_allocator
@@ -562,6 +717,23 @@ def test_engine_contract_requires_broadcast_object_fn_for_shared_tp():
     engine.broadcast_object_fn = None
 
     with pytest.raises(ValueError, match="broadcast_object_fn"):
+        engine._validate_shared_cpu_cache_contract()
+
+
+def test_engine_contract_requires_index_materialization_for_strict_sparse():
+    engine = _make_engine_for_contract(
+        use_layerwise=True,
+        sparse=True,
+        shared=True,
+    )
+    engine.broadcast_object_fn = lambda obj, src=0: obj
+    engine.config.get_extra_config_value = (
+        lambda key, default=None: False
+        if key == "shared_cpu_materialize_index_on_decode_cold"
+        else default
+    )
+
+    with pytest.raises(ValueError, match="must materialize DSA index"):
         engine._validate_shared_cpu_cache_contract()
 
 
