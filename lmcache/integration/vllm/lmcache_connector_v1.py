@@ -81,6 +81,7 @@ class LMCacheConnectorV1Dynamic(KVConnectorBase_V1):
         token_start_index: list = None,
         request_ids=None,
         target_slot_mapping=None,
+        payload_event=None,
     ) -> None:
         """
         Block until the KV for a specific layer is loaded into vLLM's
@@ -97,6 +98,8 @@ class LMCacheConnectorV1Dynamic(KVConnectorBase_V1):
                 used to pair rows to requests by identity instead of by position.
             target_slot_mapping: optional batched physical destination slots
                 matching selected_tokens. Used by sparse decode scratch loads.
+            payload_event: optional producer event for device selected-token
+                payloads. LMCache waits on it before row selection.
         """
         self._lmcache_engine.wait_for_layer_load(
             layer_name,
@@ -104,6 +107,7 @@ class LMCacheConnectorV1Dynamic(KVConnectorBase_V1):
             token_start_index,
             request_ids,
             target_slot_mapping=target_slot_mapping,
+            payload_event=payload_event,
         )
 
     def save_kv_layer(

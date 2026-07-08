@@ -315,6 +315,23 @@ def _dsa_record_current_stream_event(
     return None
 
 
+def _dsa_wait_payload_event(payload_event: Any) -> None:
+    if payload_event is None:
+        return
+    if not (hasattr(torch, "npu") and hasattr(torch.npu, "current_stream")):
+        raise RuntimeError(
+            "DSA selected-token payload event was provided, but torch.npu "
+            "stream support is unavailable."
+        )
+    try:
+        torch.npu.current_stream().wait_event(payload_event)
+    except Exception as exc:
+        raise RuntimeError(
+            "Failed to wait on DSA selected-token producer event before "
+            "LMCache row selection."
+        ) from exc
+
+
 def _row_select(value: Any, rows: list[int]):
     if hasattr(value, "__getitem__"):
         if isinstance(value, torch.Tensor):
@@ -3760,6 +3777,7 @@ class LMCacheConnectorV1Impl:
         token_start_index: list = None,
         request_ids: list = None,
         target_slot_mapping=None,
+        payload_event=None,
     ) -> None:
         """Blocking until the KV for a specific layer is loaded into vLLM's
         paged buffer.
@@ -3773,6 +3791,9 @@ class LMCacheConnectorV1Impl:
             request_ids: req_id for each selected_tokens row (duplicates allowed).
             target_slot_mapping: optional batched physical destination slots,
                 row-aligned with selected_tokens.
+            payload_event: optional producer event recorded by vLLM after
+                selected_tokens/target_slot_mapping were built. LMCache waits on
+                this before row-selecting from those tensors.
         """
         if self.layerwise_retrievers and logger.isEnabledFor(10):
             logger.debug("Waiting for layer %d to be loaded", self.current_layer)
@@ -3817,6 +3838,7 @@ class LMCacheConnectorV1Impl:
 
         selected_rows = None
         if selected_tokens is not None:
+            _dsa_wait_payload_event(payload_event)
             selected_rows = (
                 int(selected_tokens.shape[0])
                 if hasattr(selected_tokens, "shape")
