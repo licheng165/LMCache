@@ -46,6 +46,9 @@ from lmcache.v1.config import LMCacheEngineConfig
 from lmcache.v1.config_base import validate_and_set_config_value
 from lmcache.v1.manager import LMCacheManager
 
+_DSA_PUBLISH_STREAM_WARNING_LOGGED = False
+_DSA_TORCH_NPU_MODULE: Any = None
+
 if TYPE_CHECKING:
     # Third Party
     from vllm.attention.backends.abstract import AttentionMetadata
@@ -208,30 +211,104 @@ def _build_slot_mapping(
     return slots[:num_tokens]
 
 
-def _dsa_has_device_tensor(value: Any) -> bool:
+def _dsa_device_tensor_types(value: Any) -> set[str]:
     if isinstance(value, torch.Tensor):
-        return value.device.type != "cpu"
+        return set() if value.device.type == "cpu" else {value.device.type}
     if isinstance(value, list):
-        return any(_dsa_has_device_tensor(item) for item in value)
-    return False
+        out: set[str] = set()
+        for item in value:
+            out.update(_dsa_device_tensor_types(item))
+        return out
+    return set()
 
 
-def _dsa_record_current_stream_event() -> Optional[Any]:
+def _dsa_publish_current_npu_stream() -> bool:
+    global _DSA_PUBLISH_STREAM_WARNING_LOGGED, _DSA_TORCH_NPU_MODULE
+    try:
+        # _npu_getCurrentRawStream drains torch-npu's task queue before returning
+        # the raw ACL stream. The NoWait variant intentionally skips that drain.
+        if _DSA_TORCH_NPU_MODULE is None:
+            import torch_npu  # type: ignore
+
+            _DSA_TORCH_NPU_MODULE = torch_npu
+        _DSA_TORCH_NPU_MODULE._C._npu_getCurrentRawStream(
+            int(torch.npu.current_device())
+        )
+        return True
+    except Exception:
+        if not _DSA_PUBLISH_STREAM_WARNING_LOGGED:
+            _DSA_PUBLISH_STREAM_WARNING_LOGGED = True
+            logger.warning(
+                "Failed to publish current NPU stream after recording DSA "
+                "payload event; refusing to send device selected-token "
+                "metadata without a published ordering event.",
+                exc_info=True,
+            )
+        return False
+
+
+def _dsa_record_current_stream_event(
+    device_types: Optional[set[str]] = None,
+) -> Optional[Any]:
+    device_types = device_types or set()
+    needs_npu_event = bool(device_types & {"npu", "privateuseone"})
+    needs_cuda_event = "cuda" in device_types
+
+    if needs_npu_event and needs_cuda_event:
+        raise RuntimeError(
+            "DSA payload contains both NPU and CUDA tensors; refusing to "
+            "record a single ordering event for mixed device backends."
+        )
+
+    if needs_npu_event:
+        if not (hasattr(torch, "npu") and hasattr(torch.npu, "Event")):
+            raise RuntimeError(
+                "DSA payload contains NPU tensors but torch.npu.Event is "
+                "unavailable; refusing to send device selected-token payload "
+                "without a producer->consumer ordering event."
+            )
+        try:
+            event = torch.npu.Event()
+            event.record(torch.npu.current_stream())
+        except Exception as exc:
+            raise RuntimeError(
+                "Failed to record DSA payload event for NPU selected-token "
+                "metadata."
+            ) from exc
+        # selected/slot payload tensors may have just been produced by
+        # row-select operations; publish both those producers and the event.
+        if _dsa_publish_current_npu_stream():
+            return event
+        raise RuntimeError(
+            "Failed to publish DSA payload event after recording it. "
+            "Refusing to send device selected-token payload to LMCache "
+            "without a published producer->consumer ordering event."
+        )
+
+    if needs_cuda_event or not device_types:
+        try:
+            if hasattr(torch, "cuda") and torch.cuda.is_available():
+                event = torch.cuda.Event()
+                event.record(torch.cuda.current_stream())
+                return event
+        except Exception:
+            logger.debug("Failed to record CUDA DSA payload event", exc_info=True)
+
+    if device_types:
+        raise RuntimeError(
+            "DSA payload contains device tensors with unsupported device types "
+            f"{sorted(device_types)}; refusing to send selected-token payload "
+            "without a producer->consumer ordering event."
+        )
+
     try:
         if hasattr(torch, "npu") and hasattr(torch.npu, "Event"):
             event = torch.npu.Event()
             event.record(torch.npu.current_stream())
-            return event
+            if _dsa_publish_current_npu_stream():
+                return event
     except Exception:
         logger.debug("Failed to record NPU DSA payload event", exc_info=True)
-
-    try:
-        if hasattr(torch, "cuda") and torch.cuda.is_available():
-            event = torch.cuda.Event()
-            event.record(torch.cuda.current_stream())
-            return event
-    except Exception:
-        logger.debug("Failed to record CUDA DSA payload event", exc_info=True)
 
     return None
 
@@ -3815,16 +3892,19 @@ class LMCacheConnectorV1Impl:
                         target_slot_mapping_payload = _sparse_payload_value(
                             target_slot_mapping_per_req
                         )
-                        if _dsa_has_device_tensor(
+                        payload_device_types = _dsa_device_tensor_types(
                             selected_tokens_payload
-                        ) or _dsa_has_device_tensor(target_slot_mapping_payload):
+                        ) | _dsa_device_tensor_types(target_slot_mapping_payload)
+                        if payload_device_types:
                             # Preserve producer -> LMCache load-stream ordering
                             # without forcing a CPU materialization.
                             payload = {
                                 "selected_token_ids": selected_tokens_payload,
                                 "target_slot_mapping": target_slot_mapping_payload,
                             }
-                            payload_event = _dsa_record_current_stream_event()
+                            payload_event = _dsa_record_current_stream_event(
+                                payload_device_types
+                            )
                             if payload_event is not None:
                                 payload["payload_event"] = payload_event
                         else:
@@ -3850,16 +3930,19 @@ class LMCacheConnectorV1Impl:
                         token_start_payload = _sparse_payload_value(
                             token_start_index_per_req
                         )
-                        if _dsa_has_device_tensor(
+                        payload_device_types = _dsa_device_tensor_types(
                             selected_tokens_payload
-                        ) or _dsa_has_device_tensor(token_start_payload):
+                        ) | _dsa_device_tensor_types(token_start_payload)
+                        if payload_device_types:
                             # Preserve producer -> LMCache load-stream ordering
                             # without forcing a CPU materialization.
                             payload = {
                                 "selected_token_ids": selected_tokens_payload,
                                 "token_start_index": token_start_payload,
                             }
-                            payload_event = _dsa_record_current_stream_event()
+                            payload_event = _dsa_record_current_stream_event(
+                                payload_device_types
+                            )
                             if payload_event is not None:
                                 payload["payload_event"] = payload_event
                         else:
