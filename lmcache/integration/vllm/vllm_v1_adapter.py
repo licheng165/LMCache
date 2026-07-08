@@ -44,9 +44,6 @@ from lmcache.v1.config import LMCacheEngineConfig
 from lmcache.v1.config_base import validate_and_set_config_value
 from lmcache.v1.manager import LMCacheManager
 
-_DSA_PUBLISH_STREAM_WARNING_LOGGED = False
-_DSA_TORCH_NPU_MODULE: Any = None
-
 if TYPE_CHECKING:
     # Third Party
     from vllm.attention.backends.abstract import AttentionMetadata
@@ -134,31 +131,6 @@ def _dsa_device_tensor_types(value: Any) -> set[str]:
     return set()
 
 
-def _dsa_publish_current_npu_stream() -> bool:
-    global _DSA_PUBLISH_STREAM_WARNING_LOGGED, _DSA_TORCH_NPU_MODULE
-    try:
-        # _npu_getCurrentRawStream drains torch-npu's task queue before returning
-        # the raw ACL stream. The NoWait variant intentionally skips that drain.
-        if _DSA_TORCH_NPU_MODULE is None:
-            import torch_npu  # type: ignore
-
-            _DSA_TORCH_NPU_MODULE = torch_npu
-        _DSA_TORCH_NPU_MODULE._C._npu_getCurrentRawStream(
-            int(torch.npu.current_device())
-        )
-        return True
-    except Exception:
-        if not _DSA_PUBLISH_STREAM_WARNING_LOGGED:
-            _DSA_PUBLISH_STREAM_WARNING_LOGGED = True
-            logger.warning(
-                "Failed to publish current NPU stream for DSA payload event "
-                "ordering; refusing to send device selected-token metadata "
-                "without a published ordering event.",
-                exc_info=True,
-            )
-        return False
-
-
 def _dsa_payload_event_list(payload_event: Any) -> list[Any]:
     if payload_event is None:
         return []
@@ -187,16 +159,6 @@ def _dsa_record_current_stream_event(
                 "unavailable; refusing to send device selected-token payload "
                 "without a producer->consumer ordering event."
             )
-        # selected/slot payload tensors may have just been produced by
-        # vLLM row-select/remap operations. Publish the torch-npu task queue
-        # before recording the event; otherwise the event can be inserted before
-        # those queued producers and consumers can still race them.
-        if not _dsa_publish_current_npu_stream():
-            raise RuntimeError(
-                "Failed to publish current NPU stream before recording DSA "
-                "payload event. Refusing to send device selected-token payload "
-                "to LMCache without a producer->consumer ordering event."
-            )
         try:
             event = torch.npu.Event()
             event.record(torch.npu.current_stream())
@@ -205,12 +167,6 @@ def _dsa_record_current_stream_event(
                 "Failed to record DSA payload event for NPU selected-token "
                 "metadata."
             ) from exc
-        if not _dsa_publish_current_npu_stream():
-            raise RuntimeError(
-                "Failed to publish DSA payload event after recording it. "
-                "Refusing to send device selected-token payload to LMCache "
-                "without a submitted producer->consumer ordering event."
-            )
         return event
 
     if needs_cuda_event or not device_types:
@@ -231,12 +187,8 @@ def _dsa_record_current_stream_event(
 
     try:
         if hasattr(torch, "npu") and hasattr(torch.npu, "Event"):
-            if not _dsa_publish_current_npu_stream():
-                return None
             event = torch.npu.Event()
             event.record(torch.npu.current_stream())
-            if not _dsa_publish_current_npu_stream():
-                return None
             return event
     except Exception:
         logger.debug("Failed to record NPU DSA payload event", exc_info=True)
@@ -257,12 +209,6 @@ def _dsa_wait_payload_event(payload_event: Any) -> None:
         current_stream = torch.npu.current_stream()
         for event in payload_events:
             current_stream.wait_event(event)
-        if not _dsa_publish_current_npu_stream():
-            raise RuntimeError(
-                "Failed to publish current NPU stream after waiting on DSA "
-                "selected-token producer event. Refusing to row-select sparse "
-                "payload before the wait is submitted."
-            )
     except Exception as exc:
         raise RuntimeError(
             "Failed to wait on DSA selected-token producer event before "
