@@ -110,8 +110,9 @@ class TestConnectorWarmColdInvalidate:
 class TestAscendEngineWarmColdMetadata:
     def test_has_retrieve_data_cache_cold_vs_warm(self) -> None:
         assert not AscendLMCacheEngine._has_retrieve_data_cache(None, None, 2)
-        # Empty per-layer lists still mean the tensor cache structure exists.
-        assert AscendLMCacheEngine._has_retrieve_data_cache([[], []], None, 2)
+        # Empty per-layer lists describe shape only; they do not prove data is
+        # ready for warm reuse.
+        assert not AscendLMCacheEngine._has_retrieve_data_cache([[], []], None, 2)
 
         cached_tensors = [torch.zeros(1), torch.zeros(1)]
         assert AscendLMCacheEngine._has_retrieve_data_cache(cached_tensors, None, 2)
@@ -278,10 +279,11 @@ class TestSparseDecodeTokenMask:
         )
         token_mask = impl._load_token_mask_for_retrieve(request, len(retrieve_tokens), 256)
 
-        assert len(retrieve_tokens) == window
-        assert token_mask.eq(False).all()
+        assert len(retrieve_tokens) == request.load_spec.lmcache_cached_tokens
+        assert token_mask.numel() == request.load_spec.lmcache_cached_tokens
+        assert token_mask.eq(True).all()
 
-    def test_sparse_retrieve_tokens_match_slot_mapping_window(self) -> None:
+    def test_sparse_retrieve_tokens_cover_lmcache_prefix(self) -> None:
         impl = make_worker_impl()
         tokens = list(range(18879))
         retrieve_tokens = impl._load_tokens_for_retrieve(
@@ -289,4 +291,4 @@ class TestSparseDecodeTokenMask:
             lmcache_cached_tokens=16384,
             is_sparse_decode=True,
         )
-        assert len(retrieve_tokens) == _sparse_slot_mapping_len(16384)
+        assert len(retrieve_tokens) == 16384

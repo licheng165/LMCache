@@ -37,6 +37,76 @@ def check_extra_config(config: "LMCacheEngineConfig"):
     assert config.extra_config["key2"] == "value2"
 
 
+def test_shared_cpu_cache_requires_local_cpu():
+    with pytest.raises(ValueError, match="requires local_cpu=true") as exc_info:
+        config = LMCacheEngineConfig.from_defaults(
+            local_cpu=False,
+            extra_config={"enable_shared_cpu_cache": True},
+        )
+        config.validate()
+    assert "max_local_cpu_size" in str(exc_info.value)
+    assert "shared_cpu_cache_size_gb" in str(exc_info.value)
+
+
+def test_shared_cpu_cache_requires_positive_rank0_cpu_size():
+    with pytest.raises(ValueError, match="max_local_cpu_size > 0") as exc_info:
+        config = LMCacheEngineConfig.from_defaults(
+            max_local_cpu_size=0,
+            extra_config={"enable_shared_cpu_cache": True},
+        )
+        config.validate()
+    assert "local_cpu" in str(exc_info.value)
+    assert "enable_shared_cpu_cache" in str(exc_info.value)
+
+
+def test_shared_cpu_cache_rejects_non_positive_size_override():
+    with pytest.raises(ValueError, match="shared_cpu_cache_size_gb"):
+        config = LMCacheEngineConfig.from_defaults(
+            extra_config={
+                "enable_shared_cpu_cache": True,
+                "shared_cpu_cache_size_gb": 0,
+            },
+        )
+        config.validate()
+
+
+def test_shared_cpu_cache_rejects_conflicting_names():
+    with pytest.raises(ValueError, match="must not conflict"):
+        config = LMCacheEngineConfig.from_defaults(
+            extra_config={
+                "enable_shared_cpu_cache": True,
+                "shared_cpu_cache_name": "/shared-a",
+                "shm_name": "/shared-b",
+            },
+        )
+        config.validate()
+
+
+def test_shared_cpu_cache_dense_layerwise_contract_is_engine_level():
+    config = LMCacheEngineConfig.from_defaults(
+        use_layerwise=True,
+        enable_sparse_attention=False,
+        extra_config={
+            "save_only_first_rank": True,
+            "enable_shared_cpu_cache": False,
+        },
+    )
+    assert config.use_layerwise is True
+    assert config.enable_sparse_attention is False
+
+
+def test_shared_cpu_cache_passive_writable_defaults_to_auto():
+    config = LMCacheEngineConfig.from_defaults()
+    assert config.shared_cpu_cache_passive_writable is None
+
+    validate_and_set_config_value(
+        config,
+        "shared_cpu_cache_passive_writable",
+        True,
+    )
+    assert config.shared_cpu_cache_passive_writable is True
+
+
 def test_update_config_from_env_basic():
     config = LMCacheEngineConfig.from_defaults()
     original_chunk_size = config.chunk_size
@@ -120,7 +190,7 @@ def test_get_lookup_server_worker_ids(use_mla):
     lookup_server_worker_ids = config.get_lookup_server_worker_ids(use_mla, 8)
     # test default value
     if use_mla:
-        # MLA default: save_only_first_rank=true → lookup only on rank 0
+        # MLA default: save_only_first_rank=true -> lookup only on rank 0
         assert lookup_server_worker_ids == [0]
     else:
         assert lookup_server_worker_ids == [0, 1, 2, 3, 4, 5, 6, 7]

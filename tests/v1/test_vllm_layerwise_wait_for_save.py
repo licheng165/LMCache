@@ -41,7 +41,7 @@ class _FakeEngine:
     def store_layer(self, token_ids, **kwargs):
         req_id = kwargs["req_id"]
         self.store_calls.append(req_id)
-        self.store_kwargs.append(kwargs)
+        self.store_kwargs.append(dict(kwargs))
         self.store_steps.setdefault(req_id, 0)
 
         def _storer():
@@ -57,7 +57,11 @@ class _FakeManager:
         self.lmcache_engine = engine
 
 
-def _make_req(req_id: str, can_save: bool = True):
+def _make_req(
+    req_id: str,
+    can_save: bool = True,
+    request_configs: dict | None = None,
+):
     return SimpleNamespace(
         req_id=req_id,
         token_ids=[1, 2, 3, 4],
@@ -77,6 +81,8 @@ def _make_req(req_id: str, can_save: bool = True):
         cached_tensors_indexer=[],
         cached_chunk_dev_ptrs_indexer=[],
         cached_chunk_ptrs_npu_indexer=[],
+        cached_shared_handles_indexer=[],
+        request_configs=request_configs,
     )
 
 
@@ -90,6 +96,7 @@ def _make_connector(requests):
     connector.use_layerwise = True
     connector.config = SimpleNamespace(dsa_two_groups=False)
     connector.device = "cpu"
+    connector.config = SimpleNamespace(dsa_two_groups=False)
     connector._lmcache_chunk_size = 8
     connector.kv_caches = {"layer0": torch.zeros(1)}
     connector._kvcaches_list = []
@@ -107,6 +114,17 @@ def _make_connector(requests):
     connector._late_finished_sending = set()
     connector._completed_decode_window_saves = {}
     return connector, metadata, engine
+
+
+def _init_indexer_cache_fields(request) -> None:
+    request.cached_keys_indexer = []
+    request.cached_starts_indexer = []
+    request.cached_ends_indexer = []
+    request.cached_memory_objs_indexer = []
+    request.cached_tensors_indexer = []
+    request.cached_chunk_dev_ptrs_indexer = []
+    request.cached_chunk_ptrs_npu_indexer = []
+    request.cached_shared_handles_indexer = []
 
 
 def test_layerwise_storer_is_request_scoped_across_interleaved_finalize() -> None:
@@ -305,3 +323,153 @@ def test_layerwise_save_kv_producer_ignores_can_save_flag() -> None:
     connector.wait_for_save()
     assert engine.store_steps["req-1"] == 2
     assert connector._layerwise_save_storers == {}
+
+
+def test_layerwise_save_passes_request_configs() -> None:
+    request_configs = {"lmcache.tag.schema": "dsa-index-save-v2"}
+    connector, _, engine = _make_connector(
+        [_make_req("req-1", request_configs=request_configs)]
+    )
+
+    connector.save_kv_layer("layer0", torch.zeros(1), None)
+
+    assert engine.store_calls == ["req-1"]
+    assert engine.store_kwargs[0]["request_configs"] == request_configs
+
+
+def test_request_finished_closes_abandoned_layerwise_storer() -> None:
+    connector, _, engine = _make_connector([_make_req("req-1")])
+    closed = []
+
+    def _abandoned_storer():
+        try:
+            while True:
+                yield None
+        finally:
+            closed.append(True)
+
+    connector._layerwise_save_storers["req-1"] = _abandoned_storer()
+    connector.async_loading = False
+    connector._request_trackers = {}
+    connector.config = SimpleNamespace(
+        dsa_two_groups=False,
+        get_extra_config_value=lambda _key, default=None: default,
+    )
+
+    request = SimpleNamespace(request_id="req-1", status=None)
+    should_free, return_params = connector.request_finished(request, [])
+
+    assert should_free is False
+    assert return_params is None
+    assert closed == [True]
+    assert connector._layerwise_save_storers == {}
+    assert engine.unpinned == ["req-1"]
+
+
+def test_deferred_latent_flush_drains_full_store_layer() -> None:
+    request = _make_req("req-1")
+    request.save_spec.can_save_latent = True
+    connector, _, engine = _make_connector([request])
+    connector.kv_role = "kv_both"
+    connector._deferred_latent_pending.add("req-1")
+    connector._latent_kvcaches = [torch.zeros(1)]
+    connector._kvcaches_for_group = lambda _kv_group: [torch.zeros(1)]
+    connector._refresh_kvcaches_list = lambda: None
+    engine.num_layers = 4
+    engine.store_steps["req-1"] = 0
+
+    def _finite_store_layer(_token_ids, **kwargs):
+        engine.store_calls.append(kwargs["req_id"])
+
+        def _storer():
+            for _ in range(engine.num_layers + 1):
+                engine.store_steps["req-1"] += 1
+                yield None
+
+        return _storer()
+
+    engine.store_layer = _finite_store_layer
+
+    connector._flush_deferred_latent_store(request, request.save_spec)
+
+    assert engine.store_calls == ["req-1"]
+    assert engine.store_steps["req-1"] == engine.num_layers + 1
+    assert "req-1" not in connector._deferred_latent_pending
+
+
+def test_indexer_save_uses_layer_metadata_slots_not_request_slots() -> None:
+    request = _make_req("req-1")
+    request.save_spec = SaveSpec(
+        skip_leading_tokens=0,
+        can_save=True,
+        can_save_latent=True,
+        can_save_indexer=True,
+    )
+    request.indexer_slot_mapping = [torch.arange(100, 104, dtype=torch.long)]
+    _init_indexer_cache_fields(request)
+
+    connector, _, engine = _make_connector([request])
+    connector.config = SimpleNamespace(dsa_two_groups=True)
+    indexer_layer_name = "model.layers.0.self_attn.indexer.k_cache"
+    connector.kv_caches = {
+        "model.layers.0.self_attn.attn": torch.zeros(1),
+        indexer_layer_name: torch.zeros(1),
+    }
+    metadata_slots = torch.arange(200, 204, dtype=torch.long)
+    attn_metadata = {
+        indexer_layer_name: SimpleNamespace(slot_mapping=metadata_slots),
+    }
+
+    connector.save_kv_layer(indexer_layer_name, torch.zeros(1), attn_metadata)
+
+    assert engine.store_calls == ["req-1"]
+    assert engine.store_kwargs[0]["kv_group"] == 1
+    assert torch.equal(engine.store_kwargs[0]["slot_mapping"], metadata_slots)
+    assert not torch.equal(
+        engine.store_kwargs[0]["slot_mapping"],
+        request.indexer_slot_mapping[0],
+    )
+
+
+def test_chunked_indexer_save_pads_layer_metadata_slots() -> None:
+    request = _make_req("req-1")
+    request.token_ids = list(range(16))
+    request.slot_mapping = [torch.arange(16, dtype=torch.long)]
+    request.save_spec = SaveSpec(
+        skip_leading_tokens=8,
+        can_save=True,
+        can_save_latent=True,
+        can_save_indexer=True,
+    )
+    request.indexer_slot_mapping = [torch.arange(100, 116, dtype=torch.long)]
+    _init_indexer_cache_fields(request)
+
+    connector, _, engine = _make_connector([request])
+    connector.kv_role = "kv_both"
+    connector.config = SimpleNamespace(dsa_two_groups=True)
+    indexer_layer_name = "model.layers.0.self_attn.indexer.k_cache"
+    connector.kv_caches = {
+        "model.layers.0.self_attn.attn": torch.zeros(1),
+        indexer_layer_name: torch.zeros(1),
+    }
+    metadata_slots = torch.arange(200, 208, dtype=torch.long)
+    attn_metadata = {
+        indexer_layer_name: SimpleNamespace(slot_mapping=metadata_slots),
+    }
+
+    connector.save_kv_layer(indexer_layer_name, torch.zeros(1), attn_metadata)
+
+    assert engine.store_calls == ["req-1"]
+    assert engine.store_kwargs[0]["kv_group"] == 1
+    assert engine.store_kwargs[0]["offset"] == 8
+    assert torch.equal(
+        engine.store_kwargs[0]["slot_mapping"],
+        torch.cat((torch.zeros(8, dtype=torch.long), metadata_slots)),
+    )
+    assert torch.equal(
+        engine.store_kwargs[0]["mask"],
+        torch.tensor(
+            [False] * 8 + [True] * 8,
+            dtype=torch.bool,
+        ),
+    )

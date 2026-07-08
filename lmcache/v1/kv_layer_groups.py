@@ -173,17 +173,17 @@ class KVLayerGroupsManager:
         )
 
         for idx, (layer_name, kv_cache) in enumerate(kv_caches.items()):
-            # Supports two KV cache formats:
+            # Supports:
             # - Single-tensor format: a single tensor with shape
             #   [2, num_blocks, block_size, num_heads, head_size].
-            # - List/tuple format (e.g., TPU/HPU): [k_tensor, v_tensor],
-            #   where each tensor has shape
-            #   [num_blocks, block_size, num_heads, head_size].
+            # - Tuple/list KV entries such as [k_tensor, v_tensor].
+            # - DSA two-group indexer entries with one tensor:
+            #   [indexer_k].
             if isinstance(kv_cache, (tuple, list)):
-                if len(kv_cache) != 2:
+                if len(kv_cache) < 1:
                     raise ValueError(
-                        f"Expected 2 tensors (k, v) for layer {layer_name}, "
-                        f"got {len(kv_cache)}"
+                        f"Expected at least 1 tensor for layer {layer_name}, "
+                        "got an empty KV tuple/list"
                     )
                 # Prepend the count as a leading dimension to produce the
                 # same canonical shape as the single-tensor format

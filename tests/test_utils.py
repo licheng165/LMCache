@@ -389,6 +389,35 @@ class TestCacheEngineKey:
             request_configs={"some_config": "value"},
         )
         assert key.tags is None
+        assert "request_configs" not in key.to_dict()
+
+    def test_tags_are_order_insensitive(self):
+        key1 = CacheEngineKey(
+            model_name="m",
+            world_size=1,
+            worker_id=0,
+            chunk_hash=0x1,
+            dtype=torch.float16,
+            request_configs={
+                "lmcache.tag.z": "last",
+                "lmcache.tag.a": "first",
+            },
+        )
+        key2 = CacheEngineKey(
+            model_name="m",
+            world_size=1,
+            worker_id=0,
+            chunk_hash=0x1,
+            dtype=torch.float16,
+            request_configs={
+                "lmcache.tag.a": "first",
+                "lmcache.tag.z": "last",
+            },
+        )
+        assert key1 == key2
+        assert hash(key1) == hash(key2)
+        assert key1.to_string() == key2.to_string()
+        assert key1.to_dict() == key2.to_dict()
 
 
 # ============================================================
@@ -510,9 +539,6 @@ class TestCacheKeyParsing:
         assert isinstance(parsed, CacheEngineKey)
         assert parsed == key
 
-    @pytest.mark.xfail(
-        reason="parse_cache_key bug: cannot parse LayerCacheEngineKey with dtype"
-    )
     def test_parse_layer_cache_engine_key(self):
         key = LayerCacheEngineKey(
             model_name="m",
@@ -524,6 +550,77 @@ class TestCacheKeyParsing:
         )
         s = key.to_string()
         parsed = parse_cache_key(s)
+        assert isinstance(parsed, LayerCacheEngineKey)
+        assert parsed == key
+
+    def test_parse_new_cache_engine_key_kv_group_zero(self):
+        key = CacheEngineKey(
+            model_name="m",
+            world_size=1,
+            worker_id=0,
+            chunk_hash=0xABC,
+            dtype=torch.float16,
+            kv_group=0,
+        )
+        parsed = parse_cache_key(key.to_string())
+        assert isinstance(parsed, CacheEngineKey)
+        assert not isinstance(parsed, LayerCacheEngineKey)
+        assert parsed == key
+
+    def test_parse_new_cache_engine_key_kv_group_one(self):
+        key = CacheEngineKey(
+            model_name="m",
+            world_size=1,
+            worker_id=0,
+            chunk_hash=0xABC,
+            dtype=torch.float16,
+            kv_group=1,
+        )
+        parsed = parse_cache_key(key.to_string())
+        assert isinstance(parsed, CacheEngineKey)
+        assert not isinstance(parsed, LayerCacheEngineKey)
+        assert parsed == key
+
+    def test_parse_new_cache_engine_key_kv_group_with_tags(self):
+        key = CacheEngineKey(
+            model_name="m",
+            world_size=1,
+            worker_id=0,
+            chunk_hash=0xABC,
+            dtype=torch.float16,
+            request_configs={"lmcache.tag.schema": "dsa-index-save-v2"},
+            kv_group=1,
+        )
+        parsed = parse_cache_key(key.to_string())
+        assert isinstance(parsed, CacheEngineKey)
+        assert not isinstance(parsed, LayerCacheEngineKey)
+        assert parsed == key
+
+    def test_parse_new_layer_cache_engine_key_layer_zero(self):
+        key = LayerCacheEngineKey(
+            model_name="m",
+            world_size=1,
+            worker_id=0,
+            chunk_hash=0xABC,
+            dtype=torch.float16,
+            kv_group=0,
+            layer_id=0,
+        )
+        parsed = parse_cache_key(key.to_string())
+        assert isinstance(parsed, LayerCacheEngineKey)
+        assert parsed == key
+
+    def test_parse_new_layer_cache_engine_key_layer_one(self):
+        key = LayerCacheEngineKey(
+            model_name="m",
+            world_size=1,
+            worker_id=0,
+            chunk_hash=0xABC,
+            dtype=torch.float16,
+            kv_group=1,
+            layer_id=1,
+        )
+        parsed = parse_cache_key(key.to_string())
         assert isinstance(parsed, LayerCacheEngineKey)
         assert parsed == key
 
