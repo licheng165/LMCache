@@ -48,6 +48,12 @@ from lmcache.v1.manager import LMCacheManager
 
 _DSA_PUBLISH_STREAM_WARNING_LOGGED = False
 _DSA_TORCH_NPU_MODULE: Any = None
+_DSA_STREAM_DIAG = os.environ.get("LMCACHE_DSA_STREAM_DIAG", "0").lower() in (
+    "1",
+    "true",
+    "yes",
+    "on",
+)
 
 if TYPE_CHECKING:
     # Third Party
@@ -239,12 +245,52 @@ def _dsa_publish_current_npu_stream() -> bool:
         if not _DSA_PUBLISH_STREAM_WARNING_LOGGED:
             _DSA_PUBLISH_STREAM_WARNING_LOGGED = True
             logger.warning(
-                "Failed to publish current NPU stream before recording DSA "
-                "payload event; refusing to send device selected-token "
-                "metadata without a published ordering event.",
+                "Failed to publish current NPU stream for DSA payload event "
+                "ordering; refusing to send device selected-token metadata "
+                "without a published ordering event.",
                 exc_info=True,
             )
         return False
+
+
+def _dsa_describe_stream(stream: Any) -> Any:
+    if stream is None:
+        return None
+    try:
+        return {
+            "type": type(stream).__name__,
+            "npu_stream": getattr(stream, "npu_stream", None),
+            "cuda_stream": getattr(stream, "cuda_stream", None),
+            "device": str(getattr(stream, "device", None)),
+        }
+    except Exception as exc:
+        return f"{type(exc).__name__}: {exc}"
+
+
+def _dsa_current_stream_summary() -> Any:
+    summary: dict[str, Any] = {}
+    try:
+        if hasattr(torch, "npu") and hasattr(torch.npu, "current_stream"):
+            summary["npu"] = _dsa_describe_stream(torch.npu.current_stream())
+    except Exception as exc:
+        summary["npu"] = f"{type(exc).__name__}: {exc}"
+    try:
+        if hasattr(torch, "cuda") and hasattr(torch.cuda, "current_stream"):
+            summary["cuda"] = _dsa_describe_stream(torch.cuda.current_stream())
+    except Exception as exc:
+        summary["cuda"] = f"{type(exc).__name__}: {exc}"
+    return summary
+
+
+def _dsa_stream_diag(label: str, **kwargs) -> None:
+    if not _DSA_STREAM_DIAG:
+        return
+    logger.warning(
+        "[DSA_STREAM_DIAG] label=%s streams=%s extra=%s",
+        label,
+        _dsa_current_stream_summary(),
+        kwargs,
+    )
 
 
 def _dsa_record_current_stream_event(
@@ -278,13 +324,24 @@ def _dsa_record_current_stream_event(
                 "to LMCache without a producer->consumer ordering event."
             )
         try:
+            _dsa_stream_diag(
+                "adapter_payload_event_before_record",
+                device_types=sorted(device_types),
+            )
             event = torch.npu.Event()
             event.record(torch.npu.current_stream())
+            _dsa_stream_diag("adapter_payload_event_after_record")
         except Exception as exc:
             raise RuntimeError(
                 "Failed to record DSA payload event for NPU selected-token "
                 "metadata."
             ) from exc
+        if not _dsa_publish_current_npu_stream():
+            raise RuntimeError(
+                "Failed to publish DSA payload event after recording it. "
+                "Refusing to send device selected-token payload to LMCache "
+                "without a submitted producer->consumer ordering event."
+            )
         return event
 
     if needs_cuda_event or not device_types:
@@ -305,10 +362,15 @@ def _dsa_record_current_stream_event(
 
     try:
         if hasattr(torch, "npu") and hasattr(torch.npu, "Event"):
+            if not _dsa_publish_current_npu_stream():
+                return None
+            _dsa_stream_diag("adapter_fallback_event_before_record")
             event = torch.npu.Event()
             event.record(torch.npu.current_stream())
-            if _dsa_publish_current_npu_stream():
-                return event
+            _dsa_stream_diag("adapter_fallback_event_after_record")
+            if not _dsa_publish_current_npu_stream():
+                return None
+            return event
     except Exception:
         logger.debug("Failed to record NPU DSA payload event", exc_info=True)
 
@@ -324,7 +386,15 @@ def _dsa_wait_payload_event(payload_event: Any) -> None:
             "stream support is unavailable."
         )
     try:
+        _dsa_stream_diag("adapter_before_selected_payload_wait")
         torch.npu.current_stream().wait_event(payload_event)
+        if not _dsa_publish_current_npu_stream():
+            raise RuntimeError(
+                "Failed to publish current NPU stream after waiting on DSA "
+                "selected-token producer event. Refusing to row-select sparse "
+                "payload before the wait is submitted."
+            )
+        _dsa_stream_diag("adapter_after_selected_payload_wait")
     except Exception as exc:
         raise RuntimeError(
             "Failed to wait on DSA selected-token producer event before "
@@ -3839,6 +3909,11 @@ class LMCacheConnectorV1Impl:
         selected_rows = None
         if selected_tokens is not None:
             _dsa_wait_payload_event(payload_event)
+            _dsa_stream_diag(
+                "adapter_before_selected_row_select",
+                layer_name=layer_name,
+                has_payload_event=payload_event is not None,
+            )
             selected_rows = (
                 int(selected_tokens.shape[0])
                 if hasattr(selected_tokens, "shape")
