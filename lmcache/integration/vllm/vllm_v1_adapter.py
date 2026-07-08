@@ -3739,10 +3739,10 @@ class LMCacheConnectorV1Impl:
                 payload = None
                 rows = None
                 row_count = 1
+                target_slot_mapping_per_req = None
                 if selected_tokens is None:
                     selected_tokens_per_req = None
                     token_start_index_per_req = 0
-                    target_slot_mapping_per_req = None
                 else:
                     assert selected_rows is not None
                     if rows_of_req is None:
