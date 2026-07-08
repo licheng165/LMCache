@@ -64,9 +64,6 @@ SPARSE_DECODE_RETRIEVE_TOKENS = int(
     os.environ.get("LMCACHE_SPARSE_DECODE_RETRIEVE_TOKENS", "2048")
 )
 SPARSE_DECODE_SHARED_CPU_PHASE = "sparse_decode_bootstrap"
-_DSA_RECORD_PAYLOAD_EVENT = os.environ.get(
-    "LMCACHE_DSA_RECORD_PAYLOAD_EVENT", "0"
-).lower() in ("1", "true", "yes", "on")
 _DSA_DIAG = os.environ.get("LMCACHE_DSA_DIAG", "0").lower() in (
     "1",
     "true",
@@ -3818,10 +3815,11 @@ class LMCacheConnectorV1Impl:
                         target_slot_mapping_payload = _sparse_payload_value(
                             target_slot_mapping_per_req
                         )
-                        if _DSA_RECORD_PAYLOAD_EVENT and (
-                            _dsa_has_device_tensor(selected_tokens_payload)
-                            or _dsa_has_device_tensor(target_slot_mapping_payload)
-                        ):
+                        if _dsa_has_device_tensor(
+                            selected_tokens_payload
+                        ) or _dsa_has_device_tensor(target_slot_mapping_payload):
+                            # Preserve producer -> LMCache load-stream ordering
+                            # without forcing a CPU materialization.
                             payload = {
                                 "selected_token_ids": selected_tokens_payload,
                                 "target_slot_mapping": target_slot_mapping_payload,
@@ -3846,6 +3844,27 @@ class LMCacheConnectorV1Impl:
                                 else _row_select(token_start_index, rows)
                             )
                         )
+                        selected_tokens_payload = _sparse_payload_value(
+                            selected_tokens_per_req
+                        )
+                        token_start_payload = _sparse_payload_value(
+                            token_start_index_per_req
+                        )
+                        if _dsa_has_device_tensor(
+                            selected_tokens_payload
+                        ) or _dsa_has_device_tensor(token_start_payload):
+                            # Preserve producer -> LMCache load-stream ordering
+                            # without forcing a CPU materialization.
+                            payload = {
+                                "selected_token_ids": selected_tokens_payload,
+                                "token_start_index": token_start_payload,
+                            }
+                            payload_event = _dsa_record_current_stream_event()
+                            if payload_event is not None:
+                                payload["payload_event"] = payload_event
+                        else:
+                            selected_tokens_per_req = selected_tokens_payload
+                            token_start_index_per_req = token_start_payload
                 sparse_payload = (
                     payload
                     if payload is not None
