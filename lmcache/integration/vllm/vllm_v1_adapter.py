@@ -4,9 +4,7 @@ from collections.abc import Iterable
 from dataclasses import dataclass, field
 from types import SimpleNamespace
 from typing import TYPE_CHECKING, Any, Generator, Optional, Union
-import hashlib
 import os
-import time
 
 # Third Party
 from vllm.config import (
@@ -48,24 +46,6 @@ from lmcache.v1.manager import LMCacheManager
 
 _DSA_PUBLISH_STREAM_WARNING_LOGGED = False
 _DSA_TORCH_NPU_MODULE: Any = None
-_DSA_STREAM_DIAG = os.environ.get("LMCACHE_DSA_STREAM_DIAG", "0").lower() in (
-    "1",
-    "true",
-    "yes",
-    "on",
-)
-_DSA_SYNC_PROBES = {
-    probe.strip().lower()
-    for probe in os.environ.get("LMCACHE_DSA_SYNC_PROBE", "").split(",")
-    if probe.strip()
-}
-_DSA_WAIT_STREAM_PROBES = {
-    probe.strip().lower()
-    for probe in os.environ.get("LMCACHE_DSA_WAIT_STREAM_PROBE", "").split(",")
-    if probe.strip()
-}
-_DSA_SYNC_PROBE_LOGGED: set[str] = set()
-_DSA_WAIT_STREAM_PROBE_LOGGED: set[str] = set()
 
 if TYPE_CHECKING:
     # Third Party
@@ -85,92 +65,6 @@ SPARSE_DECODE_RETRIEVE_TOKENS = int(
     os.environ.get("LMCACHE_SPARSE_DECODE_RETRIEVE_TOKENS", "2048")
 )
 SPARSE_DECODE_SHARED_CPU_PHASE = "sparse_decode_bootstrap"
-_DSA_DIAG = os.environ.get("LMCACHE_DSA_DIAG", "0").lower() in (
-    "1",
-    "true",
-    "yes",
-    "on",
-)
-_DSA_DIAG_PROMPT_RUNS: dict[str, int] = {}
-_DSA_DIAG_REQ_RUNS: dict[str, tuple[str, int, int]] = {}
-_DSA_DIAG_SESSION_ID = os.environ.get("LMCACHE_DSA_DIAG_SESSION_ID") or (
-    f"pid{os.getpid()}_{int(time.time() * 1000)}"
-)
-
-
-def _dsa_diag_layer_counts(cache: Optional[list], max_layers: int = 8) -> list[Any]:
-    if not cache:
-        return []
-    counts: list[Any] = []
-    for layer_cache in cache[:max_layers]:
-        try:
-            counts.append(len(layer_cache))
-        except TypeError:
-            counts.append(type(layer_cache).__name__)
-    if len(cache) > max_layers:
-        counts.append("...")
-    return counts
-
-
-def _dsa_diag_tensor_summary(value: Any, max_items: int = 6) -> Any:
-    if isinstance(value, torch.Tensor):
-        summary: dict[str, Any] = {
-            "type": "Tensor",
-            "shape": tuple(int(dim) for dim in value.shape),
-            "dtype": str(value.dtype),
-            "device": str(value.device),
-            "numel": int(value.numel()),
-        }
-        if value.device.type == "cpu" and value.numel() > 0:
-            flat = value.detach().reshape(-1)
-            head = flat[:max_items].tolist()
-            summary["head"] = [int(v) if isinstance(v, int) else v for v in head]
-        return summary
-    if isinstance(value, (list, tuple)):
-        return {
-            "type": type(value).__name__,
-            "len": len(value),
-            "head": [
-                _dsa_diag_tensor_summary(item, max_items=max_items)
-                for item in list(value)[:max_items]
-            ],
-        }
-    return value
-
-
-def _dsa_diag_prompt_digest(tokens: Any) -> tuple[str, int]:
-    h = hashlib.blake2b(digest_size=8)
-    count = 0
-    if isinstance(tokens, torch.Tensor):
-        if tokens.device.type != "cpu":
-            return (f"tensor:{tokens.device}:{tuple(tokens.shape)}", int(tokens.numel()))
-        iterable = tokens.detach().reshape(-1).tolist()
-    else:
-        iterable = tokens or []
-    for token in iterable:
-        h.update(int(token).to_bytes(8, byteorder="little", signed=True))
-        count += 1
-    return h.hexdigest(), count
-
-
-def _dsa_diag_prompt_run(tokens: Any) -> tuple[str, int, int]:
-    digest, token_count = _dsa_diag_prompt_digest(tokens)
-    run = _DSA_DIAG_PROMPT_RUNS.get(digest, 0) + 1
-    _DSA_DIAG_PROMPT_RUNS[digest] = run
-    return digest, run, token_count
-
-
-def _dsa_diag_request_prompt_run(
-    req_id: str,
-    tokens: Any,
-) -> tuple[str, int, int]:
-    cached = _DSA_DIAG_REQ_RUNS.get(req_id)
-    if cached is not None:
-        return cached
-    digest, run, token_count = _dsa_diag_prompt_run(tokens)
-    cached = (digest, run, token_count)
-    _DSA_DIAG_REQ_RUNS[req_id] = cached
-    return cached
 
 
 def _sparse_slot_mapping_len(prompt_tokens: int) -> int:
@@ -265,107 +159,12 @@ def _dsa_publish_current_npu_stream() -> bool:
         return False
 
 
-def _dsa_describe_stream(stream: Any) -> Any:
-    if stream is None:
-        return None
-    try:
-        return {
-            "type": type(stream).__name__,
-            "npu_stream": getattr(stream, "npu_stream", None),
-            "cuda_stream": getattr(stream, "cuda_stream", None),
-            "device": str(getattr(stream, "device", None)),
-        }
-    except Exception as exc:
-        return f"{type(exc).__name__}: {exc}"
-
-
-def _dsa_current_stream_summary() -> Any:
-    summary: dict[str, Any] = {}
-    try:
-        if hasattr(torch, "npu") and hasattr(torch.npu, "current_stream"):
-            summary["npu"] = _dsa_describe_stream(torch.npu.current_stream())
-    except Exception as exc:
-        summary["npu"] = f"{type(exc).__name__}: {exc}"
-    try:
-        if hasattr(torch, "cuda") and hasattr(torch.cuda, "current_stream"):
-            summary["cuda"] = _dsa_describe_stream(torch.cuda.current_stream())
-    except Exception as exc:
-        summary["cuda"] = f"{type(exc).__name__}: {exc}"
-    return summary
-
-
-def _dsa_stream_diag(label: str, **kwargs) -> None:
-    if not _DSA_STREAM_DIAG:
-        return
-    logger.warning(
-        "[DSA_STREAM_DIAG] label=%s streams=%s extra=%s",
-        label,
-        _dsa_current_stream_summary(),
-        kwargs,
-    )
-
-
 def _dsa_payload_event_list(payload_event: Any) -> list[Any]:
     if payload_event is None:
         return []
     if isinstance(payload_event, (list, tuple)):
         return [event for event in payload_event if event is not None]
     return [payload_event]
-
-
-def _dsa_payload_stream_list(payload_stream: Any) -> list[Any]:
-    if payload_stream is None:
-        return []
-    if isinstance(payload_stream, (list, tuple)):
-        return [stream for stream in payload_stream if stream is not None]
-    return [payload_stream]
-
-
-def _dsa_probe_enabled(probes: set[str], name: str) -> bool:
-    return name in probes or "all" in probes
-
-
-def _dsa_sync_probe(name: str) -> None:
-    if not _dsa_probe_enabled(_DSA_SYNC_PROBES, name):
-        return
-    try:
-        torch.npu.current_stream().synchronize()
-    except Exception:
-        logger.warning(
-            "[LMCACHE_DSA_SYNC_PROBE_ERROR] probe=%s failed",
-            name,
-            exc_info=True,
-        )
-    else:
-        if name not in _DSA_SYNC_PROBE_LOGGED:
-            _DSA_SYNC_PROBE_LOGGED.add(name)
-            logger.warning("[LMCACHE_DSA_SYNC_PROBE] probe=%s", name)
-
-
-def _dsa_wait_stream_probe(name: str, payload_stream: Any) -> None:
-    payload_streams = _dsa_payload_stream_list(payload_stream)
-    if not payload_streams or not _dsa_probe_enabled(_DSA_WAIT_STREAM_PROBES, name):
-        return
-    try:
-        current_stream = torch.npu.current_stream()
-        for stream in payload_streams:
-            current_stream.wait_stream(stream)
-        if not _dsa_publish_current_npu_stream():
-            raise RuntimeError("failed to publish stream after wait_stream")
-    except Exception:
-        logger.warning(
-            "[LMCACHE_DSA_WAIT_STREAM_PROBE_ERROR] probe=%s failed",
-            name,
-            exc_info=True,
-        )
-    else:
-        if name not in _DSA_WAIT_STREAM_PROBE_LOGGED:
-            _DSA_WAIT_STREAM_PROBE_LOGGED.add(name)
-            logger.warning(
-                "[LMCACHE_DSA_WAIT_STREAM_PROBE] probe=%s stream_count=%d",
-                name,
-                len(payload_streams),
-            )
 
 
 def _dsa_record_current_stream_event(
@@ -399,13 +198,8 @@ def _dsa_record_current_stream_event(
                 "to LMCache without a producer->consumer ordering event."
             )
         try:
-            _dsa_stream_diag(
-                "adapter_payload_event_before_record",
-                device_types=sorted(device_types),
-            )
             event = torch.npu.Event()
             event.record(torch.npu.current_stream())
-            _dsa_stream_diag("adapter_payload_event_after_record")
         except Exception as exc:
             raise RuntimeError(
                 "Failed to record DSA payload event for NPU selected-token "
@@ -439,10 +233,8 @@ def _dsa_record_current_stream_event(
         if hasattr(torch, "npu") and hasattr(torch.npu, "Event"):
             if not _dsa_publish_current_npu_stream():
                 return None
-            _dsa_stream_diag("adapter_fallback_event_before_record")
             event = torch.npu.Event()
             event.record(torch.npu.current_stream())
-            _dsa_stream_diag("adapter_fallback_event_after_record")
             if not _dsa_publish_current_npu_stream():
                 return None
             return event
@@ -462,10 +254,6 @@ def _dsa_wait_payload_event(payload_event: Any) -> None:
             "stream support is unavailable."
         )
     try:
-        _dsa_stream_diag(
-            "adapter_before_selected_payload_wait",
-            event_count=len(payload_events),
-        )
         current_stream = torch.npu.current_stream()
         for event in payload_events:
             current_stream.wait_event(event)
@@ -475,7 +263,6 @@ def _dsa_wait_payload_event(payload_event: Any) -> None:
                 "selected-token producer event. Refusing to row-select sparse "
                 "payload before the wait is submitted."
             )
-        _dsa_stream_diag("adapter_after_selected_payload_wait")
     except Exception as exc:
         raise RuntimeError(
             "Failed to wait on DSA selected-token producer event before "
@@ -495,18 +282,6 @@ def _dsa_attach_payload_events(
     payload["payload_event"] = payload_events[0]
     if len(payload_events) > 1:
         payload["payload_events"] = tuple(payload_events)
-
-
-def _dsa_attach_payload_streams(
-    payload: dict[str, Any],
-    upstream_stream: Any,
-) -> None:
-    payload_streams = _dsa_payload_stream_list(upstream_stream)
-    if not payload_streams:
-        return
-    payload["payload_stream"] = payload_streams[0]
-    if len(payload_streams) > 1:
-        payload["payload_streams"] = tuple(payload_streams)
 
 
 def _row_select(value: Any, rows: list[int]):
@@ -3455,47 +3230,6 @@ class LMCacheConnectorV1Impl:
                     latent_cache = _retrieve_cache_kwargs(
                         request, kv_group=0, dsa_two_groups=dsa_two_groups
                     )
-                    diag_prompt_digest = None
-                    diag_prompt_run = None
-                    if _DSA_DIAG:
-                        (
-                            diag_prompt_digest,
-                            diag_prompt_run,
-                            diag_prompt_token_count,
-                        ) = _dsa_diag_request_prompt_run(
-                            request.req_id,
-                            request.token_ids,
-                        )
-                        request._lmcache_dsa_diag_prompt_digest = diag_prompt_digest
-                        request._lmcache_dsa_diag_prompt_run = diag_prompt_run
-                        request._lmcache_dsa_diag_session_id = _DSA_DIAG_SESSION_ID
-                        logger.warning(
-                            "[DSA_DIAG] start_sparse req_id=%s diag_session=%s "
-                            "prompt_digest=%s prompt_run=%s prompt_tokens=%s "
-                            "retrieve_tokens=%s "
-                            "lmcache_cached=%s vllm_cached=%s shared_cpu=%s "
-                            "dsa_two_groups=%s bound_state=%s "
-                            "latent_mem_counts=%s latent_tensor_counts=%s "
-                            "latent_ptr_ready=%s slot_mapping=%s",
-                            request.req_id,
-                            _DSA_DIAG_SESSION_ID,
-                            diag_prompt_digest,
-                            diag_prompt_run,
-                            diag_prompt_token_count,
-                            len(retrieve_tokens),
-                            request.load_spec.lmcache_cached_tokens,
-                            request.load_spec.vllm_cached_tokens,
-                            shared_cpu_enabled,
-                            dsa_two_groups,
-                            bound_state is not None,
-                            _dsa_diag_layer_counts(request.cached_memory_objs),
-                            _dsa_diag_layer_counts(request.cached_tensors),
-                            [
-                                ptr is not None
-                                for ptr in request.cached_chunk_ptrs_npu[:8]
-                            ],
-                            _dsa_diag_tensor_summary(slot_mapping),
-                        )
                     retrieve_kwargs: dict[str, Any] = {
                         "kvcaches": kvcaches,
                         "slot_mapping": slot_mapping,
@@ -3509,14 +3243,6 @@ class LMCacheConnectorV1Impl:
                         "shared_cpu_request_ordinal": idx,
                         **latent_cache,
                     }
-                    if _DSA_DIAG:
-                        retrieve_kwargs["_dsa_diag_prompt_digest"] = (
-                            diag_prompt_digest
-                        )
-                        retrieve_kwargs["_dsa_diag_prompt_run"] = diag_prompt_run
-                        retrieve_kwargs["_dsa_diag_session_id"] = (
-                            _DSA_DIAG_SESSION_ID
-                        )
                     if shared_cpu_preflight_state is not None:
                         retrieve_kwargs["shared_cpu_request_preflight_state"] = (
                             shared_cpu_preflight_state
@@ -3605,30 +3331,6 @@ class LMCacheConnectorV1Impl:
                                 kv_group=1,
                                 dsa_two_groups=dsa_two_groups,
                             )
-                            if _DSA_DIAG:
-                                logger.warning(
-                                    "[DSA_DIAG] start_sparse_index req_id=%s "
-                                    "diag_session=%s prompt_digest=%s prompt_run=%s "
-                                    "index_mem_counts=%s index_tensor_counts=%s "
-                                    "index_ptr_ready=%s idx_slot=%s",
-                                    request.req_id,
-                                    _DSA_DIAG_SESSION_ID,
-                                    diag_prompt_digest,
-                                    diag_prompt_run,
-                                    _dsa_diag_layer_counts(
-                                        request.cached_memory_objs_indexer
-                                    ),
-                                    _dsa_diag_layer_counts(
-                                        request.cached_tensors_indexer
-                                    ),
-                                    [
-                                        ptr is not None
-                                        for ptr in request.cached_chunk_ptrs_npu_indexer[
-                                            :8
-                                        ]
-                                    ],
-                                    _dsa_diag_tensor_summary(idx_slot),
-                                )
                             indexer_kwargs: dict[str, Any] = {
                                 "kvcaches": indexer_kvcaches,
                                 "slot_mapping": idx_slot,
@@ -3642,16 +3344,6 @@ class LMCacheConnectorV1Impl:
                                 "shared_cpu_request_ordinal": idx,
                                 **indexer_cache,
                             }
-                            if _DSA_DIAG:
-                                indexer_kwargs["_dsa_diag_prompt_digest"] = (
-                                    diag_prompt_digest
-                                )
-                                indexer_kwargs["_dsa_diag_prompt_run"] = (
-                                    diag_prompt_run
-                                )
-                                indexer_kwargs["_dsa_diag_session_id"] = (
-                                    _DSA_DIAG_SESSION_ID
-                                )
                             if shared_cpu_preflight_state is not None:
                                 indexer_kwargs[
                                     "shared_cpu_request_preflight_state"
@@ -3955,7 +3647,6 @@ class LMCacheConnectorV1Impl:
         request_ids: list = None,
         target_slot_mapping=None,
         payload_event=None,
-        payload_stream=None,
     ) -> None:
         """Blocking until the KV for a specific layer is loaded into vLLM's
         paged buffer.
@@ -3972,8 +3663,6 @@ class LMCacheConnectorV1Impl:
             payload_event: optional producer event recorded by vLLM after
                 selected_tokens/target_slot_mapping were built. LMCache waits on
                 this before row-selecting from those tensors.
-            payload_stream: optional producer stream captured beside
-                payload_event. Only used by diagnostic wait_stream probes.
         """
         if self.layerwise_retrievers and logger.isEnabledFor(10):
             logger.debug("Waiting for layer %d to be loaded", self.current_layer)
@@ -4018,15 +3707,7 @@ class LMCacheConnectorV1Impl:
 
         selected_rows = None
         if selected_tokens is not None:
-            _dsa_wait_stream_probe("before_row_select", payload_stream)
             _dsa_wait_payload_event(payload_event)
-            _dsa_sync_probe("after_row_select_wait")
-            _dsa_stream_diag(
-                "adapter_before_selected_row_select",
-                layer_name=layer_name,
-                has_payload_event=payload_event is not None,
-                has_payload_stream=payload_stream is not None,
-            )
             selected_rows = (
                 int(selected_tokens.shape[0])
                 if hasattr(selected_tokens, "shape")
@@ -4056,10 +3737,10 @@ class LMCacheConnectorV1Impl:
                 payload = None
                 rows = None
                 row_count = 1
-                target_slot_mapping_per_req = None
                 if selected_tokens is None:
                     selected_tokens_per_req = None
                     token_start_index_per_req = 0
+                    target_slot_mapping_per_req = None
                 else:
                     assert selected_rows is not None
                     if rows_of_req is None:
@@ -4122,7 +3803,6 @@ class LMCacheConnectorV1Impl:
                                 payload_event,
                                 local_payload_event,
                             )
-                            _dsa_attach_payload_streams(payload, payload_stream)
                         else:
                             payload = (
                                 selected_tokens_payload,
@@ -4164,7 +3844,6 @@ class LMCacheConnectorV1Impl:
                                 payload_event,
                                 local_payload_event,
                             )
-                            _dsa_attach_payload_streams(payload, payload_stream)
                         else:
                             selected_tokens_per_req = selected_tokens_payload
                             token_start_index_per_req = token_start_payload
@@ -4195,25 +3874,6 @@ class LMCacheConnectorV1Impl:
                             self._layerwise_sparse_indexer_sent_layers = (
                                 sparse_indexer_sent_layers
                             )
-                if _DSA_DIAG:
-                    logger.warning(
-                        "[DSA_DIAG] wait_layer req_id=%s diag_session=%s "
-                        "prompt_digest=%s prompt_run=%s layer_name=%s current_layer=%s "
-                        "wait_group=%s row_count=%s rows=%s selected=%s "
-                        "token_start=%s target_slot=%s",
-                        request.req_id,
-                        getattr(request, "_lmcache_dsa_diag_session_id", None),
-                        getattr(request, "_lmcache_dsa_diag_prompt_digest", None),
-                        getattr(request, "_lmcache_dsa_diag_prompt_run", None),
-                        layer_name,
-                        self.current_layer,
-                        wait_group,
-                        row_count,
-                        rows,
-                        _dsa_diag_tensor_summary(selected_tokens_per_req),
-                        _dsa_diag_tensor_summary(token_start_index_per_req),
-                        _dsa_diag_tensor_summary(target_slot_mapping_per_req),
-                    )
                 if wait_group == 1:
                     ret_token_mask = None
                     if (

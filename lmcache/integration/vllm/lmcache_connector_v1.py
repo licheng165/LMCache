@@ -82,7 +82,6 @@ class LMCacheConnectorV1Dynamic(KVConnectorBase_V1):
         request_ids=None,
         target_slot_mapping=None,
         payload_event=None,
-        payload_stream=None,
     ) -> None:
         """
         Block until the KV for a specific layer is loaded into vLLM's
@@ -101,8 +100,6 @@ class LMCacheConnectorV1Dynamic(KVConnectorBase_V1):
                 matching selected_tokens. Used by sparse decode scratch loads.
             payload_event: optional producer event for device selected-token
                 payloads. LMCache waits on it before row selection.
-            payload_stream: optional producer stream for diagnostic
-                wait_stream probes.
         """
         self._lmcache_engine.wait_for_layer_load(
             layer_name,
@@ -111,7 +108,6 @@ class LMCacheConnectorV1Dynamic(KVConnectorBase_V1):
             request_ids,
             target_slot_mapping=target_slot_mapping,
             payload_event=payload_event,
-            payload_stream=payload_stream,
         )
 
     def save_kv_layer(
