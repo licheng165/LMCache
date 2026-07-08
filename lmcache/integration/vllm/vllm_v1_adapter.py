@@ -4,6 +4,7 @@ from collections.abc import Iterable
 from dataclasses import dataclass, field
 from types import SimpleNamespace
 from typing import TYPE_CHECKING, Any, Generator, Optional, Union
+import hashlib
 import os
 
 # Third Party
@@ -65,6 +66,75 @@ SPARSE_DECODE_SHARED_CPU_PHASE = "sparse_decode_bootstrap"
 _DSA_RECORD_PAYLOAD_EVENT = os.environ.get(
     "LMCACHE_DSA_RECORD_PAYLOAD_EVENT", "0"
 ).lower() in ("1", "true", "yes", "on")
+_DSA_DIAG = os.environ.get("LMCACHE_DSA_DIAG", "0").lower() in (
+    "1",
+    "true",
+    "yes",
+    "on",
+)
+_DSA_DIAG_PROMPT_RUNS: dict[str, int] = {}
+
+
+def _dsa_diag_layer_counts(cache: Optional[list], max_layers: int = 8) -> list[Any]:
+    if not cache:
+        return []
+    counts: list[Any] = []
+    for layer_cache in cache[:max_layers]:
+        try:
+            counts.append(len(layer_cache))
+        except TypeError:
+            counts.append(type(layer_cache).__name__)
+    if len(cache) > max_layers:
+        counts.append("...")
+    return counts
+
+
+def _dsa_diag_tensor_summary(value: Any, max_items: int = 6) -> Any:
+    if isinstance(value, torch.Tensor):
+        summary: dict[str, Any] = {
+            "type": "Tensor",
+            "shape": tuple(int(dim) for dim in value.shape),
+            "dtype": str(value.dtype),
+            "device": str(value.device),
+            "numel": int(value.numel()),
+        }
+        if value.device.type == "cpu" and value.numel() > 0:
+            flat = value.detach().reshape(-1)
+            head = flat[:max_items].tolist()
+            summary["head"] = [int(v) if isinstance(v, int) else v for v in head]
+        return summary
+    if isinstance(value, (list, tuple)):
+        return {
+            "type": type(value).__name__,
+            "len": len(value),
+            "head": [
+                _dsa_diag_tensor_summary(item, max_items=max_items)
+                for item in list(value)[:max_items]
+            ],
+        }
+    return value
+
+
+def _dsa_diag_prompt_digest(tokens: Any) -> tuple[str, int]:
+    h = hashlib.blake2b(digest_size=8)
+    count = 0
+    if isinstance(tokens, torch.Tensor):
+        if tokens.device.type != "cpu":
+            return (f"tensor:{tokens.device}:{tuple(tokens.shape)}", int(tokens.numel()))
+        iterable = tokens.detach().reshape(-1).tolist()
+    else:
+        iterable = tokens or []
+    for token in iterable:
+        h.update(int(token).to_bytes(8, byteorder="little", signed=True))
+        count += 1
+    return h.hexdigest(), count
+
+
+def _dsa_diag_prompt_run(tokens: Any) -> tuple[str, int, int]:
+    digest, token_count = _dsa_diag_prompt_digest(tokens)
+    run = _DSA_DIAG_PROMPT_RUNS.get(digest, 0) + 1
+    _DSA_DIAG_PROMPT_RUNS[digest] = run
+    return digest, run, token_count
 
 
 def _sparse_slot_mapping_len(prompt_tokens: int) -> int:
@@ -3097,6 +3167,41 @@ class LMCacheConnectorV1Impl:
                     latent_cache = _retrieve_cache_kwargs(
                         request, kv_group=0, dsa_two_groups=dsa_two_groups
                     )
+                    diag_prompt_digest = None
+                    diag_prompt_run = None
+                    if _DSA_DIAG:
+                        (
+                            diag_prompt_digest,
+                            diag_prompt_run,
+                            diag_prompt_token_count,
+                        ) = _dsa_diag_prompt_run(request.token_ids)
+                        request._lmcache_dsa_diag_prompt_digest = diag_prompt_digest
+                        request._lmcache_dsa_diag_prompt_run = diag_prompt_run
+                        logger.warning(
+                            "[DSA_DIAG] start_sparse req_id=%s prompt_digest=%s "
+                            "prompt_run=%s prompt_tokens=%s retrieve_tokens=%s "
+                            "lmcache_cached=%s vllm_cached=%s shared_cpu=%s "
+                            "dsa_two_groups=%s bound_state=%s "
+                            "latent_mem_counts=%s latent_tensor_counts=%s "
+                            "latent_ptr_ready=%s slot_mapping=%s",
+                            request.req_id,
+                            diag_prompt_digest,
+                            diag_prompt_run,
+                            diag_prompt_token_count,
+                            len(retrieve_tokens),
+                            request.load_spec.lmcache_cached_tokens,
+                            request.load_spec.vllm_cached_tokens,
+                            shared_cpu_enabled,
+                            dsa_two_groups,
+                            bound_state is not None,
+                            _dsa_diag_layer_counts(request.cached_memory_objs),
+                            _dsa_diag_layer_counts(request.cached_tensors),
+                            [
+                                ptr is not None
+                                for ptr in request.cached_chunk_ptrs_npu[:8]
+                            ],
+                            _dsa_diag_tensor_summary(slot_mapping),
+                        )
                     retrieve_kwargs: dict[str, Any] = {
                         "kvcaches": kvcaches,
                         "slot_mapping": slot_mapping,
@@ -3110,6 +3215,11 @@ class LMCacheConnectorV1Impl:
                         "shared_cpu_request_ordinal": idx,
                         **latent_cache,
                     }
+                    if _DSA_DIAG:
+                        retrieve_kwargs["_dsa_diag_prompt_digest"] = (
+                            diag_prompt_digest
+                        )
+                        retrieve_kwargs["_dsa_diag_prompt_run"] = diag_prompt_run
                     if shared_cpu_preflight_state is not None:
                         retrieve_kwargs["shared_cpu_request_preflight_state"] = (
                             shared_cpu_preflight_state
@@ -3198,6 +3308,29 @@ class LMCacheConnectorV1Impl:
                                 kv_group=1,
                                 dsa_two_groups=dsa_two_groups,
                             )
+                            if _DSA_DIAG:
+                                logger.warning(
+                                    "[DSA_DIAG] start_sparse_index req_id=%s "
+                                    "prompt_digest=%s prompt_run=%s "
+                                    "index_mem_counts=%s index_tensor_counts=%s "
+                                    "index_ptr_ready=%s idx_slot=%s",
+                                    request.req_id,
+                                    diag_prompt_digest,
+                                    diag_prompt_run,
+                                    _dsa_diag_layer_counts(
+                                        request.cached_memory_objs_indexer
+                                    ),
+                                    _dsa_diag_layer_counts(
+                                        request.cached_tensors_indexer
+                                    ),
+                                    [
+                                        ptr is not None
+                                        for ptr in request.cached_chunk_ptrs_npu_indexer[
+                                            :8
+                                        ]
+                                    ],
+                                    _dsa_diag_tensor_summary(idx_slot),
+                                )
                             indexer_kwargs: dict[str, Any] = {
                                 "kvcaches": indexer_kvcaches,
                                 "slot_mapping": idx_slot,
@@ -3211,6 +3344,13 @@ class LMCacheConnectorV1Impl:
                                 "shared_cpu_request_ordinal": idx,
                                 **indexer_cache,
                             }
+                            if _DSA_DIAG:
+                                indexer_kwargs["_dsa_diag_prompt_digest"] = (
+                                    diag_prompt_digest
+                                )
+                                indexer_kwargs["_dsa_diag_prompt_run"] = (
+                                    diag_prompt_run
+                                )
                             if shared_cpu_preflight_state is not None:
                                 indexer_kwargs[
                                     "shared_cpu_request_preflight_state"
@@ -3702,6 +3842,24 @@ class LMCacheConnectorV1Impl:
                             self._layerwise_sparse_indexer_sent_layers = (
                                 sparse_indexer_sent_layers
                             )
+                if _DSA_DIAG:
+                    logger.warning(
+                        "[DSA_DIAG] wait_layer req_id=%s prompt_digest=%s "
+                        "prompt_run=%s layer_name=%s current_layer=%s "
+                        "wait_group=%s row_count=%s rows=%s selected=%s "
+                        "token_start=%s target_slot=%s",
+                        request.req_id,
+                        getattr(request, "_lmcache_dsa_diag_prompt_digest", None),
+                        getattr(request, "_lmcache_dsa_diag_prompt_run", None),
+                        layer_name,
+                        self.current_layer,
+                        wait_group,
+                        row_count,
+                        rows,
+                        _dsa_diag_tensor_summary(selected_tokens_per_req),
+                        _dsa_diag_tensor_summary(token_start_index_per_req),
+                        _dsa_diag_tensor_summary(target_slot_mapping_per_req),
+                    )
                 if wait_group == 1:
                     ret_token_mask = None
                     if (
