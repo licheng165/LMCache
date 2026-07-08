@@ -293,6 +293,14 @@ def _dsa_stream_diag(label: str, **kwargs) -> None:
     )
 
 
+def _dsa_payload_event_list(payload_event: Any) -> list[Any]:
+    if payload_event is None:
+        return []
+    if isinstance(payload_event, (list, tuple)):
+        return [event for event in payload_event if event is not None]
+    return [payload_event]
+
+
 def _dsa_record_current_stream_event(
     device_types: Optional[set[str]] = None,
 ) -> Optional[Any]:
@@ -378,7 +386,8 @@ def _dsa_record_current_stream_event(
 
 
 def _dsa_wait_payload_event(payload_event: Any) -> None:
-    if payload_event is None:
+    payload_events = _dsa_payload_event_list(payload_event)
+    if not payload_events:
         return
     if not (hasattr(torch, "npu") and hasattr(torch.npu, "current_stream")):
         raise RuntimeError(
@@ -386,8 +395,13 @@ def _dsa_wait_payload_event(payload_event: Any) -> None:
             "stream support is unavailable."
         )
     try:
-        _dsa_stream_diag("adapter_before_selected_payload_wait")
-        torch.npu.current_stream().wait_event(payload_event)
+        _dsa_stream_diag(
+            "adapter_before_selected_payload_wait",
+            event_count=len(payload_events),
+        )
+        current_stream = torch.npu.current_stream()
+        for event in payload_events:
+            current_stream.wait_event(event)
         if not _dsa_publish_current_npu_stream():
             raise RuntimeError(
                 "Failed to publish current NPU stream after waiting on DSA "
@@ -400,6 +414,20 @@ def _dsa_wait_payload_event(payload_event: Any) -> None:
             "Failed to wait on DSA selected-token producer event before "
             "LMCache row selection."
         ) from exc
+
+
+def _dsa_attach_payload_events(
+    payload: dict[str, Any],
+    upstream_event: Any,
+    local_event: Any,
+) -> None:
+    payload_events = _dsa_payload_event_list(upstream_event)
+    payload_events.extend(_dsa_payload_event_list(local_event))
+    if not payload_events:
+        return
+    payload["payload_event"] = payload_events[0]
+    if len(payload_events) > 1:
+        payload["payload_events"] = tuple(payload_events)
 
 
 def _row_select(value: Any, rows: list[int]):
@@ -4001,11 +4029,14 @@ class LMCacheConnectorV1Impl:
                                 "selected_token_ids": selected_tokens_payload,
                                 "target_slot_mapping": target_slot_mapping_payload,
                             }
-                            payload_event = _dsa_record_current_stream_event(
+                            local_payload_event = _dsa_record_current_stream_event(
                                 payload_device_types
                             )
-                            if payload_event is not None:
-                                payload["payload_event"] = payload_event
+                            _dsa_attach_payload_events(
+                                payload,
+                                payload_event,
+                                local_payload_event,
+                            )
                         else:
                             payload = (
                                 selected_tokens_payload,
@@ -4039,11 +4070,14 @@ class LMCacheConnectorV1Impl:
                                 "selected_token_ids": selected_tokens_payload,
                                 "token_start_index": token_start_payload,
                             }
-                            payload_event = _dsa_record_current_stream_event(
+                            local_payload_event = _dsa_record_current_stream_event(
                                 payload_device_types
                             )
-                            if payload_event is not None:
-                                payload["payload_event"] = payload_event
+                            _dsa_attach_payload_events(
+                                payload,
+                                payload_event,
+                                local_payload_event,
+                            )
                         else:
                             selected_tokens_per_req = selected_tokens_payload
                             token_start_index_per_req = token_start_payload
