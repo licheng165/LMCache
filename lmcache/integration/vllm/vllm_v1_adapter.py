@@ -239,7 +239,7 @@ def _dsa_publish_current_npu_stream() -> bool:
         if not _DSA_PUBLISH_STREAM_WARNING_LOGGED:
             _DSA_PUBLISH_STREAM_WARNING_LOGGED = True
             logger.warning(
-                "Failed to publish current NPU stream after recording DSA "
+                "Failed to publish current NPU stream before recording DSA "
                 "payload event; refusing to send device selected-token "
                 "metadata without a published ordering event.",
                 exc_info=True,
@@ -267,6 +267,16 @@ def _dsa_record_current_stream_event(
                 "unavailable; refusing to send device selected-token payload "
                 "without a producer->consumer ordering event."
             )
+        # selected/slot payload tensors may have just been produced by
+        # vLLM row-select/remap operations. Publish the torch-npu task queue
+        # before recording the event; otherwise the event can be inserted before
+        # those queued producers and consumers can still race them.
+        if not _dsa_publish_current_npu_stream():
+            raise RuntimeError(
+                "Failed to publish current NPU stream before recording DSA "
+                "payload event. Refusing to send device selected-token payload "
+                "to LMCache without a producer->consumer ordering event."
+            )
         try:
             event = torch.npu.Event()
             event.record(torch.npu.current_stream())
@@ -275,15 +285,7 @@ def _dsa_record_current_stream_event(
                 "Failed to record DSA payload event for NPU selected-token "
                 "metadata."
             ) from exc
-        # selected/slot payload tensors may have just been produced by
-        # row-select operations; publish both those producers and the event.
-        if _dsa_publish_current_npu_stream():
-            return event
-        raise RuntimeError(
-            "Failed to publish DSA payload event after recording it. "
-            "Refusing to send device selected-token payload to LMCache "
-            "without a published producer->consumer ordering event."
-        )
+        return event
 
     if needs_cuda_event or not device_types:
         try:
