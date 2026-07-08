@@ -54,6 +54,18 @@ _DSA_STREAM_DIAG = os.environ.get("LMCACHE_DSA_STREAM_DIAG", "0").lower() in (
     "yes",
     "on",
 )
+_DSA_SYNC_PROBES = {
+    probe.strip().lower()
+    for probe in os.environ.get("LMCACHE_DSA_SYNC_PROBE", "").split(",")
+    if probe.strip()
+}
+_DSA_WAIT_STREAM_PROBES = {
+    probe.strip().lower()
+    for probe in os.environ.get("LMCACHE_DSA_WAIT_STREAM_PROBE", "").split(",")
+    if probe.strip()
+}
+_DSA_SYNC_PROBE_LOGGED: set[str] = set()
+_DSA_WAIT_STREAM_PROBE_LOGGED: set[str] = set()
 
 if TYPE_CHECKING:
     # Third Party
@@ -301,6 +313,61 @@ def _dsa_payload_event_list(payload_event: Any) -> list[Any]:
     return [payload_event]
 
 
+def _dsa_payload_stream_list(payload_stream: Any) -> list[Any]:
+    if payload_stream is None:
+        return []
+    if isinstance(payload_stream, (list, tuple)):
+        return [stream for stream in payload_stream if stream is not None]
+    return [payload_stream]
+
+
+def _dsa_probe_enabled(probes: set[str], name: str) -> bool:
+    return name in probes or "all" in probes
+
+
+def _dsa_sync_probe(name: str) -> None:
+    if not _dsa_probe_enabled(_DSA_SYNC_PROBES, name):
+        return
+    try:
+        torch.npu.current_stream().synchronize()
+    except Exception:
+        logger.warning(
+            "[LMCACHE_DSA_SYNC_PROBE_ERROR] probe=%s failed",
+            name,
+            exc_info=True,
+        )
+    else:
+        if name not in _DSA_SYNC_PROBE_LOGGED:
+            _DSA_SYNC_PROBE_LOGGED.add(name)
+            logger.warning("[LMCACHE_DSA_SYNC_PROBE] probe=%s", name)
+
+
+def _dsa_wait_stream_probe(name: str, payload_stream: Any) -> None:
+    payload_streams = _dsa_payload_stream_list(payload_stream)
+    if not payload_streams or not _dsa_probe_enabled(_DSA_WAIT_STREAM_PROBES, name):
+        return
+    try:
+        current_stream = torch.npu.current_stream()
+        for stream in payload_streams:
+            current_stream.wait_stream(stream)
+        if not _dsa_publish_current_npu_stream():
+            raise RuntimeError("failed to publish stream after wait_stream")
+    except Exception:
+        logger.warning(
+            "[LMCACHE_DSA_WAIT_STREAM_PROBE_ERROR] probe=%s failed",
+            name,
+            exc_info=True,
+        )
+    else:
+        if name not in _DSA_WAIT_STREAM_PROBE_LOGGED:
+            _DSA_WAIT_STREAM_PROBE_LOGGED.add(name)
+            logger.warning(
+                "[LMCACHE_DSA_WAIT_STREAM_PROBE] probe=%s stream_count=%d",
+                name,
+                len(payload_streams),
+            )
+
+
 def _dsa_record_current_stream_event(
     device_types: Optional[set[str]] = None,
 ) -> Optional[Any]:
@@ -428,6 +495,18 @@ def _dsa_attach_payload_events(
     payload["payload_event"] = payload_events[0]
     if len(payload_events) > 1:
         payload["payload_events"] = tuple(payload_events)
+
+
+def _dsa_attach_payload_streams(
+    payload: dict[str, Any],
+    upstream_stream: Any,
+) -> None:
+    payload_streams = _dsa_payload_stream_list(upstream_stream)
+    if not payload_streams:
+        return
+    payload["payload_stream"] = payload_streams[0]
+    if len(payload_streams) > 1:
+        payload["payload_streams"] = tuple(payload_streams)
 
 
 def _row_select(value: Any, rows: list[int]):
@@ -3876,6 +3955,7 @@ class LMCacheConnectorV1Impl:
         request_ids: list = None,
         target_slot_mapping=None,
         payload_event=None,
+        payload_stream=None,
     ) -> None:
         """Blocking until the KV for a specific layer is loaded into vLLM's
         paged buffer.
@@ -3892,6 +3972,8 @@ class LMCacheConnectorV1Impl:
             payload_event: optional producer event recorded by vLLM after
                 selected_tokens/target_slot_mapping were built. LMCache waits on
                 this before row-selecting from those tensors.
+            payload_stream: optional producer stream captured beside
+                payload_event. Only used by diagnostic wait_stream probes.
         """
         if self.layerwise_retrievers and logger.isEnabledFor(10):
             logger.debug("Waiting for layer %d to be loaded", self.current_layer)
@@ -3936,11 +4018,14 @@ class LMCacheConnectorV1Impl:
 
         selected_rows = None
         if selected_tokens is not None:
+            _dsa_wait_stream_probe("before_row_select", payload_stream)
             _dsa_wait_payload_event(payload_event)
+            _dsa_sync_probe("after_row_select_wait")
             _dsa_stream_diag(
                 "adapter_before_selected_row_select",
                 layer_name=layer_name,
                 has_payload_event=payload_event is not None,
+                has_payload_stream=payload_stream is not None,
             )
             selected_rows = (
                 int(selected_tokens.shape[0])
@@ -4037,6 +4122,7 @@ class LMCacheConnectorV1Impl:
                                 payload_event,
                                 local_payload_event,
                             )
+                            _dsa_attach_payload_streams(payload, payload_stream)
                         else:
                             payload = (
                                 selected_tokens_payload,
@@ -4078,6 +4164,7 @@ class LMCacheConnectorV1Impl:
                                 payload_event,
                                 local_payload_event,
                             )
+                            _dsa_attach_payload_streams(payload, payload_stream)
                         else:
                             selected_tokens_per_req = selected_tokens_payload
                             token_start_index_per_req = token_start_payload
