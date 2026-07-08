@@ -6,6 +6,7 @@ from types import SimpleNamespace
 from typing import TYPE_CHECKING, Any, Generator, Optional, Union
 import hashlib
 import os
+import time
 
 # Third Party
 from vllm.config import (
@@ -73,6 +74,10 @@ _DSA_DIAG = os.environ.get("LMCACHE_DSA_DIAG", "0").lower() in (
     "on",
 )
 _DSA_DIAG_PROMPT_RUNS: dict[str, int] = {}
+_DSA_DIAG_REQ_RUNS: dict[str, tuple[str, int, int]] = {}
+_DSA_DIAG_SESSION_ID = os.environ.get("LMCACHE_DSA_DIAG_SESSION_ID") or (
+    f"pid{os.getpid()}_{int(time.time() * 1000)}"
+)
 
 
 def _dsa_diag_layer_counts(cache: Optional[list], max_layers: int = 8) -> list[Any]:
@@ -135,6 +140,19 @@ def _dsa_diag_prompt_run(tokens: Any) -> tuple[str, int, int]:
     run = _DSA_DIAG_PROMPT_RUNS.get(digest, 0) + 1
     _DSA_DIAG_PROMPT_RUNS[digest] = run
     return digest, run, token_count
+
+
+def _dsa_diag_request_prompt_run(
+    req_id: str,
+    tokens: Any,
+) -> tuple[str, int, int]:
+    cached = _DSA_DIAG_REQ_RUNS.get(req_id)
+    if cached is not None:
+        return cached
+    digest, run, token_count = _dsa_diag_prompt_run(tokens)
+    cached = (digest, run, token_count)
+    _DSA_DIAG_REQ_RUNS[req_id] = cached
+    return cached
 
 
 def _sparse_slot_mapping_len(prompt_tokens: int) -> int:
@@ -3174,17 +3192,23 @@ class LMCacheConnectorV1Impl:
                             diag_prompt_digest,
                             diag_prompt_run,
                             diag_prompt_token_count,
-                        ) = _dsa_diag_prompt_run(request.token_ids)
+                        ) = _dsa_diag_request_prompt_run(
+                            request.req_id,
+                            request.token_ids,
+                        )
                         request._lmcache_dsa_diag_prompt_digest = diag_prompt_digest
                         request._lmcache_dsa_diag_prompt_run = diag_prompt_run
+                        request._lmcache_dsa_diag_session_id = _DSA_DIAG_SESSION_ID
                         logger.warning(
-                            "[DSA_DIAG] start_sparse req_id=%s prompt_digest=%s "
-                            "prompt_run=%s prompt_tokens=%s retrieve_tokens=%s "
+                            "[DSA_DIAG] start_sparse req_id=%s diag_session=%s "
+                            "prompt_digest=%s prompt_run=%s prompt_tokens=%s "
+                            "retrieve_tokens=%s "
                             "lmcache_cached=%s vllm_cached=%s shared_cpu=%s "
                             "dsa_two_groups=%s bound_state=%s "
                             "latent_mem_counts=%s latent_tensor_counts=%s "
                             "latent_ptr_ready=%s slot_mapping=%s",
                             request.req_id,
+                            _DSA_DIAG_SESSION_ID,
                             diag_prompt_digest,
                             diag_prompt_run,
                             diag_prompt_token_count,
@@ -3220,6 +3244,9 @@ class LMCacheConnectorV1Impl:
                             diag_prompt_digest
                         )
                         retrieve_kwargs["_dsa_diag_prompt_run"] = diag_prompt_run
+                        retrieve_kwargs["_dsa_diag_session_id"] = (
+                            _DSA_DIAG_SESSION_ID
+                        )
                     if shared_cpu_preflight_state is not None:
                         retrieve_kwargs["shared_cpu_request_preflight_state"] = (
                             shared_cpu_preflight_state
@@ -3311,10 +3338,11 @@ class LMCacheConnectorV1Impl:
                             if _DSA_DIAG:
                                 logger.warning(
                                     "[DSA_DIAG] start_sparse_index req_id=%s "
-                                    "prompt_digest=%s prompt_run=%s "
+                                    "diag_session=%s prompt_digest=%s prompt_run=%s "
                                     "index_mem_counts=%s index_tensor_counts=%s "
                                     "index_ptr_ready=%s idx_slot=%s",
                                     request.req_id,
+                                    _DSA_DIAG_SESSION_ID,
                                     diag_prompt_digest,
                                     diag_prompt_run,
                                     _dsa_diag_layer_counts(
@@ -3350,6 +3378,9 @@ class LMCacheConnectorV1Impl:
                                 )
                                 indexer_kwargs["_dsa_diag_prompt_run"] = (
                                     diag_prompt_run
+                                )
+                                indexer_kwargs["_dsa_diag_session_id"] = (
+                                    _DSA_DIAG_SESSION_ID
                                 )
                             if shared_cpu_preflight_state is not None:
                                 indexer_kwargs[
@@ -3844,11 +3875,12 @@ class LMCacheConnectorV1Impl:
                             )
                 if _DSA_DIAG:
                     logger.warning(
-                        "[DSA_DIAG] wait_layer req_id=%s prompt_digest=%s "
-                        "prompt_run=%s layer_name=%s current_layer=%s "
+                        "[DSA_DIAG] wait_layer req_id=%s diag_session=%s "
+                        "prompt_digest=%s prompt_run=%s layer_name=%s current_layer=%s "
                         "wait_group=%s row_count=%s rows=%s selected=%s "
                         "token_start=%s target_slot=%s",
                         request.req_id,
+                        getattr(request, "_lmcache_dsa_diag_session_id", None),
                         getattr(request, "_lmcache_dsa_diag_prompt_digest", None),
                         getattr(request, "_lmcache_dsa_diag_prompt_run", None),
                         layer_name,
