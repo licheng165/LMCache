@@ -1422,6 +1422,7 @@ class LMCacheConnectorV1Impl:
         if role != KVConnectorRole.SCHEDULER:
             self._worker_retrieve_state: dict[str, WorkerRetrieveState] = {}
             self._completed_decode_window_saves: dict[str, int] = {}
+            self._decode_window_save_started_groups: set[Any] = set()
             self._warn_mla_per_rank_lookup_config(config)
 
     def _warn_mla_per_rank_lookup_config(self, config: LMCacheEngineConfig) -> None:
@@ -2515,6 +2516,68 @@ class LMCacheConnectorV1Impl:
             return storer_key[1] == kv_group
         return False
 
+    def _clear_decode_window_save_groups_for_req(self, req_id: str) -> None:
+        groups = getattr(self, "_decode_window_save_started_groups", None)
+        if groups is None:
+            return
+        for group_key in list(groups):
+            if (
+                isinstance(group_key, tuple)
+                and group_key
+                and group_key[0] == req_id
+            ):
+                groups.discard(group_key)
+
+    def _clear_decode_window_save_groups_for_window(
+        self,
+        request: ReqMeta,
+    ) -> None:
+        groups = getattr(self, "_decode_window_save_started_groups", None)
+        if groups is None:
+            return
+        for kv_group in self._decode_window_save_required_groups(request):
+            groups.discard(self._layerwise_save_storer_key(request, kv_group))
+
+    def _record_decode_window_save_group_started(
+        self,
+        request: ReqMeta,
+        kv_group: int,
+    ) -> None:
+        if not self._is_decode_window_save_request(request):
+            return
+        groups = getattr(self, "_decode_window_save_started_groups", None)
+        if groups is None:
+            return
+        groups.add(self._layerwise_save_storer_key(request, kv_group))
+
+    def _decode_window_save_required_groups(self, request: ReqMeta) -> set[int]:
+        if not self._is_decode_window_save_request(request):
+            return set()
+        save_spec = request.save_spec
+        if save_spec is None:
+            return set()
+        required: set[int] = set()
+        if getattr(save_spec, "can_save_latent", getattr(save_spec, "can_save", False)):
+            required.add(0)
+        if (
+            getattr(self.config, "dsa_two_groups", False)
+            and getattr(save_spec, "can_save_indexer", False)
+        ):
+            required.add(1)
+        return required
+
+    def _decode_window_save_has_required_groups(self, request: ReqMeta) -> bool:
+        required = self._decode_window_save_required_groups(request)
+        if not required:
+            return False
+        groups = getattr(self, "_decode_window_save_started_groups", None)
+        if groups is None:
+            return False
+        return all(
+            self._layerwise_save_storer_key(request, kv_group) in groups
+            for kv_group in required
+        )
+
     def _drop_layerwise_save_storers(self, req_id: str) -> None:
         if hasattr(self, "_layerwise_save_storers"):
             for storer_key in list(self._layerwise_save_storers):
@@ -2531,6 +2594,7 @@ class LMCacheConnectorV1Impl:
                     self._close_layerwise_storer(
                         self._layerwise_save_storers.pop(storer_key, None)
                     )
+        self._clear_decode_window_save_groups_for_req(req_id)
 
         pending = getattr(self, "_deferred_latent_pending", None)
         if pending is not None:
@@ -2566,6 +2630,14 @@ class LMCacheConnectorV1Impl:
         is_passive = getattr(engine, "_is_passive", None)
         if callable(is_passive) and is_passive():
             return
+        if not self._decode_window_save_has_required_groups(request):
+            logger.debug(
+                "Decode-window save not marked complete before required "
+                "store groups are seen: req_id=%s required_groups=%s",
+                request.req_id,
+                sorted(self._decode_window_save_required_groups(request)),
+            )
+            return
         window_end = request.decode_window_end
         if window_end is None:
             return
@@ -2573,6 +2645,7 @@ class LMCacheConnectorV1Impl:
         if completed is None:
             return
         completed[request.req_id] = max(completed.get(request.req_id, 0), window_end)
+        self._clear_decode_window_save_groups_for_window(request)
 
     def get_completed_decode_window_saves(self) -> dict[str, int]:
         completed = getattr(self, "_completed_decode_window_saves", None)
@@ -4472,6 +4545,7 @@ class LMCacheConnectorV1Impl:
         )
         self._drain_layerwise_storer_fully(storer)
         self._close_layerwise_storer(storer)
+        self._record_decode_window_save_group_started(request, 0)
         self._deferred_latent_pending.discard(pending_key)
         indexer_required = (
             self._is_decode_window_save_request(request)
@@ -4767,6 +4841,7 @@ class LMCacheConnectorV1Impl:
                     **store_kwargs,
                 )
                 self._layerwise_save_storers[storer_key] = layerwise_storer
+                self._record_decode_window_save_group_started(request, kv_group)
 
             indexer_group_last = (
                 is_indexer_layer
@@ -4848,6 +4923,9 @@ class LMCacheConnectorV1Impl:
                     if layerwise_storer is not None:
                         self._advance_layerwise_storer_once(layerwise_storer)
                         self._close_layerwise_storer(layerwise_storer)
+                        self._record_decode_window_save_group_started(
+                            request, _kv_group
+                        )
                 self._maybe_seed_worker_retrieve_state_from_store(request)
                 self._mark_decode_window_save_completed(request)
                 self._maybe_lookup_unpin_for_request(request)
@@ -4934,6 +5012,7 @@ class LMCacheConnectorV1Impl:
                 request_configs=request.request_configs,
                 req_id=request.req_id,
             )
+            self._record_decode_window_save_group_started(request, 0)
             self._mark_decode_window_save_completed(request)
 
             # Update skip_leading_tokens only on last rank to ensure
