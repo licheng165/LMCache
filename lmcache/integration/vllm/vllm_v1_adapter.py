@@ -165,6 +165,17 @@ def _am_get(attn_metadata, key, default=None):
     return getattr(attn_metadata, key, default)
 
 
+def _ensure_list_attr(obj: Any, name: str) -> list:
+    value = getattr(obj, name, None)
+    if value is None:
+        value = []
+        try:
+            setattr(obj, name, value)
+        except Exception:
+            pass
+    return value
+
+
 def _retrieve_cache_kwargs(
     obj: Any,
     *,
@@ -174,24 +185,36 @@ def _retrieve_cache_kwargs(
     """Return per-group cached retrieve/store kwargs for two-group DSA."""
     if dsa_two_groups and kv_group == 1:
         return {
-            "cached_keys": obj.cached_keys_indexer,
-            "cached_starts": obj.cached_starts_indexer,
-            "cached_ends": obj.cached_ends_indexer,
-            "cached_memory_objs": obj.cached_memory_objs_indexer,
-            "cached_tensors": obj.cached_tensors_indexer,
-            "cached_chunk_dev_ptrs": obj.cached_chunk_dev_ptrs_indexer,
-            "cached_chunk_ptrs_npu": obj.cached_chunk_ptrs_npu_indexer,
-            "cached_shared_handles": obj.cached_shared_handles_indexer,
+            "cached_keys": _ensure_list_attr(obj, "cached_keys_indexer"),
+            "cached_starts": _ensure_list_attr(obj, "cached_starts_indexer"),
+            "cached_ends": _ensure_list_attr(obj, "cached_ends_indexer"),
+            "cached_memory_objs": _ensure_list_attr(
+                obj, "cached_memory_objs_indexer"
+            ),
+            "cached_tensors": _ensure_list_attr(obj, "cached_tensors_indexer"),
+            "cached_chunk_dev_ptrs": _ensure_list_attr(
+                obj, "cached_chunk_dev_ptrs_indexer"
+            ),
+            "cached_chunk_ptrs_npu": _ensure_list_attr(
+                obj, "cached_chunk_ptrs_npu_indexer"
+            ),
+            "cached_shared_handles": _ensure_list_attr(
+                obj, "cached_shared_handles_indexer"
+            ),
         }
     return {
-        "cached_keys": obj.cached_keys,
-        "cached_starts": obj.cached_starts,
-        "cached_ends": obj.cached_ends,
-        "cached_memory_objs": obj.cached_memory_objs,
-        "cached_tensors": obj.cached_tensors,
-        "cached_chunk_dev_ptrs": obj.cached_chunk_dev_ptrs,
-        "cached_chunk_ptrs_npu": obj.cached_chunk_ptrs_npu,
-        "cached_shared_handles": obj.cached_shared_handles,
+        "cached_keys": _ensure_list_attr(obj, "cached_keys"),
+        "cached_starts": _ensure_list_attr(obj, "cached_starts"),
+        "cached_ends": _ensure_list_attr(obj, "cached_ends"),
+        "cached_memory_objs": _ensure_list_attr(obj, "cached_memory_objs"),
+        "cached_tensors": _ensure_list_attr(obj, "cached_tensors"),
+        "cached_chunk_dev_ptrs": _ensure_list_attr(
+            obj, "cached_chunk_dev_ptrs"
+        ),
+        "cached_chunk_ptrs_npu": _ensure_list_attr(
+            obj, "cached_chunk_ptrs_npu"
+        ),
+        "cached_shared_handles": _ensure_list_attr(obj, "cached_shared_handles"),
     }
 
 
@@ -1702,7 +1725,17 @@ class LMCacheConnectorV1Impl:
 
     def _kvcaches_for_group(self, kv_group: int) -> list[torch.Tensor]:
         """Return the per-group kv_caches list for the connector."""
-        if kv_group == 1 and getattr(self.config, "dsa_two_groups", False):
+        if not hasattr(self, "_latent_kvcaches") or not hasattr(
+            self, "_indexer_kvcaches"
+        ):
+            if hasattr(self, "kv_caches"):
+                self._refresh_kvcaches_list()
+            else:
+                self._latent_kvcaches = list(getattr(self, "_kvcaches_list", []))
+                self._indexer_kvcaches = []
+        if kv_group == 1 and getattr(
+            getattr(self, "config", None), "dsa_two_groups", False
+        ):
             return self._indexer_kvcaches
         return self._latent_kvcaches
 
@@ -1912,14 +1945,17 @@ class LMCacheConnectorV1Impl:
 
     @staticmethod
     def _clear_request_indexer_cache(request: ReqMeta) -> None:
-        request.cached_keys_indexer.clear()
-        request.cached_starts_indexer.clear()
-        request.cached_ends_indexer.clear()
-        request.cached_memory_objs_indexer.clear()
-        request.cached_tensors_indexer.clear()
-        request.cached_chunk_dev_ptrs_indexer.clear()
-        request.cached_chunk_ptrs_npu_indexer.clear()
-        request.cached_shared_handles_indexer.clear()
+        for field_name in (
+            "cached_keys_indexer",
+            "cached_starts_indexer",
+            "cached_ends_indexer",
+            "cached_memory_objs_indexer",
+            "cached_tensors_indexer",
+            "cached_chunk_dev_ptrs_indexer",
+            "cached_chunk_ptrs_npu_indexer",
+            "cached_shared_handles_indexer",
+        ):
+            _ensure_list_attr(request, field_name).clear()
 
     def _validate_shared_worker_retrieve_state(
         self,
@@ -3168,6 +3204,9 @@ class LMCacheConnectorV1Impl:
         ):
             return
 
+        _retrieve_cache_kwargs(request, kv_group=0, dsa_two_groups=False)
+        _retrieve_cache_kwargs(request, kv_group=1, dsa_two_groups=True)
+
         inherited_ids: set[int] = set()
         if old_state is not None:
             for group_map in (
@@ -3222,6 +3261,10 @@ class LMCacheConnectorV1Impl:
             or not request.is_sparse_decode
         ):
             return
+
+        _retrieve_cache_kwargs(request, kv_group=0, dsa_two_groups=False)
+        if self._is_dsa_two_groups():
+            _retrieve_cache_kwargs(request, kv_group=1, dsa_two_groups=True)
 
         generation = int(getattr(engine, "shared_cpu_cache_generation", 0) or 0)
         metadata = getattr(engine, "metadata", None)
@@ -3651,6 +3694,8 @@ class LMCacheConnectorV1Impl:
         state: WorkerRetrieveState,
         request: ReqMeta,
     ) -> int:
+        _retrieve_cache_kwargs(request, kv_group=0, dsa_two_groups=False)
+        _retrieve_cache_kwargs(request, kv_group=1, dsa_two_groups=True)
         merged_chunks = self._merge_cache_group_by_ranges(
             dst_starts=state.cached_starts,
             dst_ends=state.cached_ends,
@@ -3855,6 +3900,8 @@ class LMCacheConnectorV1Impl:
     ) -> None:
         if not hasattr(self, "_worker_retrieve_state"):
             return
+        _retrieve_cache_kwargs(request, kv_group=0, dsa_two_groups=False)
+        _retrieve_cache_kwargs(request, kv_group=1, dsa_two_groups=True)
         if not metadata_warm and not request.cached_keys:
             return
         old_state = self._worker_retrieve_state.get(request.req_id)
@@ -4226,19 +4273,16 @@ class LMCacheConnectorV1Impl:
                             _dsa_debug_minmax_count(slot_mapping),
                             request.load_spec.vllm_cached_tokens,
                             request.load_spec.lmcache_cached_tokens,
-                            len(request.cached_keys)
-                            if request.cached_keys is not None else None,
-                            len(request.cached_starts)
-                            if request.cached_starts is not None else None,
-                            len(request.cached_ends)
-                            if request.cached_ends is not None else None,
-                            len(request.cached_tensors)
-                            if request.cached_tensors is not None else None,
-                            len(request.cached_chunk_ptrs_npu)
-                            if request.cached_chunk_ptrs_npu is not None else None,
+                            len(getattr(request, "cached_keys", [])),
+                            len(getattr(request, "cached_starts", [])),
+                            len(getattr(request, "cached_ends", [])),
+                            len(getattr(request, "cached_tensors", [])),
+                            len(getattr(request, "cached_chunk_ptrs_npu", [])),
                             bool(retrieve_kwargs.get("_retrieve_metadata_warm")),
                             bound_state is not None,
-                            _dsa_debug_shape(request.decode_ret_mask),
+                            _dsa_debug_shape(
+                                getattr(request, "decode_ret_mask", None)
+                            ),
                         )
 
                     layerwise_retriever = (
@@ -5027,8 +5071,12 @@ class LMCacheConnectorV1Impl:
             "request_configs": request.request_configs,
         }
         if request.is_sparse_decode or self._is_decode_window_save_request(request):
-            store_kwargs["cached_chunk_dev_ptrs"] = request.cached_chunk_dev_ptrs
-            store_kwargs["cached_chunk_ptrs_npu"] = request.cached_chunk_ptrs_npu
+            store_kwargs["cached_chunk_dev_ptrs"] = _ensure_list_attr(
+                request, "cached_chunk_dev_ptrs"
+            )
+            store_kwargs["cached_chunk_ptrs_npu"] = _ensure_list_attr(
+                request, "cached_chunk_ptrs_npu"
+            )
 
         storer = self.lmcache_engine.store_layer(
             token_ids,
@@ -5292,11 +5340,11 @@ class LMCacheConnectorV1Impl:
                     request.is_sparse_decode
                     or self._is_decode_window_save_request(request)
                 ):
-                    store_kwargs["cached_chunk_dev_ptrs"] = (
-                        request.cached_chunk_dev_ptrs
+                    store_kwargs["cached_chunk_dev_ptrs"] = _ensure_list_attr(
+                        request, "cached_chunk_dev_ptrs"
                     )
-                    store_kwargs["cached_chunk_ptrs_npu"] = (
-                        request.cached_chunk_ptrs_npu
+                    store_kwargs["cached_chunk_ptrs_npu"] = _ensure_list_attr(
+                        request, "cached_chunk_ptrs_npu"
                     )
                 # Indexer-only extras. Latent (kv_group=0) matches dev-qzy and
                 # does not pass kv_group or indexer cached_* fields.
