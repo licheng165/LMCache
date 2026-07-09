@@ -272,6 +272,154 @@ class TestBuildConnectorMetaSparseSyntheticLoadSpec:
         assert req_meta.slot_mapping[0].numel() == 512
         assert tracker.sparse_slot_mapping[0].numel() == 512
 
+    def test_decode_window_completion_is_clamped_to_emitted_save_frontier(self) -> None:
+        impl = _make_scheduler_impl()
+        impl._decode_window_save_window_size = 256
+        req_id = "sparse-window"
+        tracker = RequestTracker(
+            req_id=req_id,
+            prompt_len=256,
+            token_ids=list(range(600)),
+            allocated_block_ids=list(range(40)),
+            num_saved_tokens=256,
+        )
+        tracker.decode_window_save_next_start = 512
+        tracker.decode_window_save_committed_end = 256
+        impl._request_trackers[req_id] = tracker
+
+        impl.update_connector_output(
+            SimpleNamespace(completed_decode_window_saves={req_id: 999})
+        )
+
+        assert tracker.decode_window_save_committed_end == 512
+
+    def test_decode_window_completion_ignored_before_save_frontier_exists(self) -> None:
+        impl = _make_scheduler_impl()
+        impl._decode_window_save_window_size = 256
+        req_id = "sparse-window"
+        tracker = RequestTracker(
+            req_id=req_id,
+            prompt_len=256,
+            token_ids=list(range(600)),
+            allocated_block_ids=list(range(40)),
+            num_saved_tokens=256,
+        )
+        tracker.decode_window_save_committed_end = 256
+        impl._request_trackers[req_id] = tracker
+
+        impl.update_connector_output(
+            SimpleNamespace(completed_decode_window_saves={req_id: 512})
+        )
+
+        assert tracker.decode_window_save_committed_end == 256
+
+    def test_decode_window_completion_is_clamped_to_known_token_length(self) -> None:
+        impl = _make_scheduler_impl()
+        impl._decode_window_save_window_size = 256
+        req_id = "sparse-window"
+        tracker = RequestTracker(
+            req_id=req_id,
+            prompt_len=256,
+            token_ids=list(range(384)),
+            allocated_block_ids=list(range(40)),
+            num_saved_tokens=256,
+        )
+        tracker.decode_window_save_next_start = 512
+        tracker.decode_window_save_committed_end = 256
+        impl._request_trackers[req_id] = tracker
+
+        impl.update_connector_output(
+            SimpleNamespace(completed_decode_window_saves={req_id: 512})
+        )
+
+        assert tracker.decode_window_save_committed_end == 256
+
+    def test_decode_window_completion_clamp_preserves_nonzero_window_start(self) -> None:
+        impl = _make_scheduler_impl()
+        impl._decode_window_save_window_size = 512
+        req_id = "sparse-window"
+        tracker = RequestTracker(
+            req_id=req_id,
+            prompt_len=300,
+            token_ids=list(range(768)),
+            allocated_block_ids=list(range(60)),
+            num_saved_tokens=300,
+        )
+        tracker.decode_window_save_next_start = 768
+        tracker.decode_window_save_committed_end = 300
+        impl._request_trackers[req_id] = tracker
+
+        impl.update_connector_output(
+            SimpleNamespace(completed_decode_window_saves={req_id: 768})
+        )
+
+        assert tracker.decode_window_save_committed_end == 768
+
+    def test_decode_window_completion_partial_value_clamps_to_previous_boundary(self) -> None:
+        impl = _make_scheduler_impl()
+        impl._decode_window_save_window_size = 512
+        req_id = "sparse-window"
+        tracker = RequestTracker(
+            req_id=req_id,
+            prompt_len=300,
+            token_ids=list(range(700)),
+            allocated_block_ids=list(range(60)),
+            num_saved_tokens=300,
+        )
+        tracker.decode_window_save_next_start = 768
+        tracker.decode_window_save_committed_end = 300
+        impl._request_trackers[req_id] = tracker
+
+        impl.update_connector_output(
+            SimpleNamespace(completed_decode_window_saves={req_id: 700})
+        )
+
+        assert tracker.decode_window_save_committed_end == 300
+
+    def test_decode_window_sparse_load_uses_nonzero_save_frontier(self) -> None:
+        impl = _make_scheduler_impl()
+        impl._decode_window_save_window_size = 512
+        req_id = "sparse-window"
+        all_tokens = list(range(900))
+        vllm_req = SimpleNamespace(
+            request_id=req_id,
+            num_prompt_tokens=300,
+            prompt_token_ids=all_tokens[:300],
+            num_computed_tokens=800,
+            all_token_ids=all_tokens,
+        )
+        impl._unfinished_requests[req_id] = vllm_req
+        tracker = RequestTracker(
+            req_id=req_id,
+            prompt_len=300,
+            token_ids=all_tokens[:799],
+            allocated_block_ids=list(range(80)),
+            num_saved_tokens=300,
+        )
+        tracker.is_decode_phase = True
+        tracker.decode_window_save_next_start = 768
+        tracker.decode_window_save_committed_end = 768
+        tracker.sparse_token_ids = all_tokens[:300]
+        tracker.sparse_slot_mapping = [torch.arange(300)]
+        impl._request_trackers[req_id] = tracker
+
+        scheduler_output = StubSchedulerOutput(
+            finished_req_ids=set(),
+            scheduled_new_reqs=[],
+            scheduled_cached_reqs=StubCachedRequestData(
+                req_ids=[req_id],
+                new_token_ids=[[all_tokens[799]]],
+                new_block_ids=[[]],
+            ),
+            num_scheduled_tokens={req_id: 1},
+        )
+
+        meta = impl.build_connector_meta(scheduler_output)
+        req_meta = next(req for req in meta.requests if req.is_sparse_decode)
+
+        assert req_meta.load_spec is not None
+        assert req_meta.load_spec.lmcache_cached_tokens == 768
+
 
 class TestZombieRequestInMetadata:
     def test_finished_request_still_in_metadata_keeps_worker_state(self) -> None:
@@ -480,6 +628,72 @@ class TestDecodeWindowSaveMetadata:
         assert meta.requests == []
         assert tracker.num_saved_tokens == 256
         assert tracker.decode_window_save_next_start == 256
+
+    def test_decode_window_frontier_resets_after_preemption(self) -> None:
+        tracker = RequestTracker(
+            req_id="decode-window",
+            prompt_len=356,
+            token_ids=list(range(768)),
+            allocated_block_ids=list(range(32)),
+            num_saved_tokens=256,
+        )
+        tracker.decode_window_save_next_start = 768
+        tracker.decode_window_save_committed_end = 768
+
+        tracker.update(
+            new_token_ids=[999],
+            new_block_ids=[],
+            preempted=True,
+            lmcache_cached_tokens=256,
+            vllm_cached_tokens=0,
+            all_token_ids=list(range(400)),
+        )
+
+        assert tracker.decode_window_save_next_start is None
+        assert tracker.decode_window_save_committed_end == 256
+
+    def test_decode_window_frontier_resets_after_token_rollback(self) -> None:
+        impl = _make_scheduler_impl()
+        impl.enable_sparse_attention = False
+        impl._decode_window_save_window_size = 256
+
+        req_id = "decode-window"
+        all_tokens = list(range(600))
+        vllm_req = SimpleNamespace(
+            request_id=req_id,
+            num_prompt_tokens=356,
+            prompt_token_ids=all_tokens[:356],
+            num_computed_tokens=400,
+            all_token_ids=all_tokens,
+        )
+        impl._unfinished_requests[req_id] = vllm_req
+        tracker = RequestTracker(
+            req_id=req_id,
+            prompt_len=356,
+            token_ids=list(range(768)),
+            allocated_block_ids=list(range(32)),
+            num_saved_tokens=512,
+        )
+        tracker.is_decode_phase = True
+        tracker.decode_window_save_next_start = 768
+        tracker.decode_window_save_committed_end = 768
+        impl._request_trackers[req_id] = tracker
+
+        scheduler_output = StubSchedulerOutput(
+            finished_req_ids=set(),
+            scheduled_new_reqs=[],
+            scheduled_cached_reqs=StubCachedRequestData(
+                req_ids=[req_id],
+                new_token_ids=[[all_tokens[400]]],
+                new_block_ids=[[]],
+            ),
+            num_scheduled_tokens={req_id: 1},
+        )
+
+        impl.build_connector_meta(scheduler_output)
+
+        assert tracker.decode_window_save_next_start == 256
+        assert tracker.decode_window_save_committed_end == 400
 
     def test_two_group_decode_window_save_without_shared_cpu_allows_latent_only(
         self,

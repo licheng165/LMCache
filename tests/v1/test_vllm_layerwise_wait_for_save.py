@@ -44,9 +44,10 @@ class _FakeEngine:
         self.store_calls.append(req_id)
         self.store_kwargs.append(dict(kwargs))
         self.store_steps.setdefault(req_id, 0)
+        num_layers = max(1, len(kwargs.get("kvcaches", []) or []))
 
         def _storer():
-            while True:
+            for _ in range(num_layers + 1):
                 self.store_steps[req_id] += 1
                 yield None
 
@@ -117,7 +118,8 @@ def _make_connector(requests):
     connector._finished_req_ids_waiting_for_save = set()
     connector._late_finished_sending = set()
     connector._completed_decode_window_saves = {}
-    connector._decode_window_save_started_groups = set()
+    connector._decode_window_save_completed_groups = set()
+    connector._decode_window_save_expected_start = {}
     return connector, metadata, engine
 
 
@@ -174,9 +176,13 @@ def test_wait_for_save_repeated_call_does_not_readvance_finalized_storer() -> No
 def test_multi_layer_save_and_finalize() -> None:
     connector, _, engine = _make_connector([_make_req("req-1"), _make_req("req-2")])
     num_layers = 4
+    connector.kv_caches = {
+        f"layer{i}": torch.zeros(1) for i in range(num_layers)
+    }
+    connector._refresh_kvcaches_list()
 
-    for _ in range(num_layers):
-        connector.save_kv_layer("layer_x", torch.zeros(1), None)
+    for layer_name in connector.kv_caches:
+        connector.save_kv_layer(layer_name, torch.zeros(1), None)
 
     assert engine.store_steps["req-1"] == num_layers
     assert engine.store_steps["req-2"] == num_layers
@@ -226,6 +232,99 @@ def test_decode_window_save_completion_not_reported_without_store() -> None:
     request.decode_window_size = 256
     connector, _, _ = _make_connector([request])
 
+    connector.wait_for_save()
+
+    assert connector.get_completed_decode_window_saves() == {}
+
+
+def test_decode_window_save_completion_not_reported_if_storer_does_not_finish() -> None:
+    request = _make_req("req-window")
+    request.is_decode_window_save = True
+    request.decode_window_start = 256
+    request.decode_window_end = 512
+    request.decode_window_size = 256
+    connector, _, engine = _make_connector([request])
+
+    def _unfinished_store_layer(token_ids, **kwargs):
+        req_id = kwargs["req_id"]
+        engine.store_calls.append(req_id)
+        engine.store_kwargs.append(dict(kwargs))
+        engine.store_steps.setdefault(req_id, 0)
+
+        def _storer():
+            while True:
+                engine.store_steps[req_id] += 1
+                yield None
+
+        return _storer()
+
+    engine.store_layer = _unfinished_store_layer
+
+    connector.save_kv_layer("layer0", torch.zeros(1), None)
+    connector.wait_for_save()
+
+    assert connector.get_completed_decode_window_saves() == {}
+
+
+def test_decode_window_save_completion_cannot_skip_unfinished_window() -> None:
+    first = _make_req("req-window")
+    first.is_decode_window_save = True
+    first.decode_window_start = 256
+    first.decode_window_end = 512
+    first.decode_window_size = 256
+    connector, metadata, engine = _make_connector([first])
+
+    def _unfinished_store_layer(token_ids, **kwargs):
+        req_id = kwargs["req_id"]
+        engine.store_calls.append(req_id)
+        engine.store_kwargs.append(dict(kwargs))
+        engine.store_steps.setdefault(req_id, 0)
+
+        def _storer():
+            while True:
+                engine.store_steps[req_id] += 1
+                yield None
+
+        return _storer()
+
+    engine.store_layer = _unfinished_store_layer
+    connector.save_kv_layer("layer0", torch.zeros(1), None)
+    connector.wait_for_save()
+    assert connector.get_completed_decode_window_saves() == {}
+
+    second = _make_req("req-window")
+    second.is_decode_window_save = True
+    second.decode_window_start = 512
+    second.decode_window_end = 768
+    second.decode_window_size = 256
+    metadata.requests = [second]
+    engine.store_layer = _FakeEngine.store_layer.__get__(engine, _FakeEngine)
+
+    connector.save_kv_layer("layer0", torch.zeros(1), None)
+    connector.wait_for_save()
+
+    assert connector.get_completed_decode_window_saves() == {}
+
+
+def test_decode_window_save_completion_cannot_skip_window_without_store() -> None:
+    first = _make_req("req-window")
+    first.is_decode_window_save = True
+    first.decode_window_start = 256
+    first.decode_window_end = 512
+    first.decode_window_size = 256
+    connector, metadata, _ = _make_connector([first])
+
+    connector.wait_for_save()
+    assert connector.get_completed_decode_window_saves() == {}
+
+    second = _make_req("req-window")
+    second.is_decode_window_save = True
+    second.decode_window_start = 512
+    second.decode_window_end = 768
+    second.decode_window_size = 256
+    metadata.requests = [second]
+
+    connector.save_kv_layer("layer0", torch.zeros(1), None)
     connector.wait_for_save()
 
     assert connector.get_completed_decode_window_saves() == {}
@@ -312,7 +411,7 @@ def test_decode_window_save_completion_resumes_after_late_indexer_group() -> Non
     connector.wait_for_save()
 
     assert connector.get_completed_decode_window_saves() == {"req-window": 512}
-    assert connector._decode_window_save_started_groups == set()
+    assert connector._decode_window_save_completed_groups == set()
 
 
 def test_decode_window_save_tracks_multiple_windows_for_same_request() -> None:

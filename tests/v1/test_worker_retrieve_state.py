@@ -16,6 +16,7 @@ from lmcache.integration.vllm.vllm_v1_adapter import (
     LoadSpec,
     ReqMeta,
     RequestTracker,
+    SaveSpec,
     WorkerRetrieveState,
 )
 from lmcache.v1.kv_layer_groups import KVLayerGroupsManager
@@ -1514,6 +1515,17 @@ class TestWorkerRetrieveState:
         with pytest.raises(RuntimeError, match="missing MLA latent"):
             impl._bind_worker_retrieve_state_to_request(request)
 
+    def test_shared_pointer_cache_entry_requires_actual_coverage(self):
+        covers = LMCacheConnectorV1Impl._shared_pointer_cache_entry_covers
+
+        assert not covers(None, 1)
+        assert not covers([], 1)
+        assert not covers(torch.empty(0, dtype=torch.long), 1)
+        assert covers(torch.tensor([123], dtype=torch.long), 1)
+        assert not covers(torch.tensor([123], dtype=torch.long), 2)
+        assert covers(torch.tensor([123, 456], dtype=torch.long), 2)
+        assert covers("fake-ptr", 1)
+
     def test_bind_rejects_shared_request_scope_mismatch(self):
         impl = _make_impl()
         impl.config = SimpleNamespace(dsa_two_groups=False)
@@ -1999,6 +2011,235 @@ class TestWorkerRetrieveState:
         assert state.cached_chunk_dev_ptrs == [[111]]
         assert state.cached_chunk_ptrs_npu[0].tolist() == [111]
         assert state.token_count == 256
+
+    def test_decode_window_save_missing_pointer_cache_does_not_advance_state(self):
+        impl = _make_impl()
+        impl.config = SimpleNamespace(dsa_two_groups=False)
+        impl.num_layers = 1
+        impl._completed_decode_window_saves = {}
+        impl._decode_window_save_completed_groups = set()
+        impl.lmcache_engine = SimpleNamespace(
+            enable_shared_cpu_cache=True,
+            shared_cpu_cache_generation=5,
+            storage_manager=None,
+            store_location="LocalCPUBackend",
+        )
+        impl._worker_retrieve_state["req-1"] = WorkerRetrieveState(
+            cached_keys=[["k0"]],
+            cached_starts=[0],
+            cached_ends=[256],
+            cached_memory_objs=[["m0"]],
+            cached_tensors=[["t0"]],
+            cached_chunk_dev_ptrs=[[111]],
+            cached_chunk_ptrs_npu=[torch.tensor([111], dtype=torch.long)],
+            rank0_backing_objs_by_group={0: [["m0"]]},
+            metadata_warm=True,
+            token_count=256,
+            shared_latent_status="present",
+            shared_generation=5,
+            pointer_cache_generation=5,
+            shared_request_active=True,
+            request_scope_token="req-1:5:256",
+        )
+
+        saved = _make_store_request(
+            token_count=512,
+            start=256,
+            end=512,
+            key="k1",
+            tensor="t1",
+        )
+        saved.is_decode_window_save = True
+        saved.decode_window_start = 256
+        saved.decode_window_end = 512
+        saved.decode_window_size = 256
+        saved.save_spec = SaveSpec(
+            256,
+            True,
+            can_save_latent=True,
+            can_save_indexer=False,
+        )
+        saved.cached_chunk_dev_ptrs = [[222]]
+        saved.cached_chunk_ptrs_npu = [None]
+
+        impl._record_decode_window_save_group_completed(saved, 0)
+        impl._maybe_seed_worker_retrieve_state_from_store(saved)
+        impl._mark_decode_window_save_completed(saved)
+
+        state = impl._worker_retrieve_state["req-1"]
+        assert state.cached_starts == [0]
+        assert state.cached_ends == [256]
+        assert state.cached_chunk_dev_ptrs == [[111]]
+        assert state.cached_chunk_ptrs_npu[0].tolist() == [111]
+        assert state.token_count == 256
+        assert impl.get_completed_decode_window_saves() == {}
+
+    def test_decode_window_save_does_not_advertise_short_pointer_table(self):
+        impl = _make_impl()
+        impl.config = SimpleNamespace(dsa_two_groups=False)
+        impl.num_layers = 1
+        impl._completed_decode_window_saves = {}
+        impl._decode_window_save_completed_groups = set()
+        impl._decode_window_save_expected_start = {}
+        impl.lmcache_engine = SimpleNamespace(
+            enable_shared_cpu_cache=True,
+            shared_cpu_cache_generation=5,
+            storage_manager=None,
+            store_location="LocalCPUBackend",
+        )
+        old_chunk_count = 73
+        old_end = old_chunk_count * 256
+        impl._worker_retrieve_state["req-1"] = WorkerRetrieveState(
+            cached_keys=[[f"k{i}" for i in range(old_chunk_count)]],
+            cached_starts=[i * 256 for i in range(old_chunk_count)],
+            cached_ends=[(i + 1) * 256 for i in range(old_chunk_count)],
+            cached_memory_objs=[[f"m{i}" for i in range(old_chunk_count)]],
+            cached_tensors=[[f"t{i}" for i in range(old_chunk_count)]],
+            cached_chunk_dev_ptrs=[list(range(old_chunk_count))],
+            cached_chunk_ptrs_npu=[
+                torch.arange(old_chunk_count, dtype=torch.long)
+            ],
+            rank0_backing_objs_by_group={
+                0: [[f"m{i}" for i in range(old_chunk_count)]]
+            },
+            metadata_warm=True,
+            token_count=old_end,
+            shared_latent_status="present",
+            shared_generation=5,
+            pointer_cache_generation=5,
+            shared_request_active=True,
+            request_scope_token=f"req-1:5:{old_end}",
+        )
+
+        saved = _make_store_request(
+            token_count=old_end + 256,
+            start=old_end,
+            end=old_end + 256,
+            key="k-new",
+            tensor="t-new",
+        )
+        saved.is_decode_window_save = True
+        saved.decode_window_start = old_end
+        saved.decode_window_end = old_end + 256
+        saved.decode_window_size = 256
+        saved.save_spec = SaveSpec(
+            old_end,
+            True,
+            can_save_latent=True,
+            can_save_indexer=False,
+        )
+        saved.cached_chunk_dev_ptrs = [[999]]
+        saved.cached_chunk_ptrs_npu = [None]
+
+        impl._record_decode_window_save_group_completed(saved, 0)
+        impl._maybe_seed_worker_retrieve_state_from_store(saved)
+        impl._mark_decode_window_save_completed(saved)
+
+        state = impl._worker_retrieve_state["req-1"]
+        assert state.cached_ends[-1] == old_end
+        assert state.cached_chunk_ptrs_npu[0].numel() == old_chunk_count
+        assert state.token_count == old_end
+        assert impl.get_completed_decode_window_saves() == {}
+
+    def test_decode_window_save_completion_requires_matching_window_range(self):
+        impl = _make_impl()
+        impl.config = SimpleNamespace(dsa_two_groups=False)
+        impl.num_layers = 1
+        impl._completed_decode_window_saves = {}
+        impl._decode_window_save_completed_groups = set()
+        impl._decode_window_save_expected_start = {}
+        impl.lmcache_engine = SimpleNamespace(
+            enable_shared_cpu_cache=True,
+            shared_cpu_cache_generation=5,
+            storage_manager=None,
+            store_location="LocalCPUBackend",
+        )
+
+        saved = _make_store_request(
+            token_count=512,
+            start=0,
+            end=256,
+            key="wrong-window",
+            tensor="wrong-tensor",
+        )
+        saved.is_decode_window_save = True
+        saved.decode_window_start = 256
+        saved.decode_window_end = 512
+        saved.decode_window_size = 256
+        saved.save_spec = SaveSpec(
+            256,
+            True,
+            can_save_latent=True,
+            can_save_indexer=False,
+        )
+        saved.cached_chunk_dev_ptrs = [[111]]
+        saved.cached_chunk_ptrs_npu = [torch.tensor([111], dtype=torch.long)]
+
+        impl._record_decode_window_save_group_completed(saved, 0)
+        impl._mark_decode_window_save_completed(saved)
+
+        assert impl.get_completed_decode_window_saves() == {}
+
+    def test_decode_window_save_out_of_order_window_does_not_merge_state(self):
+        impl = _make_impl()
+        impl.config = SimpleNamespace(dsa_two_groups=False)
+        impl.num_layers = 1
+        impl._completed_decode_window_saves = {}
+        impl._decode_window_save_completed_groups = set()
+        impl._decode_window_save_expected_start = {"req-1": 256}
+        impl.lmcache_engine = SimpleNamespace(
+            enable_shared_cpu_cache=True,
+            shared_cpu_cache_generation=5,
+            storage_manager=None,
+            store_location="LocalCPUBackend",
+        )
+        impl._worker_retrieve_state["req-1"] = WorkerRetrieveState(
+            cached_keys=[["k0"]],
+            cached_starts=[0],
+            cached_ends=[256],
+            cached_memory_objs=[["m0"]],
+            cached_tensors=[["t0"]],
+            cached_chunk_dev_ptrs=[[111]],
+            cached_chunk_ptrs_npu=[torch.tensor([111], dtype=torch.long)],
+            rank0_backing_objs_by_group={0: [["m0"]]},
+            metadata_warm=True,
+            token_count=256,
+            shared_latent_status="present",
+            shared_generation=5,
+            pointer_cache_generation=5,
+            shared_request_active=True,
+            request_scope_token="req-1:5:256",
+        )
+
+        saved = _make_store_request(
+            token_count=768,
+            start=512,
+            end=768,
+            key="future",
+            tensor="future-tensor",
+        )
+        saved.is_decode_window_save = True
+        saved.decode_window_start = 512
+        saved.decode_window_end = 768
+        saved.decode_window_size = 256
+        saved.save_spec = SaveSpec(
+            512,
+            True,
+            can_save_latent=True,
+            can_save_indexer=False,
+        )
+        saved.cached_chunk_dev_ptrs = [[333]]
+        saved.cached_chunk_ptrs_npu = [torch.tensor([333], dtype=torch.long)]
+
+        impl._record_decode_window_save_group_completed(saved, 0)
+        impl._maybe_seed_worker_retrieve_state_from_store(saved)
+        impl._mark_decode_window_save_completed(saved)
+
+        state = impl._worker_retrieve_state["req-1"]
+        assert state.cached_starts == [0]
+        assert state.cached_ends == [256]
+        assert state.cached_chunk_ptrs_npu[0].tolist() == [111]
+        assert impl.get_completed_decode_window_saves() == {}
 
     def test_decode_save_merge_rejects_latent_growth_without_indexer_growth(self):
         impl = _make_impl()

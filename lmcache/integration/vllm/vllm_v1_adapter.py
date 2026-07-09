@@ -611,6 +611,7 @@ class RequestTracker:
             # reset the number of saved tokens
             self.num_saved_tokens = lmcache_cached_tokens
             self.decode_window_save_committed_end = lmcache_cached_tokens
+            self.decode_window_save_next_start = None
             num_computed_tokens = max(lmcache_cached_tokens, vllm_cached_tokens)
 
             # FIX: For preempted requests, restore token_ids from the full
@@ -1428,7 +1429,8 @@ class LMCacheConnectorV1Impl:
         if role != KVConnectorRole.SCHEDULER:
             self._worker_retrieve_state: dict[str, WorkerRetrieveState] = {}
             self._completed_decode_window_saves: dict[str, int] = {}
-            self._decode_window_save_started_groups: set[Any] = set()
+            self._decode_window_save_completed_groups: set[Any] = set()
+            self._decode_window_save_expected_start: dict[str, int] = {}
             self._warn_mla_per_rank_lookup_config(config)
 
     def _warn_mla_per_rank_lookup_config(self, config: LMCacheEngineConfig) -> None:
@@ -2720,38 +2722,62 @@ class LMCacheConnectorV1Impl:
         return False
 
     def _clear_decode_window_save_groups_for_req(self, req_id: str) -> None:
-        groups = getattr(self, "_decode_window_save_started_groups", None)
-        if groups is None:
-            return
-        for group_key in list(groups):
-            if (
-                isinstance(group_key, tuple)
-                and group_key
-                and group_key[0] == req_id
-            ):
-                groups.discard(group_key)
+        groups = getattr(self, "_decode_window_save_completed_groups", None)
+        if groups is not None:
+            for group_key in list(groups):
+                if (
+                    isinstance(group_key, tuple)
+                    and group_key
+                    and group_key[0] == req_id
+                ):
+                    groups.discard(group_key)
+        expected = getattr(self, "_decode_window_save_expected_start", None)
+        if expected is not None:
+            expected.pop(req_id, None)
 
     def _clear_decode_window_save_groups_for_window(
         self,
         request: ReqMeta,
     ) -> None:
-        groups = getattr(self, "_decode_window_save_started_groups", None)
+        groups = getattr(self, "_decode_window_save_completed_groups", None)
         if groups is None:
             return
         for kv_group in self._decode_window_save_required_groups(request):
             groups.discard(self._layerwise_save_storer_key(request, kv_group))
 
-    def _record_decode_window_save_group_started(
+    def _record_decode_window_save_group_completed(
         self,
         request: ReqMeta,
         kv_group: int,
     ) -> None:
         if not self._is_decode_window_save_request(request):
             return
-        groups = getattr(self, "_decode_window_save_started_groups", None)
+        groups = getattr(self, "_decode_window_save_completed_groups", None)
         if groups is None:
             return
         groups.add(self._layerwise_save_storer_key(request, kv_group))
+
+    def _note_decode_window_save_seen(self, request: ReqMeta) -> None:
+        if not self._is_decode_window_save_request(request):
+            return
+        expected = getattr(self, "_decode_window_save_expected_start", None)
+        if expected is None:
+            return
+        window_start = getattr(request, "decode_window_start", None)
+        if window_start is None:
+            return
+        window_start = int(window_start)
+        expected.setdefault(request.req_id, window_start)
+
+    def _decode_window_save_is_next_expected(self, request: ReqMeta) -> bool:
+        expected = getattr(self, "_decode_window_save_expected_start", None)
+        if expected is None:
+            return True
+        window_start = getattr(request, "decode_window_start", None)
+        if window_start is None:
+            return True
+        self._note_decode_window_save_seen(request)
+        return int(window_start) == int(expected.get(request.req_id, window_start))
 
     def _decode_window_save_required_groups(self, request: ReqMeta) -> set[int]:
         if not self._is_decode_window_save_request(request):
@@ -2773,11 +2799,74 @@ class LMCacheConnectorV1Impl:
         required = self._decode_window_save_required_groups(request)
         if not required:
             return False
-        groups = getattr(self, "_decode_window_save_started_groups", None)
+        groups = getattr(self, "_decode_window_save_completed_groups", None)
         if groups is None:
             return False
         return all(
             self._layerwise_save_storer_key(request, kv_group) in groups
+            for kv_group in required
+        )
+
+    def _decode_window_save_uses_shared_cpu(self) -> bool:
+        engine = getattr(self, "lmcache_engine", None)
+        return bool(getattr(engine, "enable_shared_cpu_cache", False))
+
+    def _decode_window_save_group_pointer_ready(
+        self,
+        request: ReqMeta,
+        kv_group: int,
+    ) -> bool:
+        cache_kwargs = _retrieve_cache_kwargs(
+            request,
+            kv_group=kv_group,
+            dsa_two_groups=self._is_dsa_two_groups(),
+        )
+        starts = cache_kwargs["cached_starts"]
+        ends = cache_kwargs["cached_ends"]
+        memory_objs = cache_kwargs["cached_memory_objs"]
+        chunk_ptrs = cache_kwargs["cached_chunk_ptrs_npu"]
+        window_start = getattr(request, "decode_window_start", None)
+        window_end = getattr(request, "decode_window_end", None)
+        if window_start is not None and window_end is not None:
+            if not self._cached_ranges_cover_interval(
+                starts,
+                ends,
+                int(window_start),
+                int(window_end),
+            ):
+                return False
+        required_chunks = self._shared_required_chunk_count(
+            starts,
+            ends,
+            memory_objs,
+        )
+        if required_chunks <= 0:
+            return False
+        expected_layers = int(getattr(self, "num_layers", 0) or 0)
+        if expected_layers <= 0:
+            expected_layers = len(memory_objs or [])
+        if expected_layers <= 0:
+            return False
+        if self._missing_shared_layer_cache_coverage(
+            memory_objs,
+            expected_layers,
+            required_chunks,
+        ):
+            return False
+        return not self._missing_shared_pointer_cache_layers(
+            memory_objs,
+            chunk_ptrs,
+            required_chunks,
+        )
+
+    def _decode_window_save_store_cache_ready(self, request: ReqMeta) -> bool:
+        if not self._decode_window_save_uses_shared_cpu():
+            return True
+        required = self._decode_window_save_required_groups(request)
+        if not required:
+            return False
+        return all(
+            self._decode_window_save_group_pointer_ready(request, kv_group)
             for kv_group in required
         )
 
@@ -2829,6 +2918,7 @@ class LMCacheConnectorV1Impl:
     def _mark_decode_window_save_completed(self, request: ReqMeta) -> None:
         if not self._is_decode_window_save_request(request):
             return
+        self._note_decode_window_save_seen(request)
         engine = self.lmcache_engine
         is_passive = getattr(engine, "_is_passive", None)
         if callable(is_passive) and is_passive():
@@ -2841,6 +2931,25 @@ class LMCacheConnectorV1Impl:
                 sorted(self._decode_window_save_required_groups(request)),
             )
             return
+        if not self._decode_window_save_is_next_expected(request):
+            expected = getattr(self, "_decode_window_save_expected_start", {})
+            logger.debug(
+                "Decode-window save not marked complete out of order: "
+                "req_id=%s window_start=%s expected_start=%s",
+                request.req_id,
+                getattr(request, "decode_window_start", None),
+                expected.get(request.req_id),
+            )
+            return
+        if not self._decode_window_save_store_cache_ready(request):
+            logger.debug(
+                "Decode-window save not marked complete before shared CPU "
+                "store cache has per-layer pointer coverage: req_id=%s "
+                "required_groups=%s",
+                request.req_id,
+                sorted(self._decode_window_save_required_groups(request)),
+            )
+            return
         window_end = request.decode_window_end
         if window_end is None:
             return
@@ -2848,6 +2957,12 @@ class LMCacheConnectorV1Impl:
         if completed is None:
             return
         completed[request.req_id] = max(completed.get(request.req_id, 0), window_end)
+        expected = getattr(self, "_decode_window_save_expected_start", None)
+        if expected is not None:
+            expected[request.req_id] = max(
+                int(expected.get(request.req_id, 0)),
+                int(window_end),
+            )
         self._clear_decode_window_save_groups_for_window(request)
 
     def get_completed_decode_window_saves(self) -> dict[str, int]:
@@ -2867,6 +2982,30 @@ class LMCacheConnectorV1Impl:
             if tracker is None:
                 continue
             committed_end = int(window_end)
+            window_size = int(getattr(self, "_decode_window_save_window_size", 0) or 0)
+            if window_size > 0 and tracker.decode_window_save_next_start is None:
+                logger.debug(
+                    "Ignoring decode-window completion before scheduler "
+                    "emitted any save window: req_id=%s window_end=%s",
+                    req_id,
+                    window_end,
+                )
+                continue
+            if tracker.decode_window_save_next_start is not None:
+                next_start = int(tracker.decode_window_save_next_start)
+                committed_end = min(
+                    committed_end,
+                    next_start,
+                )
+                committed_end = min(committed_end, len(tracker.token_ids))
+                if window_size > 0 and committed_end < next_start:
+                    delta = next_start - committed_end
+                    windows_back = (delta + window_size - 1) // window_size
+                    committed_end = max(0, next_start - windows_back * window_size)
+            else:
+                committed_end = min(committed_end, len(tracker.token_ids))
+                if window_size > 0:
+                    committed_end = committed_end // window_size * window_size
             tracker.decode_window_save_committed_end = max(
                 tracker.decode_window_save_committed_end,
                 committed_end,
@@ -3036,6 +3175,30 @@ class LMCacheConnectorV1Impl:
             covered = max(covered, end)
         return covered
 
+    @staticmethod
+    def _cached_ranges_cover_interval(
+        starts: list[int],
+        ends: list[int],
+        interval_start: int,
+        interval_end: int,
+    ) -> bool:
+        interval_start = max(0, int(interval_start))
+        interval_end = max(interval_start, int(interval_end))
+        if interval_end == interval_start:
+            return True
+        covered = interval_start
+        for start, end in zip(starts or [], ends or [], strict=False):
+            start = int(start)
+            end = int(end)
+            if end <= start or end <= covered:
+                continue
+            if start > covered:
+                break
+            covered = max(covered, end)
+            if covered >= interval_end:
+                return True
+        return False
+
     @classmethod
     def _cached_ranges_cover_prefix(
         cls,
@@ -3055,14 +3218,13 @@ class LMCacheConnectorV1Impl:
     ) -> bool:
         if entry is None:
             return False
-        if required_chunks <= 1:
-            return True
+        required_chunks = max(1, int(required_chunks))
         if isinstance(entry, torch.Tensor):
             return int(entry.numel()) >= required_chunks
         try:
             return len(entry) >= required_chunks
         except TypeError:
-            return True
+            return required_chunks == 1
 
     @staticmethod
     def _missing_shared_layer_cache_coverage(
@@ -3074,6 +3236,7 @@ class LMCacheConnectorV1Impl:
             return []
         required_chunks = max(1, int(required_chunks))
         missing = []
+        layers = layers or []
         for layer_id in range(expected_layers):
             if layer_id >= len(layers):
                 missing.append(layer_id)
@@ -3680,6 +3843,7 @@ class LMCacheConnectorV1Impl:
         src_chunk_dev_ptrs: list[list[int]],
         src_chunk_ptrs_npu: list[Optional[torch.Tensor]],
         src_shared_handles: list[list[Any]],
+        require_pointer_cache: bool = False,
     ) -> int:
         if not src_starts or not src_ends:
             return 0
@@ -3691,13 +3855,63 @@ class LMCacheConnectorV1Impl:
         ):
             if chunk_range in existing_ranges:
                 continue
-            dst_starts.append(chunk_range[0])
-            dst_ends.append(chunk_range[1])
             existing_ranges.add(chunk_range)
             append_indices.append(chunk_idx)
 
         if not append_indices:
             return 0
+
+        def selected_ptrs_from_source(src_ptrs: torch.Tensor) -> Optional[torch.Tensor]:
+            if not isinstance(src_ptrs, torch.Tensor):
+                return None
+            if any(chunk_idx >= int(src_ptrs.numel()) for chunk_idx in append_indices):
+                return None
+            if (
+                append_indices[0] == 0
+                and append_indices[-1] == len(append_indices) - 1
+            ):
+                return src_ptrs[: len(append_indices)]
+            if append_indices[-1] - append_indices[0] + 1 == len(append_indices):
+                return src_ptrs[append_indices[0] : append_indices[-1] + 1]
+            return None
+
+        def select_layer_ptr_tensors() -> Optional[list[torch.Tensor]]:
+            if not src_chunk_ptrs_npu:
+                return None
+            selected_by_layer: list[torch.Tensor] = []
+            for src_ptrs in src_chunk_ptrs_npu:
+                selected = selected_ptrs_from_source(src_ptrs)
+                if selected is None:
+                    return None
+                selected_by_layer.append(selected)
+            return selected_by_layer
+
+        selected_ptrs_by_layer = select_layer_ptr_tensors()
+        source_layer_count = max(
+            len(src_memory_objs or []),
+            len(src_tensors or []),
+            len(src_keys or []),
+        )
+
+        def can_append_layer_ptr_tensors() -> bool:
+            if selected_ptrs_by_layer is None:
+                return False
+            if require_pointer_cache and len(selected_ptrs_by_layer) < source_layer_count:
+                return False
+            for layer_id in range(len(selected_ptrs_by_layer)):
+                if layer_id >= len(dst_chunk_ptrs_npu):
+                    continue
+                existing = dst_chunk_ptrs_npu[layer_id]
+                if existing is not None and not isinstance(existing, torch.Tensor):
+                    return False
+            return True
+
+        if require_pointer_cache and not can_append_layer_ptr_tensors():
+            return 0
+
+        for chunk_idx in append_indices:
+            dst_starts.append(src_starts[chunk_idx])
+            dst_ends.append(src_ends[chunk_idx])
 
         def append_layer_values(dst: list, src: list) -> None:
             if not src:
@@ -3714,31 +3928,9 @@ class LMCacheConnectorV1Impl:
         append_layer_values(dst_chunk_dev_ptrs, src_chunk_dev_ptrs)
         append_layer_values(dst_shared_handles, src_shared_handles)
 
-        def selected_ptrs_from_source(src_ptrs: torch.Tensor) -> Optional[torch.Tensor]:
-            if not isinstance(src_ptrs, torch.Tensor):
-                return None
-            if any(chunk_idx >= int(src_ptrs.numel()) for chunk_idx in append_indices):
-                return None
-            if (
-                append_indices[0] == 0
-                and append_indices[-1] == len(append_indices) - 1
-            ):
-                return src_ptrs[: len(append_indices)]
-            if append_indices[-1] - append_indices[0] + 1 == len(append_indices):
-                return src_ptrs[append_indices[0] : append_indices[-1] + 1]
-            return None
-
         def append_layer_ptr_tensors() -> bool:
-            if not src_chunk_ptrs_npu:
+            if not can_append_layer_ptr_tensors():
                 return False
-
-            selected_by_layer: list[torch.Tensor] = []
-            for src_ptrs in src_chunk_ptrs_npu:
-                selected = selected_ptrs_from_source(src_ptrs)
-                if selected is None:
-                    return False
-                selected_by_layer.append(selected)
-
             if not dst_chunk_ptrs_npu:
                 dst_chunk_ptrs_npu.extend(
                     None for _ in range(len(src_chunk_ptrs_npu))
@@ -3746,11 +3938,7 @@ class LMCacheConnectorV1Impl:
             while len(dst_chunk_ptrs_npu) < len(src_chunk_ptrs_npu):
                 dst_chunk_ptrs_npu.append(None)
 
-            for layer_id in range(len(selected_by_layer)):
-                existing = dst_chunk_ptrs_npu[layer_id]
-                if existing is not None and not isinstance(existing, torch.Tensor):
-                    return False
-            for layer_id, selected in enumerate(selected_by_layer):
+            for layer_id, selected in enumerate(selected_ptrs_by_layer):
                 existing = dst_chunk_ptrs_npu[layer_id]
                 dst_chunk_ptrs_npu[layer_id] = (
                     selected
@@ -3773,6 +3961,16 @@ class LMCacheConnectorV1Impl:
     ) -> int:
         _retrieve_cache_kwargs(request, kv_group=0, dsa_two_groups=False)
         _retrieve_cache_kwargs(request, kv_group=1, dsa_two_groups=True)
+        require_pointer_cache = (
+            self._is_decode_window_save_request(request)
+            and bool(
+                getattr(
+                    getattr(self, "lmcache_engine", None),
+                    "enable_shared_cpu_cache",
+                    False,
+                )
+            )
+        )
         merged_chunks = self._merge_cache_group_by_ranges(
             dst_starts=state.cached_starts,
             dst_ends=state.cached_ends,
@@ -3790,6 +3988,7 @@ class LMCacheConnectorV1Impl:
             src_chunk_dev_ptrs=request.cached_chunk_dev_ptrs,
             src_chunk_ptrs_npu=request.cached_chunk_ptrs_npu,
             src_shared_handles=request.cached_shared_handles,
+            require_pointer_cache=require_pointer_cache,
         )
         merged_chunks += self._merge_cache_group_by_ranges(
             dst_starts=state.cached_starts_indexer,
@@ -3808,6 +4007,7 @@ class LMCacheConnectorV1Impl:
             src_chunk_dev_ptrs=request.cached_chunk_dev_ptrs_indexer,
             src_chunk_ptrs_npu=request.cached_chunk_ptrs_npu_indexer,
             src_shared_handles=request.cached_shared_handles_indexer,
+            require_pointer_cache=require_pointer_cache,
         )
         return merged_chunks
 
@@ -3882,6 +4082,27 @@ class LMCacheConnectorV1Impl:
         if existing_state is not None and (
             existing_state.metadata_warm or existing_state.cached_keys
         ):
+            if (
+                self._is_decode_window_save_request(request)
+                and not self._decode_window_save_is_next_expected(request)
+            ):
+                logger.debug(
+                    "Skipping decode-window warm-state merge for out-of-order "
+                    "window: req_id=%s window_start=%s",
+                    request.req_id,
+                    getattr(request, "decode_window_start", None),
+                )
+                return
+            if (
+                self._is_decode_window_save_request(request)
+                and not self._decode_window_save_store_cache_ready(request)
+            ):
+                logger.debug(
+                    "Skipping decode-window warm-state merge before shared CPU "
+                    "store cache is fully pointer-ready: req_id=%s",
+                    request.req_id,
+                )
+                return
             rollback_snapshot = (
                 self._snapshot_worker_retrieve_cache_state(existing_state)
                 if existing_state.shared_request_active
@@ -5087,17 +5308,18 @@ class LMCacheConnectorV1Impl:
             num_layers = len(getattr(self, "kv_caches", {}) or {})
         return max(num_layers + 2, 2)
 
-    def _drain_layerwise_storer_fully(self, storer) -> None:
+    def _drain_layerwise_storer_fully(self, storer) -> bool:
         if storer is None:
-            return
+            return True
         for _ in range(self._layerwise_storer_drain_limit()):
             try:
                 next(storer)
             except StopIteration:
-                return
+                return True
         logger.warning(
             "Layerwise storer did not finish after bounded drain; closing it"
         )
+        return False
 
     @staticmethod
     def _close_layerwise_storer(storer) -> None:
@@ -5121,6 +5343,7 @@ class LMCacheConnectorV1Impl:
             and legacy_pending_key not in self._deferred_latent_pending
         ):
             return
+        self._note_decode_window_save_seen(request)
         if save_spec is None or not save_spec.can_save_latent:
             self._deferred_latent_pending.discard(pending_key)
             self._deferred_latent_pending.discard(legacy_pending_key)
@@ -5197,9 +5420,10 @@ class LMCacheConnectorV1Impl:
             req_id=request.req_id,
             **store_kwargs,
         )
-        self._drain_layerwise_storer_fully(storer)
+        latent_completed = self._drain_layerwise_storer_fully(storer)
         self._close_layerwise_storer(storer)
-        self._record_decode_window_save_group_started(request, 0)
+        if latent_completed:
+            self._record_decode_window_save_group_completed(request, 0)
         self._deferred_latent_pending.discard(pending_key)
         self._deferred_latent_pending.discard(legacy_pending_key)
         indexer_required = (
@@ -5267,6 +5491,7 @@ class LMCacheConnectorV1Impl:
                 save_spec is None or not save_spec.can_save
             ) and self.kv_role != "kv_producer":
                 continue
+            self._note_decode_window_save_seen(request)
 
             # Per-group gating: in two-group mode, skip indexer save if
             # can_save_indexer is False, and skip latent save if
@@ -5506,7 +5731,6 @@ class LMCacheConnectorV1Impl:
                     **store_kwargs,
                 )
                 self._layerwise_save_storers[storer_key] = layerwise_storer
-                self._record_decode_window_save_group_started(request, kv_group)
 
             indexer_group_last = (
                 is_indexer_layer
@@ -5534,10 +5758,17 @@ class LMCacheConnectorV1Impl:
                 raise
 
             if indexer_group_last:
-                self._drain_layerwise_storer_fully(layerwise_storer)
+                indexer_completed = self._drain_layerwise_storer_fully(
+                    layerwise_storer
+                )
                 self._layerwise_save_storers.pop(storer_key, None)
                 self._close_layerwise_storer(layerwise_storer)
                 layerwise_storer = None
+                if indexer_completed:
+                    self._record_decode_window_save_group_completed(
+                        request,
+                        kv_group,
+                    )
 
             if (
                 indexer_group_last
@@ -5586,11 +5817,18 @@ class LMCacheConnectorV1Impl:
                         storer_key, None
                     )
                     if layerwise_storer is not None:
-                        self._advance_layerwise_storer_once(layerwise_storer)
+                        if self._is_decode_window_save_request(request):
+                            save_completed = self._drain_layerwise_storer_fully(
+                                layerwise_storer
+                            )
+                        else:
+                            self._advance_layerwise_storer_once(layerwise_storer)
+                            save_completed = True
                         self._close_layerwise_storer(layerwise_storer)
-                        self._record_decode_window_save_group_started(
-                            request, _kv_group
-                        )
+                        if save_completed:
+                            self._record_decode_window_save_group_completed(
+                                request, _kv_group
+                            )
                 self._maybe_seed_worker_retrieve_state_from_store(request)
                 self._mark_decode_window_save_completed(request)
                 self._maybe_lookup_unpin_for_request(request)
@@ -5677,7 +5915,7 @@ class LMCacheConnectorV1Impl:
                 request_configs=request.request_configs,
                 req_id=request.req_id,
             )
-            self._record_decode_window_save_group_started(request, 0)
+            self._record_decode_window_save_group_completed(request, 0)
             self._mark_decode_window_save_completed(request)
 
             # Update skip_leading_tokens only on last rank to ensure
@@ -6224,6 +6462,11 @@ class LMCacheConnectorV1Impl:
                 request_tracker.num_saved_tokens = min(
                     request_tracker.num_saved_tokens, tokens_to_keep
                 )
+                request_tracker.decode_window_save_committed_end = min(
+                    request_tracker.decode_window_save_committed_end,
+                    tokens_to_keep,
+                )
+                request_tracker.decode_window_save_next_start = None
 
             # Pass all_token_ids for preempted requests to restore
             # token_ids correctly for chunk key computation
@@ -6254,16 +6497,15 @@ class LMCacheConnectorV1Impl:
                 lmcache_cached_for_sparse = request_tracker.prompt_len
                 if self._decode_window_save_window_size > 0:
                     token_len = len(request_tracker.token_ids)
-                    current_window_start = (
-                        (token_len - 1)
-                        // self._decode_window_save_window_size
-                        * self._decode_window_save_window_size
-                        if token_len > 0
-                        else 0
-                    )
+                    save_frontier = request_tracker.decode_window_save_next_start
+                    if save_frontier is None:
+                        save_frontier = self._init_decode_window_save_start(
+                            request_tracker
+                        )
+                    save_frontier = min(int(save_frontier), token_len)
                     lmcache_cached_for_sparse = min(
                         request_tracker.decode_window_save_committed_end,
-                        current_window_start,
+                        save_frontier,
                         token_len,
                     )
                 load_spec = LoadSpec(
