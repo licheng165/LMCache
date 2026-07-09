@@ -714,6 +714,21 @@ def test_engine_contract_requires_shared_cache_for_dense_layerwise_tp():
     assert "shared_cpu_cache_size_gb" in message
 
 
+def test_engine_contract_requires_shared_cache_for_sparse_tp():
+    engine = _make_engine_for_contract(
+        use_layerwise=False,
+        sparse=True,
+        shared=False,
+    )
+
+    with pytest.raises(ValueError, match="enable_sparse_attention=true") as exc_info:
+        engine._validate_shared_cpu_cache_contract()
+    message = str(exc_info.value)
+    assert "enable_shared_cpu_cache" in message
+    assert "save_only_first_rank" in message
+    assert "TP/world_size=2" in message
+
+
 def test_engine_contract_requires_broadcast_object_fn_for_shared_tp():
     engine = _make_engine_for_contract(
         use_layerwise=True,

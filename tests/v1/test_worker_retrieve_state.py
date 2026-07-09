@@ -10,6 +10,7 @@ import pytest
 import torch
 
 # First Party
+from lmcache.integration.vllm import vllm_v1_adapter as adapter_mod
 from lmcache.integration.vllm.vllm_v1_adapter import (
     LMCacheConnectorV1Impl,
     LoadSpec,
@@ -77,6 +78,48 @@ def _make_request(*, resumed: bool = False) -> ReqMeta:
 
 
 class TestWorkerRetrieveState:
+    def test_sparse_decode_load_tokens_reuses_full_prefix_list(self):
+        tokens = [1, 2, 3, 4]
+
+        full = LMCacheConnectorV1Impl._load_tokens_for_retrieve(
+            tokens,
+            4,
+            is_sparse_decode=True,
+        )
+        longer = LMCacheConnectorV1Impl._load_tokens_for_retrieve(
+            tokens,
+            8,
+            is_sparse_decode=True,
+        )
+        partial = LMCacheConnectorV1Impl._load_tokens_for_retrieve(
+            tokens,
+            2,
+            is_sparse_decode=True,
+        )
+
+        assert full is tokens
+        assert longer is tokens
+        assert partial == [1, 2]
+        assert partial is not tokens
+
+    def test_sparse_decode_load_mask_uses_none_for_full_lmcache_prefix(self):
+        req = _make_request()
+        req.load_spec = LoadSpec(
+            vllm_cached_tokens=0,
+            lmcache_cached_tokens=4,
+            can_load=True,
+        )
+        req.decode_token_mask = torch.ones(4, dtype=torch.bool)
+
+        mask = LMCacheConnectorV1Impl._load_token_mask_for_retrieve(
+            req,
+            4,
+            lmcache_chunk_size=256,
+        )
+
+        assert mask is None
+        assert req.decode_token_mask is None
+
     def test_dsa_kv_metadata_group_order_is_semantic(self):
         impl = _make_group_order_impl(
             {
@@ -136,9 +179,13 @@ class TestWorkerRetrieveState:
         assert state.pointer_cache_generation == 0
         assert state.shared_request_active is False
         assert state.request_scope_token is None
+        assert state.shared_validation_signature is None
 
     def test_mark_shared_index_skipped_keeps_active_latent_state(self):
-        state = WorkerRetrieveState(shared_latent_status="present")
+        state = WorkerRetrieveState(
+            shared_latent_status="present",
+            shared_validation_signature=("old",),
+        )
 
         LMCacheConnectorV1Impl._mark_shared_index_skipped(
             state,
@@ -153,6 +200,7 @@ class TestWorkerRetrieveState:
         assert state.pointer_cache_generation == 7
         assert state.shared_request_active is True
         assert state.request_scope_token == "req-1:7:512"
+        assert state.shared_validation_signature is None
 
     def test_sparse_decode_index_materialization_policy_for_shared_cpu_kv_both(self):
         impl = _make_impl()
@@ -377,6 +425,33 @@ class TestWorkerRetrieveState:
         with pytest.raises(RuntimeError, match="incomplete MLA latent"):
             impl._record_shared_worker_retrieve_state(state, request)
 
+    def test_record_shared_state_rejects_tail_only_prefix_coverage(self):
+        impl = _make_impl()
+        impl.num_layers = 1
+        impl.config = SimpleNamespace(dsa_two_groups=False)
+        impl.kv_role = "kv_both"
+        impl.lmcache_engine = SimpleNamespace(
+            enable_shared_cpu_cache=True,
+            shared_cpu_cache_generation=7,
+            metadata=SimpleNamespace(is_first_rank=lambda: False),
+        )
+        state = WorkerRetrieveState(token_count=512)
+        request = _make_request()
+        request.token_ids = [0] * 512
+        request.load_spec = LoadSpec(
+            vllm_cached_tokens=0,
+            lmcache_cached_tokens=512,
+            can_load=True,
+        )
+        request.cached_starts = [256]
+        request.cached_ends = [512]
+        request.cached_memory_objs = [["latent-view"]]
+        request.cached_shared_handles = [["latent-handle"]]
+        request.cached_chunk_ptrs_npu = [torch.tensor([111], dtype=torch.long)]
+
+        with pytest.raises(RuntimeError, match="non-contiguous prefix coverage"):
+            impl._record_shared_worker_retrieve_state(state, request)
+
     def test_record_shared_state_rejects_partial_required_index_group(self):
         impl = _make_impl()
         impl.num_layers = 2
@@ -462,6 +537,56 @@ class TestWorkerRetrieveState:
             0: request.cached_shared_handles,
             1: request.cached_shared_handles_indexer,
         }
+
+    def test_record_shared_state_rejects_short_latent_pointer_tensor(self):
+        impl = _make_impl()
+        impl.num_layers = 1
+        impl.config = SimpleNamespace(dsa_two_groups=False)
+        impl.kv_role = "kv_both"
+        impl.lmcache_engine = SimpleNamespace(
+            enable_shared_cpu_cache=True,
+            shared_cpu_cache_generation=7,
+            metadata=SimpleNamespace(is_first_rank=lambda: False),
+        )
+        state = WorkerRetrieveState()
+        request = _make_request()
+        request.cached_starts = [0, 256]
+        request.cached_ends = [256, 512]
+        request.cached_memory_objs = [["latent-view-0", "latent-view-1"]]
+        request.cached_shared_handles = [["latent-handle-0", "latent-handle-1"]]
+        request.cached_chunk_ptrs_npu = [torch.tensor([111], dtype=torch.long)]
+
+        with pytest.raises(RuntimeError, match="pointer-cache install"):
+            impl._record_shared_worker_retrieve_state(state, request)
+
+    def test_record_shared_state_rejects_indexer_shorter_than_latent_prefix(self):
+        impl = _make_impl()
+        impl.num_layers = 1
+        impl.config = SimpleNamespace(dsa_two_groups=True)
+        impl.kv_role = "kv_both"
+        impl.lmcache_engine = SimpleNamespace(
+            enable_shared_cpu_cache=True,
+            shared_cpu_cache_generation=7,
+            shared_cpu_materialize_index_on_decode_cold=True,
+            metadata=SimpleNamespace(is_first_rank=lambda: False),
+        )
+        state = WorkerRetrieveState()
+        request = _make_request()
+        request.cached_starts = [0, 256]
+        request.cached_ends = [256, 512]
+        request.cached_memory_objs = [["latent-view-0", "latent-view-1"]]
+        request.cached_shared_handles = [["latent-handle-0", "latent-handle-1"]]
+        request.cached_chunk_ptrs_npu = [torch.tensor([111, 222], dtype=torch.long)]
+        request.cached_starts_indexer = [0]
+        request.cached_ends_indexer = [256]
+        request.cached_memory_objs_indexer = [["index-view-0"]]
+        request.cached_shared_handles_indexer = [["index-handle-0"]]
+        request.cached_chunk_ptrs_npu_indexer = [
+            torch.tensor([333], dtype=torch.long)
+        ]
+
+        with pytest.raises(RuntimeError, match="materialized DSA index"):
+            impl._record_shared_worker_retrieve_state(state, request)
 
     def test_shared_cpu_config_value_reads_engine_extra_config(self):
         impl = _make_impl()
@@ -599,6 +724,70 @@ class TestWorkerRetrieveState:
         assert state.shared_request_active is True
         assert state.pointer_cache_generation == 8
         assert state.request_scope_token == "req-1:8:256"
+        assert state.shared_validation_signature is None
+
+    def test_save_replacement_does_not_reuse_old_validation_signature(self):
+        impl = _make_impl()
+        impl.num_layers = 1
+        impl.config = SimpleNamespace(dsa_two_groups=False)
+        impl.lmcache_engine = SimpleNamespace(
+            enable_shared_cpu_cache=True,
+            shared_cpu_cache_generation=7,
+            metadata=SimpleNamespace(is_first_rank=lambda: False),
+        )
+        old_state = WorkerRetrieveState(
+            cached_keys=[["k0"]],
+            cached_starts=[0],
+            cached_ends=[256],
+            cached_memory_objs=[["old-latent-view"]],
+            cached_chunk_ptrs_npu=[torch.tensor([111], dtype=torch.long)],
+            cached_shared_handles=[["old-handle"]],
+            metadata_warm=True,
+            token_count=256,
+            shared_latent_status="present",
+            shared_generation=7,
+            pointer_cache_generation=7,
+            shared_request_active=True,
+            request_scope_token="req-1:7:256",
+        )
+        request = _make_request()
+        request.token_ids = [0] * 256
+        request.load_spec.lmcache_cached_tokens = 256
+        old_state.shared_validation_signature = (
+            impl._shared_worker_validation_signature(
+                old_state,
+                request,
+                current_generation=7,
+                pointer_generation=7,
+                materialize_index=False,
+            )
+        )
+        impl._worker_retrieve_state["req-1"] = old_state
+
+        fresh = _make_request()
+        fresh.token_ids = [0] * 256
+        fresh.load_spec.lmcache_cached_tokens = 256
+        fresh.cached_keys = [["k0"]]
+        fresh.cached_starts = [0]
+        fresh.cached_ends = [256]
+        fresh.cached_memory_objs = [["new-latent-view"]]
+        fresh.cached_chunk_ptrs_npu = [torch.tensor([222], dtype=torch.long)]
+        fresh.cached_shared_handles = [["new-handle"]]
+
+        impl._save_worker_retrieve_state_from_request(
+            fresh,
+            location="local",
+            metadata_warm=True,
+            token_count=256,
+        )
+
+        new_state = impl._worker_retrieve_state["req-1"]
+        assert new_state is not old_state
+        assert new_state.shared_validation_signature is not None
+        assert new_state.shared_validation_signature != (
+            old_state.shared_validation_signature
+        )
+        assert new_state.cached_memory_objs == [["new-latent-view"]]
 
     def test_save_records_rank0_shared_backing_objs_for_cleanup(self):
         class FakeMemObj:
@@ -959,12 +1148,78 @@ class TestWorkerRetrieveState:
         assert torch.equal(selected_payload, selected_tokens[1])
         assert torch.equal(target_payload, target_slot_mapping[1])
 
-    def test_wait_for_layer_load_ordered_sparse_rows_use_view_payload(self):
+    def test_wait_for_layer_load_reordered_rows_forward_payload_event(
+        self, monkeypatch
+    ):
         req = make_sparse_req_meta("req-1", token_count=4)
         impl, _, _ = make_worker_connector([req], use_layerwise=True)
         impl.current_layer = 0
         impl.num_layers = 2
         impl._layerwise_retriever_is_sparse = [True]
+
+        sentinel_event = object()
+        event_calls = []
+
+        def _record_event(*values):
+            event_calls.append(values)
+            return sentinel_event
+
+        monkeypatch.setattr(
+            adapter_mod,
+            "_dsa_record_payload_event_if_needed",
+            _record_event,
+        )
+
+        captured = []
+
+        def _retriever():
+            payload = yield None
+            captured.append(payload)
+            yield torch.ones(4, dtype=torch.bool)
+
+        retriever = _retriever()
+        next(retriever)
+        impl.layerwise_retrievers = [(retriever, None)]
+
+        selected_tokens = torch.tensor(
+            [[10, 11, 12, 13], [18831, 18814, 18810, 18651]],
+            dtype=torch.int32,
+        )
+        target_slot_mapping = torch.tensor(
+            [[100, 101, 102, 103], [900, 901, 902, 903]],
+            dtype=torch.long,
+        )
+
+        impl.wait_for_layer_load(
+            "model.layers.0.self_attn.attn",
+            selected_tokens=selected_tokens,
+            token_start_index=[0, 0],
+            request_ids=["other-req", "req-1"],
+            target_slot_mapping=target_slot_mapping,
+        )
+
+        assert len(event_calls) == 1
+        assert len(captured) == 1
+        payload = captured[0]
+        assert payload["payload_event"] is sentinel_event
+        assert torch.equal(payload["selected_token_ids"], selected_tokens[1])
+        assert torch.equal(payload["target_slot_mapping"], target_slot_mapping[1])
+
+    def test_wait_for_layer_load_ordered_sparse_rows_use_view_payload(
+        self, monkeypatch
+    ):
+        req = make_sparse_req_meta("req-1", token_count=4)
+        impl, _, _ = make_worker_connector([req], use_layerwise=True)
+        impl.current_layer = 0
+        impl.num_layers = 2
+        impl._layerwise_retriever_is_sparse = [True]
+        monkeypatch.setattr(
+            adapter_mod,
+            "_dsa_record_payload_event_if_needed",
+            lambda *values: (_ for _ in ()).throw(
+                AssertionError("ordered sparse rows must not record payload events")
+            ),
+        )
 
         captured = []
 
@@ -1267,6 +1522,78 @@ class TestWorkerRetrieveState:
 
         assert impl._bind_worker_retrieve_state_to_request(request) is not None
 
+    def test_bind_shared_hot_state_reuses_validation_signature(self, monkeypatch):
+        impl = _make_impl()
+        impl.num_layers = 2
+        impl.config = SimpleNamespace(dsa_two_groups=False)
+        impl.lmcache_engine = SimpleNamespace(
+            enable_shared_cpu_cache=True,
+            shared_cpu_cache_generation=2,
+        )
+        request = _make_request()
+        impl._worker_retrieve_state["req-1"] = WorkerRetrieveState(
+            cached_keys=[["layer0-key"], ["layer1-key"]],
+            cached_starts=[0],
+            cached_ends=[3],
+            cached_memory_objs=[["latent-view-layer0"], ["latent-view-layer1"]],
+            cached_chunk_ptrs_npu=[
+                torch.tensor([111], dtype=torch.long),
+                torch.tensor([222], dtype=torch.long),
+            ],
+            metadata_warm=True,
+            shared_latent_status="present",
+            shared_generation=2,
+            pointer_cache_generation=2,
+            shared_request_active=True,
+            request_scope_token="req-1:2:3",
+        )
+
+        calls = []
+        prefix_checks = []
+        original = LMCacheConnectorV1Impl._missing_shared_layer_cache_coverage
+        original_prefix = LMCacheConnectorV1Impl._cached_ranges_cover_prefix
+
+        def counting_coverage(layers, expected_layers, required_chunks):
+            calls.append((expected_layers, required_chunks))
+            return original(layers, expected_layers, required_chunks)
+
+        def counting_prefix(starts, ends, token_count):
+            prefix_checks.append((list(starts), list(ends), token_count))
+            return original_prefix(starts, ends, token_count)
+
+        monkeypatch.setattr(
+            LMCacheConnectorV1Impl,
+            "_missing_shared_layer_cache_coverage",
+            staticmethod(counting_coverage),
+        )
+        monkeypatch.setattr(
+            LMCacheConnectorV1Impl,
+            "_cached_ranges_cover_prefix",
+            classmethod(lambda cls, starts, ends, token_count: counting_prefix(
+                starts,
+                ends,
+                token_count,
+            )),
+        )
+
+        assert impl._bind_worker_retrieve_state_to_request(request) is not None
+        assert calls == [(2, 1)]
+        assert prefix_checks == [([0], [3], 3)]
+
+        calls.clear()
+        prefix_checks.clear()
+        assert impl._bind_worker_retrieve_state_to_request(request) is not None
+        assert calls == []
+        assert prefix_checks == []
+
+        state = impl._worker_retrieve_state["req-1"]
+        state.cached_memory_objs = [list(layer) for layer in state.cached_memory_objs]
+        calls.clear()
+        prefix_checks.clear()
+        assert impl._bind_worker_retrieve_state_to_request(request) is not None
+        assert calls == [(2, 1)]
+        assert prefix_checks == [([0], [3], 3)]
+
     def test_bind_rejects_incomplete_shared_latent_state(self):
         impl = _make_impl()
         impl.num_layers = 2
@@ -1435,6 +1762,33 @@ class TestWorkerRetrieveState:
         assert req_meta.cached_shared_handles == [["latent-handle"]]
         assert req_meta.cached_shared_handles_indexer == [["index-handle"]]
 
+    def test_sparse_reqmeta_does_not_allocate_full_true_decode_mask(self):
+        tracker = RequestTracker(
+            req_id="req-1",
+            prompt_len=512,
+            token_ids=list(range(512)),
+            allocated_block_ids=list(range(4)),
+        )
+        tracker.is_decode_phase = True
+
+        req_meta = ReqMeta.from_request_tracker(
+            tracker,
+            block_size=128,
+            lmcache_chunk_size=256,
+            load_spec=LoadSpec(
+                vllm_cached_tokens=0,
+                lmcache_cached_tokens=512,
+                can_load=True,
+            ),
+            is_sparse_decode=True,
+        )
+
+        assert req_meta is not None
+        assert req_meta.decode_token_mask is None
+        assert tracker.sparse_decode_token_mask is None
+        assert req_meta.decode_ret_mask is not None
+        assert req_meta.decode_ret_mask.numel() == 512
+
     def test_store_seed_merges_chunked_prefill_hot_cache(self):
         impl = _make_impl()
         impl.config = SimpleNamespace(dsa_two_groups=False)
@@ -1474,6 +1828,254 @@ class TestWorkerRetrieveState:
         assert state.cached_shared_handles == [["h0", "h1"]]
         assert state.token_count == 8192
 
+    def test_decode_save_merge_extends_pointer_cache_and_scope_token(self):
+        impl = _make_impl()
+        impl.lmcache_engine = SimpleNamespace(
+            enable_shared_cpu_cache=True,
+            shared_cpu_cache_generation=5,
+            storage_manager=None,
+            store_location="LocalCPUBackend",
+        )
+        old_ptrs = torch.tensor([111], dtype=torch.long)
+        impl._worker_retrieve_state["req-1"] = WorkerRetrieveState(
+            cached_keys=[["k0"]],
+            cached_starts=[0],
+            cached_ends=[256],
+            cached_memory_objs=[["m0"]],
+            cached_tensors=[["t0"]],
+            cached_chunk_dev_ptrs=[[111]],
+            cached_chunk_ptrs_npu=[old_ptrs],
+            cached_shared_handles=[["h0"]],
+            rank0_backing_objs_by_group={0: [["m0"]]},
+            metadata_warm=True,
+            token_count=256,
+            shared_latent_status="present",
+            shared_generation=5,
+            pointer_cache_generation=5,
+            shared_request_active=True,
+            request_scope_token="req-1:5:256",
+        )
+
+        saved = _make_store_request(
+            token_count=512,
+            start=256,
+            end=512,
+            key="k1",
+            tensor="t1",
+        )
+        saved.cached_chunk_dev_ptrs = [[222]]
+        saved.cached_chunk_ptrs_npu = [torch.tensor([222], dtype=torch.long)]
+
+        impl._maybe_seed_worker_retrieve_state_from_store(saved)
+
+        state = impl._worker_retrieve_state["req-1"]
+        assert state.cached_starts == [0, 256]
+        assert state.cached_ends == [256, 512]
+        assert state.cached_chunk_dev_ptrs == [[111, 222]]
+        assert state.cached_chunk_ptrs_npu[0].tolist() == [111, 222]
+        # Decode-save does not broadcast shm handles. The next retrieve must
+        # republish because handle coverage still reflects only the old chunk.
+        assert state.cached_shared_handles == [["h0"]]
+        assert state.token_count == 512
+        assert state.request_scope_token == "req-1:5:512"
+        assert state.shared_validation_signature is None
+
+    def test_decode_window_save_tail_only_does_not_seed_warm_state(self):
+        impl = _make_impl()
+        impl.config = SimpleNamespace(dsa_two_groups=False)
+        impl._latent_kvcaches = [object()]
+        impl.lmcache_engine = SimpleNamespace(
+            enable_shared_cpu_cache=True,
+            shared_cpu_cache_generation=5,
+            storage_manager=None,
+            store_location="LocalCPUBackend",
+        )
+        saved = _make_store_request(
+            token_count=512,
+            start=256,
+            end=512,
+            key="k1",
+            tensor="t1",
+        )
+        saved.is_decode_window_save = True
+        saved.decode_window_start = 256
+        saved.decode_window_end = 512
+        saved.decode_window_size = 256
+
+        impl._maybe_seed_worker_retrieve_state_from_store(saved)
+
+        assert "req-1" not in impl._worker_retrieve_state
+
+    def test_decode_save_merge_rejects_missing_pointer_cache(self):
+        impl = _make_impl()
+        impl.lmcache_engine = SimpleNamespace(
+            enable_shared_cpu_cache=True,
+            shared_cpu_cache_generation=5,
+            storage_manager=None,
+            store_location="LocalCPUBackend",
+        )
+        impl._worker_retrieve_state["req-1"] = WorkerRetrieveState(
+            cached_keys=[["k0"]],
+            cached_starts=[0],
+            cached_ends=[256],
+            cached_memory_objs=[["m0"]],
+            cached_tensors=[["t0"]],
+            cached_chunk_dev_ptrs=[[111]],
+            cached_chunk_ptrs_npu=[torch.tensor([111], dtype=torch.long)],
+            rank0_backing_objs_by_group={0: [["m0"]]},
+            metadata_warm=True,
+            token_count=256,
+            shared_latent_status="present",
+            shared_generation=5,
+            pointer_cache_generation=5,
+            shared_request_active=True,
+            request_scope_token="req-1:5:256",
+        )
+
+        saved = _make_store_request(
+            token_count=512,
+            start=256,
+            end=512,
+            key="k1",
+            tensor="t1",
+        )
+        saved.cached_chunk_dev_ptrs = [[222]]
+        # Missing per-layer NPU pointer tensor must not be hidden by a fresh
+        # scope token; the next decode would otherwise look warm but be unable
+        # to launch the shared sparse direct path.
+        saved.cached_chunk_ptrs_npu = [None]
+
+        with pytest.raises(RuntimeError, match="incomplete shared CPU MLA"):
+            impl._maybe_seed_worker_retrieve_state_from_store(saved)
+
+        state = impl._worker_retrieve_state["req-1"]
+        assert state.request_scope_token == "req-1:5:256"
+        assert state.pointer_cache_generation == 5
+        assert state.cached_starts == [0]
+        assert state.cached_ends == [256]
+        assert state.cached_chunk_dev_ptrs == [[111]]
+        assert state.cached_chunk_ptrs_npu[0].tolist() == [111]
+        assert state.token_count == 256
+
+    def test_decode_save_merge_rejects_latent_growth_without_indexer_growth(self):
+        impl = _make_impl()
+        impl.config = SimpleNamespace(dsa_two_groups=True)
+        impl.num_layers = 1
+        impl.kv_role = "kv_both"
+        impl.lmcache_engine = SimpleNamespace(
+            enable_shared_cpu_cache=True,
+            shared_cpu_cache_generation=5,
+            storage_manager=None,
+            store_location="LocalCPUBackend",
+            config=SimpleNamespace(
+                extra_config={"shared_cpu_materialize_index_on_decode_cold": True}
+            ),
+        )
+        impl._worker_retrieve_state["req-1"] = WorkerRetrieveState(
+            cached_keys=[["k0"]],
+            cached_starts=[0],
+            cached_ends=[256],
+            cached_memory_objs=[["m0"]],
+            cached_tensors=[["t0"]],
+            cached_chunk_dev_ptrs=[[111]],
+            cached_chunk_ptrs_npu=[torch.tensor([111], dtype=torch.long)],
+            cached_keys_indexer=[["ik0"]],
+            cached_starts_indexer=[0],
+            cached_ends_indexer=[256],
+            cached_memory_objs_indexer=[["im0"]],
+            cached_tensors_indexer=[["it0"]],
+            cached_chunk_dev_ptrs_indexer=[[333]],
+            cached_chunk_ptrs_npu_indexer=[
+                torch.tensor([333], dtype=torch.long)
+            ],
+            rank0_backing_objs_by_group={0: [["m0"]], 1: [["im0"]]},
+            metadata_warm=True,
+            token_count=256,
+            shared_latent_status="present",
+            shared_index_status="present",
+            shared_generation=5,
+            pointer_cache_generation=5,
+            shared_request_active=True,
+            request_scope_token="req-1:5:256",
+        )
+
+        saved = _make_store_request(
+            token_count=512,
+            start=256,
+            end=512,
+            key="k1",
+            tensor="t1",
+        )
+        saved.cached_chunk_dev_ptrs = [[222]]
+        saved.cached_chunk_ptrs_npu = [torch.tensor([222], dtype=torch.long)]
+
+        with pytest.raises(RuntimeError, match="incomplete shared CPU DSA index"):
+            impl._maybe_seed_worker_retrieve_state_from_store(saved)
+
+        state = impl._worker_retrieve_state["req-1"]
+        assert state.request_scope_token == "req-1:5:256"
+        assert state.cached_starts == [0]
+        assert state.cached_ends == [256]
+        assert state.cached_ends_indexer == [256]
+        assert state.token_count == 256
+
+    def test_bind_shared_hot_state_rejects_short_pointer_tensor(self):
+        impl = _make_impl()
+        impl.num_layers = 1
+        impl.config = SimpleNamespace(dsa_two_groups=False)
+        impl.lmcache_engine = SimpleNamespace(
+            enable_shared_cpu_cache=True,
+            shared_cpu_cache_generation=3,
+        )
+        request = _make_request()
+        request.load_spec.lmcache_cached_tokens = 512
+        impl._worker_retrieve_state["req-1"] = WorkerRetrieveState(
+            cached_keys=[["k0", "k1"]],
+            cached_starts=[0, 256],
+            cached_ends=[256, 512],
+            cached_memory_objs=[["latent-view-0", "latent-view-1"]],
+            cached_chunk_ptrs_npu=[torch.tensor([111], dtype=torch.long)],
+            metadata_warm=True,
+            token_count=512,
+            shared_latent_status="present",
+            shared_generation=3,
+            pointer_cache_generation=3,
+            shared_request_active=True,
+            request_scope_token="req-1:3:512",
+        )
+
+        with pytest.raises(RuntimeError, match="pointer-cache tensors"):
+            impl._bind_worker_retrieve_state_to_request(request)
+
+    def test_bind_shared_hot_state_rejects_gapped_prefix_coverage(self):
+        impl = _make_impl()
+        impl.num_layers = 1
+        impl.config = SimpleNamespace(dsa_two_groups=False)
+        impl.lmcache_engine = SimpleNamespace(
+            enable_shared_cpu_cache=True,
+            shared_cpu_cache_generation=3,
+        )
+        request = _make_request()
+        request.token_ids = [0] * 768
+        request.load_spec.lmcache_cached_tokens = 768
+        impl._worker_retrieve_state["req-1"] = WorkerRetrieveState(
+            cached_keys=[["k0", "k2"]],
+            cached_starts=[0, 512],
+            cached_ends=[256, 768],
+            cached_memory_objs=[["latent-view-0", "latent-view-2"]],
+            cached_chunk_ptrs_npu=[torch.tensor([111, 333], dtype=torch.long)],
+            metadata_warm=True,
+            token_count=768,
+            shared_latent_status="present",
+            shared_generation=3,
+            pointer_cache_generation=3,
+            shared_request_active=True,
+            request_scope_token="req-1:3:768",
+        )
+
+        with pytest.raises(RuntimeError, match="non-contiguous MLA"):
+            impl._bind_worker_retrieve_state_to_request(request)
+
     def test_warm_kwargs_only_when_prefix_unchanged(self):
         impl = _make_impl()
         request = _make_request()
@@ -1493,6 +2095,31 @@ class TestWorkerRetrieveState:
         extended = impl._sparse_decode_retrieve_warm_kwargs(request, 512, state)
         assert "_retrieve_metadata_warm" not in extended
         assert extended["cached_retrieve_location"] == "local"
+
+    def test_tail_only_sparse_state_is_not_metadata_warm(self):
+        impl = _make_impl()
+        request = _make_request()
+        request.token_ids = [0] * 512
+        request.load_spec = LoadSpec(
+            vllm_cached_tokens=0,
+            lmcache_cached_tokens=512,
+            can_load=True,
+        )
+        state = WorkerRetrieveState(
+            cached_keys=[["k1"]],
+            cached_starts=[256],
+            cached_ends=[512],
+            metadata_warm=True,
+            location="local",
+            token_count=512,
+        )
+
+        warm = impl._sparse_decode_retrieve_warm_kwargs(request, 512, state)
+
+        assert "_retrieve_metadata_warm" not in warm
+        assert warm["cached_retrieve_location"] == "local"
+        impl._worker_retrieve_state["req-1"] = state
+        assert impl._should_invalidate_worker_retrieve_state(request, 512)
 
     def test_invalidate_on_preemption_and_token_rollback(self):
         impl = _make_impl()
@@ -1622,6 +2249,59 @@ class TestWorkerRetrieveState:
         }
         impl._prune_worker_retrieve_state({"req-1"})
         assert set(impl._worker_retrieve_state) == {"req-1", "req-2"}
+
+    def test_prune_releases_shared_scope_but_keeps_warm_metadata(self):
+        class FakeMemObj:
+            def __init__(self):
+                self.released = 0
+                self.unpinned = 0
+                self.is_pinned = True
+
+            def ref_count_down(self):
+                self.released += 1
+
+            def unpin(self):
+                self.unpinned += 1
+                self.is_pinned = False
+
+        engine = SimpleNamespace(
+            release_shared_cpu_sparse_request=MagicMock(),
+        )
+        impl = _make_impl()
+        impl.lmcache_engine = engine
+        backing = FakeMemObj()
+        impl._worker_retrieve_state = {
+            "req-1": WorkerRetrieveState(metadata_warm=True, cached_keys=[["k"]]),
+            "req-2": WorkerRetrieveState(
+                req_id="req-2",
+                cached_keys=[["k2"]],
+                cached_starts=[0],
+                cached_ends=[256],
+                cached_memory_objs=[[backing]],
+                cached_chunk_ptrs_npu=[torch.tensor([123], dtype=torch.long)],
+                rank0_backing_objs_by_group={0: [[backing]]},
+                metadata_warm=True,
+                shared_latent_status="present",
+                shared_generation=9,
+                pointer_cache_generation=9,
+                shared_request_active=True,
+                request_scope_token="req-2:9:256",
+            ),
+        }
+
+        impl._prune_worker_retrieve_state({"req-1"})
+
+        state = impl._worker_retrieve_state["req-2"]
+        assert backing.unpinned == 1
+        assert backing.released == 1
+        engine.release_shared_cpu_sparse_request.assert_called_once_with("req-2")
+        assert state.cached_keys == [["k2"]]
+        assert state.cached_starts == [0]
+        assert state.cached_ends == [256]
+        assert state.cached_memory_objs == []
+        assert state.cached_chunk_ptrs_npu == []
+        assert state.shared_request_active is False
+        assert state.metadata_warm is True
 
     def test_prune_drops_non_warm_finished_requests(self):
         impl = _make_impl()

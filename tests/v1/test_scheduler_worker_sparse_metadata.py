@@ -332,6 +332,57 @@ class TestZombieRequestInMetadata:
 
 
 class TestDecodeWindowSaveMetadata:
+    @staticmethod
+    def _build_decode_window_case(
+        *,
+        shared_cpu: bool,
+        indexer_blocks: bool,
+    ) -> tuple[LMCacheConnectorV1Impl, RequestTracker, StubSchedulerOutput]:
+        impl = _make_scheduler_impl()
+        impl.enable_sparse_attention = False
+        impl.config.dsa_two_groups = True
+        impl.config.extra_config = (
+            {"enable_shared_cpu_cache": True} if shared_cpu else {}
+        )
+        impl._decode_window_save_window_size = 256
+
+        req_id = "decode-window"
+        prompt_len = 356
+        prompt = list(range(prompt_len))
+        decode_tokens = list(range(10_000, 10_156))
+        vllm_req = SimpleNamespace(
+            request_id=req_id,
+            num_prompt_tokens=prompt_len,
+            prompt_token_ids=prompt,
+            num_computed_tokens=prompt_len + 155,
+            all_token_ids=prompt + decode_tokens,
+        )
+        impl._unfinished_requests[req_id] = vllm_req
+        tracker = RequestTracker(
+            req_id=req_id,
+            prompt_len=prompt_len,
+            token_ids=prompt + decode_tokens[:-1],
+            allocated_block_ids=list(range(32)),
+            allocated_block_ids_indexer=(
+                list(range(32)) if indexer_blocks else None
+            ),
+            num_saved_tokens=256,
+        )
+        tracker.is_decode_phase = True
+        impl._request_trackers[req_id] = tracker
+
+        scheduler_output = StubSchedulerOutput(
+            finished_req_ids=set(),
+            scheduled_new_reqs=[],
+            scheduled_cached_reqs=StubCachedRequestData(
+                req_ids=[req_id],
+                new_token_ids=[[decode_tokens[-1]]],
+                new_block_ids=[[]],
+            ),
+            num_scheduled_tokens={req_id: 1},
+        )
+        return impl, tracker, scheduler_output
+
     def test_decode_window_save_includes_prefill_tail_at_boundary(self) -> None:
         impl = _make_scheduler_impl()
         impl.enable_sparse_attention = False
@@ -429,3 +480,51 @@ class TestDecodeWindowSaveMetadata:
         assert meta.requests == []
         assert tracker.num_saved_tokens == 256
         assert tracker.decode_window_save_next_start == 256
+
+    def test_two_group_decode_window_save_without_shared_cpu_allows_latent_only(
+        self,
+    ) -> None:
+        impl, tracker, scheduler_output = self._build_decode_window_case(
+            shared_cpu=False,
+            indexer_blocks=False,
+        )
+
+        meta = impl.build_connector_meta(scheduler_output)
+
+        assert len(meta.requests) == 1
+        req_meta = meta.requests[0]
+        assert req_meta.is_decode_window_save is True
+        assert req_meta.save_spec is not None
+        assert req_meta.save_spec.can_save_indexer is False
+        assert tracker.decode_window_save_next_start == 512
+
+    def test_shared_cpu_two_group_decode_window_save_requires_indexer_slots(
+        self,
+    ) -> None:
+        impl, tracker, scheduler_output = self._build_decode_window_case(
+            shared_cpu=True,
+            indexer_blocks=False,
+        )
+
+        meta = impl.build_connector_meta(scheduler_output)
+
+        assert meta.requests == []
+        assert tracker.decode_window_save_next_start == 256
+
+    def test_shared_cpu_two_group_decode_window_save_allows_matching_indexer(
+        self,
+    ) -> None:
+        impl, tracker, scheduler_output = self._build_decode_window_case(
+            shared_cpu=True,
+            indexer_blocks=True,
+        )
+
+        meta = impl.build_connector_meta(scheduler_output)
+
+        assert len(meta.requests) == 1
+        req_meta = meta.requests[0]
+        assert req_meta.is_decode_window_save is True
+        assert req_meta.save_spec is not None
+        assert req_meta.save_spec.can_save_indexer is True
+        assert req_meta.indexer_slot_mapping
+        assert tracker.decode_window_save_next_start == 512

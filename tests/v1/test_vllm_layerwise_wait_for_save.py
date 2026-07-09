@@ -283,6 +283,36 @@ def test_decode_window_save_completion_waits_for_required_indexer_group() -> Non
     assert connector.get_completed_decode_window_saves() == {}
 
 
+def test_decode_window_save_completion_resumes_after_late_indexer_group() -> None:
+    request = _make_req("req-window")
+    request.is_decode_window_save = True
+    request.decode_window_start = 256
+    request.decode_window_end = 512
+    request.decode_window_size = 256
+    request.save_spec.can_save_indexer = True
+    request.indexer_slot_mapping = [torch.arange(4, 8, dtype=torch.long)]
+    connector, _, _ = _make_connector([request])
+    connector.config.dsa_two_groups = True
+    connector.kv_caches = {
+        "layer0.attn": torch.zeros(1),
+        "layer0.indexer.k_cache": torch.zeros(1),
+    }
+
+    connector.save_kv_layer("layer0.attn", torch.zeros(1), None)
+    connector.wait_for_save()
+    assert connector.get_completed_decode_window_saves() == {}
+
+    connector.save_kv_layer(
+        "layer0.indexer.k_cache",
+        torch.zeros(1),
+        SimpleNamespace(slot_mapping=torch.arange(1, dtype=torch.long)),
+    )
+    connector.wait_for_save()
+
+    assert connector.get_completed_decode_window_saves() == {"req-window": 512}
+    assert connector._decode_window_save_started_groups == set()
+
+
 def test_decode_window_save_tracks_multiple_windows_for_same_request() -> None:
     requests = []
     for window_start, window_end in ((0, 4), (4, 8)):

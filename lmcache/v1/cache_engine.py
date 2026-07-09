@@ -2044,11 +2044,9 @@ class LMCacheEngine:
                         expected_shape=expected_shape,
                         expected_dtype=expected_dtype,
                         expected_fmt=expected_fmt,
-                        expected_cached_positions=list(
-                            range(
-                                int(starts_all[chunk_index]),
-                                int(ends_all[chunk_index]),
-                            )
+                        expected_cached_positions=range(
+                            int(starts_all[chunk_index]),
+                            int(ends_all[chunk_index]),
                         ),
                         expected_producer_rank=self.metadata.first_rank,
                     )

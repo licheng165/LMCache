@@ -11,7 +11,7 @@ from __future__ import annotations
 
 import ctypes
 from dataclasses import dataclass
-from typing import Any, Optional, Union
+from typing import Any, Iterable, Optional, Union
 
 import torch
 
@@ -64,6 +64,30 @@ def _positions_to_list(
     if isinstance(cached_positions, torch.Tensor):
         return [int(x) for x in cached_positions.detach().cpu().flatten().tolist()]
     return [int(x) for x in cached_positions]
+
+
+def _expected_positions_match(
+    cached_positions: list[int],
+    expected_positions: Iterable[int],
+) -> tuple[bool, Any]:
+    if isinstance(expected_positions, range):
+        if len(cached_positions) != len(expected_positions):
+            return (
+                False,
+                f"range({expected_positions.start}, "
+                f"{expected_positions.stop}, {expected_positions.step})",
+            )
+        for cached, expected in zip(cached_positions, expected_positions):
+            if int(cached) != int(expected):
+                return (
+                    False,
+                    f"range({expected_positions.start}, "
+                    f"{expected_positions.stop}, {expected_positions.step})",
+                )
+        return True, None
+
+    expected_list = [int(pos) for pos in expected_positions]
+    return cached_positions == expected_list, expected_list
 
 
 def _shape_nbytes(shape: torch.Size, dtype: torch.dtype) -> int:
@@ -443,7 +467,7 @@ def validate_shared_handle(
     expected_shape: Optional[torch.Size] = None,
     expected_dtype: Optional[torch.dtype] = None,
     expected_fmt: Optional[MemoryFormat] = None,
-    expected_cached_positions: Optional[list[int]] = None,
+    expected_cached_positions: Optional[Iterable[int]] = None,
     expected_producer_rank: Optional[int] = None,
 ) -> None:
     """Validate a handle before passive view creation."""
@@ -528,13 +552,18 @@ def validate_shared_handle(
             cached_positions = [int(pos) for pos in handle.cached_positions]
             if any(pos < 0 for pos in cached_positions):
                 failures.append("cached_positions contains negative offsets")
-            if (
-                expected_cached_positions is not None
-                and cached_positions != [int(pos) for pos in expected_cached_positions]
-            ):
+            if expected_cached_positions is not None:
+                positions_match, expected_for_log = _expected_positions_match(
+                    cached_positions,
+                    expected_cached_positions,
+                )
+            else:
+                positions_match = True
+                expected_for_log = None
+            if not positions_match:
                 failures.append(
                     f"cached_positions={cached_positions}, "
-                    f"expected={expected_cached_positions}"
+                    f"expected={expected_for_log}"
                 )
         except Exception as exc:
             failures.append(f"invalid cached_positions metadata: {exc}")
@@ -590,7 +619,7 @@ class PassiveSharedViewAllocator(MemoryAllocatorInterface):
         expected_shape: Optional[torch.Size] = None,
         expected_dtype: Optional[torch.dtype] = None,
         expected_fmt: Optional[MemoryFormat] = None,
-        expected_cached_positions: Optional[list[int]] = None,
+        expected_cached_positions: Optional[Iterable[int]] = None,
         expected_producer_rank: Optional[int] = None,
     ) -> TensorMemoryObj:
         validate_shared_handle(
