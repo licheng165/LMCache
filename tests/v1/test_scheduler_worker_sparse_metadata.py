@@ -16,6 +16,8 @@ pytest.importorskip("vllm")
 from lmcache.integration.vllm.vllm_v1_adapter import (
     LMCacheConnectorV1Impl,
     RequestTracker,
+    ReqMeta,
+    SaveSpec,
     WorkerRetrieveState,
 )
 from tests.v1.connector_test_utils import make_worker_impl
@@ -271,6 +273,109 @@ class TestBuildConnectorMetaSparseSyntheticLoadSpec:
         assert tracker.sparse_token_ids == all_tokens[:512]
         assert req_meta.slot_mapping[0].numel() == 512
         assert tracker.sparse_slot_mapping[0].numel() == 512
+
+    def test_decode_window_sparse_load_uses_committed_boundary_before_window_end(
+        self,
+    ) -> None:
+        impl = _make_scheduler_impl()
+        impl._decode_window_save_window_size = 512
+
+        req_id = "sparse-window-short"
+        prompt_len = 356
+        prompt = list(range(prompt_len))
+        decode_tokens = [10_000, 10_001]
+        all_tokens = prompt + decode_tokens
+        vllm_req = SimpleNamespace(
+            request_id=req_id,
+            num_prompt_tokens=prompt_len,
+            prompt_token_ids=prompt,
+            num_computed_tokens=prompt_len + 1,
+            all_token_ids=all_tokens,
+        )
+
+        impl._unfinished_requests[req_id] = vllm_req
+        tracker = RequestTracker(
+            req_id=req_id,
+            prompt_len=prompt_len,
+            token_ids=all_tokens[:-1],
+            allocated_block_ids=list(range(40)),
+            num_saved_tokens=256,
+        )
+        tracker.is_decode_phase = True
+        tracker.sparse_token_ids = all_tokens[:256]
+        tracker.sparse_slot_mapping = [torch.arange(256)]
+        impl._request_trackers[req_id] = tracker
+
+        scheduler_output = StubSchedulerOutput(
+            finished_req_ids=set(),
+            scheduled_new_reqs=[],
+            scheduled_cached_reqs=StubCachedRequestData(
+                req_ids=[req_id],
+                new_token_ids=[[decode_tokens[-1]]],
+                new_block_ids=[[]],
+            ),
+            num_scheduled_tokens={req_id: 1},
+        )
+
+        meta = impl.build_connector_meta(scheduler_output)
+        req_meta = next(req for req in meta.requests if req.is_sparse_decode)
+
+        assert req_meta.load_spec is not None
+        assert req_meta.load_spec.can_load is True
+        assert req_meta.load_spec.lmcache_cached_tokens == 256
+        assert req_meta.token_ids == all_tokens[:256]
+        assert tracker.decode_window_save_committed_end == 256
+        assert tracker.decode_window_save_next_start == 256
+
+    def test_last_prefill_saves_partial_block_but_commits_block_boundary(
+        self,
+    ) -> None:
+        impl = _make_scheduler_impl()
+        impl._completed_decode_window_saves = {}
+
+        req_id = "prefill-partial"
+        prompt_len = 356
+        tracker = RequestTracker(
+            req_id=req_id,
+            prompt_len=prompt_len,
+            token_ids=list(range(prompt_len)),
+            allocated_block_ids=list(range(32)),
+            num_saved_tokens=256,
+        )
+
+        req_meta = ReqMeta.from_request_tracker(
+            tracker,
+            impl._block_size,
+            impl._lmcache_chunk_size,
+            discard_partial_chunks=False,
+        )
+
+        assert req_meta is not None
+        assert req_meta.is_last_prefill is True
+        assert req_meta.save_spec is not None
+        assert req_meta.save_spec.can_save is True
+        assert req_meta.token_ids == list(range(prompt_len))
+
+        impl._mark_lmcache_commit_completed(req_meta)
+
+        assert impl.get_completed_decode_window_saves() == {
+            req_id: prompt_len // impl._block_size * impl._block_size
+        }
+
+    def test_last_prefill_commit_marker_requires_latent_save(self) -> None:
+        impl = _make_scheduler_impl()
+        impl._completed_decode_window_saves = {}
+        req_meta = ReqMeta(
+            req_id="prefill-skip",
+            token_ids=list(range(356)),
+            slot_mapping=[torch.arange(356)],
+            is_last_prefill=True,
+            save_spec=SaveSpec(0, False, can_save_latent=False),
+        )
+
+        impl._mark_lmcache_commit_completed(req_meta)
+
+        assert impl.get_completed_decode_window_saves() == {}
 
 
 class TestZombieRequestInMetadata:

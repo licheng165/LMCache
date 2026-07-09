@@ -1309,6 +1309,14 @@ class LMCacheConnectorV1Impl:
                 "decode_window_save_window_size must be a multiple of "
                 f"lmcache chunk_size ({self._lmcache_chunk_size}), got {window_size}"
             )
+        assert self._lmcache_chunk_size % self._block_size == 0, (
+            "decode_window_save requires lmcache chunk_size to be block aligned: "
+            f"chunk_size={self._lmcache_chunk_size} block_size={self._block_size}"
+        )
+        assert window_size % self._block_size == 0, (
+            "decode_window_save_window_size must be block aligned: "
+            f"window_size={window_size} block_size={self._block_size}"
+        )
 
         logger.info(
             "Decode window save enabled: window_size=%d, lmcache_chunk_size=%d",
@@ -1975,16 +1983,38 @@ class LMCacheConnectorV1Impl:
             return
         self._release_request_lookup_pins(request.req_id)
 
-    def _mark_decode_window_save_completed(self, request: ReqMeta) -> None:
-        if not self._is_decode_window_save_request(request):
-            return
-        window_end = request.decode_window_end
-        if window_end is None:
+    def _completed_commit_boundary(self, request: ReqMeta) -> Optional[int]:
+        save_spec = request.save_spec
+        if save_spec is None or not save_spec.can_save_latent:
+            return None
+
+        if self._is_decode_window_save_request(request):
+            window_end = request.decode_window_end
+            if window_end is None:
+                return None
+            return int(window_end)
+
+        if not request.is_last_prefill or request.is_sparse_decode:
+            return None
+
+        token_len = len(request.token_ids)
+        return token_len // self._block_size * self._block_size
+
+    def _mark_lmcache_commit_completed(self, request: ReqMeta) -> None:
+        committed_end = self._completed_commit_boundary(request)
+        if committed_end is None:
             return
         completed = getattr(self, "_completed_decode_window_saves", None)
         if completed is None:
             return
-        completed[request.req_id] = max(completed.get(request.req_id, 0), window_end)
+        assert committed_end % self._block_size == 0, (
+            "DSA committed boundary must be block aligned: "
+            f"req={request.req_id} committed_end={committed_end} "
+            f"block_size={self._block_size}"
+        )
+        completed[request.req_id] = max(
+            completed.get(request.req_id, 0), committed_end
+        )
 
     def get_completed_decode_window_saves(self) -> dict[str, int]:
         completed = getattr(self, "_completed_decode_window_saves", None)
@@ -1998,11 +2028,16 @@ class LMCacheConnectorV1Impl:
         completed = getattr(connector_output, "completed_decode_window_saves", None)
         if not completed:
             return
-        for req_id, window_end in completed.items():
+        for req_id, boundary in completed.items():
             tracker = self._request_trackers.get(req_id)
             if tracker is None:
                 continue
-            committed_end = int(window_end)
+            committed_end = int(boundary)
+            assert committed_end % self._block_size == 0, (
+                "DSA committed boundary must be block aligned: "
+                f"req={req_id} committed_end={committed_end} "
+                f"block_size={self._block_size}"
+            )
             tracker.decode_window_save_committed_end = max(
                 tracker.decode_window_save_committed_end,
                 committed_end,
@@ -3151,7 +3186,7 @@ class LMCacheConnectorV1Impl:
             and getattr(self.config, "dsa_two_groups", False)
         )
         if not indexer_required:
-            self._mark_decode_window_save_completed(request)
+            self._mark_lmcache_commit_completed(request)
 
 
     @_lmcache_nvtx_annotate
@@ -3510,7 +3545,7 @@ class LMCacheConnectorV1Impl:
                     if layerwise_storer is not None:
                         self._drain_layerwise_storer_fully(layerwise_storer)
                 self._maybe_seed_worker_retrieve_state_from_store(request)
-                self._mark_decode_window_save_completed(request)
+                self._mark_lmcache_commit_completed(request)
                 self._maybe_lookup_unpin_for_request(request)
             return
 
@@ -3595,7 +3630,7 @@ class LMCacheConnectorV1Impl:
                 request_configs=request.request_configs,
                 req_id=request.req_id,
             )
-            self._mark_decode_window_save_completed(request)
+            self._mark_lmcache_commit_completed(request)
 
             # Update skip_leading_tokens only on last rank to ensure
             # each PP stage stores its own KV cache
@@ -3867,10 +3902,18 @@ class LMCacheConnectorV1Impl:
             * self._lmcache_chunk_size
         )
         start = max(prompt_chunk_start, saved_chunk_start)
+        assert start % self._block_size == 0, (
+            "DSA decode-window initial committed boundary must be block aligned: "
+            f"req={tracker.req_id} start={start} block_size={self._block_size}"
+        )
+        assert start <= len(tracker.token_ids), (
+            "DSA decode-window initial committed boundary exceeds token length: "
+            f"req={tracker.req_id} start={start} token_len={len(tracker.token_ids)}"
+        )
         tracker.decode_window_save_next_start = start
         tracker.decode_window_save_committed_end = max(
             tracker.decode_window_save_committed_end,
-            min(start, len(tracker.token_ids)),
+            start,
         )
         return start
 
@@ -3888,6 +3931,11 @@ class LMCacheConnectorV1Impl:
         while len(tracker.token_ids) >= next_start + window_size:
             window_start = next_start
             window_end = window_start + window_size
+            assert window_end % self._block_size == 0, (
+                "DSA decode-window committed boundary must be block aligned: "
+                f"req={tracker.req_id} window_end={window_end} "
+                f"block_size={self._block_size}"
+            )
             req_meta = ReqMeta.from_decode_window_save(
                 tracker,
                 self._block_size,
@@ -4153,17 +4201,20 @@ class LMCacheConnectorV1Impl:
                 lmcache_cached_for_sparse = request_tracker.prompt_len
                 if self._decode_window_save_window_size > 0:
                     token_len = len(request_tracker.token_ids)
-                    current_window_start = (
-                        (token_len - 1)
-                        // self._decode_window_save_window_size
-                        * self._decode_window_save_window_size
-                        if token_len > 0
-                        else 0
+                    lmcache_cached_for_sparse = (
+                        request_tracker.decode_window_save_committed_end
                     )
-                    lmcache_cached_for_sparse = min(
-                        request_tracker.decode_window_save_committed_end,
-                        current_window_start,
-                        token_len,
+                    assert lmcache_cached_for_sparse % self._block_size == 0, (
+                        "DSA sparse LMCache boundary must be block aligned: "
+                        f"req={request_tracker.req_id} "
+                        f"committed_end={lmcache_cached_for_sparse} "
+                        f"block_size={self._block_size}"
+                    )
+                    assert lmcache_cached_for_sparse <= token_len, (
+                        "DSA sparse LMCache boundary exceeds token length: "
+                        f"req={request_tracker.req_id} "
+                        f"committed_end={lmcache_cached_for_sparse} "
+                        f"token_len={token_len}"
                     )
                 load_spec = LoadSpec(
                     vllm_cached_tokens=0,
