@@ -1699,7 +1699,7 @@ class TestWorkerRetrieveState:
         with pytest.raises(RuntimeError, match="invalid DSA index"):
             impl._bind_worker_retrieve_state_to_request(request)
 
-    def test_bind_rejects_incomplete_strict_shared_index_state(self):
+    def test_bind_warm_shared_state_does_not_walk_index_metadata(self):
         impl = _make_impl()
         impl.num_layers = 2
         impl.config = SimpleNamespace(dsa_two_groups=True)
@@ -1733,8 +1733,7 @@ class TestWorkerRetrieveState:
             request_scope_token="req-1:3:3",
         )
 
-        with pytest.raises(RuntimeError, match="incomplete DSA index"):
-            impl._bind_worker_retrieve_state_to_request(request)
+        assert impl._bind_worker_retrieve_state_to_request(request) is not None
 
     def test_save_then_bind_round_trip(self):
         impl = _make_impl()
@@ -1843,6 +1842,53 @@ class TestWorkerRetrieveState:
         assert tracker.sparse_decode_token_mask is None
         assert req_meta.decode_ret_mask is not None
         assert req_meta.decode_ret_mask.numel() == 512
+
+    def test_sparse_decode_indexer_reuses_request_ret_mask(self):
+        req = make_sparse_req_meta("req-1", token_count=512)
+        req.decode_ret_mask = torch.zeros(512, dtype=torch.bool)
+        req.indexer_slot_mapping = [torch.arange(512, dtype=torch.long)]
+        impl, _, _ = make_worker_connector([req], use_layerwise=True)
+        impl.config.dsa_two_groups = True
+        impl.num_layers = 1
+        impl.kv_caches = {
+            "model.layers.0.self_attn.attn.k_cache": torch.zeros(1),
+            "model.layers.0.self_attn.indexer.k_cache": torch.zeros(1),
+        }
+        impl._refresh_kvcaches_list()
+        impl.layerwise_retrievers = []
+        impl._layerwise_retriever_is_sparse = []
+        impl._stats_monitor = SimpleNamespace(
+            update_interval_vllm_hit_tokens=lambda *_args: None,
+            update_interval_prompt_tokens=lambda *_args: None,
+        )
+
+        captured_kwargs = []
+
+        class _FakeSharedEngine:
+            enable_shared_cpu_cache = True
+            shared_cpu_cache_generation = 1
+            config = SimpleNamespace(
+                extra_config={"shared_cpu_materialize_index_on_decode_cold": True}
+            )
+
+            def retrieve_layer_head_token_wise(self, tokens, mask, **kwargs):
+                captured_kwargs.append(kwargs)
+
+                def _retriever():
+                    yield None
+                    yield torch.ones(len(tokens), dtype=torch.bool)
+
+                return _retriever()
+
+        impl.lmcache_engine = _FakeSharedEngine()
+
+        impl.start_load_kv(SimpleNamespace(attn_metadata=SimpleNamespace()))
+
+        assert len(captured_kwargs) == 2
+        assert captured_kwargs[0]["kv_group"] == 0
+        assert captured_kwargs[1]["kv_group"] == 1
+        assert captured_kwargs[0]["ret_mask"] is req.decode_ret_mask
+        assert captured_kwargs[1]["ret_mask"] is req.decode_ret_mask
 
     def test_store_seed_merges_chunked_prefill_hot_cache(self):
         impl = _make_impl()
@@ -2758,6 +2804,27 @@ class TestWorkerRetrieveState:
         req.token_ids = [0] * 18880
 
         assert not impl._should_invalidate_worker_retrieve_state(req, 18879)
+
+    def test_sparse_decode_invalidation_does_not_walk_index_metadata(self):
+        impl = _make_impl()
+        impl.lmcache_engine = SimpleNamespace(shared_cpu_cache_generation=5)
+        impl._worker_retrieve_state["req-1"] = WorkerRetrieveState(
+            cached_keys=[["k"]],
+            cached_starts=[0],
+            cached_ends=[512],
+            cached_starts_indexer=[256],
+            cached_ends_indexer=[512],
+            metadata_warm=True,
+            token_count=512,
+            shared_request_active=True,
+            shared_index_status="present",
+            request_scope_token="req-1:5:512",
+        )
+        req = _make_request()
+        req.token_ids = [0] * 512
+        req.load_spec.lmcache_cached_tokens = 512
+
+        assert not impl._should_invalidate_worker_retrieve_state(req, 512)
 
     def test_passive_shared_metadata_warm_skips_storage_probe(self):
         ensure_metadata = MagicMock(side_effect=AssertionError("should not probe"))

@@ -1973,12 +1973,8 @@ class LMCacheConnectorV1Impl:
             request.req_id,
             len(state.cached_starts or []),
             len(state.cached_ends or []),
-            len(state.cached_starts_indexer or []),
-            len(state.cached_ends_indexer or []),
             id(state.cached_memory_objs),
             id(state.cached_chunk_ptrs_npu),
-            id(state.cached_memory_objs_indexer),
-            id(state.cached_chunk_ptrs_npu_indexer),
         )
 
     @staticmethod
@@ -2123,61 +2119,9 @@ class LMCacheConnectorV1Impl:
                 f"req_id={request.req_id}, "
                 f"missing_layers={missing_latent_pointer_layers}"
             )
-        if self._is_dsa_two_groups():
-            if state.shared_index_status == "present":
-                required_index_chunks = max(
-                    required_latent_chunks,
-                    self._shared_required_chunk_count(
-                        state.cached_starts_indexer,
-                        state.cached_ends_indexer,
-                        state.cached_memory_objs_indexer,
-                    ),
-                )
-                missing_index_layers = self._missing_shared_layer_cache_coverage(
-                    state.cached_memory_objs_indexer,
-                    expected_layers,
-                    required_index_chunks,
-                )
-                if missing_index_layers:
-                    raise RuntimeError(
-                        "Shared CPU sparse decode hot path has incomplete "
-                        "DSA index state before transfer: "
-                        f"req_id={request.req_id}, kv_group=1, "
-                        f"missing_layers={missing_index_layers}"
-                    )
-                if not self._cached_ranges_cover_prefix(
-                    state.cached_starts_indexer,
-                    state.cached_ends_indexer,
-                    retrieve_token_count,
-                ):
-                    cached_ranges = list(
-                        zip(
-                            state.cached_starts_indexer,
-                            state.cached_ends_indexer,
-                            strict=False,
-                        )
-                    )
-                    raise RuntimeError(
-                        "Shared CPU sparse decode hot path has non-contiguous "
-                        "DSA index prefix coverage before transfer: "
-                        f"req_id={request.req_id}, kv_group=1, "
-                        f"token_count={retrieve_token_count}, "
-                        f"cached_ranges={cached_ranges}"
-                    )
-                missing_index_pointer_layers = (
-                    self._missing_shared_pointer_cache_layers(
-                        state.cached_memory_objs_indexer,
-                        state.cached_chunk_ptrs_npu_indexer,
-                        required_index_chunks,
-                    )
-                )
-                if missing_index_pointer_layers:
-                    raise RuntimeError(
-                        "Shared CPU sparse decode hot path is missing DSA "
-                        "index NPU pointer-cache tensors before transfer: "
-                        f"req_id={request.req_id}, "
-                        f"missing_layers={missing_index_pointer_layers}"
-                    )
+        # DSA index is cold-materialized and admitted into the live request
+        # state before warm sparse decode reuse. Warm decode retrieves only MLA
+        # latent rows, so avoid walking index metadata or pointer caches here.
         state.shared_validation_signature = validation_signature
 
     def _shared_worker_retrieve_state_is_current(
@@ -3737,12 +3681,6 @@ class LMCacheConnectorV1Impl:
             if state.cached_starts and state.cached_starts[0] != 0:
                 return True
             if (
-                state.shared_index_status == "present"
-                and state.cached_starts_indexer
-                and state.cached_starts_indexer[0] != 0
-            ):
-                return True
-            if (
                 request.load_spec is not None
                 and request.load_spec.lmcache_cached_tokens > state.token_count
             ):
@@ -4735,6 +4673,8 @@ class LMCacheConnectorV1Impl:
                                     request, token_count, bound_state
                                 )
                             )
+                            if request.decode_ret_mask is not None:
+                                indexer_kwargs["ret_mask"] = request.decode_ret_mask
                             indexer_retriever = (
                                 self.lmcache_engine.retrieve_layer_head_token_wise(
                                     retrieve_tokens,
