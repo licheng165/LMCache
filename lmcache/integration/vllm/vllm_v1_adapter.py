@@ -3565,6 +3565,11 @@ class LMCacheConnectorV1Impl:
     def _request_has_retrieve_tensor_cache(self, request: ReqMeta) -> bool:
         num_layers = self._num_layers_for_group(0)
         tensors = request.cached_tensors
+        if num_layers <= 0:
+            if tensors and any(tensors):
+                return True
+            mem = request.cached_memory_objs
+            return bool(mem and any(mem))
         if tensors and len(tensors) == num_layers and any(tensors):
             return True
         mem = request.cached_memory_objs
