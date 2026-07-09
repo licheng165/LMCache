@@ -1879,6 +1879,31 @@ class LMCacheConnectorV1Impl:
         return kv_role == "kv_consumer"
 
     @staticmethod
+    def _shared_sparse_decode_indexer_is_resident(
+        request: "ReqMeta",
+        bound_state: Optional[WorkerRetrieveState],
+        token_count: int,
+    ) -> bool:
+        """Return true when the live request already has DSA index in vLLM.
+
+        Shared CPU decode must cold-materialize the DSA index once because a
+        prefix hit may skip prefill. After that, the same live request keeps
+        the indexer KV resident in vLLM; reloading it from LMCache on every
+        decode token is redundant. Decode-save growth resets/extends the
+        request state, so the next larger prefix still materializes once.
+        """
+        if bound_state is None or not bound_state.shared_request_active:
+            return False
+        if bound_state.shared_index_status != "present":
+            return False
+        if request.load_spec is None:
+            return False
+        return (
+            int(request.load_spec.lmcache_cached_tokens) <= int(bound_state.token_count)
+            and int(token_count) <= int(bound_state.token_count)
+        )
+
+    @staticmethod
     def _mark_shared_index_skipped(
         state: Optional[WorkerRetrieveState],
         req_id: str,
@@ -2152,6 +2177,42 @@ class LMCacheConnectorV1Impl:
                         f"missing_layers={missing_index_pointer_layers}"
                     )
         state.shared_validation_signature = validation_signature
+
+    def _shared_worker_retrieve_state_is_current(
+        self,
+        state: WorkerRetrieveState,
+        request: ReqMeta,
+        token_count: int,
+    ) -> bool:
+        if not state.shared_request_active or state.shared_validation_signature is None:
+            return False
+        if request.load_spec is not None and (
+            int(request.load_spec.lmcache_cached_tokens) > int(state.token_count)
+        ):
+            return False
+        if int(token_count) > int(state.token_count):
+            return False
+
+        engine = getattr(self, "lmcache_engine", None)
+        current_generation = int(
+            getattr(engine, "shared_cpu_cache_generation", 0) or 0
+        )
+        pointer_generation = int(
+            getattr(state, "pointer_cache_generation", 0)
+            or int(state.shared_generation or 0)
+        )
+        materialize_index = (
+            self._is_dsa_two_groups()
+            and self._sparse_decode_requires_index_materialization(request, True)
+        )
+        validation_signature = self._shared_worker_validation_signature(
+            state,
+            request,
+            current_generation=current_generation,
+            pointer_generation=pointer_generation,
+            materialize_index=materialize_index,
+        )
+        return state.shared_validation_signature == validation_signature
 
     @staticmethod
     def _save_storer_key(req_id: str, kv_group: int) -> Union[str, tuple[str, int]]:
@@ -3998,6 +4059,15 @@ class LMCacheConnectorV1Impl:
             token_count = len(request.token_ids)
             if request.load_spec is not None:
                 token_count = int(request.load_spec.lmcache_cached_tokens)
+            if (
+                existing is not None
+                and self._shared_worker_retrieve_state_is_current(
+                    existing,
+                    request,
+                    token_count,
+                )
+            ):
+                continue
             self._save_worker_retrieve_state_from_request(
                 request,
                 location=location,
@@ -4331,6 +4401,22 @@ class LMCacheConnectorV1Impl:
                             and not materialize_index
                         ):
                             indexer_skipped = True
+                        elif (
+                            shared_cpu_enabled
+                            and materialize_index
+                            and self._shared_sparse_decode_indexer_is_resident(
+                                request,
+                                bound_state,
+                                token_count,
+                            )
+                        ):
+                            logger.debug(
+                                "Skipping shared CPU DSA index retrieve for "
+                                "resident live sparse decode state: req_id=%s "
+                                "token_count=%d",
+                                request.req_id,
+                                token_count,
+                            )
                         elif not materialize_index:
                             indexer_skipped = True
                         elif not indexer_kvcaches:

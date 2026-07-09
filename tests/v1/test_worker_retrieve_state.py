@@ -1342,6 +1342,49 @@ class TestWorkerRetrieveState:
         assert torch.equal(target_payload, target_slot_mapping[0])
         assert impl.current_layer == 1
 
+    def test_sparse_decode_resident_indexer_wait_is_noop(self):
+        req = make_sparse_req_meta("req-1", token_count=4)
+        impl, _, _ = make_worker_connector([req], use_layerwise=True)
+        impl.config.dsa_two_groups = True
+        impl._indexer_layer_names = ["model.layers.0.self_attn.indexer.k_cache"]
+        impl.current_layer = 0
+        impl.num_layers = 2
+        impl._layerwise_retriever_is_sparse = [True]
+        impl._layerwise_sparse_req_ids = ["req-1"]
+        impl._layerwise_sparse_indexer_sent_layers = set()
+
+        captured = []
+
+        def _retriever():
+            payload = yield None
+            captured.append(payload)
+            yield torch.ones(4, dtype=torch.bool)
+
+        latent = _retriever()
+        next(latent)
+        impl.layerwise_retrievers = [(latent, None)]
+
+        impl.wait_for_layer_load("model.layers.0.self_attn.indexer.k_cache")
+
+        assert captured == []
+        assert impl.current_layer == 0
+
+        selected_tokens = torch.tensor([[10, 11, 12, 13]], dtype=torch.int32)
+        target_slot_mapping = torch.tensor([[900, 901, 902, 903]], dtype=torch.long)
+        impl.wait_for_layer_load(
+            "model.layers.0.self_attn.attn",
+            selected_tokens=selected_tokens,
+            token_start_index=[0],
+            request_ids=["req-1"],
+            target_slot_mapping=target_slot_mapping,
+        )
+
+        selected_payload, token_start, target_payload = captured[0]
+        assert token_start is None
+        assert torch.equal(selected_payload, selected_tokens[0])
+        assert torch.equal(target_payload, target_slot_mapping[0])
+        assert impl.current_layer == 1
+
     def test_dense_prefix_two_group_wait_advances_after_both_groups(self):
         req = ReqMeta(
             req_id="req-1",
@@ -2018,6 +2061,90 @@ class TestWorkerRetrieveState:
         assert state.cached_ends == [256]
         assert state.cached_ends_indexer == [256]
         assert state.token_count == 256
+
+    def test_shared_indexer_resident_only_when_present_and_covered(self):
+        request = _make_request()
+        request.load_spec.lmcache_cached_tokens = 512
+        state = WorkerRetrieveState(
+            token_count=512,
+            shared_request_active=True,
+            shared_index_status="present",
+        )
+
+        assert LMCacheConnectorV1Impl._shared_sparse_decode_indexer_is_resident(
+            request,
+            state,
+            512,
+        )
+
+        request.load_spec.lmcache_cached_tokens = 768
+        assert not LMCacheConnectorV1Impl._shared_sparse_decode_indexer_is_resident(
+            request,
+            state,
+            768,
+        )
+
+        request.load_spec.lmcache_cached_tokens = 512
+        state.shared_index_status = "missing"
+        assert not LMCacheConnectorV1Impl._shared_sparse_decode_indexer_is_resident(
+            request,
+            state,
+            512,
+        )
+
+    def test_current_shared_state_skip_requires_validation_signature(self):
+        impl = _make_impl()
+        impl.config = SimpleNamespace(dsa_two_groups=True)
+        impl.num_layers = 1
+        impl.kv_role = "kv_both"
+        impl.lmcache_engine = SimpleNamespace(
+            enable_shared_cpu_cache=True,
+            shared_cpu_cache_generation=5,
+            config=SimpleNamespace(
+                extra_config={"shared_cpu_materialize_index_on_decode_cold": True}
+            ),
+        )
+        request = _make_request()
+        request.load_spec.lmcache_cached_tokens = 512
+        state = WorkerRetrieveState(
+            req_id="req-1",
+            cached_starts=[0, 256],
+            cached_ends=[256, 512],
+            cached_memory_objs=[["m0", "m1"]],
+            cached_chunk_ptrs_npu=[torch.tensor([111, 222], dtype=torch.long)],
+            cached_starts_indexer=[0, 256],
+            cached_ends_indexer=[256, 512],
+            cached_memory_objs_indexer=[["im0", "im1"]],
+            cached_chunk_ptrs_npu_indexer=[
+                torch.tensor([333, 444], dtype=torch.long)
+            ],
+            token_count=512,
+            shared_latent_status="present",
+            shared_index_status="present",
+            shared_generation=5,
+            pointer_cache_generation=5,
+            shared_request_active=True,
+            request_scope_token="req-1:5:512",
+        )
+
+        assert not impl._shared_worker_retrieve_state_is_current(
+            state,
+            request,
+            512,
+        )
+        impl._validate_shared_worker_retrieve_state(state, request)
+        assert impl._shared_worker_retrieve_state_is_current(
+            state,
+            request,
+            512,
+        )
+
+        request.load_spec.lmcache_cached_tokens = 768
+        assert not impl._shared_worker_retrieve_state_is_current(
+            state,
+            request,
+            768,
+        )
 
     def test_bind_shared_hot_state_rejects_short_pointer_tensor(self):
         impl = _make_impl()
