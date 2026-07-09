@@ -605,6 +605,14 @@ class StorageManager:
         ):
             local_backend = self.storage_backends["LocalCPUBackend"]
             if local_backend.contains(keys[0][0]):
+                logger.info(
+                    "Layerwise batched get redirected to LocalCPUBackend "
+                    "because first key exists in local CPU: "
+                    "requested_location=%s, layers=%s, chunks=%s",
+                    location,
+                    len(keys),
+                    len(keys[0]),
+                )
                 location = "LocalCPUBackend"
         backend = self.storage_backends[location]
         use_blocking = self._layerwise_get_prefers_blocking(location, backend)

@@ -1012,6 +1012,22 @@ class LMCacheEngine:
                     location = current_location
                 else:
                     # TODO(Jiayi): Support multi-location retrieval in the future
+                    if location != current_location:
+                        logger.error(
+                            "Layerwise retrieve encountered multiple locations "
+                            "before assertion: req_id=%s, kv_group=%s, "
+                            "retrieved_tokens_before_current_chunk=%s, "
+                            "current_chunk=[%s, %s), first=%s, current=%s, "
+                            "retrieve_locations=%s",
+                            req_id,
+                            kv_group,
+                            ends[-1] if ends else 0,
+                            start,
+                            end,
+                            location,
+                            current_location,
+                            self.retrieve_locations,
+                        )
                     assert location == current_location, (
                         "All retrieved keys should be from the same location "
                         "when use layerwise retrieval."
@@ -1151,6 +1167,7 @@ class LMCacheEngine:
 
             # TODO: support batched_contains when layerwise is enabled
             if self.use_layerwise:
+                layerwise_location = None
                 for start, end, key in chunk_info_iterator:
                     assert isinstance(key, CacheEngineKey)
 
@@ -1166,11 +1183,30 @@ class LMCacheEngine:
                     # Only all layers are hit and hit in one location,
                     # we consider this key as a hit
                     if hit_chunks == self.num_layers and len(block_mapping) == 1:
+                        location = next(iter(block_mapping.keys()))
+                        if layerwise_location is None:
+                            layerwise_location = location
+                        elif layerwise_location != location:
+                            logger.warning(
+                                "Layerwise lookup observed that matched "
+                                "chunks span multiple locations: lookup_id=%s, "
+                                "tokens_before_current_chunk=%s, "
+                                "current_chunk=[%s, %s), first=%s, current=%s, "
+                                "search_range=%s, pin=%s. Keeping original "
+                                "lookup behavior for diagnosis.",
+                                lookup_id,
+                                res,
+                                start,
+                                end,
+                                layerwise_location,
+                                location,
+                                search_range,
+                                pin,
+                            )
                         if pin:
                             assert lookup_id is not None, (
                                 "lookup_id is required when pin is True"
                             )
-                            location = next(iter(block_mapping.keys()))
                             self.lookup_pins[lookup_id][location].extend(key_all_layers)
                         res = end
                         continue
