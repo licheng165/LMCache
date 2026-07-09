@@ -4077,6 +4077,27 @@ class LMCacheConnectorV1Impl:
         if not self._request_has_retrieve_tensor_cache(request):
             return
 
+        if (
+            self._is_decode_window_save_request(request)
+            and self._decode_window_save_uses_shared_cpu()
+        ):
+            # Rank0 is the only worker that owns newly saved shared CPU backing
+            # objects during decode-window save. If it privately merges those
+            # chunks into its hot sparse state, the next decode step can diverge:
+            # rank0 takes the cached path while passive ranks wait for a fresh
+            # broadcast. Leave all ranks on the old scope; the next sparse load
+            # invalidates it and refreshes shared handles once, in ordered TP
+            # collective flow.
+            logger.debug(
+                "Skipping shared CPU decode-window worker-state merge so the "
+                "next sparse load refreshes handles on every TP rank: req_id=%s "
+                "window=[%s,%s)",
+                request.req_id,
+                getattr(request, "decode_window_start", None),
+                getattr(request, "decode_window_end", None),
+            )
+            return
+
         location = self._resolve_store_retrieve_location(request)
         existing_state = self._worker_retrieve_state.get(request.req_id)
         if existing_state is not None and (
