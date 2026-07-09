@@ -3070,6 +3070,9 @@ class LMCacheConnectorV1Impl:
             self._is_dsa_two_groups()
             and self._sparse_decode_requires_index_materialization(request, True)
         ):
+            expected_index_layers = int(getattr(self, "num_layers", 0) or 0)
+            if expected_index_layers <= 0:
+                expected_index_layers = len(state.cached_memory_objs_indexer or [])
             required_index_chunks = max(
                 required_latent_chunks,
                 self._shared_required_chunk_count(
@@ -3080,7 +3083,7 @@ class LMCacheConnectorV1Impl:
             )
             missing_index_layers = self._missing_shared_layer_cache_coverage(
                 state.cached_memory_objs_indexer,
-                int(getattr(self, "num_layers", 0) or 0),
+                expected_index_layers,
                 required_index_chunks,
             )
             if missing_index_layers:
