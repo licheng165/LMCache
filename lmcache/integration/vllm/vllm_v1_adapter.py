@@ -886,6 +886,18 @@ class ReqMeta:
             operations, None otherwise.
         """
         input_token_ids = tracker.token_ids
+        if (
+            is_sparse_decode
+            and load_spec is not None
+            and tracker.sparse_token_ids
+        ):
+            sparse_token_count = (
+                load_spec.lmcache_cached_tokens
+                if load_spec.can_load
+                else len(tracker.sparse_token_ids)
+            )
+            if len(tracker.sparse_token_ids) >= sparse_token_count:
+                input_token_ids = tracker.sparse_token_ids[:sparse_token_count]
         input_token_len = len(input_token_ids)
 
         is_last_prefill = False
@@ -1725,14 +1737,13 @@ class LMCacheConnectorV1Impl:
 
     def _kvcaches_for_group(self, kv_group: int) -> list[torch.Tensor]:
         """Return the per-group kv_caches list for the connector."""
-        if not hasattr(self, "_latent_kvcaches") or not hasattr(
-            self, "_indexer_kvcaches"
-        ):
+        if not hasattr(self, "_latent_kvcaches"):
             if hasattr(self, "kv_caches"):
                 self._refresh_kvcaches_list()
             else:
                 self._latent_kvcaches = list(getattr(self, "_kvcaches_list", []))
-                self._indexer_kvcaches = []
+        if not hasattr(self, "_indexer_kvcaches"):
+            self._indexer_kvcaches = []
         if kv_group == 1 and getattr(
             getattr(self, "config", None), "dsa_two_groups", False
         ):
@@ -2055,28 +2066,6 @@ class LMCacheConnectorV1Impl:
                 f"token_count={retrieve_token_count}, "
                 f"cached_ranges={cached_ranges}"
             )
-        if state.shared_index_status == "present" and not (
-            self._cached_ranges_cover_prefix(
-                state.cached_starts_indexer,
-                state.cached_ends_indexer,
-                retrieve_token_count,
-            )
-        ):
-            cached_ranges = list(
-                zip(
-                    state.cached_starts_indexer,
-                    state.cached_ends_indexer,
-                    strict=False,
-                )
-            )
-            raise RuntimeError(
-                "Shared CPU sparse decode hot path has non-contiguous DSA "
-                "index prefix coverage before transfer: "
-                f"req_id={request.req_id}, kv_group=1, "
-                f"token_count={retrieve_token_count}, "
-                f"cached_ranges={cached_ranges}"
-            )
-
         expected_layers = int(getattr(self, "num_layers", 0) or 0)
         required_latent_chunks = self._shared_required_chunk_count(
             state.cached_starts,
@@ -2128,6 +2117,25 @@ class LMCacheConnectorV1Impl:
                         "DSA index state before transfer: "
                         f"req_id={request.req_id}, kv_group=1, "
                         f"missing_layers={missing_index_layers}"
+                    )
+                if not self._cached_ranges_cover_prefix(
+                    state.cached_starts_indexer,
+                    state.cached_ends_indexer,
+                    retrieve_token_count,
+                ):
+                    cached_ranges = list(
+                        zip(
+                            state.cached_starts_indexer,
+                            state.cached_ends_indexer,
+                            strict=False,
+                        )
+                    )
+                    raise RuntimeError(
+                        "Shared CPU sparse decode hot path has non-contiguous "
+                        "DSA index prefix coverage before transfer: "
+                        f"req_id={request.req_id}, kv_group=1, "
+                        f"token_count={retrieve_token_count}, "
+                        f"cached_ranges={cached_ranges}"
                     )
                 missing_index_pointer_layers = (
                     self._missing_shared_pointer_cache_layers(
@@ -5013,16 +5021,22 @@ class LMCacheConnectorV1Impl:
     ) -> None:
         """Run a full latent store_layer after indexer layers finish (TP>1)."""
         pending_key = self._layerwise_save_storer_key(request, 0)
-        if pending_key not in self._deferred_latent_pending:
+        legacy_pending_key = request.req_id
+        if (
+            pending_key not in self._deferred_latent_pending
+            and legacy_pending_key not in self._deferred_latent_pending
+        ):
             return
         if save_spec is None or not save_spec.can_save_latent:
             self._deferred_latent_pending.discard(pending_key)
+            self._deferred_latent_pending.discard(legacy_pending_key)
             return
 
         self._refresh_kvcaches_list()
         kvcaches = self._kvcaches_for_group(0)
         if not kvcaches:
             self._deferred_latent_pending.discard(pending_key)
+            self._deferred_latent_pending.discard(legacy_pending_key)
             return
 
         token_ids = request.token_ids
@@ -5048,6 +5062,7 @@ class LMCacheConnectorV1Impl:
             skip_leading_tokens = save_spec.skip_leading_tokens
             if skip_leading_tokens == len(token_ids):
                 self._deferred_latent_pending.discard(pending_key)
+                self._deferred_latent_pending.discard(legacy_pending_key)
                 return
             skip_leading_tokens = (
                 skip_leading_tokens
@@ -5092,6 +5107,7 @@ class LMCacheConnectorV1Impl:
         self._close_layerwise_storer(storer)
         self._record_decode_window_save_group_started(request, 0)
         self._deferred_latent_pending.discard(pending_key)
+        self._deferred_latent_pending.discard(legacy_pending_key)
         indexer_required = (
             self._is_decode_window_save_request(request)
             and getattr(save_spec, "can_save_indexer", False)

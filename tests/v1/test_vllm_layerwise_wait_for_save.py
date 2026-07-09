@@ -256,7 +256,9 @@ def test_decode_window_save_storer_is_scoped_by_kv_group() -> None:
     assert len(engine.store_calls) == 2
     assert [kwargs.get("kv_group", 0) for kwargs in engine.store_kwargs] == [0, 1]
     assert engine.store_kwargs[1]["slot_mapping"].tolist() == [4, 5, 6, 7]
-    assert len(connector._layerwise_save_storers) == 2
+    assert set(connector._layerwise_save_storers) == {
+        ("req-window", "decode_window_save", 0, 256, 512)
+    }
 
     connector.wait_for_save()
     assert connector._layerwise_save_storers == {}
@@ -443,7 +445,9 @@ def test_request_finished_closes_abandoned_layerwise_storer() -> None:
         finally:
             closed.append(True)
 
-    connector._layerwise_save_storers["req-1"] = _abandoned_storer()
+    storer = _abandoned_storer()
+    next(storer)
+    connector._layerwise_save_storers["req-1"] = storer
     connector.async_loading = False
     connector._request_trackers = {}
     connector.config = SimpleNamespace(
