@@ -2562,6 +2562,10 @@ class LMCacheConnectorV1Impl:
     def _mark_decode_window_save_completed(self, request: ReqMeta) -> None:
         if not self._is_decode_window_save_request(request):
             return
+        engine = self.lmcache_engine
+        is_passive = getattr(engine, "_is_passive", None)
+        if callable(is_passive) and is_passive():
+            return
         window_end = request.decode_window_end
         if window_end is None:
             return
@@ -4792,6 +4796,7 @@ class LMCacheConnectorV1Impl:
             if indexer_group_last:
                 self._drain_layerwise_storer_fully(layerwise_storer)
                 self._layerwise_save_storers.pop(storer_key, None)
+                self._close_layerwise_storer(layerwise_storer)
                 layerwise_storer = None
 
             if (
