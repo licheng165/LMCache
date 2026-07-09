@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # Standard
+from collections import defaultdict
 from copy import deepcopy
+from typing import Any, Iterator, Optional
 import os
 import random
 import shlex
@@ -14,10 +16,11 @@ import torch
 
 # First Party
 from lmcache.utils import (
+    CacheEngineKey,
     mock_up_broadcast_fn,
     mock_up_broadcast_object_fn,
 )
-from lmcache.v1.cache_engine import LMCacheEngineBuilder
+from lmcache.v1.cache_engine import LMCacheEngine, LMCacheEngineBuilder
 from lmcache.v1.config import LMCacheEngineConfig
 from lmcache.v1.event_manager import EventStatus, EventType
 
@@ -49,6 +52,94 @@ def get_expected_count(token_len, save_unfull_chunk, chunk_size):
     if save_unfull_chunk:
         return token_len
     return (token_len // chunk_size) * chunk_size
+
+
+class _FakeLookupStatsMonitor:
+    def __init__(self) -> None:
+        self.finished_result = None
+
+    def on_lookup_request(self, token_count: int) -> int:
+        return token_count
+
+    def on_lookup_finished(self, lookup_stats: int, result: int) -> None:
+        self.finished_result = result
+
+
+class _FakeTokenDatabase:
+    def __init__(self, chunks: list[tuple[int, int, CacheEngineKey]]) -> None:
+        self.chunks = chunks
+
+    def process_tokens(
+        self,
+        tokens: Optional[list[int]] = None,
+        hashes: Optional[list[int]] = None,
+        offsets: Optional[list[int]] = None,
+        request_configs: Optional[dict[str, Any]] = None,
+        kv_group: int = 0,
+    ) -> Iterator[tuple[int, int, CacheEngineKey]]:
+        return iter(self.chunks)
+
+
+class _FakeStorageManager:
+    def __init__(self, locations: list[str]) -> None:
+        self.locations = iter(locations)
+        self.unpinned = []
+        self.touched = False
+
+    def batched_contains(
+        self,
+        keys: list[Any],
+        search_range: Optional[list[str]] = None,
+        pin: bool = False,
+    ) -> tuple[int, dict[str, list[Any]]]:
+        location = next(self.locations)
+        return len(keys), {location: keys}
+
+    def batched_unpin(
+        self,
+        keys: list[Any],
+        locations: Optional[list[str]] = None,
+    ) -> None:
+        self.unpinned.append((keys, locations))
+
+    def touch_cache(self) -> None:
+        self.touched = True
+
+
+def test_layerwise_lookup_truncates_cross_location_prefix() -> None:
+    num_layers = 2
+    key_0 = CacheEngineKey("model", 1, 0, 0, torch.bfloat16)
+    key_1 = CacheEngineKey("model", 1, 0, 1, torch.bfloat16)
+    storage_manager = _FakeStorageManager(["LocalCPUBackend", "RemoteBackend"])
+    stats_monitor = _FakeLookupStatsMonitor()
+
+    def healthy() -> bool:
+        return True
+
+    engine = LMCacheEngine.__new__(LMCacheEngine)
+    engine.is_healthy = healthy
+    engine.lookup_pins = defaultdict(lambda: defaultdict(list))
+    engine.num_layers = num_layers
+    engine.retrieve_locations = None
+    engine.stats_monitor = stats_monitor
+    engine.storage_manager = storage_manager
+    engine.token_database = _FakeTokenDatabase(
+        [(0, 768, key_0), (768, 843, key_1)]
+    )
+    engine.use_layerwise = True
+
+    result = engine.lookup(tokens=[0] * 843, lookup_id="req", pin=True)
+
+    assert result == 768
+    assert stats_monitor.finished_result == 768
+    assert storage_manager.touched
+    assert list(engine.lookup_pins["req"].keys()) == ["LocalCPUBackend"]
+    assert engine.lookup_pins["req"]["LocalCPUBackend"] == key_0.split_layers(
+        num_layers
+    )
+    assert storage_manager.unpinned == [
+        (key_1.split_layers(num_layers), ["RemoteBackend"])
+    ]
 
 
 @pytest.mark.parametrize("save_unfull_chunk", [False, True])

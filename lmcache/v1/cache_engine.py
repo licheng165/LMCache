@@ -1187,13 +1187,15 @@ class LMCacheEngine:
                         if layerwise_location is None:
                             layerwise_location = location
                         elif layerwise_location != location:
+                            if pin:
+                                self.storage_manager.batched_unpin(
+                                    key_all_layers, [location]
+                                )
                             logger.warning(
-                                "Layerwise lookup observed that matched "
+                                "Layerwise lookup stopped because matched "
                                 "chunks span multiple locations: lookup_id=%s, "
-                                "tokens_before_current_chunk=%s, "
-                                "current_chunk=[%s, %s), first=%s, current=%s, "
-                                "search_range=%s, pin=%s. Keeping original "
-                                "lookup behavior for diagnosis.",
+                                "return_tokens=%s, current_chunk=[%s, %s), "
+                                "first=%s, current=%s, search_range=%s, pin=%s",
                                 lookup_id,
                                 res,
                                 start,
@@ -1203,6 +1205,7 @@ class LMCacheEngine:
                                 search_range,
                                 pin,
                             )
+                            return res
                         if pin:
                             assert lookup_id is not None, (
                                 "lookup_id is required when pin is True"
