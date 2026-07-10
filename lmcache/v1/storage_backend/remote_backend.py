@@ -45,6 +45,13 @@ def _pd_diag_key(key: CacheEngineKey) -> str:
         return str(key)
 
 
+def _put_diag_limit(keys: Sequence[CacheEngineKey]) -> Optional[int]:
+    if not keys:
+        return 4
+    layer_id = getattr(keys[0], "layer_id", None)
+    return None if layer_id in (None, 0) else 4
+
+
 class RemoteBackend(StorageBackendInterface):
     def __init__(
         self,
@@ -287,14 +294,32 @@ class RemoteBackend(StorageBackendInterface):
         with self.lock:
             return key in self.put_tasks
 
-    def put_callback(self, future: Future, key: CacheEngineKey):
+    def put_callback(
+        self,
+        future: Future,
+        key: CacheEngineKey,
+        submit_time: Optional[float] = None,
+    ) -> None:
         with self.lock:
             self.put_tasks.discard(key)
+        elapsed_ms = (
+            (time.perf_counter() - submit_time) * 1000
+            if submit_time is not None
+            else None
+        )
         try:
             future.result()
         except Exception as e:
             self._put_failed_count += 1
             logger.error(f"Put task failed for key {key}: {e}")
+            record_key_event(
+                "remote_put_error",
+                key,
+                elapsed_ms=elapsed_ms,
+                error=f"{type(e).__name__}:{e}",
+            )
+            return
+        record_key_event("remote_put_done", key, elapsed_ms=elapsed_ms)
 
     def submit_put_task(
         self,
@@ -316,13 +341,16 @@ class RemoteBackend(StorageBackendInterface):
 
         if self.connection is None:
             logger.warning("Connection is None in submit_put_task, returning None")
+            record_key_event("remote_put_connection_none", key)
             return create_immediate_empty_future()
 
         # If MLA worker id as 0 mode is enabled, skip put tasks
         if self._mla_worker_id_as0_mode:
+            record_key_event("remote_put_skip_mla_worker_id_as0", key)
             return create_immediate_empty_future()
 
         if self.exists_in_put_tasks(key):
+            record_key_event("remote_put_skip_duplicate", key)
             return create_immediate_empty_future()
 
         memory_obj.ref_count_up()
@@ -330,11 +358,17 @@ class RemoteBackend(StorageBackendInterface):
         with self.lock:
             self.put_tasks.add(key)
 
+        record_key_event(
+            "remote_put_serialize_begin",
+            key,
+            memory_obj_type=type(memory_obj).__name__,
+        )
         compressed_memory_obj = self.serializer.serialize(memory_obj)
         memory_obj.ref_count_down()
+        record_key_event("remote_put_submit", key)
 
         def put_done_callback(f: Future) -> None:
-            self.put_callback(f, key)
+            self.put_callback(f, key, submit_time)
             if on_complete_callback is not None:
                 try:
                     on_complete_callback(key)
@@ -343,18 +377,52 @@ class RemoteBackend(StorageBackendInterface):
 
         # NOTE: No need to do error handling here
         # since the `future` is never waited
+        submit_time = time.perf_counter()
         future = asyncio.run_coroutine_threadsafe(
             self.connection.put(key, compressed_memory_obj), self.loop
         )
         future.add_done_callback(put_done_callback)
         return future
 
-    def batched_put_callback(self, future: Future, keys: List[CacheEngineKey]):
+    def batched_put_callback(
+        self,
+        future: Future,
+        keys: List[CacheEngineKey],
+        submit_time: Optional[float] = None,
+    ) -> None:
         """
         Callback function for batched put tasks.
         """
         with self.lock:
             self.put_tasks.difference_update(keys)
+        elapsed_ms = (
+            (time.perf_counter() - submit_time) * 1000
+            if submit_time is not None
+            else None
+        )
+        limit = _put_diag_limit(keys)
+        try:
+            exc = future.exception()
+        except Exception as err:
+            exc = err
+        if exc is not None:
+            self._put_failed_count += 1
+            record_key_batch_event(
+                "remote_batched_put_error",
+                keys,
+                limit=limit,
+                keys_count=len(keys),
+                elapsed_ms=elapsed_ms,
+                error=f"{type(exc).__name__}:{exc}",
+            )
+            return
+        record_key_batch_event(
+            "remote_batched_put_done",
+            keys,
+            limit=limit,
+            keys_count=len(keys),
+            elapsed_ms=elapsed_ms,
+        )
 
     def batched_submit_put_task(
         self,
@@ -373,12 +441,35 @@ class RemoteBackend(StorageBackendInterface):
             logger.warning(
                 "Connection is None in batched_submit_put_task, returning None"
             )
+            record_key_batch_event(
+                "remote_batched_put_connection_none",
+                keys,
+                limit=_put_diag_limit(keys),
+                keys_count=len(keys),
+                memory_objs_count=len(memory_objs),
+            )
             return
         if self.connection.support_batched_put():
             if self._mla_worker_id_as0_mode:
+                record_key_batch_event(
+                    "remote_batched_put_skip_mla_worker_id_as0",
+                    keys,
+                    limit=_put_diag_limit(keys),
+                    keys_count=len(keys),
+                    memory_objs_count=len(memory_objs),
+                )
                 return
 
             key_list = list(keys)
+            put_diag_limit = _put_diag_limit(key_list)
+            record_key_batch_event(
+                "remote_batched_put_begin",
+                key_list,
+                limit=put_diag_limit,
+                keys_count=len(key_list),
+                memory_objs_count=len(memory_objs),
+                transfer_spec_type=type(transfer_spec).__name__,
+            )
 
             # First, increment reference counts for all objects
             for memory_obj in memory_objs:
@@ -388,6 +479,16 @@ class RemoteBackend(StorageBackendInterface):
             try:
                 for memory_obj in memory_objs:
                     compressed_memory_objs.append(self.serializer.serialize(memory_obj))
+            except Exception as exc:
+                record_key_batch_event(
+                    "remote_batched_put_serialize_error",
+                    key_list,
+                    limit=put_diag_limit,
+                    keys_count=len(key_list),
+                    memory_objs_count=len(memory_objs),
+                    error=f"{type(exc).__name__}:{exc}",
+                )
+                raise
             finally:
                 # Always decrement reference counts for all objects,
                 # regardless of whether serialization succeeded or failed
@@ -406,7 +507,7 @@ class RemoteBackend(StorageBackendInterface):
                 )
 
             def batched_done_callback(f: Future) -> None:
-                self.batched_put_callback(f, key_list)
+                self.batched_put_callback(f, key_list, submit_time)
                 if _pd_diag_enabled():
                     elapsed_ms = (time.perf_counter() - submit_time) * 1000
                     try:
@@ -432,12 +533,26 @@ class RemoteBackend(StorageBackendInterface):
                                 f"on_complete_callback failed for key {key}: {e}"
                             )
 
+            record_key_batch_event(
+                "remote_batched_put_submit",
+                key_list,
+                limit=put_diag_limit,
+                keys_count=len(key_list),
+                memory_objs_count=len(memory_objs),
+            )
             future = asyncio.run_coroutine_threadsafe(
                 self.connection.batched_put(key_list, compressed_memory_objs),  # type: ignore
                 self.loop,
             )
             future.add_done_callback(batched_done_callback)
         else:
+            record_key_batch_event(
+                "remote_batched_put_fallback_single",
+                keys,
+                limit=_put_diag_limit(keys),
+                keys_count=len(keys),
+                memory_objs_count=len(memory_objs),
+            )
             for key, memory_obj in zip(keys, memory_objs, strict=False):
                 self.submit_put_task(
                     key, memory_obj, on_complete_callback=on_complete_callback

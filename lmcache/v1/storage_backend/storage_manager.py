@@ -65,6 +65,13 @@ def get_backend_cname(backend: StorageBackendInterface) -> str:
     return backend.__class__.__name__
 
 
+def get_put_diag_limit(keys: Sequence[CacheEngineKey]) -> Optional[int]:
+    if not keys:
+        return 4
+    layer_id = getattr(keys[0], "layer_id", None)
+    return None if layer_id in (None, 0) else 4
+
+
 # Helper function to allocate and copy memory objects between D and H
 def allocate_and_copy_objects(
     allocator_backend: AllocatorBackendInterface,
@@ -408,6 +415,17 @@ class StorageManager:
         if self.allocator_backend is None:
             # For scheduler role, no allocator backend available
             raise RuntimeError("Batched put not available for scheduler role")
+        put_diag_limit = get_put_diag_limit(keys)
+        allocator_backend_name = get_backend_cname(self.allocator_backend)
+        record_key_batch_event(
+            "storage_batched_put_begin",
+            keys,
+            limit=put_diag_limit,
+            location_filter=location,
+            keys_count=len(keys),
+            memory_objs_count=len(memory_objs),
+            allocator_backend=allocator_backend_name,
+        )
         obj_dict[get_backend_cname(self.allocator_backend)] = (
             keys,
             memory_objs,
@@ -415,15 +433,41 @@ class StorageManager:
 
         for backend_name, backend in self.storage_backends.items():
             if location and backend_name != location:
+                record_key_batch_event(
+                    "storage_batched_put_skip_location",
+                    keys,
+                    limit=4,
+                    backend=backend_name,
+                    location_filter=location,
+                    keys_count=len(keys),
+                )
                 continue
             # Skip bypassed backends
             with self._bypass_lock:
                 if backend_name in self._bypassed_backends:
+                    record_key_batch_event(
+                        "storage_batched_put_skip_bypassed",
+                        keys,
+                        limit=4,
+                        backend=backend_name,
+                        location_filter=location,
+                        keys_count=len(keys),
+                    )
                     continue
 
             allocator_backend = backend.get_allocator_backend()
             cname = get_backend_cname(allocator_backend)
             if cname not in obj_dict:
+                record_key_batch_event(
+                    "storage_batched_put_allocate_copy",
+                    keys,
+                    limit=put_diag_limit,
+                    backend=backend_name,
+                    source_allocator_backend=allocator_backend_name,
+                    target_allocator_backend=cname,
+                    keys_count=len(keys),
+                    memory_objs_count=len(memory_objs),
+                )
                 new_keys, new_objs = allocate_and_copy_objects(
                     allocator_backend, keys, memory_objs, self.internal_copy_stream
                 )
@@ -432,9 +476,27 @@ class StorageManager:
             # NOTE: the handling of exists_in_put_tasks
             # is done in the backend
             ks, objs = obj_dict[cname]
+            record_key_batch_event(
+                "storage_batched_put_submit_backend",
+                ks,
+                limit=put_diag_limit,
+                backend=backend_name,
+                allocator_backend=cname,
+                keys_count=len(ks),
+                memory_objs_count=len(objs),
+                location_filter=location,
+            )
             backend.batched_submit_put_task(ks, objs, transfer_spec=transfer_spec)
 
         for cname, (ks, objs) in obj_dict.items():
+            record_key_batch_event(
+                "storage_batched_put_ref_down",
+                ks,
+                limit=put_diag_limit,
+                allocator_backend=cname,
+                keys_count=len(ks),
+                memory_objs_count=len(objs),
+            )
             for memory_obj in objs:
                 memory_obj.ref_count_down()
 

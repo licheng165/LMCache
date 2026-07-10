@@ -13,7 +13,7 @@ def _env_bool(name: str, default: str = "1") -> bool:
 
 
 ENABLED = _env_bool("LMCACHE_MULTILOCATION_DIAG", "1")
-MAX_KEYS = int(os.environ.get("LMCACHE_MULTILOCATION_DIAG_MAX_KEYS", "20000"))
+MAX_KEYS = int(os.environ.get("LMCACHE_MULTILOCATION_DIAG_MAX_KEYS", "300000"))
 MAX_EVENTS_PER_KEY = int(
     os.environ.get("LMCACHE_MULTILOCATION_DIAG_MAX_EVENTS_PER_KEY", "64")
 )
@@ -97,13 +97,13 @@ def record_key_batch_event(
     event: str,
     keys: Iterable[Any],
     *,
-    limit: int = 4,
+    limit: Optional[int] = 4,
     **fields: Any,
 ) -> None:
     if not ENABLED:
         return
     for index, key in enumerate(keys):
-        if index >= limit:
+        if limit is not None and index >= limit:
             break
         record_key_event(event, key, batch_index=index, **fields)
 
