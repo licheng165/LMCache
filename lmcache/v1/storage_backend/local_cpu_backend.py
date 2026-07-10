@@ -26,6 +26,7 @@ from lmcache.v1.metadata import LMCacheMetadata
 from lmcache.v1.storage_backend.abstract_backend import AllocatorBackendInterface
 from lmcache.v1.storage_backend.batched_message_sender import BatchedMessageSender
 from lmcache.v1.storage_backend.cache_policy import get_cache_policy
+from lmcache.v1.storage_backend.multilocation_debug import record_key_event
 from lmcache.v1.system_detection import NUMADetector, SystemMemoryDetector
 
 if TYPE_CHECKING:
@@ -118,11 +119,25 @@ class LocalCPUBackend(AllocatorBackendInterface):
     def contains(self, key: CacheEngineKey, pin: bool = False) -> bool:
         with self.cpu_lock:
             if key not in self.hot_cache:
+                record_key_event(
+                    "local_cpu_contains_miss",
+                    key,
+                    pin=pin,
+                    use_hot=self.use_hot,
+                    hot_cache_size=len(self.hot_cache),
+                )
                 return False
             if pin:
                 self.hot_cache[key].pin()
                 # vllm lookup sets pin to True
                 self.keys_in_request.append(key)
+            record_key_event(
+                "local_cpu_contains_hit",
+                key,
+                pin=pin,
+                use_hot=self.use_hot,
+                hot_cache_size=len(self.hot_cache),
+            )
             return True
 
     def touch_cache(self):
@@ -153,12 +168,24 @@ class LocalCPUBackend(AllocatorBackendInterface):
         stored = False
         with self.cpu_lock:
             if key in self.hot_cache:
+                record_key_event(
+                    "local_cpu_put_skip_exists",
+                    key,
+                    hot_cache_size=len(self.hot_cache),
+                )
                 return None
 
             memory_obj.ref_count_up()
             self.hot_cache[key] = memory_obj
 
             self.cache_policy.update_on_put(key)
+            record_key_event(
+                "local_cpu_put",
+                key,
+                hot_cache_size=len(self.hot_cache),
+                num_tokens=memory_obj.get_num_tokens(),
+                size=memory_obj.get_size(),
+            )
 
             # Push kv admit msg with batching
             if self.batched_msg_sender is not None:
@@ -191,6 +218,12 @@ class LocalCPUBackend(AllocatorBackendInterface):
             after that key's put completes (not once per batch).
         """
         if not self.use_hot:
+            record_key_event(
+                "local_cpu_batched_put_skip_use_hot_false",
+                keys[0] if keys else None,
+                keys_count=len(keys),
+                memory_objs_count=len(memory_objs),
+            )
             return
 
         # TODO(Jiayi): optimize this with batching
@@ -205,12 +238,19 @@ class LocalCPUBackend(AllocatorBackendInterface):
     ) -> Optional[MemoryObj]:
         with self.cpu_lock:
             if key not in self.hot_cache:
+                record_key_event("local_cpu_get_miss", key)
                 return None
             memory_obj = self.hot_cache[key]
             # ref count up for caller to avoid situation where the memory_obj
             # is evicted from the local cpu backend before the caller calls
             # ref count up themselves
             memory_obj.ref_count_up()
+            record_key_event(
+                "local_cpu_get_hit",
+                key,
+                num_tokens=memory_obj.get_num_tokens(),
+                size=memory_obj.get_size(),
+            )
             return memory_obj
 
     async def batched_get_non_blocking(
@@ -225,6 +265,13 @@ class LocalCPUBackend(AllocatorBackendInterface):
                 mem_obj = self.hot_cache[key]
                 mem_obj.ref_count_up()
                 mem_objs.append(mem_obj)
+                record_key_event(
+                    "local_cpu_batched_get_hit",
+                    key,
+                    lookup_id=lookup_id,
+                    num_tokens=mem_obj.get_num_tokens(),
+                    size=mem_obj.get_size(),
+                )
         return mem_objs
 
     async def batched_async_contains(
@@ -238,12 +285,26 @@ class LocalCPUBackend(AllocatorBackendInterface):
         with self.cpu_lock:
             for key in keys:
                 if key not in self.hot_cache:
+                    record_key_event(
+                        "local_cpu_async_contains_miss",
+                        key,
+                        lookup_id=lookup_id,
+                        pin=pin,
+                        hit_chunks_before=num_hit_chunks,
+                    )
                     return num_hit_chunks
                 if pin:
                     self.hot_cache[key].pin()
                     # vllm lookup sets pin to True
                     self.keys_in_request.append(key)
                 num_hit_chunks += 1
+                record_key_event(
+                    "local_cpu_async_contains_hit",
+                    key,
+                    lookup_id=lookup_id,
+                    pin=pin,
+                    hit_chunks=num_hit_chunks,
+                )
         return num_hit_chunks
 
     def pin(self, key: CacheEngineKey) -> bool:
@@ -268,10 +329,21 @@ class LocalCPUBackend(AllocatorBackendInterface):
         if key not in self.hot_cache:
             if force:
                 self.cpu_lock.release()
+            record_key_event(
+                "local_cpu_remove_miss",
+                key,
+                force=force,
+            )
             return False
 
         memory_obj = self.hot_cache.pop(key)
         memory_obj.ref_count_down()
+        record_key_event(
+            "local_cpu_remove",
+            key,
+            force=force,
+            remaining_hot_cache_size=len(self.hot_cache),
+        )
 
         if force:
             self.cache_policy.update_on_force_evict(key)
@@ -670,6 +742,12 @@ class LocalCPUBackend(AllocatorBackendInterface):
                                 old_mem_objs.append(self.hot_cache[key])
                                 self.cache_policy.update_on_force_evict(key)
                                 self.hot_cache.pop(key, None)
+                                record_key_event(
+                                    "local_cpu_batched_allocate_evict",
+                                    key,
+                                    batch_size=batch_size,
+                                    remaining_hot_cache_size=len(self.hot_cache),
+                                )
 
                             self.memory_allocator.batched_free(old_mem_objs)
 

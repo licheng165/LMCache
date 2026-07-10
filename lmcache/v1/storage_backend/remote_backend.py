@@ -18,6 +18,11 @@ from lmcache.v1.storage_backend.abstract_backend import StorageBackendInterface
 from lmcache.v1.storage_backend.connector import CreateConnector
 from lmcache.v1.storage_backend.connector.base_connector import RemoteConnector
 from lmcache.v1.storage_backend.local_cpu_backend import LocalCPUBackend
+from lmcache.v1.storage_backend.multilocation_debug import (
+    key_to_debug_string,
+    record_key_batch_event,
+    record_key_event,
+)
 from lmcache.v1.storage_backend.naive_serde import CreateSerde
 
 logger = init_logger(__name__)
@@ -159,26 +164,48 @@ class RemoteBackend(StorageBackendInterface):
     def contains(self, key: CacheEngineKey, pin: bool = False) -> bool:
         if self.connection is None:
             logger.warning("Connection is None in contains, returning False")
+            record_key_event("remote_contains_connection_none", key, pin=pin)
             return False
 
         # For MLA worker id as 0 mode, use worker_id 0
+        raw_key = key
         if self._mla_worker_id_as0_mode:
             key = key.with_new_worker_id(0)
+            record_key_event(
+                "remote_contains_key_rewrite",
+                raw_key,
+                remote_key=key_to_debug_string(key),
+                pin=pin,
+            )
 
         try:
             if self.config.extra_config is not None and self.config.extra_config.get(
                 "use_exists_sync", False
             ):
-                return self.connection.exists_sync(key)
+                result = self.connection.exists_sync(key)
             else:
                 future = asyncio.run_coroutine_threadsafe(
                     self.connection.exists(key), self.loop
                 )
-                res = future.result()
-                return res
+                result = future.result()
+            record_key_event(
+                "remote_contains_result",
+                raw_key,
+                remote_key=key_to_debug_string(key),
+                result=result,
+                pin=pin,
+            )
+            return result
         except Exception as e:
             logger.warning(f"Remote connection failed in contains: {e}")
             logger.warning("Returning False")
+            record_key_event(
+                "remote_contains_error",
+                raw_key,
+                remote_key=key_to_debug_string(key),
+                error=f"{type(e).__name__}:{e}",
+                pin=pin,
+            )
             return False
 
     def batched_contains(
@@ -193,13 +220,50 @@ class RemoteBackend(StorageBackendInterface):
         if not self.connection.support_batched_contains():
             return super().batched_contains(keys, pin)
 
+        raw_keys = keys
         if self._mla_worker_id_as0_mode:
             keys = [key.with_new_worker_id(0) for key in keys]
+            if raw_keys:
+                record_key_event(
+                    "remote_batched_contains_key_rewrite",
+                    raw_keys[0],
+                    remote_first_key=key_to_debug_string(keys[0]),
+                    keys_count=len(keys),
+                    pin=pin,
+                )
 
         try:
-            return self.connection.batched_contains(keys)
+            hit_chunks = self.connection.batched_contains(keys)
+            if raw_keys:
+                record_key_event(
+                    "remote_batched_contains_result",
+                    raw_keys[0],
+                    remote_first_key=key_to_debug_string(keys[0]),
+                    keys_count=len(keys),
+                    hit_chunks=hit_chunks,
+                    pin=pin,
+                )
+                if hit_chunks:
+                    record_key_batch_event(
+                        "remote_batched_contains_hit",
+                        raw_keys[:hit_chunks],
+                        remote_first_key=key_to_debug_string(keys[0]),
+                        keys_count=len(keys),
+                        hit_chunks=hit_chunks,
+                        pin=pin,
+                    )
+            return hit_chunks
         except Exception as e:
             logger.warning(f"Remote connection failed in batched_contains: {e}")
+            if raw_keys:
+                record_key_event(
+                    "remote_batched_contains_error",
+                    raw_keys[0],
+                    remote_first_key=key_to_debug_string(keys[0]),
+                    keys_count=len(keys),
+                    error=f"{type(e).__name__}:{e}",
+                    pin=pin,
+                )
             return 0
 
     def exists_in_put_tasks(self, key: CacheEngineKey) -> bool:
@@ -407,8 +471,16 @@ class RemoteBackend(StorageBackendInterface):
             return [None] * len(keys)
 
         # For MLA worker id as 0 mode, use worker_id 0
+        raw_keys = keys
         if self._mla_worker_id_as0_mode:
             keys = [key.with_new_worker_id(0) for key in keys]
+            if raw_keys:
+                record_key_event(
+                    "remote_batched_get_key_rewrite",
+                    raw_keys[0],
+                    remote_first_key=key_to_debug_string(keys[0]),
+                    keys_count=len(keys),
+                )
 
         t1 = time.perf_counter()
         # batched get
@@ -498,6 +570,24 @@ class RemoteBackend(StorageBackendInterface):
             f"keys length: {len(keys)}, "
             f"decompressed memory objs length: {len(decompressed_memory_objs)}"
         )
+        if raw_keys:
+            hit_count = sum(1 for obj in decompressed_memory_objs if obj is not None)
+            record_key_event(
+                "remote_batched_get_result",
+                raw_keys[0],
+                remote_first_key=key_to_debug_string(keys[0]),
+                keys_count=len(keys),
+                hit_count=hit_count,
+                error_happened=error_happened,
+            )
+            record_key_batch_event(
+                "remote_batched_get_key_result",
+                raw_keys,
+                remote_first_key=key_to_debug_string(keys[0]),
+                keys_count=len(keys),
+                hit_count=hit_count,
+                error_happened=error_happened,
+            )
         return decompressed_memory_objs
 
     async def support_batched_async_contains(self) -> bool:
@@ -514,9 +604,27 @@ class RemoteBackend(StorageBackendInterface):
     ) -> int:
         if self.connection is None:
             logger.warning("Connection is None in batched_async_contains, returning 0")
+            if keys:
+                record_key_event(
+                    "remote_batched_async_contains_connection_none",
+                    keys[0],
+                    lookup_id=lookup_id,
+                    keys_count=len(keys),
+                    pin=pin,
+                )
             return 0
+        raw_keys = keys
         if self._mla_worker_id_as0_mode:
             keys = [key.with_new_worker_id(0) for key in keys]
+            if raw_keys:
+                record_key_event(
+                    "remote_batched_async_contains_key_rewrite",
+                    raw_keys[0],
+                    lookup_id=lookup_id,
+                    remote_first_key=key_to_debug_string(keys[0]),
+                    keys_count=len(keys),
+                    pin=pin,
+                )
 
         try:
             assert self.connection.support_batched_async_contains(), (
@@ -524,15 +632,43 @@ class RemoteBackend(StorageBackendInterface):
             )
             # warning, this timeout will not actually stop the
             # scheduler from waiting for the result
-            return await asyncio.wait_for(
+            hit_chunks = await asyncio.wait_for(
                 self.connection.batched_async_contains(lookup_id, keys, pin),
                 self.config.blocking_timeout_secs,
             )
+            if raw_keys:
+                record_key_event(
+                    "remote_batched_async_contains_result",
+                    raw_keys[0],
+                    lookup_id=lookup_id,
+                    remote_first_key=key_to_debug_string(keys[0]),
+                    keys_count=len(keys),
+                    hit_chunks=hit_chunks,
+                    pin=pin,
+                )
+            return hit_chunks
         except asyncio.TimeoutError:
             logger.warning("batched_async_contains timed out")
+            if raw_keys:
+                record_key_event(
+                    "remote_batched_async_contains_timeout",
+                    raw_keys[0],
+                    lookup_id=lookup_id,
+                    keys_count=len(keys),
+                    pin=pin,
+                )
             return 0
         except Exception as e:
             logger.warning(f"Error occurred in batched_async_contains: {e}")
+            if raw_keys:
+                record_key_event(
+                    "remote_batched_async_contains_error",
+                    raw_keys[0],
+                    lookup_id=lookup_id,
+                    keys_count=len(keys),
+                    error=f"{type(e).__name__}:{e}",
+                    pin=pin,
+                )
             return 0
 
     async def support_batched_get_non_blocking(self) -> bool:

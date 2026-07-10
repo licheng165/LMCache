@@ -43,6 +43,12 @@ from lmcache.v1.storage_backend.abstract_backend import (
     StorageBackendInterface,
 )
 from lmcache.v1.storage_backend.local_cpu_backend import LocalCPUBackend
+from lmcache.v1.storage_backend.multilocation_debug import (
+    dump_key_events,
+    key_to_debug_string,
+    record_key_batch_event,
+    record_key_event,
+)
 
 if TYPE_CHECKING:
     # First Party
@@ -511,12 +517,32 @@ class StorageManager:
             or not self.config.local_cpu
             or not memory_objs
         ):
+            if keys:
+                record_key_event(
+                    "writeback_skipped",
+                    keys[0],
+                    source_backend=backend_name,
+                    reason=(
+                        "source_or_no_local_cpu_or_disabled_or_empty_memory_objs"
+                    ),
+                    keys_count=len(keys),
+                    memory_objs_count=len(memory_objs),
+                    local_cpu_enabled=self.config.local_cpu,
+                    has_local_cpu="LocalCPUBackend" in self.storage_backends,
+                )
             return
 
         logger.debug(
             "Storing %s objects from %s to LocalCPUBackend",
             len(memory_objs),
             backend_name,
+        )
+        record_key_batch_event(
+            "writeback_submit_to_local_cpu",
+            keys[: len(memory_objs)],
+            source_backend=backend_name,
+            keys_count=len(keys),
+            memory_objs_count=len(memory_objs),
         )
         local_cpu_backend = self.storage_backends["LocalCPUBackend"]
         assert isinstance(local_cpu_backend, LocalCPUBackend)
@@ -613,9 +639,25 @@ class StorageManager:
                     len(keys),
                     len(keys[0]),
                 )
+                record_key_event(
+                    "layerwise_get_redirect_to_local_cpu",
+                    keys[0][0],
+                    requested_location=location,
+                    layers=len(keys),
+                    chunks=len(keys[0]),
+                )
                 location = "LocalCPUBackend"
         backend = self.storage_backends[location]
         use_blocking = self._layerwise_get_prefers_blocking(location, backend)
+        if keys and keys[0]:
+            record_key_event(
+                "layerwise_batched_get_begin",
+                keys[0][0],
+                location=location,
+                layers=len(keys),
+                chunks=len(keys[0]),
+                use_blocking=use_blocking,
+            )
         for keys_multi_chunk in keys:
             if use_blocking:
                 coro = self._layerwise_batched_get_blocking(
@@ -627,6 +669,28 @@ class StorageManager:
                 )
             task = asyncio.run_coroutine_threadsafe(coro, self.loop)
             yield task
+
+    def debug_key_locations(
+        self,
+        key: CacheEngineKey,
+        search_range: Optional[List[str]] = None,
+    ) -> dict[str, str]:
+        results = {}
+        for backend_name, backend in self.get_active_storage_backends(
+            search_range=search_range
+        ):
+            try:
+                hit = backend.contains(key, False)
+                results[backend_name] = "hit" if hit else "miss"
+            except Exception as exc:
+                results[backend_name] = f"error:{type(exc).__name__}:{exc}"
+        record_key_event(
+            "debug_key_locations",
+            key,
+            search_range=search_range,
+            results=results,
+        )
+        return results
 
     def prefetch_single_done_callback(
         self,
@@ -997,7 +1061,24 @@ class StorageManager:
             pin_in_backend = pin if backend_name != "PDBackend" else False
 
             if backend.contains(key, pin_in_backend):
+                record_key_event(
+                    "storage_contains_hit",
+                    key,
+                    backend=backend_name,
+                    search_range=search_range,
+                    pin=pin,
+                    pin_in_backend=pin_in_backend,
+                )
                 return backend_name
+
+            record_key_event(
+                "storage_contains_miss",
+                key,
+                backend=backend_name,
+                search_range=search_range,
+                pin=pin,
+                pin_in_backend=pin_in_backend,
+            )
 
         return None
 
@@ -1032,12 +1113,55 @@ class StorageManager:
 
             hit_chunks = backend.batched_contains(keys, pin_in_backend)
             if hit_chunks == 0:
+                if keys:
+                    record_key_event(
+                        "storage_batched_contains_miss",
+                        keys[0],
+                        backend=backend_name,
+                        remaining_keys=len(keys),
+                        search_range=search_range,
+                        pin=pin,
+                        pin_in_backend=pin_in_backend,
+                    )
                 continue
+            record_key_batch_event(
+                "storage_batched_contains_hit",
+                keys[:hit_chunks],
+                backend=backend_name,
+                hit_chunks=hit_chunks,
+                remaining_keys=len(keys),
+                total_hit_chunks_before=total_hit_chunks,
+                search_range=search_range,
+                pin=pin,
+                pin_in_backend=pin_in_backend,
+            )
             block_mapping[backend_name] = keys[:hit_chunks]
             total_hit_chunks += hit_chunks
             if total_hit_chunks == total_keys:
                 break
             keys = keys[hit_chunks:]
+
+        if len(block_mapping) > 1:
+            first_key = next(iter(next(iter(block_mapping.values()))), None)
+            logger.warning(
+                "StorageManager.batched_contains returned multi-backend prefix: "
+                "total_keys=%s total_hit_chunks=%s mapping=%s first_key=%s",
+                total_keys,
+                total_hit_chunks,
+                {name: len(mapped_keys) for name, mapped_keys in block_mapping.items()},
+                key_to_debug_string(first_key) if first_key is not None else None,
+            )
+            dump_key_events(
+                logger,
+                "storage_batched_contains_multi_backend",
+                [first_key],
+                total_keys=total_keys,
+                total_hit_chunks=total_hit_chunks,
+                mapping={
+                    name: len(mapped_keys)
+                    for name, mapped_keys in block_mapping.items()
+                },
+            )
 
         return total_hit_chunks, block_mapping
 

@@ -54,6 +54,7 @@ from lmcache.v1.memory_management import (  # noqa: E501
 )
 from lmcache.v1.metadata import LMCacheMetadata
 from lmcache.v1.pin_monitor import PinMonitor
+from lmcache.v1.storage_backend.multilocation_debug import dump_key_events
 from lmcache.v1.storage_backend.storage_manager import StorageManager
 from lmcache.v1.system_detection import NUMADetector, NUMAMapping
 from lmcache.v1.token_database import (
@@ -1013,12 +1014,24 @@ class LMCacheEngine:
                 else:
                     # TODO(Jiayi): Support multi-location retrieval in the future
                     if location != current_location:
+                        previous_first_layer_key = keys[-1][0] if keys else None
+                        previous_locations = (
+                            self.storage_manager.debug_key_locations(
+                                previous_first_layer_key, self.retrieve_locations
+                            )
+                            if previous_first_layer_key is not None
+                            else None
+                        )
+                        current_locations = self.storage_manager.debug_key_locations(
+                            keys_multi_layer[0], self.retrieve_locations
+                        )
                         logger.error(
                             "Layerwise retrieve encountered multiple locations "
                             "before assertion: req_id=%s, kv_group=%s, "
                             "retrieved_tokens_before_current_chunk=%s, "
                             "current_chunk=[%s, %s), first=%s, current=%s, "
-                            "retrieve_locations=%s",
+                            "retrieve_locations=%s, previous_key_locations=%s, "
+                            "current_key_locations=%s",
                             req_id,
                             kv_group,
                             ends[-1] if ends else 0,
@@ -1027,6 +1040,24 @@ class LMCacheEngine:
                             location,
                             current_location,
                             self.retrieve_locations,
+                            previous_locations,
+                            current_locations,
+                        )
+                        dump_key_events(
+                            logger,
+                            "layerwise_retrieve_location_change",
+                            [previous_first_layer_key, keys_multi_layer[0]],
+                            req_id=req_id,
+                            kv_group=kv_group,
+                            retrieved_tokens_before_current_chunk=(
+                                ends[-1] if ends else 0
+                            ),
+                            current_chunk=(start, end),
+                            first_location=location,
+                            current_location=current_location,
+                            retrieve_locations=self.retrieve_locations,
+                            previous_key_locations=previous_locations,
+                            current_key_locations=current_locations,
                         )
                     assert location == current_location, (
                         "All retrieved keys should be from the same location "
@@ -1168,6 +1199,7 @@ class LMCacheEngine:
             # TODO: support batched_contains when layerwise is enabled
             if self.use_layerwise:
                 layerwise_location = None
+                layerwise_location_key = None
                 for start, end, key in chunk_info_iterator:
                     assert isinstance(key, CacheEngineKey)
 
@@ -1186,6 +1218,7 @@ class LMCacheEngine:
                         location = next(iter(block_mapping.keys()))
                         if layerwise_location is None:
                             layerwise_location = location
+                            layerwise_location_key = key_all_layers[0]
                         elif layerwise_location != location:
                             logger.warning(
                                 "Layerwise lookup observed that matched "
@@ -1202,6 +1235,18 @@ class LMCacheEngine:
                                 location,
                                 search_range,
                                 pin,
+                            )
+                            dump_key_events(
+                                logger,
+                                "layerwise_lookup_location_change",
+                                [layerwise_location_key, key_all_layers[0]],
+                                lookup_id=lookup_id,
+                                tokens_before_current_chunk=res,
+                                current_chunk=(start, end),
+                                first_location=layerwise_location,
+                                current_location=location,
+                                search_range=search_range,
+                                pin=pin,
                             )
                         if pin:
                             assert lookup_id is not None, (
