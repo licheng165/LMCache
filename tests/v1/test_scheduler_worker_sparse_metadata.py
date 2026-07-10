@@ -57,6 +57,9 @@ def _make_scheduler_impl() -> LMCacheConnectorV1Impl:
     impl._unfinished_requests = {}
     impl.load_specs = {}
     impl._requests_priority = {}
+    impl._decode_window_save_commit_lag_tokens = 0
+    impl._pending_decode_window_save_commits = {}
+    impl._ready_decode_window_save_commits = {}
     return impl
 
 
@@ -591,3 +594,164 @@ class TestDecodeWindowSaveMetadata:
         assert meta.requests == []
         assert tracker.num_saved_tokens == 256
         assert tracker.decode_window_save_next_start == 256
+
+    def test_decode_window_save_commit_lag_tokens_defaults_to_one(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        impl = _make_scheduler_impl()
+        impl._decode_window_save_window_size = 256
+        config = SimpleNamespace(
+            get_extra_config_value=lambda _key, default: default,
+        )
+        monkeypatch.delenv(
+            "LMCACHE_DECODE_WINDOW_SAVE_COMMIT_LAG_TOKENS", raising=False
+        )
+
+        lag_tokens = impl._get_decode_window_save_commit_lag_tokens(config)
+
+        assert lag_tokens == 1
+
+    def test_decode_window_save_commit_lag_tokens_does_not_delay_save(self) -> None:
+        impl = _make_scheduler_impl()
+        impl.enable_sparse_attention = False
+        impl._decode_window_save_window_size = 256
+        impl._decode_window_save_commit_lag_tokens = 1
+
+        req_id = "decode-window-token-lag"
+        prompt_len = 356
+        prompt = list(range(prompt_len))
+        decode_tokens = list(range(10_000, 10_156))
+        vllm_req = SimpleNamespace(
+            request_id=req_id,
+            num_prompt_tokens=prompt_len,
+            prompt_token_ids=prompt,
+            num_computed_tokens=prompt_len + 155,
+            all_token_ids=prompt + decode_tokens,
+        )
+        impl._unfinished_requests[req_id] = vllm_req
+        tracker = RequestTracker(
+            req_id=req_id,
+            prompt_len=prompt_len,
+            token_ids=prompt + decode_tokens[:-1],
+            allocated_block_ids=list(range(32)),
+            num_saved_tokens=256,
+        )
+        tracker.is_decode_phase = True
+        impl._request_trackers[req_id] = tracker
+
+        scheduler_output = StubSchedulerOutput(
+            finished_req_ids=set(),
+            scheduled_new_reqs=[],
+            scheduled_cached_reqs=StubCachedRequestData(
+                req_ids=[req_id],
+                new_token_ids=[[decode_tokens[-1]]],
+                new_block_ids=[[]],
+            ),
+            num_scheduled_tokens={req_id: 1},
+        )
+
+        meta = impl.build_connector_meta(scheduler_output)
+
+        assert len(meta.requests) == 1
+        req_meta = meta.requests[0]
+        assert req_meta.is_decode_window_save is True
+        assert req_meta.decode_window_start == 256
+        assert req_meta.decode_window_end == 512
+        assert req_meta.token_ids == prompt + decode_tokens
+        assert tracker.decode_window_save_next_start == 512
+
+    def test_decode_window_save_commit_lag_tokens_delays_completed_output(
+        self,
+    ) -> None:
+        impl = _make_scheduler_impl()
+        impl._decode_window_save_window_size = 256
+        impl._decode_window_save_commit_lag_tokens = 1
+
+        req_id = "decode-window-token-lag"
+        tracker = RequestTracker(
+            req_id=req_id,
+            prompt_len=8,
+            token_ids=list(range(512)),
+            allocated_block_ids=list(range(32)),
+            num_saved_tokens=256,
+            decode_window_save_committed_end=256,
+        )
+        impl._request_trackers[req_id] = tracker
+
+        output = SimpleNamespace(completed_decode_window_saves={req_id: 512})
+        impl.update_connector_output(output)
+
+        assert output.completed_decode_window_saves == {}
+        assert tracker.decode_window_save_committed_end == 256
+        assert impl._pending_decode_window_save_commits == {req_id: 512}
+
+        tracker.token_ids.append(512)
+        assert len(tracker.token_ids) % impl._block_size == 1
+
+        impl._advance_ready_decode_window_commits()
+        assert tracker.decode_window_save_committed_end == 512
+
+        output = SimpleNamespace(completed_decode_window_saves={})
+        impl.update_connector_output(output)
+
+        assert output.completed_decode_window_saves == {req_id: 512}
+        assert impl._pending_decode_window_save_commits == {}
+
+    def test_decode_window_save_commit_lag_tokens_allows_next_window_save(self) -> None:
+        impl = _make_scheduler_impl()
+        impl.enable_sparse_attention = False
+        impl._decode_window_save_window_size = 256
+        impl._decode_window_save_commit_lag_tokens = 1
+
+        req_id = "decode-window-token-lag-next"
+        prompt_len = 356
+        prompt = list(range(prompt_len))
+        decode_tokens = list(range(10_000, 10_156))
+        vllm_req = SimpleNamespace(
+            request_id=req_id,
+            num_prompt_tokens=prompt_len,
+            prompt_token_ids=prompt,
+            num_computed_tokens=prompt_len + 155,
+            all_token_ids=prompt + decode_tokens,
+        )
+        impl._unfinished_requests[req_id] = vllm_req
+        tracker = RequestTracker(
+            req_id=req_id,
+            prompt_len=prompt_len,
+            token_ids=prompt + decode_tokens[:-1],
+            allocated_block_ids=list(range(32)),
+            num_saved_tokens=256,
+        )
+        tracker.is_decode_phase = True
+        impl._request_trackers[req_id] = tracker
+
+        scheduler_output = StubSchedulerOutput(
+            finished_req_ids=set(),
+            scheduled_new_reqs=[],
+            scheduled_cached_reqs=StubCachedRequestData(
+                req_ids=[req_id],
+                new_token_ids=[[decode_tokens[-1]]],
+                new_block_ids=[[]],
+            ),
+            num_scheduled_tokens={req_id: 1},
+        )
+        impl.build_connector_meta(scheduler_output)
+
+        next_token = 10_156
+        vllm_req.num_computed_tokens += 1
+        vllm_req.all_token_ids = prompt + decode_tokens + [next_token]
+        scheduler_output = StubSchedulerOutput(
+            finished_req_ids=set(),
+            scheduled_new_reqs=[],
+            scheduled_cached_reqs=StubCachedRequestData(
+                req_ids=[req_id],
+                new_token_ids=[[next_token]],
+                new_block_ids=[[]],
+            ),
+            num_scheduled_tokens={req_id: 1},
+        )
+
+        meta = impl.build_connector_meta(scheduler_output)
+
+        assert meta.requests == []
+        assert tracker.decode_window_save_next_start == 512
