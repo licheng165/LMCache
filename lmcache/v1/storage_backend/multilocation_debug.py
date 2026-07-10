@@ -54,6 +54,27 @@ def _format_value(value: Any) -> str:
     return repr(value)
 
 
+def _safe_debug_call(fn: Any) -> str:
+    try:
+        return _format_value(fn())
+    except Exception as exc:
+        return f"error:{type(exc).__name__}:{exc}"
+
+
+def memory_obj_debug_fields(memory_obj: Any) -> dict[str, str]:
+    meta = getattr(memory_obj, "meta", None)
+    metadata = getattr(memory_obj, "metadata", None)
+    return {
+        "memory_obj_type": type(memory_obj).__name__,
+        "memory_obj_meta_shape": _format_value(getattr(meta, "shape", None)),
+        "memory_obj_meta_dtype": _format_value(getattr(meta, "dtype", None)),
+        "memory_obj_metadata_shape": _format_value(getattr(metadata, "shape", None)),
+        "memory_obj_can_evict": _format_value(getattr(memory_obj, "can_evict", None)),
+        "memory_obj_num_tokens": _safe_debug_call(memory_obj.get_num_tokens),
+        "memory_obj_size": _safe_debug_call(memory_obj.get_size),
+    }
+
+
 def record_key_event(event: str, key: Any, **fields: Any) -> None:
     if not ENABLED or key is None:
         return

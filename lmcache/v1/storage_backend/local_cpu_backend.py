@@ -26,7 +26,10 @@ from lmcache.v1.metadata import LMCacheMetadata
 from lmcache.v1.storage_backend.abstract_backend import AllocatorBackendInterface
 from lmcache.v1.storage_backend.batched_message_sender import BatchedMessageSender
 from lmcache.v1.storage_backend.cache_policy import get_cache_policy
-from lmcache.v1.storage_backend.multilocation_debug import record_key_event
+from lmcache.v1.storage_backend.multilocation_debug import (
+    memory_obj_debug_fields,
+    record_key_event,
+)
 from lmcache.v1.system_detection import NUMADetector, SystemMemoryDetector
 
 if TYPE_CHECKING:
@@ -183,8 +186,7 @@ class LocalCPUBackend(AllocatorBackendInterface):
                 "local_cpu_put",
                 key,
                 hot_cache_size=len(self.hot_cache),
-                num_tokens=memory_obj.get_num_tokens(),
-                size=memory_obj.get_size(),
+                **memory_obj_debug_fields(memory_obj),
             )
 
             # Push kv admit msg with batching
@@ -248,8 +250,7 @@ class LocalCPUBackend(AllocatorBackendInterface):
             record_key_event(
                 "local_cpu_get_hit",
                 key,
-                num_tokens=memory_obj.get_num_tokens(),
-                size=memory_obj.get_size(),
+                **memory_obj_debug_fields(memory_obj),
             )
             return memory_obj
 
@@ -269,8 +270,7 @@ class LocalCPUBackend(AllocatorBackendInterface):
                     "local_cpu_batched_get_hit",
                     key,
                     lookup_id=lookup_id,
-                    num_tokens=mem_obj.get_num_tokens(),
-                    size=mem_obj.get_size(),
+                    **memory_obj_debug_fields(mem_obj),
                 )
         return mem_objs
 
