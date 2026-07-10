@@ -69,6 +69,13 @@ logger = init_logger(__name__)
 ProcessedChunk = Tuple[CacheEngineKey, MemoryObj, int, int]
 # (list of processed chunks, total kv size)
 ProcessTokensInternalResult = Tuple[List[ProcessedChunk], int]
+# (location, start indices, end indices, chunk-major layer keys)
+LayerwiseRetrieveSegment = Tuple[
+    str,
+    List[int],
+    List[int],
+    List[List[CacheEngineKey]],
+]
 
 
 class CacheEngineEndSignal:
@@ -987,12 +994,16 @@ class LMCacheEngine:
         starts = []
         ends = []
         keys = []
+        segments: List[LayerwiseRetrieveSegment] = []
+        segment_location: Optional[str] = None
+        segment_starts: List[int] = []
+        segment_ends: List[int] = []
+        segment_keys: List[List[CacheEngineKey]] = []
 
         request_configs = kwargs.get("request_configs")
         if request_configs is not None and len(request_configs) != 0:
             assert isinstance(request_configs, dict)
 
-        location = None
         kv_group = kwargs.get("kv_group", 0)
         for start, end, key in self.token_database.process_tokens(
             tokens=tokens,
@@ -1008,32 +1019,50 @@ class LMCacheEngine:
             if current_location := self.storage_manager.contains(
                 keys_multi_layer[0], self.retrieve_locations
             ):
-                if location is None:
-                    location = current_location
-                else:
-                    # TODO(Jiayi): Support multi-location retrieval in the future
-                    assert location == current_location, (
-                        "All retrieved keys should be from the same location "
-                        "when use layerwise retrieval."
-                        "Please support multi-location retrieval in the future."
+                if segment_location is None:
+                    segment_location = current_location
+                elif segment_location != current_location:
+                    segments.append(
+                        (
+                            segment_location,
+                            segment_starts,
+                            segment_ends,
+                            segment_keys,
+                        )
                     )
+                    segment_location = current_location
+                    segment_starts = []
+                    segment_ends = []
+                    segment_keys = []
             else:
                 break
 
             starts.append(start)
             ends.append(end)
             keys.append(keys_multi_layer)
+            segment_starts.append(start)
+            segment_ends.append(end)
+            segment_keys.append(keys_multi_layer)
 
             ret_mask[start:end] = True
 
-        if keys:
-            # Transpose the keys into layer major format
-            keys_layer_major = [list(row) for row in zip(*keys, strict=False)]
-
-            get_generator = self.storage_manager.layerwise_batched_get(
-                keys_layer_major,
-                location=location,
+        if segment_location is not None and segment_keys:
+            segments.append(
+                (segment_location, segment_starts, segment_ends, segment_keys)
             )
+
+        if keys:
+            get_generators = []
+            for segment in segments:
+                segment_keys_layer_major = [
+                    list(row) for row in zip(*segment[3], strict=False)
+                ]
+                get_generators.append(
+                    self.storage_manager.layerwise_batched_get(
+                        segment_keys_layer_major,
+                        location=segment[0],
+                    )
+                )
 
             assert_layerwise_gpu_connector(self.gpu_connector)
 
@@ -1042,9 +1071,9 @@ class LMCacheEngine:
 
             to_count_down = []
             for layer_id in range(self.num_layers):
-                task = next(get_generator)
-
-                assert task is not None
+                tasks = [next(get_generator) for get_generator in get_generators]
+                for task in tasks:
+                    assert task is not None
 
                 if layer_id == 0:
                     # NOTE(Yuwei): For sglang integration we need to provide retrieved
@@ -1053,7 +1082,9 @@ class LMCacheEngine:
                 else:
                     yield None
 
-                mem_objs_layer = task.result()
+                mem_objs_layer = []
+                for task in tasks:
+                    mem_objs_layer.extend(task.result())
                 mem_obj_consumer.send(mem_objs_layer)
                 to_count_down.extend(mem_objs_layer)
 
@@ -1063,7 +1094,7 @@ class LMCacheEngine:
             next(mem_obj_consumer)
 
             # Unpin disk-loaded staging objects after device-side sync is enqueued.
-            self._maybe_unpin_retrieved_objs(to_count_down, location)
+            self._maybe_unpin_retrieved_objs(to_count_down, None)
         else:
             # If no cache are found, we still need to yield to avoid
             # `StopIteration`
