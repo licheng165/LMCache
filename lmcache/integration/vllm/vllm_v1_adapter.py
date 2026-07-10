@@ -1298,6 +1298,9 @@ class LMCacheConnectorV1Impl:
         self._decode_window_save_window_size = (
             self._get_decode_window_save_window_size(config)
         )
+        self._decode_window_save_commit_lag_windows = (
+            self._get_decode_window_save_commit_lag_windows(config)
+        )
 
         self.skip_last_n_tokens = vllm_config.kv_transfer_config.get_from_extra_config(
             "skip_last_n_tokens", 0
@@ -1384,6 +1387,44 @@ class LMCacheConnectorV1Impl:
             self._lmcache_chunk_size,
         )
         return window_size
+
+    def _get_decode_window_save_commit_lag_windows(
+        self, config: LMCacheEngineConfig
+    ) -> int:
+        raw_lag = os.environ.get("LMCACHE_DECODE_WINDOW_SAVE_COMMIT_LAG_WINDOWS")
+        if raw_lag is None:
+            raw_lag = config.get_extra_config_value(
+                "decode_window_save_commit_lag_windows", 0
+            )
+
+        try:
+            lag_windows = int(raw_lag or 0)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(
+                "decode_window_save_commit_lag_windows must be an integer, "
+                f"got {raw_lag!r}"
+            ) from exc
+
+        if lag_windows < 0:
+            raise ValueError(
+                "decode_window_save_commit_lag_windows must be >= 0, "
+                f"got {lag_windows}"
+            )
+        if lag_windows and self._decode_window_save_window_size <= 0:
+            logger.warning(
+                "Ignoring decode_window_save_commit_lag_windows=%d because "
+                "decode_window_save is disabled",
+                lag_windows,
+            )
+            return 0
+        if lag_windows:
+            logger.info(
+                "Decode window save committed boundary lag enabled: "
+                "lag_windows=%d, window_size=%d",
+                lag_windows,
+                self._decode_window_save_window_size,
+            )
+        return lag_windows
 
     def _check_legacy_register_kv_caches(self) -> None:
         """Check for legacy connector without register_kv_caches implementation."""
@@ -2052,7 +2093,18 @@ class LMCacheConnectorV1Impl:
             window_end = request.decode_window_end
             if window_end is None:
                 return None
-            return int(window_end)
+            committed_end = int(window_end)
+            lag_windows = getattr(
+                self, "_decode_window_save_commit_lag_windows", 0
+            )
+            if lag_windows:
+                window_size = int(
+                    request.decode_window_size
+                    or self._decode_window_save_window_size
+                    or 0
+                )
+                committed_end = max(0, committed_end - lag_windows * window_size)
+            return committed_end
 
         if not request.is_last_prefill or request.is_sparse_decode:
             return None
