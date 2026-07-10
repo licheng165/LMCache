@@ -71,6 +71,13 @@ logger = init_logger(__name__)
 ProcessedChunk = Tuple[CacheEngineKey, MemoryObj, int, int]
 # (list of processed chunks, total kv size)
 ProcessTokensInternalResult = Tuple[List[ProcessedChunk], int]
+# (location, start indices, end indices, chunk-major layer keys)
+LayerwiseRetrieveSegment = Tuple[
+    str,
+    List[int],
+    List[int],
+    List[List[CacheEngineKey]],
+]
 
 
 def _pd_diag_enabled() -> bool:
@@ -1014,6 +1021,11 @@ class LMCacheEngine:
         starts = []
         ends = []
         keys = []
+        segments: List[LayerwiseRetrieveSegment] = []
+        segment_location: Optional[str] = None
+        segment_starts: List[int] = []
+        segment_ends: List[int] = []
+        segment_keys: List[List[CacheEngineKey]] = []
 
         request_configs = kwargs.get("request_configs")
         if request_configs is not None and len(request_configs) != 0:
@@ -1037,76 +1049,69 @@ class LMCacheEngine:
             ):
                 if location is None:
                     location = current_location
-                else:
-                    # TODO(Jiayi): Support multi-location retrieval in the future
-                    if location != current_location:
-                        previous_first_layer_key = keys[-1][0] if keys else None
-                        previous_locations = (
-                            self.storage_manager.debug_key_locations(
-                                previous_first_layer_key, self.retrieve_locations
-                            )
-                            if previous_first_layer_key is not None
-                            else None
+
+                if segment_location is None:
+                    segment_location = current_location
+                elif segment_location != current_location:
+                    segments.append(
+                        (
+                            segment_location,
+                            segment_starts,
+                            segment_ends,
+                            segment_keys,
                         )
-                        current_locations = self.storage_manager.debug_key_locations(
-                            keys_multi_layer[0], self.retrieve_locations
-                        )
-                        logger.error(
-                            "Layerwise retrieve encountered multiple locations "
-                            "before assertion: req_id=%s, kv_group=%s, "
-                            "retrieved_tokens_before_current_chunk=%s, "
-                            "current_chunk=[%s, %s), first=%s, current=%s, "
-                            "retrieve_locations=%s, previous_key_locations=%s, "
-                            "current_key_locations=%s",
-                            req_id,
-                            kv_group,
-                            ends[-1] if ends else 0,
-                            start,
-                            end,
-                            location,
-                            current_location,
-                            self.retrieve_locations,
-                            previous_locations,
-                            current_locations,
-                        )
-                        dump_key_events(
-                            logger,
-                            "layerwise_retrieve_location_change",
-                            [previous_first_layer_key, keys_multi_layer[0]],
-                            req_id=req_id,
-                            kv_group=kv_group,
-                            retrieved_tokens_before_current_chunk=(
-                                ends[-1] if ends else 0
-                            ),
-                            current_chunk=(start, end),
-                            first_location=location,
-                            current_location=current_location,
-                            retrieve_locations=self.retrieve_locations,
-                            previous_key_locations=previous_locations,
-                            current_key_locations=current_locations,
-                        )
-                    assert location == current_location, (
-                        "All retrieved keys should be from the same location "
-                        "when use layerwise retrieval."
-                        "Please support multi-location retrieval in the future."
                     )
+                    segment_location = current_location
+                    segment_starts = []
+                    segment_ends = []
+                    segment_keys = []
             else:
                 break
 
             starts.append(start)
             ends.append(end)
             keys.append(keys_multi_layer)
+            segment_starts.append(start)
+            segment_ends.append(end)
+            segment_keys.append(keys_multi_layer)
 
             ret_mask[start:end] = True
 
-        if keys:
-            # Transpose the keys into layer major format
-            keys_layer_major = [list(row) for row in zip(*keys, strict=False)]
-
-            get_generator = self.storage_manager.layerwise_batched_get(
-                keys_layer_major,
-                location=location,
+        if segment_location is not None and segment_keys:
+            segments.append(
+                (segment_location, segment_starts, segment_ends, segment_keys)
             )
+
+        if keys:
+            if len(segments) > 1:
+                logger.info(
+                    "Layerwise retrieve using mixed locations: req_id=%s, "
+                    "kv_group=%s, retrieve_locations=%s, segments=%s",
+                    req_id,
+                    kv_group,
+                    self.retrieve_locations,
+                    [
+                        (
+                            segment[0],
+                            segment[1][0],
+                            segment[2][-1],
+                            len(segment[3]),
+                        )
+                        for segment in segments
+                    ],
+                )
+
+            get_generators = []
+            for segment in segments:
+                segment_keys_layer_major = [
+                    list(row) for row in zip(*segment[3], strict=False)
+                ]
+                get_generators.append(
+                    self.storage_manager.layerwise_batched_get(
+                        segment_keys_layer_major,
+                        location=segment[0],
+                    )
+                )
 
             assert_layerwise_gpu_connector(self.gpu_connector)
 
@@ -1115,9 +1120,9 @@ class LMCacheEngine:
 
             to_count_down = []
             for layer_id in range(self.num_layers):
-                task = next(get_generator)
-
-                assert task is not None
+                tasks = [next(get_generator) for get_generator in get_generators]
+                for task in tasks:
+                    assert task is not None
 
                 if layer_id == 0:
                     # NOTE(Yuwei): For sglang integration we need to provide retrieved
@@ -1126,7 +1131,9 @@ class LMCacheEngine:
                 else:
                     yield None
 
-                mem_objs_layer = task.result()
+                mem_objs_layer = []
+                for task in tasks:
+                    mem_objs_layer.extend(task.result())
                 mem_obj_consumer.send(mem_objs_layer)
                 to_count_down.extend(mem_objs_layer)
 
@@ -1136,7 +1143,7 @@ class LMCacheEngine:
             next(mem_obj_consumer)
 
             # Unpin disk-loaded staging objects after device-side sync is enqueued.
-            self._maybe_unpin_retrieved_objs(to_count_down, location)
+            self._maybe_unpin_retrieved_objs(to_count_down, None)
         else:
             # If no cache are found, we still need to yield to avoid
             # `StopIteration`
