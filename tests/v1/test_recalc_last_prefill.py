@@ -87,9 +87,14 @@ class TestFullHitRecalcLast:
             num_tokens_to_compute=1,
             lmcache_cached_tokens=prompt_len,
             skip_save=False,
+            block_size=block_size,
         )
 
         assert tracker.token_ids == prompt_tokens
+        assert tracker.num_lmcache_cached_tokens == prompt_len
+        assert tracker.decode_window_save_committed_end == (
+            prompt_len // block_size * block_size
+        )
 
     def test_dense_full_hit_req_meta_uses_lmcache_hit_length(self) -> None:
         prompt_len = 18879

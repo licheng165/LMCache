@@ -208,6 +208,31 @@ def _build_slot_mapping(
     return slots[:num_tokens]
 
 
+def _build_slot_mapping_range(
+    block_ids: list[int],
+    block_size: int,
+    start: int,
+    end: int,
+) -> torch.Tensor:
+    if end <= start:
+        return torch.empty(0, dtype=torch.long)
+    capacity = len(block_ids) * block_size
+    start = max(0, min(start, capacity))
+    end = max(start, min(end, capacity))
+    if end <= start:
+        return torch.empty(0, dtype=torch.long)
+
+    positions = torch.arange(start, end, dtype=torch.long)
+    logical_blocks = positions // block_size
+    offsets = positions % block_size
+    block_ids_t = torch.tensor(block_ids, dtype=torch.long)
+    return block_ids_t.index_select(0, logical_blocks) * block_size + offsets
+
+
+def _dsa_block_committed_boundary(token_count: int, block_size: int) -> int:
+    return int(token_count) // block_size * block_size
+
+
 def _dsa_has_device_tensor(value: Any) -> bool:
     if isinstance(value, torch.Tensor):
         return value.device.type != "cpu"
@@ -305,6 +330,9 @@ class LoadSpec:
     lmcache_cached_tokens: int
     # Whether the scheduler allow us to load the tokens
     can_load: bool
+    # DSA sparse decode only: block-aligned LMCache/live KV boundary.
+    # lmcache_cached_tokens remains the raw LMCache read count.
+    dsa_committed_end: Optional[int] = None
 
 
 @dataclass
@@ -426,6 +454,7 @@ class RequestTracker:
         num_tokens_to_compute: int,
         lmcache_cached_tokens: int,
         skip_save: bool,
+        block_size: int,
     ) -> "RequestTracker":
         """Create the request tracker from a new request.
 
@@ -473,7 +502,9 @@ class RequestTracker:
             skip_save=skip_save,
             request_configs=request_configs,
             num_lmcache_cached_tokens=lmcache_cached_tokens,
-            decode_window_save_committed_end=lmcache_cached_tokens,
+            decode_window_save_committed_end=_dsa_block_committed_boundary(
+                lmcache_cached_tokens, block_size
+            ),
         )
 
     def update(
@@ -484,6 +515,7 @@ class RequestTracker:
         lmcache_cached_tokens: int = 0,
         vllm_cached_tokens: int = 0,
         all_token_ids: Optional[list[int]] = None,
+        block_size: Optional[int] = None,
     ) -> None:
         """Update the request tracker when a running request is
         scheduled again
@@ -529,7 +561,13 @@ class RequestTracker:
             self.allocated_block_ids_indexer = new_indexer_block_ids
             # reset the number of saved tokens
             self.num_saved_tokens = lmcache_cached_tokens
-            self.decode_window_save_committed_end = lmcache_cached_tokens
+            self.num_lmcache_cached_tokens = lmcache_cached_tokens
+            if block_size is None:
+                self.decode_window_save_committed_end = lmcache_cached_tokens
+            else:
+                self.decode_window_save_committed_end = _dsa_block_committed_boundary(
+                    lmcache_cached_tokens, block_size
+                )
             num_computed_tokens = max(lmcache_cached_tokens, vllm_cached_tokens)
 
             # FIX: For preempted requests, restore token_ids from the full
@@ -639,6 +677,9 @@ class ReqMeta:
     # Sparse decode only: shared with RequestTracker, reused across decode steps.
     decode_token_mask: Optional[torch.Tensor] = field(default=None, repr=False)
     decode_ret_mask: Optional[torch.Tensor] = field(default=None, repr=False)
+    # Sparse decode only: tokens in [dsa_committed_end, lmcache_cached_tokens)
+    # are loaded back into their original KV slots and treated as live NPU data.
+    dsa_live_slot_mapping: Optional[torch.Tensor] = field(default=None, repr=False)
     # Decode window save metadata, separate from the regular request save progress.
     is_decode_window_save: bool = False
     decode_window_start: Optional[int] = None
@@ -974,6 +1015,24 @@ class ReqMeta:
                 )
             ]
 
+        dsa_live_slot_mapping: Optional[torch.Tensor] = None
+        if is_sparse_decode and load_spec is not None:
+            committed_end = getattr(load_spec, "dsa_committed_end", None)
+            if committed_end is not None:
+                live_start = int(committed_end)
+                live_end = min(
+                    int(load_spec.lmcache_cached_tokens),
+                    len(input_token_ids),
+                    len(tracker.allocated_block_ids) * block_size,
+                )
+                if live_end > live_start:
+                    dsa_live_slot_mapping = _build_slot_mapping_range(
+                        tracker.allocated_block_ids,
+                        block_size,
+                        live_start,
+                        live_end,
+                    )
+
         indexer_slot_mapping: list[torch.Tensor] = []
         if dsa_two_groups and tracker.allocated_block_ids_indexer:
             indexer_num_blocks = len(tracker.allocated_block_ids_indexer)
@@ -1081,6 +1140,7 @@ class ReqMeta:
             cached_chunk_ptrs_npu_indexer=tracker.cached_chunk_ptrs_npu_indexer,
             decode_token_mask=decode_token_mask,
             decode_ret_mask=decode_ret_mask,
+            dsa_live_slot_mapping=dsa_live_slot_mapping,
         )
         return req_meta
 
@@ -2884,6 +2944,91 @@ class LMCacheConnectorV1Impl:
         )
         return missing_blocks
 
+    @staticmethod
+    def _flatten_sparse_tensor(
+        value: Any,
+        *,
+        device: torch.device,
+        dtype: torch.dtype,
+    ) -> Optional[torch.Tensor]:
+        if value is None:
+            return None
+        if isinstance(value, torch.Tensor):
+            return value.reshape(-1).to(device=device, dtype=dtype)
+        if isinstance(value, list):
+            chunks: list[torch.Tensor] = []
+            scalars = []
+            for item in value:
+                if isinstance(item, torch.Tensor):
+                    chunks.append(item.reshape(-1).to(device=device, dtype=dtype))
+                elif isinstance(item, list):
+                    scalars.extend(item)
+                else:
+                    scalars.append(item)
+            if scalars:
+                chunks.append(torch.tensor(scalars, device=device, dtype=dtype))
+            if chunks:
+                return torch.cat(chunks, dim=0)
+            return torch.empty(0, device=device, dtype=dtype)
+        return torch.tensor([value], device=device, dtype=dtype)
+
+    def _sparse_payload_with_live_slots(
+        self,
+        request: ReqMeta,
+        selected_tokens_per_req: Any,
+        target_slot_mapping_per_req: Any,
+    ) -> Optional[tuple[torch.Tensor, torch.Tensor]]:
+        load_spec = request.load_spec
+        if load_spec is None:
+            return None
+        live_slots = request.dsa_live_slot_mapping
+        if live_slots is None or live_slots.numel() == 0:
+            return None
+
+        slot_mapping = request.slot_mapping[0]
+        device = slot_mapping.device
+        committed_end = int(getattr(load_spec, "dsa_committed_end", 0) or 0)
+
+        selected_chunks: list[torch.Tensor] = []
+        target_chunks: list[torch.Tensor] = []
+
+        selected_flat = self._flatten_sparse_tensor(
+            selected_tokens_per_req,
+            device=device,
+            dtype=torch.int32,
+        )
+        if (
+            selected_flat is not None
+            and selected_flat.numel() > 0
+            and committed_end > 0
+        ):
+            target_flat = self._flatten_sparse_tensor(
+                target_slot_mapping_per_req,
+                device=device,
+                dtype=torch.long,
+            )
+            if target_flat is None:
+                scratch_slots = min(committed_end, int(slot_mapping.numel()))
+                if scratch_slots > 0:
+                    target_len = min(int(selected_flat.numel()), scratch_slots)
+                    selected_flat = selected_flat[:target_len]
+                    target_flat = slot_mapping[:target_len]
+            if target_flat is not None and target_flat.numel() > 0:
+                selected_chunks.append(selected_flat)
+                target_chunks.append(target_flat)
+
+        live_slots = live_slots.to(device=device, dtype=torch.long).reshape(-1)
+        live_tokens = torch.arange(
+            committed_end,
+            committed_end + int(live_slots.numel()),
+            device=device,
+            dtype=torch.int32,
+        )
+        selected_chunks.append(live_tokens)
+        target_chunks.append(live_slots)
+
+        return torch.cat(selected_chunks, dim=0), torch.cat(target_chunks, dim=0)
+
     @_lmcache_nvtx_annotate
     def wait_for_layer_load(
         self,
@@ -3015,12 +3160,39 @@ class LMCacheConnectorV1Impl:
                             target_slot_mapping_per_req = _row_select(
                                 target_slot_mapping, rows
                             )
+                        token_start_index_per_req = None
+                    else:
+                        target_slot_mapping_per_req = None
+                        token_start_index_per_req = (
+                            0
+                            if token_start_index is None
+                            else (
+                                _single_row_select(token_start_index, row)
+                                if rows_of_req is None
+                                else _row_select(token_start_index, rows)
+                            )
+                        )
+                    live_payload = self._sparse_payload_with_live_slots(
+                        request,
+                        selected_tokens_per_req,
+                        target_slot_mapping_per_req,
+                    )
+                    if live_payload is not None:
+                        selected_tokens_payload, target_slot_mapping_payload = (
+                            live_payload
+                        )
+                        token_start_index_per_req = None
+                    elif target_slot_mapping_per_req is not None:
                         selected_tokens_payload = _sparse_payload_value(
                             selected_tokens_per_req
                         )
                         target_slot_mapping_payload = _sparse_payload_value(
                             target_slot_mapping_per_req
                         )
+                    else:
+                        selected_tokens_payload = None
+                        target_slot_mapping_payload = None
+                    if target_slot_mapping_payload is not None:
                         if _DSA_RECORD_PAYLOAD_EVENT and (
                             _dsa_has_device_tensor(selected_tokens_payload)
                             or _dsa_has_device_tensor(target_slot_mapping_payload)
@@ -3038,17 +3210,6 @@ class LMCacheConnectorV1Impl:
                                 None,
                                 target_slot_mapping_payload,
                             )
-                        token_start_index_per_req = None
-                    else:
-                        token_start_index_per_req = (
-                            0
-                            if token_start_index is None
-                            else (
-                                _single_row_select(token_start_index, row)
-                                if rows_of_req is None
-                                else _row_select(token_start_index, rows)
-                            )
-                        )
                 ret_token_mask = layerwise_retriever.send(
                     payload
                     if payload is not None
@@ -4002,6 +4163,7 @@ class LMCacheConnectorV1Impl:
                 num_tokens_to_compute,
                 lmcache_cached_tokens,
                 skip_save,
+                self._block_size,
             )
             self._request_trackers[request.req_id] = request_tracker
 
@@ -4054,6 +4216,7 @@ class LMCacheConnectorV1Impl:
                     lmcache_cached_tokens=lmcache_cached_tokens,
                     vllm_cached_tokens=vllm_cached_tokens,
                     all_token_ids=all_token_ids,
+                    block_size=self._block_size,
                 )
 
                 self._add_decode_window_save_metas(meta, request_tracker)
@@ -4171,6 +4334,17 @@ class LMCacheConnectorV1Impl:
                 request_tracker.num_saved_tokens = min(
                     request_tracker.num_saved_tokens, tokens_to_keep
                 )
+                request_tracker.decode_window_save_committed_end = min(
+                    request_tracker.decode_window_save_committed_end,
+                    _dsa_block_committed_boundary(tokens_to_keep, self._block_size),
+                )
+                if (
+                    request_tracker.decode_window_save_next_start is not None
+                    and request_tracker.decode_window_save_next_start > tokens_to_keep
+                ):
+                    request_tracker.decode_window_save_next_start = (
+                        request_tracker.decode_window_save_committed_end
+                    )
 
             # Pass all_token_ids for preempted requests to restore
             # token_ids correctly for chunk key computation
@@ -4183,6 +4357,7 @@ class LMCacheConnectorV1Impl:
                 lmcache_cached_tokens=lmcache_cached_tokens,
                 vllm_cached_tokens=vllm_cached_tokens,
                 all_token_ids=all_token_ids,
+                block_size=self._block_size,
             )
 
             self._add_decode_window_save_metas(meta, request_tracker)
@@ -4199,27 +4374,34 @@ class LMCacheConnectorV1Impl:
                         list(request.all_token_ids)
                     )
                 lmcache_cached_for_sparse = request_tracker.prompt_len
+                dsa_committed_end = request_tracker.prompt_len
                 if self._decode_window_save_window_size > 0:
                     token_len = len(request_tracker.token_ids)
-                    lmcache_cached_for_sparse = (
-                        request_tracker.decode_window_save_committed_end
+                    dsa_committed_end = request_tracker.decode_window_save_committed_end
+                    lmcache_cached_for_sparse = min(
+                        token_len,
+                        max(
+                            request_tracker.num_lmcache_cached_tokens,
+                            dsa_committed_end,
+                        ),
                     )
-                    assert lmcache_cached_for_sparse % self._block_size == 0, (
+                    assert dsa_committed_end % self._block_size == 0, (
                         "DSA sparse LMCache boundary must be block aligned: "
                         f"req={request_tracker.req_id} "
-                        f"committed_end={lmcache_cached_for_sparse} "
+                        f"committed_end={dsa_committed_end} "
                         f"block_size={self._block_size}"
                     )
-                    assert lmcache_cached_for_sparse <= token_len, (
+                    assert dsa_committed_end <= token_len, (
                         "DSA sparse LMCache boundary exceeds token length: "
                         f"req={request_tracker.req_id} "
-                        f"committed_end={lmcache_cached_for_sparse} "
+                        f"committed_end={dsa_committed_end} "
                         f"token_len={token_len}"
                     )
                 load_spec = LoadSpec(
                     vllm_cached_tokens=0,
                     lmcache_cached_tokens=lmcache_cached_for_sparse,
                     can_load=lmcache_cached_for_sparse > 0,
+                    dsa_committed_end=dsa_committed_end,
                 )
 
             req_meta = ReqMeta.from_request_tracker(

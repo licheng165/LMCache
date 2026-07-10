@@ -326,6 +326,63 @@ class TestBuildConnectorMetaSparseSyntheticLoadSpec:
         assert req_meta.token_ids == all_tokens[:256]
         assert tracker.decode_window_save_committed_end == 256
         assert tracker.decode_window_save_next_start == 256
+        assert req_meta.load_spec.dsa_committed_end == 256
+
+    def test_decode_window_sparse_load_keeps_partial_hit_live(self) -> None:
+        impl = _make_scheduler_impl()
+        impl._decode_window_save_window_size = 256
+
+        req_id = "sparse-window-partial"
+        prompt_len = 8
+        prompt = list(range(prompt_len))
+        decode_token = 10_000
+        all_tokens = prompt + [decode_token]
+        vllm_req = SimpleNamespace(
+            request_id=req_id,
+            num_prompt_tokens=prompt_len,
+            prompt_token_ids=prompt,
+            num_computed_tokens=prompt_len + 1,
+            all_token_ids=all_tokens,
+        )
+
+        impl._unfinished_requests[req_id] = vllm_req
+        tracker = RequestTracker(
+            req_id=req_id,
+            prompt_len=prompt_len,
+            token_ids=prompt,
+            allocated_block_ids=[3],
+            num_saved_tokens=prompt_len,
+            num_lmcache_cached_tokens=prompt_len,
+            decode_window_save_committed_end=0,
+        )
+        tracker.is_decode_phase = True
+        tracker.sparse_token_ids = prompt.copy()
+        tracker.sparse_slot_mapping = [torch.arange(prompt_len)]
+        impl._request_trackers[req_id] = tracker
+
+        scheduler_output = StubSchedulerOutput(
+            finished_req_ids=set(),
+            scheduled_new_reqs=[],
+            scheduled_cached_reqs=StubCachedRequestData(
+                req_ids=[req_id],
+                new_token_ids=[[decode_token]],
+                new_block_ids=[[]],
+            ),
+            num_scheduled_tokens={req_id: 1},
+        )
+
+        meta = impl.build_connector_meta(scheduler_output)
+        req_meta = next(req for req in meta.requests if req.is_sparse_decode)
+
+        assert req_meta.load_spec is not None
+        assert req_meta.load_spec.lmcache_cached_tokens == prompt_len
+        assert req_meta.load_spec.dsa_committed_end == 0
+        assert req_meta.token_ids == prompt
+        assert req_meta.slot_mapping[0].numel() == prompt_len
+        assert req_meta.dsa_live_slot_mapping is not None
+        assert req_meta.dsa_live_slot_mapping.tolist() == list(
+            range(3 * impl._block_size, 3 * impl._block_size + prompt_len)
+        )
 
     def test_last_prefill_saves_partial_block_but_commits_block_boundary(
         self,
