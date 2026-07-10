@@ -2,6 +2,7 @@
 # Standard
 from typing import Optional, Union
 import json
+import os
 import threading
 
 # Third Party
@@ -19,6 +20,15 @@ from lmcache.v1.rpc.transport import (
 )
 
 logger = init_logger(__name__)
+
+
+def _pd_diag_enabled() -> bool:
+    return os.environ.get("LMCACHE_PD_DIAG", "0").lower() in (
+        "1",
+        "true",
+        "yes",
+        "on",
+    )
 
 
 class LMCacheLookupClient(LookupClientInterface):
@@ -96,10 +106,9 @@ class LMCacheLookupClient(LookupClientInterface):
         # NOTE(Jiayi): We cannot only send hashes when
         # blending enabled because the blender need the
         # input embedding.
+        hashes = []
+        offsets = []
         if not self.enable_blending:
-            hashes = []
-            offsets = []
-
             for (
                 start,
                 end,
@@ -130,6 +139,16 @@ class LMCacheLookupClient(LookupClientInterface):
 
         # Transport returns empty list on failure
         if not responses:
+            if _pd_diag_enabled():
+                logger.info(
+                    "[LMC_LOOKUP_CLIENT_RESULT] lookup_id=%s responses=0 "
+                    "hashes=%d first_hash=%s first_offset=%s request_configs=%s",
+                    lookup_id,
+                    len(hashes),
+                    hashes[0] if hashes else None,
+                    offsets[0] if offsets else None,
+                    request_configs_str or None,
+                )
             return 0
 
         results = [int.from_bytes(resp, "big") for resp in responses]
@@ -145,6 +164,21 @@ class LMCacheLookupClient(LookupClientInterface):
         # tokens is different across (TP and PP) ranks,
         # so we can use the minimum value.
         num_hit_toks = min(results)
+        if _pd_diag_enabled():
+            logger.info(
+                "[LMC_LOOKUP_CLIENT_RESULT] lookup_id=%s world_size=%d "
+                "hashes=%d first_hash=%s first_offset=%s request_configs=%s "
+                "per_rank=%s min=%d max=%d",
+                lookup_id,
+                self.transport.world_size,
+                len(hashes),
+                hashes[0] if hashes else None,
+                offsets[0] if offsets else None,
+                request_configs_str or None,
+                results,
+                num_hit_toks,
+                max(results) if results else 0,
+            )
         self.reqs_status[lookup_id] = num_hit_toks
 
         return num_hit_toks

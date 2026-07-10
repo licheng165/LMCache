@@ -22,6 +22,7 @@ if TYPE_CHECKING:
 import asyncio
 import gc
 import multiprocessing
+import os
 import time
 
 # Third Party
@@ -70,6 +71,31 @@ logger = init_logger(__name__)
 ProcessedChunk = Tuple[CacheEngineKey, MemoryObj, int, int]
 # (list of processed chunks, total kv size)
 ProcessTokensInternalResult = Tuple[List[ProcessedChunk], int]
+
+
+def _pd_diag_enabled() -> bool:
+    return os.environ.get("LMCACHE_PD_DIAG", "0").lower() in (
+        "1",
+        "true",
+        "yes",
+        "on",
+    )
+
+
+def _pd_diag_verbose_enabled() -> bool:
+    return os.environ.get("LMCACHE_PD_DIAG_VERBOSE", "0").lower() in (
+        "1",
+        "true",
+        "yes",
+        "on",
+    )
+
+
+def _pd_diag_key(key: Any) -> str:
+    try:
+        return key.to_string()
+    except Exception:
+        return str(key)
 
 
 class CacheEngineEndSignal:
@@ -1212,6 +1238,33 @@ class LMCacheEngine:
                         search_range,
                         pin,
                     )
+                    if _pd_diag_enabled() and (
+                        res == 0
+                        or hit_chunks != self.num_layers
+                        or _pd_diag_verbose_enabled()
+                    ):
+                        logger.info(
+                            "[LMC_LOOKUP_WORKER_CHUNK] lookup_id=%s worker_id=%s "
+                            "layerwise=True chunk=[%d,%d) layers=%d hit_layers=%d "
+                            "locations=%s first_key=%s last_key=%s search_range=%s "
+                            "pin=%s return_before=%d",
+                            lookup_id,
+                            getattr(self.metadata, "worker_id", None),
+                            start,
+                            end,
+                            self.num_layers,
+                            hit_chunks,
+                            list(block_mapping.keys()),
+                            _pd_diag_key(key_all_layers[0])
+                            if key_all_layers
+                            else None,
+                            _pd_diag_key(key_all_layers[-1])
+                            if key_all_layers
+                            else None,
+                            search_range,
+                            pin,
+                            res,
+                        )
                     # Only all layers are hit and hit in one location,
                     # we consider this key as a hit
                     if hit_chunks == self.num_layers and len(block_mapping) == 1:
@@ -1255,6 +1308,29 @@ class LMCacheEngine:
                             self.lookup_pins[lookup_id][location].extend(key_all_layers)
                         res = end
                         continue
+                    if _pd_diag_enabled():
+                        logger.info(
+                            "[LMC_LOOKUP_WORKER_MISS] lookup_id=%s worker_id=%s "
+                            "layerwise=True chunk=[%d,%d) layers=%d hit_layers=%d "
+                            "return_tokens=%d first_key=%s first_missing_key=%s "
+                            "locations=%s search_range=%s pin=%s",
+                            lookup_id,
+                            getattr(self.metadata, "worker_id", None),
+                            start,
+                            end,
+                            self.num_layers,
+                            hit_chunks,
+                            res,
+                            _pd_diag_key(key_all_layers[0])
+                            if key_all_layers
+                            else None,
+                            _pd_diag_key(key_all_layers[hit_chunks])
+                            if hit_chunks < len(key_all_layers)
+                            else None,
+                            list(block_mapping.keys()),
+                            search_range,
+                            pin,
+                        )
                     return res
             else:
                 chunk_info_list = []
@@ -1270,6 +1346,23 @@ class LMCacheEngine:
                 hit_chunks, block_mapping = self.storage_manager.batched_contains(
                     keys, search_range, pin
                 )
+                if _pd_diag_enabled():
+                    logger.info(
+                        "[LMC_LOOKUP_WORKER_RESULT] lookup_id=%s worker_id=%s "
+                        "layerwise=False chunks=%d hit_chunks=%d locations=%s "
+                        "first_key=%s first_missing_key=%s search_range=%s pin=%s",
+                        lookup_id,
+                        getattr(self.metadata, "worker_id", None),
+                        len(keys),
+                        hit_chunks,
+                        list(block_mapping.keys()),
+                        _pd_diag_key(keys[0]) if keys else None,
+                        _pd_diag_key(keys[hit_chunks])
+                        if hit_chunks < len(keys)
+                        else None,
+                        search_range,
+                        pin,
+                    )
                 if pin and block_mapping:
                     assert lookup_id is not None, (
                         "lookup_id is required when pin is True"

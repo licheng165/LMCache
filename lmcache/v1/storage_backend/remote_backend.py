@@ -3,6 +3,7 @@
 from concurrent.futures import Future, TimeoutError
 from typing import Any, Callable, List, Optional, Sequence, Set
 import asyncio
+import os
 import threading
 import time
 
@@ -26,6 +27,22 @@ from lmcache.v1.storage_backend.multilocation_debug import (
 from lmcache.v1.storage_backend.naive_serde import CreateSerde
 
 logger = init_logger(__name__)
+
+
+def _pd_diag_enabled() -> bool:
+    return os.environ.get("LMCACHE_PD_DIAG", "0").lower() in (
+        "1",
+        "true",
+        "yes",
+        "on",
+    )
+
+
+def _pd_diag_key(key: CacheEngineKey) -> str:
+    try:
+        return key.to_string()
+    except Exception:
+        return str(key)
 
 
 class RemoteBackend(StorageBackendInterface):
@@ -361,6 +378,8 @@ class RemoteBackend(StorageBackendInterface):
             if self._mla_worker_id_as0_mode:
                 return
 
+            key_list = list(keys)
+
             # First, increment reference counts for all objects
             for memory_obj in memory_objs:
                 memory_obj.ref_count_up()
@@ -375,11 +394,37 @@ class RemoteBackend(StorageBackendInterface):
                 for memory_obj in memory_objs:
                     memory_obj.ref_count_down()
 
+            submit_time = time.perf_counter()
+            if _pd_diag_enabled():
+                logger.info(
+                    "[LMC_REMOTE_PUT_SUBMIT] key_count=%d object_count=%d "
+                    "first_key=%s last_key=%s",
+                    len(key_list),
+                    len(memory_objs),
+                    _pd_diag_key(key_list[0]) if key_list else None,
+                    _pd_diag_key(key_list[-1]) if key_list else None,
+                )
+
             def batched_done_callback(f: Future) -> None:
-                self.batched_put_callback(f, list(keys))
+                self.batched_put_callback(f, key_list)
+                if _pd_diag_enabled():
+                    elapsed_ms = (time.perf_counter() - submit_time) * 1000
+                    try:
+                        exc = f.exception()
+                    except Exception as err:
+                        exc = err
+                    logger.info(
+                        "[LMC_REMOTE_PUT_DONE] key_count=%d elapsed_ms=%.4f "
+                        "exception=%s first_key=%s last_key=%s",
+                        len(key_list),
+                        elapsed_ms,
+                        repr(exc) if exc else None,
+                        _pd_diag_key(key_list[0]) if key_list else None,
+                        _pd_diag_key(key_list[-1]) if key_list else None,
+                    )
                 # Invoke per-key callback for each key in the batch
                 if on_complete_callback is not None:
-                    for key in keys:
+                    for key in key_list:
                         try:
                             on_complete_callback(key)
                         except Exception as e:
@@ -388,7 +433,7 @@ class RemoteBackend(StorageBackendInterface):
                             )
 
             future = asyncio.run_coroutine_threadsafe(
-                self.connection.batched_put(keys, compressed_memory_objs),  # type: ignore
+                self.connection.batched_put(key_list, compressed_memory_objs),  # type: ignore
                 self.loop,
             )
             future.add_done_callback(batched_done_callback)

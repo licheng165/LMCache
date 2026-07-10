@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # Standard
 from typing import Optional, Union
+import os
 import threading
 import time
 
@@ -27,6 +28,15 @@ from lmcache.v1.rpc_utils import (
 )
 
 logger = init_logger(__name__)
+
+
+def _pd_diag_enabled() -> bool:
+    return os.environ.get("LMCACHE_PD_DIAG", "0").lower() in (
+        "1",
+        "true",
+        "yes",
+        "on",
+    )
 
 
 # NOTE(Jiayi): Prefetch could load extra redundant cache if multiple
@@ -204,6 +214,17 @@ class LMCacheAsyncLookupClient(LookupClientInterface):
             hashes.append(hash_val)  # type: ignore[arg-type]
             offsets.append(end - start)
 
+        if _pd_diag_enabled():
+            logger.info(
+                "[LMC_LOOKUP_ASYNC_SUBMIT] lookup_id=%s hashes=%d "
+                "first_hash=%s first_offset=%s request_configs=%s",
+                lookup_id,
+                len(hashes),
+                hashes[0] if hashes else None,
+                offsets[0] if offsets else None,
+                request_configs,
+            )
+
         # Create structured message
         msg = LookupRequestMsg(
             lookup_id=lookup_id,
@@ -258,6 +279,16 @@ class LMCacheAsyncLookupClient(LookupClientInterface):
                         # can use the minimum value as the number of
                         # hit tokens.
                         self.reqs_status[lookup_id] = min_hit
+                        if _pd_diag_enabled():
+                            logger.info(
+                                "[LMC_LOOKUP_ASYNC_RESULT] lookup_id=%s "
+                                "world_size=%d per_rank=%s min=%d max=%d",
+                                lookup_id,
+                                self.world_size,
+                                all_res,
+                                min_hit,
+                                max_hit,
+                            )
 
             except Exception as e:
                 logger.error("Error processing response from worker: %s", e)

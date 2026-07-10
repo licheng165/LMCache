@@ -5,6 +5,7 @@ from typing import Any, List, Optional, no_type_check
 import asyncio
 import json
 import os
+import time
 
 # Third Party
 import torch
@@ -20,6 +21,22 @@ from lmcache.v1.storage_backend.local_cpu_backend import LocalCPUBackend
 from lmcache.v1.system_detection import NUMADetector
 
 logger = init_logger(__name__)
+
+
+def _pd_diag_enabled() -> bool:
+    return os.environ.get("LMCACHE_PD_DIAG", "0").lower() in (
+        "1",
+        "true",
+        "yes",
+        "on",
+    )
+
+
+def _pd_diag_key(key: CacheEngineKey) -> str:
+    try:
+        return key.to_string()
+    except Exception:
+        return str(key)
 
 
 @dataclass
@@ -573,10 +590,23 @@ class MooncakestoreConnector(RemoteConnector):
         pin: bool = False,
     ) -> int:
         num_hit_counts = 0
+        first_miss_key = None
         for key in keys:
             if not self.store.is_exist(key.to_string()):
+                first_miss_key = key
                 break
             num_hit_counts += 1
+        if _pd_diag_enabled():
+            logger.info(
+                "[LMC_MOONCAKE_EXISTS] lookup_id=%s key_count=%d hit_count=%d "
+                "first_key=%s first_miss_key=%s pin=%s",
+                lookup_id,
+                len(keys),
+                num_hit_counts,
+                _pd_diag_key(keys[0]) if keys else None,
+                _pd_diag_key(first_miss_key) if first_miss_key else None,
+                pin,
+            )
         return num_hit_counts
 
     async def _batch_get_into(
@@ -792,6 +822,17 @@ class MooncakestoreConnector(RemoteConnector):
             buffer_ptrs.append(obj.data_ptr)
             buffer_sizes.append(obj.get_size())
 
+        t_start = time.perf_counter()
+        if _pd_diag_enabled():
+            logger.info(
+                "[LMC_MOONCAKE_BATCH_PUT_START] key_count=%d total_bytes=%d "
+                "timeout=%s first_key=%s last_key=%s",
+                len(keys),
+                sum(buffer_sizes),
+                self.config.transfer_timeout,
+                key_strs[0] if key_strs else None,
+                key_strs[-1] if key_strs else None,
+            )
         try:
             await asyncio.wait_for(
                 asyncio.to_thread(
@@ -803,9 +844,27 @@ class MooncakestoreConnector(RemoteConnector):
                 ),
                 timeout=self.config.transfer_timeout,
             )
+            if _pd_diag_enabled():
+                elapsed_ms = (time.perf_counter() - t_start) * 1000
+                logger.info(
+                    "[LMC_MOONCAKE_BATCH_PUT_DONE] key_count=%d "
+                    "elapsed_ms=%.4f total_bytes=%d first_key=%s last_key=%s",
+                    len(keys),
+                    elapsed_ms,
+                    sum(buffer_sizes),
+                    key_strs[0] if key_strs else None,
+                    key_strs[-1] if key_strs else None,
+                )
         except asyncio.TimeoutError:
+            elapsed_ms = (time.perf_counter() - t_start) * 1000
             logger.warning(
-                "Timeout during batch_put_from; some decoders may redo prefill."
+                "Timeout during batch_put_from; some decoders may redo prefill. "
+                "key_count=%d elapsed_ms=%.4f timeout=%s first_key=%s last_key=%s",
+                len(keys),
+                elapsed_ms,
+                self.config.transfer_timeout,
+                key_strs[0] if key_strs else None,
+                key_strs[-1] if key_strs else None,
             )
 
     async def _batched_put_with_metadata(
