@@ -2,6 +2,7 @@
 # Standard
 from collections.abc import Iterable
 from dataclasses import dataclass, field
+from types import SimpleNamespace
 from typing import TYPE_CHECKING, Any, Generator, Optional, Union
 import os
 
@@ -61,9 +62,7 @@ logger = init_logger(__name__)
 SPARSE_DECODE_RETRIEVE_TOKENS = int(
     os.environ.get("LMCACHE_SPARSE_DECODE_RETRIEVE_TOKENS", "2048")
 )
-_DSA_RECORD_PAYLOAD_EVENT = os.environ.get(
-    "LMCACHE_DSA_RECORD_PAYLOAD_EVENT", "0"
-).lower() in ("1", "true", "yes", "on")
+SPARSE_DECODE_SHARED_CPU_PHASE = "sparse_decode_bootstrap"
 
 
 def _dsa_debug_enabled() -> bool:
@@ -166,6 +165,17 @@ def _am_get(attn_metadata, key, default=None):
     return getattr(attn_metadata, key, default)
 
 
+def _ensure_list_attr(obj: Any, name: str) -> list:
+    value = getattr(obj, name, None)
+    if value is None:
+        value = []
+        try:
+            setattr(obj, name, value)
+        except Exception:
+            pass
+    return value
+
+
 def _retrieve_cache_kwargs(
     obj: Any,
     *,
@@ -175,22 +185,36 @@ def _retrieve_cache_kwargs(
     """Return per-group cached retrieve/store kwargs for two-group DSA."""
     if dsa_two_groups and kv_group == 1:
         return {
-            "cached_keys": obj.cached_keys_indexer,
-            "cached_starts": obj.cached_starts_indexer,
-            "cached_ends": obj.cached_ends_indexer,
-            "cached_memory_objs": obj.cached_memory_objs_indexer,
-            "cached_tensors": obj.cached_tensors_indexer,
-            "cached_chunk_dev_ptrs": obj.cached_chunk_dev_ptrs_indexer,
-            "cached_chunk_ptrs_npu": obj.cached_chunk_ptrs_npu_indexer,
+            "cached_keys": _ensure_list_attr(obj, "cached_keys_indexer"),
+            "cached_starts": _ensure_list_attr(obj, "cached_starts_indexer"),
+            "cached_ends": _ensure_list_attr(obj, "cached_ends_indexer"),
+            "cached_memory_objs": _ensure_list_attr(
+                obj, "cached_memory_objs_indexer"
+            ),
+            "cached_tensors": _ensure_list_attr(obj, "cached_tensors_indexer"),
+            "cached_chunk_dev_ptrs": _ensure_list_attr(
+                obj, "cached_chunk_dev_ptrs_indexer"
+            ),
+            "cached_chunk_ptrs_npu": _ensure_list_attr(
+                obj, "cached_chunk_ptrs_npu_indexer"
+            ),
+            "cached_shared_handles": _ensure_list_attr(
+                obj, "cached_shared_handles_indexer"
+            ),
         }
     return {
-        "cached_keys": obj.cached_keys,
-        "cached_starts": obj.cached_starts,
-        "cached_ends": obj.cached_ends,
-        "cached_memory_objs": obj.cached_memory_objs,
-        "cached_tensors": obj.cached_tensors,
-        "cached_chunk_dev_ptrs": obj.cached_chunk_dev_ptrs,
-        "cached_chunk_ptrs_npu": obj.cached_chunk_ptrs_npu,
+        "cached_keys": _ensure_list_attr(obj, "cached_keys"),
+        "cached_starts": _ensure_list_attr(obj, "cached_starts"),
+        "cached_ends": _ensure_list_attr(obj, "cached_ends"),
+        "cached_memory_objs": _ensure_list_attr(obj, "cached_memory_objs"),
+        "cached_tensors": _ensure_list_attr(obj, "cached_tensors"),
+        "cached_chunk_dev_ptrs": _ensure_list_attr(
+            obj, "cached_chunk_dev_ptrs"
+        ),
+        "cached_chunk_ptrs_npu": _ensure_list_attr(
+            obj, "cached_chunk_ptrs_npu"
+        ),
+        "cached_shared_handles": _ensure_list_attr(obj, "cached_shared_handles"),
     }
 
 
@@ -209,32 +233,80 @@ def _build_slot_mapping(
     return slots[:num_tokens]
 
 
-def _dsa_has_device_tensor(value: Any) -> bool:
+def _dsa_payload_event_list(payload_event: Any) -> list[Any]:
+    if payload_event is None:
+        return []
+    if isinstance(payload_event, (list, tuple)):
+        return [event for event in payload_event if event is not None]
+    return [payload_event]
+
+
+def _dsa_wait_payload_event(payload_event: Any) -> None:
+    payload_events = _dsa_payload_event_list(payload_event)
+    if not payload_events:
+        return
+    if not (hasattr(torch, "npu") and hasattr(torch.npu, "current_stream")):
+        raise RuntimeError(
+            "DSA selected-token payload event was provided, but torch.npu "
+            "stream support is unavailable."
+        )
+    try:
+        current_stream = torch.npu.current_stream()
+        for event in payload_events:
+            current_stream.wait_event(event)
+    except Exception as exc:
+        raise RuntimeError(
+            "Failed to wait on DSA selected-token producer event before "
+            "LMCache row selection."
+        ) from exc
+
+
+def _dsa_device_tensor_types(value: Any) -> set[str]:
     if isinstance(value, torch.Tensor):
-        return value.device.type != "cpu"
+        return set() if value.device.type == "cpu" else {value.device.type}
     if isinstance(value, list):
-        return any(_dsa_has_device_tensor(item) for item in value)
-    return False
+        out: set[str] = set()
+        for item in value:
+            out.update(_dsa_device_tensor_types(item))
+        return out
+    return set()
 
 
-def _dsa_record_current_stream_event() -> Optional[Any]:
-    try:
-        if hasattr(torch, "npu") and hasattr(torch.npu, "Event"):
-            event = torch.npu.Event()
-            event.record(torch.npu.current_stream())
-            return event
-    except Exception:
-        logger.debug("Failed to record NPU DSA payload event", exc_info=True)
-
-    try:
-        if hasattr(torch, "cuda") and torch.cuda.is_available():
-            event = torch.cuda.Event()
-            event.record(torch.cuda.current_stream())
-            return event
-    except Exception:
-        logger.debug("Failed to record CUDA DSA payload event", exc_info=True)
-
-    return None
+def _dsa_record_payload_event_if_needed(*values: Any) -> Optional[Any]:
+    device_types: set[str] = set()
+    for value in values:
+        device_types.update(_dsa_device_tensor_types(value))
+    if not device_types:
+        return None
+    needs_npu_event = bool(device_types & {"npu", "privateuseone"})
+    needs_cuda_event = "cuda" in device_types
+    if needs_npu_event and needs_cuda_event:
+        raise RuntimeError(
+            "DSA payload contains both NPU and CUDA tensors; refusing to "
+            "record a single ordering event for mixed device backends."
+        )
+    if needs_npu_event:
+        if not (hasattr(torch, "npu") and hasattr(torch.npu, "Event")):
+            raise RuntimeError(
+                "DSA reordered payload contains NPU tensors but torch.npu.Event "
+                "is unavailable."
+            )
+        event = torch.npu.Event()
+        event.record(torch.npu.current_stream())
+        return event
+    if needs_cuda_event:
+        if not (hasattr(torch, "cuda") and torch.cuda.is_available()):
+            raise RuntimeError(
+                "DSA reordered payload contains CUDA tensors but CUDA stream "
+                "support is unavailable."
+            )
+        event = torch.cuda.Event()
+        event.record(torch.cuda.current_stream())
+        return event
+    raise RuntimeError(
+        "DSA reordered payload contains device tensors with unsupported "
+        f"device types {sorted(device_types)}."
+    )
 
 
 def _row_select(value: Any, rows: list[int]):
@@ -396,6 +468,7 @@ class RequestTracker:
     cached_chunk_dev_ptrs: list[list[int]] = field(default_factory=list)
     # Sparse decode only: prebuilt NPU tensor of chunk device ptrs, one entry per layer.
     cached_chunk_ptrs_npu: list[Optional[torch.Tensor]] = field(default_factory=list)
+    cached_shared_handles: list[list[Any]] = field(default_factory=list)
     # Two-group DSA: separate sparse/prefill retrieve cache for kv_group=1 (indexer).
     cached_keys_indexer: list[list] = field(default_factory=list)
     cached_starts_indexer: list[int] = field(default_factory=list)
@@ -406,10 +479,14 @@ class RequestTracker:
     cached_chunk_ptrs_npu_indexer: list[Optional[torch.Tensor]] = field(
         default_factory=list
     )
+    cached_shared_handles_indexer: list[list[Any]] = field(default_factory=list)
     # Sparse decode only: prompt token ids for retrieve keys, built once.
     sparse_token_ids: list[int] = field(default_factory=list, repr=False)
     # Sparse decode only: single-element list holding CPU then NPU slot_mapping.
     sparse_slot_mapping: list[torch.Tensor] = field(default_factory=list, repr=False)
+    sparse_indexer_slot_mapping: list[torch.Tensor] = field(
+        default_factory=list, repr=False
+    )
     # Sparse decode only: reused across decode steps to avoid per-step allocation.
     sparse_decode_token_mask: Optional[torch.Tensor] = field(default=None, repr=False)
     sparse_decode_ret_mask: Optional[torch.Tensor] = field(default=None, repr=False)
@@ -509,6 +586,7 @@ class RequestTracker:
             )
             self.sparse_token_ids.clear()
             self.sparse_slot_mapping.clear()
+            self.sparse_indexer_slot_mapping.clear()
             self.sparse_decode_token_mask = None
             self.sparse_decode_ret_mask = None
             self.cached_keys.clear()
@@ -518,6 +596,7 @@ class RequestTracker:
             self.cached_tensors.clear()
             self.cached_chunk_dev_ptrs.clear()
             self.cached_chunk_ptrs_npu.clear()
+            self.cached_shared_handles.clear()
             self.cached_keys_indexer.clear()
             self.cached_starts_indexer.clear()
             self.cached_ends_indexer.clear()
@@ -525,12 +604,14 @@ class RequestTracker:
             self.cached_tensors_indexer.clear()
             self.cached_chunk_dev_ptrs_indexer.clear()
             self.cached_chunk_ptrs_npu_indexer.clear()
+            self.cached_shared_handles_indexer.clear()
             # the block ids will change after preemption
             self.allocated_block_ids = new_block_ids
             self.allocated_block_ids_indexer = new_indexer_block_ids
             # reset the number of saved tokens
             self.num_saved_tokens = lmcache_cached_tokens
             self.decode_window_save_committed_end = lmcache_cached_tokens
+            self.decode_window_save_next_start = None
             num_computed_tokens = max(lmcache_cached_tokens, vllm_cached_tokens)
 
             # FIX: For preempted requests, restore token_ids from the full
@@ -589,6 +670,7 @@ class RequestTracker:
 class WorkerRetrieveState:
     """Worker-local retrieve cache; survives scheduler/worker IPC each decode step."""
 
+    req_id: Optional[str] = None
     cached_keys: list[list] = field(default_factory=list)
     cached_starts: list[int] = field(default_factory=list)
     cached_ends: list[int] = field(default_factory=list)
@@ -596,6 +678,7 @@ class WorkerRetrieveState:
     cached_tensors: list[list] = field(default_factory=list)
     cached_chunk_dev_ptrs: list[list[int]] = field(default_factory=list)
     cached_chunk_ptrs_npu: list[Optional[torch.Tensor]] = field(default_factory=list)
+    cached_shared_handles: list[list[Any]] = field(default_factory=list)
     cached_keys_indexer: list[list] = field(default_factory=list)
     cached_starts_indexer: list[int] = field(default_factory=list)
     cached_ends_indexer: list[int] = field(default_factory=list)
@@ -605,6 +688,24 @@ class WorkerRetrieveState:
     cached_chunk_ptrs_npu_indexer: list[Optional[torch.Tensor]] = field(
         default_factory=list
     )
+    cached_shared_handles_indexer: list[list[Any]] = field(default_factory=list)
+    shared_handles_by_group: dict[int, list[list[Any]]] = field(
+        default_factory=dict
+    )
+    shared_views_by_group: dict[int, list[list[Any]]] = field(default_factory=dict)
+    shared_chunk_ptrs_npu_by_group: dict[int, list[Optional[torch.Tensor]]] = field(
+        default_factory=dict
+    )
+    rank0_backing_objs_by_group: dict[int, list[list[Any]]] = field(
+        default_factory=dict
+    )
+    shared_latent_status: str = "missing"
+    shared_index_status: str = "missing"
+    shared_generation: int = 0
+    pointer_cache_generation: int = 0
+    shared_request_active: bool = False
+    request_scope_token: Optional[str] = None
+    shared_validation_signature: Optional[tuple[Any, ...]] = None
     location: Optional[str] = None
     metadata_warm: bool = False
     token_count: int = 0
@@ -628,6 +729,7 @@ class ReqMeta:
     cached_tensors: list[list] = field(default_factory=list)
     cached_chunk_dev_ptrs: list[list[int]] = field(default_factory=list)
     cached_chunk_ptrs_npu: list[Optional[torch.Tensor]] = field(default_factory=list)
+    cached_shared_handles: list[list[Any]] = field(default_factory=list)
     cached_keys_indexer: list[list] = field(default_factory=list)
     cached_starts_indexer: list[int] = field(default_factory=list)
     cached_ends_indexer: list[int] = field(default_factory=list)
@@ -637,6 +739,10 @@ class ReqMeta:
     cached_chunk_ptrs_npu_indexer: list[Optional[torch.Tensor]] = field(
         default_factory=list
     )
+    cached_shared_handles_indexer: list[list[Any]] = field(default_factory=list)
+    # Sparse shared CPU decode only: kv_group=1 was intentionally skipped by
+    # config, so hot-path validation may accept absent DSA index state.
+    shared_index_skipped: bool = False
     # Sparse decode only: shared with RequestTracker, reused across decode steps.
     decode_token_mask: Optional[torch.Tensor] = field(default=None, repr=False)
     decode_ret_mask: Optional[torch.Tensor] = field(default=None, repr=False)
@@ -781,6 +887,18 @@ class ReqMeta:
             operations, None otherwise.
         """
         input_token_ids = tracker.token_ids
+        if (
+            is_sparse_decode
+            and load_spec is not None
+            and tracker.sparse_token_ids
+        ):
+            sparse_token_count = (
+                load_spec.lmcache_cached_tokens
+                if load_spec.can_load
+                else len(tracker.sparse_token_ids)
+            )
+            if len(tracker.sparse_token_ids) >= sparse_token_count:
+                input_token_ids = tracker.sparse_token_ids[:sparse_token_count]
         input_token_len = len(input_token_ids)
 
         is_last_prefill = False
@@ -868,8 +986,8 @@ class ReqMeta:
         # will skip re-storing on later steps. This is partially mitigated by
         # the lookup-miss re-store path in the async lookup client (min(hit)
         # aggregation detects missing chunks). A full fix would defer the
-        # advance until wait_for_save confirms success (requires worker→scheduler
-        # feedback channel — future work).
+        # advance until wait_for_save confirms success (requires worker-to-scheduler
+        # feedback channel - future work).
         if not skip_save:
             tracker.num_saved_tokens = num_tokens_to_save
 
@@ -991,7 +1109,22 @@ class ReqMeta:
                     indexer_num_blocks,
                     block_size,
                 )
-            if not is_sparse_decode:
+            if is_sparse_decode and load_spec is not None and load_spec.can_load:
+                if (
+                    not tracker.sparse_indexer_slot_mapping
+                    or tracker.sparse_indexer_slot_mapping[0].numel()
+                    < load_spec.lmcache_cached_tokens
+                ):
+                    tracker.sparse_indexer_slot_mapping.clear()
+                    tracker.sparse_indexer_slot_mapping.append(
+                        _build_slot_mapping(
+                            tracker.allocated_block_ids_indexer,
+                            block_size,
+                            load_spec.lmcache_cached_tokens,
+                        )
+                    )
+                indexer_slot_mapping = tracker.sparse_indexer_slot_mapping
+            elif not is_sparse_decode:
                 indexer_slot_mapping = [
                     _build_slot_mapping(
                         tracker.allocated_block_ids_indexer,
@@ -1011,13 +1144,18 @@ class ReqMeta:
         decode_ret_mask: Optional[torch.Tensor] = None
         if is_sparse_decode and load_spec is not None:
             num_retrieve_tokens = len(token_ids)
-            if (
-                tracker.sparse_decode_token_mask is None
-                or tracker.sparse_decode_token_mask.numel() != num_retrieve_tokens
-            ):
-                tracker.sparse_decode_token_mask = torch.ones(
-                    num_retrieve_tokens, dtype=torch.bool
-                )
+            if load_spec.vllm_cached_tokens > 0:
+                if (
+                    tracker.sparse_decode_token_mask is None
+                    or tracker.sparse_decode_token_mask.numel()
+                    != num_retrieve_tokens
+                ):
+                    tracker.sparse_decode_token_mask = torch.ones(
+                        num_retrieve_tokens, dtype=torch.bool
+                    )
+                decode_token_mask = tracker.sparse_decode_token_mask
+            else:
+                tracker.sparse_decode_token_mask = None
             if (
                 tracker.sparse_decode_ret_mask is None
                 or tracker.sparse_decode_ret_mask.numel() != num_retrieve_tokens
@@ -1025,7 +1163,6 @@ class ReqMeta:
                 tracker.sparse_decode_ret_mask = torch.zeros(
                     num_retrieve_tokens, dtype=torch.bool, device="cpu"
                 )
-            decode_token_mask = tracker.sparse_decode_token_mask
             decode_ret_mask = tracker.sparse_decode_ret_mask
 
         if is_sparse_decode and load_spec is not None and _dsa_debug_should_log(
@@ -1073,6 +1210,7 @@ class ReqMeta:
             cached_tensors=tracker.cached_tensors,
             cached_chunk_dev_ptrs=tracker.cached_chunk_dev_ptrs,
             cached_chunk_ptrs_npu=tracker.cached_chunk_ptrs_npu,
+            cached_shared_handles=tracker.cached_shared_handles,
             cached_keys_indexer=tracker.cached_keys_indexer,
             cached_starts_indexer=tracker.cached_starts_indexer,
             cached_ends_indexer=tracker.cached_ends_indexer,
@@ -1080,6 +1218,7 @@ class ReqMeta:
             cached_tensors_indexer=tracker.cached_tensors_indexer,
             cached_chunk_dev_ptrs_indexer=tracker.cached_chunk_dev_ptrs_indexer,
             cached_chunk_ptrs_npu_indexer=tracker.cached_chunk_ptrs_npu_indexer,
+            cached_shared_handles_indexer=tracker.cached_shared_handles_indexer,
             decode_token_mask=decode_token_mask,
             decode_ret_mask=decode_ret_mask,
         )
@@ -1160,6 +1299,29 @@ class LMCacheConnectorV1Impl:
                             config_key,
                         )
 
+        if config.extra_config is None:
+            config.extra_config = {}
+
+        model_config = getattr(vllm_config, "model_config", None)
+        scheduler_config = getattr(vllm_config, "scheduler_config", None)
+        if model_config is not None:
+            max_model_len = getattr(model_config, "max_model_len", None)
+            if max_model_len is not None:
+                config.extra_config["vllm_max_model_len"] = max_model_len
+        if scheduler_config is not None:
+            max_num_seqs = getattr(scheduler_config, "max_num_seqs", None)
+            if max_num_seqs is not None:
+                config.extra_config["vllm_max_num_seqs"] = max_num_seqs
+            max_num_batched_tokens = getattr(
+                scheduler_config,
+                "max_num_batched_tokens",
+                None,
+            )
+            if max_num_batched_tokens is not None:
+                config.extra_config["vllm_max_num_batched_tokens"] = (
+                    max_num_batched_tokens
+                )
+
     def _init_connector_state(
         self,
         role: KVConnectorRole,
@@ -1170,8 +1332,10 @@ class LMCacheConnectorV1Impl:
         self.async_loading = config.enable_async_loading
         # Each entry is a (primary, secondary) retriever pair. primary is the
         # latent (kv_group=0) retriever; secondary is the indexer (kv_group=1)
-        # retriever for two-group prefix retrieve, or None for sparse decode /
-        # single-group. Both are advanced per layer in wait_for_layer_load.
+        # retriever for two-group prefix/sparse retrieve, or None for
+        # single-group. wait_for_layer_load routes latent and indexer layer
+        # waits to the matching group and advances current_layer after all
+        # required groups for that layer have completed.
         self.layerwise_retrievers: list[
             tuple[Optional[Generator[Optional[torch.Tensor], None, None]],
                   Optional[Generator[Optional[torch.Tensor], None, None]]]
@@ -1179,6 +1343,7 @@ class LMCacheConnectorV1Impl:
         self._layerwise_requests: list[ReqMeta] = []
         self._layerwise_retriever_is_sparse: list[bool] = []
         self._layerwise_sparse_req_ids: list[str] = []
+        self._layerwise_waited_groups: set[int] = set()
         self._layerwise_save_storers: dict[
             Any, Generator[Optional[torch.Tensor], None, None]
         ] = {}
@@ -1264,6 +1429,8 @@ class LMCacheConnectorV1Impl:
         if role != KVConnectorRole.SCHEDULER:
             self._worker_retrieve_state: dict[str, WorkerRetrieveState] = {}
             self._completed_decode_window_saves: dict[str, int] = {}
+            self._decode_window_save_completed_groups: set[Any] = set()
+            self._decode_window_save_expected_start: dict[str, int] = {}
             self._warn_mla_per_rank_lookup_config(config)
 
     def _warn_mla_per_rank_lookup_config(self, config: LMCacheEngineConfig) -> None:
@@ -1284,7 +1451,7 @@ class LMCacheConnectorV1Impl:
                 "MLA per-rank store (save_only_first_rank=false) but lookup "
                 "server runs on ranks %s only (world_size=%d). The scheduler "
                 "may trust rank0 hit count while other TP ranks miss KV on "
-                "retrieve_layer → garbled generation. Remove "
+                "retrieve_layer -> garbled generation. Remove "
                 "lookup_server_worker_ids override or list all TP ranks.",
                 lookup_ids,
                 metadata.world_size,
@@ -1354,7 +1521,19 @@ class LMCacheConnectorV1Impl:
     @property
     def lmcache_engine(self) -> Optional[LMCacheEngine]:
         """Get the LMCache engine instance from manager."""
-        return self._manager.lmcache_engine
+        manager = getattr(self, "_manager", None)
+        if manager is None:
+            return None
+        return manager.lmcache_engine
+
+    @lmcache_engine.setter
+    def lmcache_engine(self, value: Optional[LMCacheEngine]) -> None:
+        """Set the LMCache engine instance on manager-backed adapters."""
+        manager = getattr(self, "_manager", None)
+        if manager is None:
+            self._manager = SimpleNamespace(lmcache_engine=value)
+            return
+        manager.lmcache_engine = value
 
     @property
     def lmcache_engine_metadata(self):
@@ -1467,6 +1646,64 @@ class LMCacheConnectorV1Impl:
                 self.lmcache_engine.metadata.kv_layer_groups_manager
             )
             kv_layer_groups_manager.build_kv_layer_groups(self.kv_caches)
+            self._normalize_dsa_kv_layer_groups()
+
+    def _normalize_dsa_kv_layer_groups(self) -> None:
+        """Keep metadata group index aligned with the DSA kv_group contract."""
+        if not self._is_dsa_two_groups() or self.lmcache_engine is None:
+            return
+        manager = self.lmcache_engine.metadata.kv_layer_groups_manager
+        groups = list(manager.kv_layer_groups)
+        if not groups:
+            return
+
+        latent_names = set(getattr(self, "_latent_layer_names", []))
+        indexer_names = set(getattr(self, "_indexer_layer_names", []))
+        if not latent_names and not indexer_names:
+            self._refresh_kvcaches_list()
+            latent_names = set(getattr(self, "_latent_layer_names", []))
+            indexer_names = set(getattr(self, "_indexer_layer_names", []))
+        if not indexer_names:
+            return
+
+        latent_groups = []
+        indexer_groups = []
+        for group in groups:
+            names = set(group.layer_names)
+            has_indexer = bool(names & indexer_names) or any(
+                "indexer" in name for name in names
+            )
+            has_latent = bool(names & latent_names) or not has_indexer
+            if has_indexer and has_latent:
+                raise RuntimeError(
+                    "DSA two-group KV metadata is ambiguous: one metadata "
+                    "group contains both latent and indexer layers. "
+                    f"layer_names={group.layer_names}"
+                )
+            if has_indexer:
+                indexer_groups.append(group)
+            else:
+                latent_groups.append(group)
+
+        if len(latent_groups) != 1 or len(indexer_groups) != 1:
+            raise RuntimeError(
+                "DSA two-group KV metadata requires exactly one latent "
+                "metadata group and one indexer metadata group so kv_group=0 "
+                "maps to latent and kv_group=1 maps to indexer. "
+                f"latent_groups={len(latent_groups)}, "
+                f"indexer_groups={len(indexer_groups)}, "
+                f"groups={groups}"
+            )
+
+        normalized_groups = latent_groups + indexer_groups
+        if manager.kv_layer_groups != normalized_groups:
+            logger.info(
+                "Reordered DSA KV metadata groups to latent/indexer order: "
+                "latent_dtype=%s, indexer_dtype=%s",
+                normalized_groups[0].dtype,
+                normalized_groups[1].dtype,
+            )
+            manager.kv_layer_groups = normalized_groups
 
     def _refresh_kvcaches_list(self) -> None:
         self._latent_layer_names = []
@@ -1502,7 +1739,16 @@ class LMCacheConnectorV1Impl:
 
     def _kvcaches_for_group(self, kv_group: int) -> list[torch.Tensor]:
         """Return the per-group kv_caches list for the connector."""
-        if kv_group == 1 and getattr(self.config, "dsa_two_groups", False):
+        if not hasattr(self, "_latent_kvcaches"):
+            if hasattr(self, "kv_caches"):
+                self._refresh_kvcaches_list()
+            else:
+                self._latent_kvcaches = list(getattr(self, "_kvcaches_list", []))
+        if not hasattr(self, "_indexer_kvcaches"):
+            self._indexer_kvcaches = []
+        if kv_group == 1 and getattr(
+            getattr(self, "config", None), "dsa_two_groups", False
+        ):
             return self._indexer_kvcaches
         return self._latent_kvcaches
 
@@ -1510,7 +1756,409 @@ class LMCacheConnectorV1Impl:
         return len(self._kvcaches_for_group(kv_group))
 
     def _is_dsa_two_groups(self) -> bool:
-        return bool(getattr(self.config, "dsa_two_groups", False))
+        return bool(getattr(getattr(self, "config", None), "dsa_two_groups", False))
+
+    def _is_indexer_layer_wait(self, layer_name: str) -> bool:
+        if not self._is_dsa_two_groups():
+            return False
+        indexer_names = getattr(self, "_indexer_layer_names", [])
+        return layer_name in indexer_names or "indexer" in layer_name
+
+    def _layerwise_wait_group(self, layer_name: str) -> int:
+        return 1 if self._is_indexer_layer_wait(layer_name) else 0
+
+    @staticmethod
+    def _layerwise_layer_id_from_name(layer_name: str) -> Optional[int]:
+        marker = "layers."
+        marker_idx = layer_name.find(marker)
+        if marker_idx < 0:
+            return None
+        start = marker_idx + len(marker)
+        end = start
+        while end < len(layer_name) and layer_name[end].isdigit():
+            end += 1
+        if end == start:
+            return None
+        return int(layer_name[start:end])
+
+    def _layerwise_required_wait_groups(self) -> set[int]:
+        cached = getattr(self, "_layerwise_required_wait_groups_cache", None)
+        if cached is not None:
+            return cached
+
+        required = {0}
+        if self._is_dsa_two_groups():
+            for idx, (_, indexer_retriever) in enumerate(
+                getattr(self, "layerwise_retrievers", [])
+            ):
+                is_sparse = (
+                    idx < len(getattr(self, "_layerwise_retriever_is_sparse", []))
+                    and self._layerwise_retriever_is_sparse[idx]
+                )
+                if indexer_retriever is not None and not is_sparse:
+                    required.add(1)
+                    break
+        self._layerwise_required_wait_groups_cache = required
+        return required
+
+    def _layerwise_wait_should_advance(self, wait_group: int) -> bool:
+        waited_groups = getattr(self, "_layerwise_waited_groups", None)
+        if waited_groups is None:
+            waited_groups = set()
+            self._layerwise_waited_groups = waited_groups
+        waited_groups.add(wait_group)
+        if self._layerwise_required_wait_groups().issubset(waited_groups):
+            waited_groups.clear()
+            return True
+        return False
+
+    def _shared_cpu_config_value(self, key: str, default: Any = None) -> Any:
+        missing = object()
+
+        def config_value(config: Any) -> Any:
+            extra_config = getattr(config, "extra_config", None)
+            if isinstance(extra_config, dict) and key in extra_config:
+                return extra_config[key]
+            config_dict = getattr(config, "__dict__", None)
+            if isinstance(config_dict, dict) and key in config_dict:
+                return config_dict[key]
+            getter = getattr(config, "get_extra_config_value", None)
+            if (
+                callable(getter)
+                and not type(config).__module__.startswith("unittest.mock")
+            ):
+                return getter(key, default)
+            return missing
+
+        engine = getattr(self, "lmcache_engine", None)
+        if engine is not None:
+            getter = getattr(engine, "_get_shared_config_value", None)
+            if callable(getter):
+                return getter(key, default)
+            config = getattr(engine, "config", None)
+            if config is not None:
+                value = config_value(config)
+                if value is not missing:
+                    return value
+            engine_dict = getattr(engine, "__dict__", None)
+            if isinstance(engine_dict, dict) and key in engine_dict:
+                return engine_dict[key]
+
+        config = getattr(self, "config", None)
+        if config is not None:
+            value = config_value(config)
+            if value is not missing:
+                return value
+        return default
+
+    def _shared_cpu_materialize_index_on_decode_cold(self) -> bool:
+        return bool(
+            self._shared_cpu_config_value(
+                "shared_cpu_materialize_index_on_decode_cold",
+                True,
+            )
+        )
+
+    def _sparse_decode_requires_index_materialization(
+        self,
+        request: "ReqMeta",
+        shared_cpu_enabled: bool,
+    ) -> bool:
+        """True when sparse decode must materialize DSA index from LMCache.
+
+        In the non-shared kv_both path, prefill may populate the resident DSA
+        index cache in vLLM. A shared-CPU sparse decode hit, however, can skip
+        prompt prefill entirely, so it must materialize the index group from
+        LMCache instead of assuming resident index state is valid.
+        """
+        if not self._is_dsa_two_groups():
+            return False
+        if not self._shared_cpu_materialize_index_on_decode_cold():
+            return False
+        if shared_cpu_enabled:
+            return True
+        kv_role = getattr(self, "kv_role", "kv_both")
+        return kv_role == "kv_consumer"
+
+    @staticmethod
+    def _shared_sparse_decode_indexer_is_resident(
+        request: "ReqMeta",
+        bound_state: Optional[WorkerRetrieveState],
+        token_count: int,
+    ) -> bool:
+        """Return true when the live request already has DSA index in vLLM.
+
+        Shared CPU decode must cold-materialize the DSA index once because a
+        prefix hit may skip prefill. After that, the same live request keeps
+        the indexer KV resident in vLLM; reloading it from LMCache on every
+        decode token is redundant. Decode-save growth resets/extends the
+        request state, so the next larger prefix still materializes once.
+        """
+        if bound_state is None or not bound_state.shared_request_active:
+            return False
+        if bound_state.shared_index_status != "present":
+            return False
+        if request.load_spec is None:
+            return False
+        return (
+            int(request.load_spec.lmcache_cached_tokens) <= int(bound_state.token_count)
+            and int(token_count) <= int(bound_state.token_count)
+        )
+
+    @staticmethod
+    def _mark_shared_index_skipped(
+        state: Optional[WorkerRetrieveState],
+        req_id: str,
+        generation: int,
+        token_count: int,
+    ) -> None:
+        if state is None:
+            return
+        state.req_id = req_id
+        state.shared_index_status = "skipped"
+        state.shared_generation = generation
+        state.shared_validation_signature = None
+        if state.shared_latent_status == "present":
+            state.shared_request_active = True
+            state.pointer_cache_generation = generation
+            state.request_scope_token = f"{req_id}:{generation}:{token_count}"
+
+    @staticmethod
+    def _shared_request_scope_token(
+        req_id: str,
+        generation: int,
+        token_count: int,
+    ) -> str:
+        return f"{req_id}:{generation}:{token_count}"
+
+    @staticmethod
+    def _shared_retrieve_token_count_for_request(
+        request: ReqMeta,
+    ) -> int:
+        token_count = len(request.token_ids)
+        if request.is_sparse_decode and request.load_spec is not None:
+            token_count = int(request.load_spec.lmcache_cached_tokens)
+        return token_count
+
+    @classmethod
+    def _shared_request_scope_token_for_request(
+        cls,
+        request: ReqMeta,
+        generation: int,
+    ) -> str:
+        return cls._shared_request_scope_token(
+            request.req_id,
+            generation,
+            cls._shared_retrieve_token_count_for_request(request),
+        )
+
+    def _shared_worker_validation_signature(
+        self,
+        state: WorkerRetrieveState,
+        request: ReqMeta,
+        *,
+        current_generation: int,
+        pointer_generation: int,
+        materialize_index: bool,
+    ) -> tuple[Any, ...]:
+        return (
+            state.request_scope_token,
+            current_generation,
+            pointer_generation,
+            state.shared_latent_status,
+            state.shared_index_status,
+            bool(self._is_dsa_two_groups()),
+            bool(materialize_index),
+            int(getattr(self, "num_layers", 0) or 0),
+            request.req_id,
+            len(state.cached_starts or []),
+            len(state.cached_ends or []),
+            id(state.cached_memory_objs),
+            id(state.cached_chunk_ptrs_npu),
+        )
+
+    @staticmethod
+    def _clear_request_indexer_cache(request: ReqMeta) -> None:
+        for field_name in (
+            "cached_keys_indexer",
+            "cached_starts_indexer",
+            "cached_ends_indexer",
+            "cached_memory_objs_indexer",
+            "cached_tensors_indexer",
+            "cached_chunk_dev_ptrs_indexer",
+            "cached_chunk_ptrs_npu_indexer",
+            "cached_shared_handles_indexer",
+        ):
+            _ensure_list_attr(request, field_name).clear()
+
+    def _validate_shared_worker_retrieve_state(
+        self,
+        state: WorkerRetrieveState,
+        request: ReqMeta,
+    ) -> None:
+        engine = getattr(self, "lmcache_engine", None)
+        if (
+            engine is None
+            or not getattr(engine, "enable_shared_cpu_cache", False)
+            or not getattr(request, "is_sparse_decode", False)
+            or not state.shared_request_active
+        ):
+            return
+
+        current_generation = int(
+            getattr(engine, "shared_cpu_cache_generation", 0) or 0
+        )
+        state_generation = int(state.shared_generation or 0)
+        pointer_generation = int(
+            getattr(state, "pointer_cache_generation", 0) or state_generation
+        )
+        if state_generation != current_generation:
+            raise RuntimeError(
+                "Shared CPU sparse decode state generation mismatch before "
+                "hot-path reuse: "
+                f"req_id={request.req_id}, state_generation="
+                f"{state.shared_generation}, current_generation="
+                f"{current_generation}"
+            )
+        if pointer_generation != current_generation:
+            raise RuntimeError(
+                "Shared CPU sparse decode pointer-cache generation mismatch "
+                "before hot-path reuse: "
+                f"req_id={request.req_id}, pointer_cache_generation="
+                f"{pointer_generation}, current_generation={current_generation}"
+            )
+        expected_scope_token = self._shared_request_scope_token_for_request(
+            request,
+            current_generation,
+        )
+        if state.request_scope_token != expected_scope_token:
+            raise RuntimeError(
+                "Shared CPU sparse decode request scope mismatch before "
+                "hot-path reuse: "
+                f"req_id={request.req_id}, request_scope_token="
+                f"{state.request_scope_token!r}, expected="
+                f"{expected_scope_token!r}"
+            )
+        retrieve_token_count = self._shared_retrieve_token_count_for_request(
+            request
+        )
+        if state.shared_latent_status != "present":
+            raise RuntimeError(
+                "Shared CPU sparse decode hot path requires MLA latent "
+                "state before transfer: "
+                f"req_id={request.req_id}, status={state.shared_latent_status!r}"
+            )
+        materialize_index = False
+        if self._is_dsa_two_groups():
+            materialize_index = self._sparse_decode_requires_index_materialization(
+                request,
+                True,
+            )
+            allowed = ("present",) if materialize_index else ("present", "skipped")
+            if state.shared_index_status not in allowed:
+                raise RuntimeError(
+                    "Shared CPU sparse decode hot path has invalid DSA index "
+                    "state before transfer: "
+                    f"req_id={request.req_id}, status="
+                    f"{state.shared_index_status!r}, materialize_index="
+                    f"{materialize_index}"
+                )
+
+        validation_signature = self._shared_worker_validation_signature(
+            state,
+            request,
+            current_generation=current_generation,
+            pointer_generation=pointer_generation,
+            materialize_index=materialize_index,
+        )
+        if state.shared_validation_signature == validation_signature:
+            return
+
+        if not self._cached_ranges_cover_prefix(
+            state.cached_starts,
+            state.cached_ends,
+            retrieve_token_count,
+        ):
+            cached_ranges = list(
+                zip(state.cached_starts, state.cached_ends, strict=False)
+            )
+            raise RuntimeError(
+                "Shared CPU sparse decode hot path has non-contiguous MLA "
+                "latent prefix coverage before transfer: "
+                f"req_id={request.req_id}, kv_group=0, "
+                f"token_count={retrieve_token_count}, "
+                f"cached_ranges={cached_ranges}"
+            )
+        expected_layers = int(getattr(self, "num_layers", 0) or 0)
+        required_latent_chunks = self._shared_required_chunk_count(
+            state.cached_starts,
+            state.cached_ends,
+            state.cached_memory_objs,
+        )
+        missing_latent_layers = self._missing_shared_layer_cache_coverage(
+            state.cached_memory_objs,
+            expected_layers,
+            required_latent_chunks,
+        )
+        if missing_latent_layers:
+            raise RuntimeError(
+                "Shared CPU sparse decode hot path has incomplete MLA "
+                "latent state before transfer: "
+                f"req_id={request.req_id}, kv_group=0, "
+                f"missing_layers={missing_latent_layers}"
+            )
+        missing_latent_pointer_layers = self._missing_shared_pointer_cache_layers(
+            state.cached_memory_objs,
+            state.cached_chunk_ptrs_npu,
+            required_latent_chunks,
+        )
+        if missing_latent_pointer_layers:
+            raise RuntimeError(
+                "Shared CPU sparse decode hot path is missing MLA latent "
+                "NPU pointer-cache tensors before transfer: "
+                f"req_id={request.req_id}, "
+                f"missing_layers={missing_latent_pointer_layers}"
+            )
+        # DSA index is cold-materialized and admitted into the live request
+        # state before warm sparse decode reuse. Warm decode retrieves only MLA
+        # latent rows, so avoid walking index metadata or pointer caches here.
+        state.shared_validation_signature = validation_signature
+
+    def _shared_worker_retrieve_state_is_current(
+        self,
+        state: WorkerRetrieveState,
+        request: ReqMeta,
+        token_count: int,
+    ) -> bool:
+        if not state.shared_request_active or state.shared_validation_signature is None:
+            return False
+        if request.load_spec is not None and (
+            int(request.load_spec.lmcache_cached_tokens) > int(state.token_count)
+        ):
+            return False
+        if int(token_count) > int(state.token_count):
+            return False
+
+        engine = getattr(self, "lmcache_engine", None)
+        current_generation = int(
+            getattr(engine, "shared_cpu_cache_generation", 0) or 0
+        )
+        pointer_generation = int(
+            getattr(state, "pointer_cache_generation", 0)
+            or int(state.shared_generation or 0)
+        )
+        materialize_index = (
+            self._is_dsa_two_groups()
+            and self._sparse_decode_requires_index_materialization(request, True)
+        )
+        validation_signature = self._shared_worker_validation_signature(
+            state,
+            request,
+            current_generation=current_generation,
+            pointer_generation=pointer_generation,
+            materialize_index=materialize_index,
+        )
+        return state.shared_validation_signature == validation_signature
 
     @staticmethod
     def _save_storer_key(req_id: str, kv_group: int) -> Union[str, tuple[str, int]]:
@@ -1704,21 +2352,79 @@ class LMCacheConnectorV1Impl:
             idx_slot = idx_slot[:lmcache_cached_tokens]
         return idx_slot
 
+    def _indexer_save_slot_mapping(
+        self,
+        request: "ReqMeta",
+        attn_metadata,
+        layer_name: Optional[str],
+        token_count: int,
+    ) -> Optional[torch.Tensor]:
+        """Return indexer save slots from the active layer metadata.
+
+        DSA indexer save is reading the current indexer-layer KV buffer, so the
+        source slots must come from the attention metadata for that layer. The
+        request-level indexer_slot_mapping may be a full/cumulative scheduler
+        destination used by retrieve; using it for save can publish cache chunks
+        that differ from the cold prefill state.
+        """
+        if (
+            self._is_decode_window_save_request(request)
+            and request.indexer_slot_mapping
+        ):
+            return request.indexer_slot_mapping[0]
+        _ = token_count
+        return self._indexer_slot_mapping_from_attn_metadata(
+            attn_metadata, layer_name
+        )
+
     def _sparse_indexer_slot_mapping(
         self,
         attn_metadata,
         latent_sparse_slots: torch.Tensor,
         lmcache_cached_tokens: int,
-    ) -> torch.Tensor:
-        """Indexer slots for sparse decode, aligned to the latent sparse window."""
+        request_indexer_slots: Optional[torch.Tensor] = None,
+        strict: bool = False,
+    ) -> Optional[torch.Tensor]:
+        """Indexer slots for sparse decode, covering the full LMCache-hit prefix.
+
+        The latent group loads only selected top-k rows into a compact scratch
+        window, but the DSA index group must be fully materialized before top-k
+        selection. Capping index slots to the latent scratch window leaves most
+        prompt index rows stale and degrades sparse decode quality.
+        """
         sparse_len = len(latent_sparse_slots)
+        indexer_len = int(lmcache_cached_tokens)
+        if request_indexer_slots is not None and request_indexer_slots.numel() > 0:
+            request_indexer_slots = request_indexer_slots.to(
+                device=self.device, dtype=torch.long
+            )
+            if request_indexer_slots.numel() >= indexer_len:
+                return request_indexer_slots[:indexer_len]
+
         idx_slot = self._indexer_retrieve_slot_mapping(
             attn_metadata, lmcache_cached_tokens
         )
+        if idx_slot is not None and idx_slot.numel() >= indexer_len:
+            return idx_slot[:indexer_len]
+        if strict:
+            request_len = (
+                int(request_indexer_slots.numel())
+                if request_indexer_slots is not None
+                else 0
+            )
+            metadata_len = int(idx_slot.numel()) if idx_slot is not None else 0
+            raise RuntimeError(
+                "Shared CPU sparse decode with dsa_two_groups=true could not "
+                "resolve full DSA index slot mapping. Refusing to fall back "
+                "to latent slots because that can load indexer KV into the "
+                "wrong cache group: "
+                f"indexer_len={indexer_len}, sparse_len={sparse_len}, "
+                f"request_indexer_slots={request_len}, "
+                f"metadata_indexer_slots={metadata_len}, "
+                f"lmcache_cached_tokens={lmcache_cached_tokens}"
+            )
         if idx_slot is None or idx_slot.numel() == 0:
             return latent_sparse_slots
-        if idx_slot.numel() >= sparse_len:
-            return idx_slot[:sparse_len]
         return idx_slot
 
     def _layer_index_from_name(self, layer_name: str) -> int:
@@ -1746,8 +2452,8 @@ class LMCacheConnectorV1Impl:
                     forward_context.virtual_engine
                 ]
 
-        self._build_kv_layer_groups()
         self._refresh_kvcaches_list()
+        self._build_kv_layer_groups()
 
     ####################
     # Worker side APIs
@@ -1762,7 +2468,7 @@ class LMCacheConnectorV1Impl:
             # selected_tokens can point anywhere in the cached prefix. Retrieve
             # metadata and cached chunk pointers must therefore cover the full
             # LMCache-hit prefix, not only the scratch window length.
-            if lmcache_cached_tokens > 0:
+            if 0 < lmcache_cached_tokens < len(tokens):
                 return tokens[:lmcache_cached_tokens]
             return tokens
         if lmcache_cached_tokens >= len(tokens):
@@ -1774,8 +2480,16 @@ class LMCacheConnectorV1Impl:
         request: "ReqMeta",
         token_count: int,
         lmcache_chunk_size: int,
-    ) -> torch.Tensor:
+    ) -> Optional[torch.Tensor]:
         """Build or reuse the token mask for a retrieve call."""
+        if (
+            request.is_sparse_decode
+            and request.load_spec is not None
+            and request.load_spec.vllm_cached_tokens <= 0
+        ):
+            request.decode_token_mask = None
+            return None
+
         if request.is_sparse_decode and request.decode_token_mask is not None:
             mask = request.decode_token_mask
             if mask.numel() == token_count:
@@ -1877,6 +2591,11 @@ class LMCacheConnectorV1Impl:
         self._layerwise_retriever_is_sparse.clear()
         if hasattr(self, "_layerwise_sparse_req_ids"):
             self._layerwise_sparse_req_ids.clear()
+        if hasattr(self, "_layerwise_waited_groups"):
+            self._layerwise_waited_groups.clear()
+        if hasattr(self, "_layerwise_sparse_indexer_sent_layers"):
+            self._layerwise_sparse_indexer_sent_layers.clear()
+        self._layerwise_required_wait_groups_cache = None
 
     def _drain_sparse_layerwise_retriever(
         self, retriever: Generator[Any, Any, Any]
@@ -1946,17 +2665,172 @@ class LMCacheConnectorV1Impl:
             return storer_key[1] == kv_group
         return False
 
+    def _clear_decode_window_save_groups_for_req(self, req_id: str) -> None:
+        groups = getattr(self, "_decode_window_save_completed_groups", None)
+        if groups is not None:
+            for group_key in list(groups):
+                if (
+                    isinstance(group_key, tuple)
+                    and group_key
+                    and group_key[0] == req_id
+                ):
+                    groups.discard(group_key)
+        expected = getattr(self, "_decode_window_save_expected_start", None)
+        if expected is not None:
+            expected.pop(req_id, None)
+
+    def _clear_decode_window_save_groups_for_window(
+        self,
+        request: ReqMeta,
+    ) -> None:
+        groups = getattr(self, "_decode_window_save_completed_groups", None)
+        if groups is None:
+            return
+        for kv_group in self._decode_window_save_required_groups(request):
+            groups.discard(self._layerwise_save_storer_key(request, kv_group))
+
+    def _record_decode_window_save_group_completed(
+        self,
+        request: ReqMeta,
+        kv_group: int,
+    ) -> None:
+        if not self._is_decode_window_save_request(request):
+            return
+        groups = getattr(self, "_decode_window_save_completed_groups", None)
+        if groups is None:
+            return
+        groups.add(self._layerwise_save_storer_key(request, kv_group))
+
+    def _note_decode_window_save_seen(self, request: ReqMeta) -> None:
+        if not self._is_decode_window_save_request(request):
+            return
+        expected = getattr(self, "_decode_window_save_expected_start", None)
+        if expected is None:
+            return
+        window_start = getattr(request, "decode_window_start", None)
+        if window_start is None:
+            return
+        window_start = int(window_start)
+        expected.setdefault(request.req_id, window_start)
+
+    def _decode_window_save_is_next_expected(self, request: ReqMeta) -> bool:
+        expected = getattr(self, "_decode_window_save_expected_start", None)
+        if expected is None:
+            return True
+        window_start = getattr(request, "decode_window_start", None)
+        if window_start is None:
+            return True
+        self._note_decode_window_save_seen(request)
+        return int(window_start) == int(expected.get(request.req_id, window_start))
+
+    def _decode_window_save_required_groups(self, request: ReqMeta) -> set[int]:
+        if not self._is_decode_window_save_request(request):
+            return set()
+        save_spec = request.save_spec
+        if save_spec is None:
+            return set()
+        required: set[int] = set()
+        if getattr(save_spec, "can_save_latent", getattr(save_spec, "can_save", False)):
+            required.add(0)
+        if (
+            getattr(self.config, "dsa_two_groups", False)
+            and getattr(save_spec, "can_save_indexer", False)
+        ):
+            required.add(1)
+        return required
+
+    def _decode_window_save_has_required_groups(self, request: ReqMeta) -> bool:
+        required = self._decode_window_save_required_groups(request)
+        if not required:
+            return False
+        groups = getattr(self, "_decode_window_save_completed_groups", None)
+        if groups is None:
+            return False
+        return all(
+            self._layerwise_save_storer_key(request, kv_group) in groups
+            for kv_group in required
+        )
+
+    def _decode_window_save_uses_shared_cpu(self) -> bool:
+        engine = getattr(self, "lmcache_engine", None)
+        return bool(getattr(engine, "enable_shared_cpu_cache", False))
+
+    def _decode_window_save_group_pointer_ready(
+        self,
+        request: ReqMeta,
+        kv_group: int,
+    ) -> bool:
+        cache_kwargs = _retrieve_cache_kwargs(
+            request,
+            kv_group=kv_group,
+            dsa_two_groups=self._is_dsa_two_groups(),
+        )
+        starts = cache_kwargs["cached_starts"]
+        ends = cache_kwargs["cached_ends"]
+        memory_objs = cache_kwargs["cached_memory_objs"]
+        chunk_ptrs = cache_kwargs["cached_chunk_ptrs_npu"]
+        window_start = getattr(request, "decode_window_start", None)
+        window_end = getattr(request, "decode_window_end", None)
+        if window_start is not None and window_end is not None:
+            if not self._cached_ranges_cover_interval(
+                starts,
+                ends,
+                int(window_start),
+                int(window_end),
+            ):
+                return False
+        required_chunks = self._shared_required_chunk_count(
+            starts,
+            ends,
+            memory_objs,
+        )
+        if required_chunks <= 0:
+            return False
+        expected_layers = int(getattr(self, "num_layers", 0) or 0)
+        if expected_layers <= 0:
+            expected_layers = len(memory_objs or [])
+        if expected_layers <= 0:
+            return False
+        if self._missing_shared_layer_cache_coverage(
+            memory_objs,
+            expected_layers,
+            required_chunks,
+        ):
+            return False
+        return not self._missing_shared_pointer_cache_layers(
+            memory_objs,
+            chunk_ptrs,
+            required_chunks,
+        )
+
+    def _decode_window_save_store_cache_ready(self, request: ReqMeta) -> bool:
+        if not self._decode_window_save_uses_shared_cpu():
+            return True
+        required = self._decode_window_save_required_groups(request)
+        if not required:
+            return False
+        return all(
+            self._decode_window_save_group_pointer_ready(request, kv_group)
+            for kv_group in required
+        )
+
     def _drop_layerwise_save_storers(self, req_id: str) -> None:
         if hasattr(self, "_layerwise_save_storers"):
             for storer_key in list(self._layerwise_save_storers):
+                should_drop = False
                 if storer_key == req_id:
-                    self._layerwise_save_storers.pop(storer_key, None)
+                    should_drop = True
                 elif (
                     isinstance(storer_key, tuple)
                     and storer_key
                     and storer_key[0] == req_id
                 ):
-                    self._layerwise_save_storers.pop(storer_key, None)
+                    should_drop = True
+                if should_drop:
+                    self._close_layerwise_storer(
+                        self._layerwise_save_storers.pop(storer_key, None)
+                    )
+        self._clear_decode_window_save_groups_for_req(req_id)
 
         pending = getattr(self, "_deferred_latent_pending", None)
         if pending is not None:
@@ -1988,6 +2862,38 @@ class LMCacheConnectorV1Impl:
     def _mark_decode_window_save_completed(self, request: ReqMeta) -> None:
         if not self._is_decode_window_save_request(request):
             return
+        self._note_decode_window_save_seen(request)
+        engine = self.lmcache_engine
+        is_passive = getattr(engine, "_is_passive", None)
+        if callable(is_passive) and is_passive():
+            return
+        if not self._decode_window_save_has_required_groups(request):
+            logger.debug(
+                "Decode-window save not marked complete before required "
+                "store groups are seen: req_id=%s required_groups=%s",
+                request.req_id,
+                sorted(self._decode_window_save_required_groups(request)),
+            )
+            return
+        if not self._decode_window_save_is_next_expected(request):
+            expected = getattr(self, "_decode_window_save_expected_start", {})
+            logger.debug(
+                "Decode-window save not marked complete out of order: "
+                "req_id=%s window_start=%s expected_start=%s",
+                request.req_id,
+                getattr(request, "decode_window_start", None),
+                expected.get(request.req_id),
+            )
+            return
+        if not self._decode_window_save_store_cache_ready(request):
+            logger.debug(
+                "Decode-window save not marked complete before shared CPU "
+                "store cache has per-layer pointer coverage: req_id=%s "
+                "required_groups=%s",
+                request.req_id,
+                sorted(self._decode_window_save_required_groups(request)),
+            )
+            return
         window_end = request.decode_window_end
         if window_end is None:
             return
@@ -1995,6 +2901,13 @@ class LMCacheConnectorV1Impl:
         if completed is None:
             return
         completed[request.req_id] = max(completed.get(request.req_id, 0), window_end)
+        expected = getattr(self, "_decode_window_save_expected_start", None)
+        if expected is not None:
+            expected[request.req_id] = max(
+                int(expected.get(request.req_id, 0)),
+                int(window_end),
+            )
+        self._clear_decode_window_save_groups_for_window(request)
 
     def get_completed_decode_window_saves(self) -> dict[str, int]:
         completed = getattr(self, "_completed_decode_window_saves", None)
@@ -2013,6 +2926,30 @@ class LMCacheConnectorV1Impl:
             if tracker is None:
                 continue
             committed_end = int(window_end)
+            window_size = int(getattr(self, "_decode_window_save_window_size", 0) or 0)
+            if window_size > 0 and tracker.decode_window_save_next_start is None:
+                logger.debug(
+                    "Ignoring decode-window completion before scheduler "
+                    "emitted any save window: req_id=%s window_end=%s",
+                    req_id,
+                    window_end,
+                )
+                continue
+            if tracker.decode_window_save_next_start is not None:
+                next_start = int(tracker.decode_window_save_next_start)
+                committed_end = min(
+                    committed_end,
+                    next_start,
+                )
+                committed_end = min(committed_end, len(tracker.token_ids))
+                if window_size > 0 and committed_end < next_start:
+                    delta = next_start - committed_end
+                    windows_back = (delta + window_size - 1) // window_size
+                    committed_end = max(0, next_start - windows_back * window_size)
+            else:
+                committed_end = min(committed_end, len(tracker.token_ids))
+                if window_size > 0:
+                    committed_end = committed_end // window_size * window_size
             tracker.decode_window_save_committed_end = max(
                 tracker.decode_window_save_committed_end,
                 committed_end,
@@ -2025,9 +2962,19 @@ class LMCacheConnectorV1Impl:
         kept_warm_req_ids: list[str] = []
         for req_id in dropped_req_ids:
             state = self._worker_retrieve_state.get(req_id)
+            if state is not None and state.shared_request_active:
+                self._release_shared_worker_retrieve_state(
+                    state,
+                    getattr(self, "lmcache_engine", None),
+                )
             if state is not None and (state.metadata_warm or state.cached_keys):
                 kept_warm_req_ids.append(req_id)
                 continue
+            if state is not None:
+                self._release_shared_worker_retrieve_state(
+                    state,
+                    getattr(self, "lmcache_engine", None),
+                )
             self._release_request_lookup_pins(req_id)
         self._worker_retrieve_state = {
             req_id: state
@@ -2037,8 +2984,678 @@ class LMCacheConnectorV1Impl:
 
     def _drop_worker_retrieve_state(self, req_id: str) -> None:
         if hasattr(self, "_worker_retrieve_state"):
-            self._worker_retrieve_state.pop(req_id, None)
+            state = self._worker_retrieve_state.pop(req_id, None)
+            if state is not None:
+                self._release_shared_worker_retrieve_state(
+                    state,
+                    getattr(self, "lmcache_engine", None),
+                )
         self._release_request_lookup_pins(req_id)
+
+    @staticmethod
+    def _release_shared_worker_retrieve_state(
+        state: WorkerRetrieveState,
+        engine: Optional[Any] = None,
+    ) -> None:
+        if engine is not None and state.shared_request_active:
+            release_fn = getattr(engine, "release_shared_cpu_sparse_request", None)
+            if callable(release_fn):
+                release_fn(state.req_id)
+        for layers in state.shared_views_by_group.values():
+            for layer_views in layers:
+                for mem_obj in layer_views:
+                    try:
+                        mem_obj.ref_count_down()
+                    except Exception as exc:
+                        logger.warning(
+                            "Failed to release passive shared view: %s", exc
+                        )
+        for layers in state.rank0_backing_objs_by_group.values():
+            for layer_objs in layers:
+                for mem_obj in layer_objs:
+                    try:
+                        if getattr(mem_obj, "is_pinned", False):
+                            mem_obj.unpin()
+                        mem_obj.ref_count_down()
+                    except Exception as exc:
+                        logger.warning(
+                            "Failed to release rank0 shared backing object: %s",
+                            exc,
+                        )
+        state.shared_handles_by_group.clear()
+        state.shared_views_by_group.clear()
+        state.shared_chunk_ptrs_npu_by_group.clear()
+        state.rank0_backing_objs_by_group.clear()
+        state.cached_memory_objs.clear()
+        state.cached_tensors.clear()
+        state.cached_chunk_dev_ptrs.clear()
+        state.cached_chunk_ptrs_npu.clear()
+        state.cached_shared_handles.clear()
+        state.cached_memory_objs_indexer.clear()
+        state.cached_tensors_indexer.clear()
+        state.cached_chunk_dev_ptrs_indexer.clear()
+        state.cached_chunk_ptrs_npu_indexer.clear()
+        state.cached_shared_handles_indexer.clear()
+        state.shared_latent_status = "missing"
+        state.shared_index_status = "missing"
+        state.shared_generation = 0
+        state.pointer_cache_generation = 0
+        state.shared_request_active = False
+        state.request_scope_token = None
+        state.shared_validation_signature = None
+        state.req_id = None
+
+    @staticmethod
+    def _release_replaced_shared_layer_objs(
+        old_layers: list[list[Any]],
+        new_layers: list[list[Any]],
+        *,
+        rank0_backing: bool,
+    ) -> None:
+        new_ids = {
+            id(mem_obj)
+            for layer_objs in (new_layers or [])
+            for mem_obj in layer_objs
+        }
+        for layer_objs in old_layers or []:
+            for mem_obj in layer_objs:
+                if id(mem_obj) in new_ids:
+                    continue
+                try:
+                    if rank0_backing and getattr(mem_obj, "is_pinned", False):
+                        mem_obj.unpin()
+                    mem_obj.ref_count_down()
+                except Exception as exc:
+                    logger.warning(
+                        "Failed to release replaced shared CPU %s object: %s",
+                        "rank0 backing" if rank0_backing else "passive view",
+                        exc,
+                    )
+
+    @classmethod
+    def _release_replaced_shared_groups(
+        cls,
+        old_by_group: dict[int, list[list[Any]]],
+        new_by_group: dict[int, list[list[Any]]],
+        *,
+        rank0_backing: bool,
+    ) -> None:
+        for kv_group, new_layers in new_by_group.items():
+            old_layers = old_by_group.get(kv_group)
+            if old_layers is None:
+                continue
+            cls._release_replaced_shared_layer_objs(
+                old_layers,
+                new_layers,
+                rank0_backing=rank0_backing,
+            )
+
+    @staticmethod
+    def _shared_required_chunk_count(
+        starts: list[int],
+        ends: list[int],
+        layers: list[list[Any]],
+    ) -> int:
+        count = max(len(starts or []), len(ends or []))
+        if count > 0:
+            return count
+        if any(layer for layer in (layers or [])):
+            return 1
+        return 0
+
+    @staticmethod
+    def _cached_prefix_covered_token_count(
+        starts: list[int],
+        ends: list[int],
+    ) -> int:
+        covered = 0
+        for start, end in zip(starts or [], ends or [], strict=False):
+            start = int(start)
+            end = int(end)
+            if end <= start:
+                continue
+            if start > covered:
+                break
+            covered = max(covered, end)
+        return covered
+
+    @staticmethod
+    def _cached_ranges_cover_interval(
+        starts: list[int],
+        ends: list[int],
+        interval_start: int,
+        interval_end: int,
+    ) -> bool:
+        interval_start = max(0, int(interval_start))
+        interval_end = max(interval_start, int(interval_end))
+        if interval_end == interval_start:
+            return True
+        covered = interval_start
+        for start, end in zip(starts or [], ends or [], strict=False):
+            start = int(start)
+            end = int(end)
+            if end <= start or end <= covered:
+                continue
+            if start > covered:
+                break
+            covered = max(covered, end)
+            if covered >= interval_end:
+                return True
+        return False
+
+    @classmethod
+    def _cached_ranges_cover_prefix(
+        cls,
+        starts: list[int],
+        ends: list[int],
+        token_count: int,
+    ) -> bool:
+        token_count = max(0, int(token_count))
+        if token_count == 0:
+            return True
+        return cls._cached_prefix_covered_token_count(starts, ends) >= token_count
+
+    @staticmethod
+    def _shared_pointer_cache_entry_covers(
+        entry: Any,
+        required_chunks: int,
+    ) -> bool:
+        if entry is None:
+            return False
+        required_chunks = max(1, int(required_chunks))
+        if isinstance(entry, torch.Tensor):
+            return int(entry.numel()) >= required_chunks
+        try:
+            return len(entry) >= required_chunks
+        except TypeError:
+            return required_chunks == 1
+
+    @staticmethod
+    def _missing_shared_layer_cache_coverage(
+        layers: list[list[Any]],
+        expected_layers: int,
+        required_chunks: int,
+    ) -> list[int]:
+        if expected_layers <= 0:
+            return []
+        required_chunks = max(1, int(required_chunks))
+        missing = []
+        layers = layers or []
+        for layer_id in range(expected_layers):
+            if layer_id >= len(layers):
+                missing.append(layer_id)
+                continue
+            layer_cache = layers[layer_id]
+            if layer_cache is None or len(layer_cache) < required_chunks:
+                missing.append(layer_id)
+        return missing
+
+    @staticmethod
+    def _missing_shared_pointer_cache_layers(
+        layers: list[list[Any]],
+        chunk_ptrs: list[Optional[torch.Tensor]],
+        required_chunks: int = 1,
+    ) -> list[int]:
+        missing: list[int] = []
+        for layer_id, layer_entries in enumerate(layers or []):
+            if not layer_entries:
+                continue
+            if layer_id >= len(chunk_ptrs):
+                missing.append(layer_id)
+                continue
+            if not LMCacheConnectorV1Impl._shared_pointer_cache_entry_covers(
+                chunk_ptrs[layer_id],
+                required_chunks,
+            ):
+                missing.append(layer_id)
+        return missing
+
+    def _validate_decode_save_shared_pointer_cache(
+        self,
+        state: WorkerRetrieveState,
+        request: ReqMeta,
+    ) -> None:
+        required_latent_chunks = self._shared_required_chunk_count(
+            state.cached_starts,
+            state.cached_ends,
+            state.cached_memory_objs,
+        )
+        missing_latent_layers = self._missing_shared_pointer_cache_layers(
+            state.cached_memory_objs,
+            state.cached_chunk_ptrs_npu,
+            required_latent_chunks,
+        )
+        if missing_latent_layers:
+            raise RuntimeError(
+                "Decode-window save merge produced incomplete shared CPU MLA "
+                "latent pointer cache before refreshing the hot request "
+                "scope: "
+                f"req_id={request.req_id}, kv_group=0, "
+                f"missing_layers={missing_latent_layers}"
+            )
+
+        if (
+            self._is_dsa_two_groups()
+            and self._sparse_decode_requires_index_materialization(request, True)
+        ):
+            expected_index_layers = int(getattr(self, "num_layers", 0) or 0)
+            if expected_index_layers <= 0:
+                expected_index_layers = len(state.cached_memory_objs_indexer or [])
+            required_index_chunks = max(
+                required_latent_chunks,
+                self._shared_required_chunk_count(
+                    state.cached_starts_indexer,
+                    state.cached_ends_indexer,
+                    state.cached_memory_objs_indexer,
+                ),
+            )
+            missing_index_layers = self._missing_shared_layer_cache_coverage(
+                state.cached_memory_objs_indexer,
+                expected_index_layers,
+                required_index_chunks,
+            )
+            if missing_index_layers:
+                raise RuntimeError(
+                    "Decode-window save merge produced incomplete shared CPU "
+                    "DSA index state before refreshing the hot request scope: "
+                    f"req_id={request.req_id}, kv_group=1, "
+                    f"missing_layers={missing_index_layers}"
+                )
+            missing_index_layers = self._missing_shared_pointer_cache_layers(
+                state.cached_memory_objs_indexer,
+                state.cached_chunk_ptrs_npu_indexer,
+                required_index_chunks,
+            )
+            if missing_index_layers:
+                raise RuntimeError(
+                    "Decode-window save merge produced incomplete shared CPU "
+                    "DSA index pointer cache before refreshing the hot "
+                    "request scope: "
+                    f"req_id={request.req_id}, kv_group=1, "
+                    f"missing_layers={missing_index_layers}"
+                )
+
+    @staticmethod
+    def _missing_required_shared_layers(
+        layers: list[list[Any]],
+        expected_layers: int,
+    ) -> list[int]:
+        if expected_layers <= 0:
+            return []
+        missing = []
+        for layer_id in range(expected_layers):
+            if layer_id >= len(layers) or not layers[layer_id]:
+                missing.append(layer_id)
+        return missing
+
+    @staticmethod
+    def _copy_shared_layer_map(
+        layer_map: dict[int, list[list[Any]]],
+    ) -> dict[int, list[list[Any]]]:
+        return {
+            kv_group: [list(layer) for layer in layers]
+            for kv_group, layers in layer_map.items()
+        }
+
+    @staticmethod
+    def _copy_shared_ptr_map(
+        ptr_map: dict[int, list[Optional[torch.Tensor]]],
+    ) -> dict[int, list[Optional[torch.Tensor]]]:
+        return {
+            kv_group: list(ptrs)
+            for kv_group, ptrs in ptr_map.items()
+        }
+
+    @staticmethod
+    def _copy_layer_cache(cache: list[list[Any]]) -> list[list[Any]]:
+        return [
+            list(layer_cache) if isinstance(layer_cache, list) else layer_cache
+            for layer_cache in (cache or [])
+        ]
+
+    def _snapshot_worker_retrieve_cache_state(
+        self,
+        state: WorkerRetrieveState,
+    ) -> dict[str, Any]:
+        return {
+            "cached_starts": list(state.cached_starts),
+            "cached_ends": list(state.cached_ends),
+            "cached_keys": self._copy_layer_cache(state.cached_keys),
+            "cached_memory_objs": self._copy_layer_cache(state.cached_memory_objs),
+            "cached_tensors": self._copy_layer_cache(state.cached_tensors),
+            "cached_chunk_dev_ptrs": self._copy_layer_cache(
+                state.cached_chunk_dev_ptrs
+            ),
+            "cached_chunk_ptrs_npu": list(state.cached_chunk_ptrs_npu),
+            "cached_shared_handles": self._copy_layer_cache(
+                state.cached_shared_handles
+            ),
+            "cached_starts_indexer": list(state.cached_starts_indexer),
+            "cached_ends_indexer": list(state.cached_ends_indexer),
+            "cached_keys_indexer": self._copy_layer_cache(
+                state.cached_keys_indexer
+            ),
+            "cached_memory_objs_indexer": self._copy_layer_cache(
+                state.cached_memory_objs_indexer
+            ),
+            "cached_tensors_indexer": self._copy_layer_cache(
+                state.cached_tensors_indexer
+            ),
+            "cached_chunk_dev_ptrs_indexer": self._copy_layer_cache(
+                state.cached_chunk_dev_ptrs_indexer
+            ),
+            "cached_chunk_ptrs_npu_indexer": list(
+                state.cached_chunk_ptrs_npu_indexer
+            ),
+            "cached_shared_handles_indexer": self._copy_layer_cache(
+                state.cached_shared_handles_indexer
+            ),
+            "shared_chunk_ptrs_npu_by_group": self._copy_shared_ptr_map(
+                state.shared_chunk_ptrs_npu_by_group
+            ),
+            "location": state.location,
+            "metadata_warm": state.metadata_warm,
+            "token_count": state.token_count,
+            "shared_generation": state.shared_generation,
+            "pointer_cache_generation": state.pointer_cache_generation,
+            "request_scope_token": state.request_scope_token,
+            "shared_validation_signature": state.shared_validation_signature,
+        }
+
+    @staticmethod
+    def _restore_worker_retrieve_cache_state(
+        state: WorkerRetrieveState,
+        snapshot: dict[str, Any],
+    ) -> None:
+        for attr, value in snapshot.items():
+            setattr(state, attr, value)
+
+    def _release_unstored_shared_request_objects(
+        self,
+        request: ReqMeta,
+        old_state: Optional[WorkerRetrieveState],
+    ) -> None:
+        engine = getattr(self, "lmcache_engine", None)
+        if (
+            engine is None
+            or not getattr(engine, "enable_shared_cpu_cache", False)
+            or not request.is_sparse_decode
+        ):
+            return
+
+        _retrieve_cache_kwargs(request, kv_group=0, dsa_two_groups=False)
+        _retrieve_cache_kwargs(request, kv_group=1, dsa_two_groups=True)
+
+        inherited_ids: set[int] = set()
+        if old_state is not None:
+            for group_map in (
+                old_state.shared_views_by_group,
+                old_state.rank0_backing_objs_by_group,
+            ):
+                for layers in group_map.values():
+                    for layer_objs in layers:
+                        inherited_ids.update(id(mem_obj) for mem_obj in layer_objs)
+
+        def filter_new(layers: list[list[Any]]) -> list[list[Any]]:
+            return [
+                [
+                    mem_obj
+                    for mem_obj in layer_objs
+                    if id(mem_obj) not in inherited_ids
+                ]
+                for layer_objs in (layers or [])
+            ]
+
+        groups = [
+            (0, filter_new(request.cached_memory_objs)),
+        ]
+        if request.cached_memory_objs_indexer:
+            groups.append((1, filter_new(request.cached_memory_objs_indexer)))
+
+        if not any(any(layer for layer in layers) for _, layers in groups):
+            return
+
+        metadata = getattr(engine, "metadata", None)
+        is_first_rank_fn = getattr(metadata, "is_first_rank", None)
+        is_rank0 = bool(is_first_rank_fn()) if callable(is_first_rank_fn) else False
+        temp_state = WorkerRetrieveState(req_id=request.req_id)
+        for kv_group, layers in groups:
+            if not any(layer for layer in layers):
+                continue
+            if is_rank0:
+                temp_state.rank0_backing_objs_by_group[kv_group] = layers
+            else:
+                temp_state.shared_views_by_group[kv_group] = layers
+        self._release_shared_worker_retrieve_state(temp_state)
+
+    def _record_shared_worker_retrieve_state(
+        self,
+        state: WorkerRetrieveState,
+        request: ReqMeta,
+    ) -> None:
+        engine = self.lmcache_engine
+        if (
+            engine is None
+            or not getattr(engine, "enable_shared_cpu_cache", False)
+            or not request.is_sparse_decode
+        ):
+            return
+
+        _retrieve_cache_kwargs(request, kv_group=0, dsa_two_groups=False)
+        if self._is_dsa_two_groups():
+            _retrieve_cache_kwargs(request, kv_group=1, dsa_two_groups=True)
+
+        generation = int(getattr(engine, "shared_cpu_cache_generation", 0) or 0)
+        metadata = getattr(engine, "metadata", None)
+        is_first_rank_fn = getattr(metadata, "is_first_rank", None)
+        is_rank0 = bool(is_first_rank_fn()) if callable(is_first_rank_fn) else False
+
+        def layer_has_entries(layers: list[list]) -> bool:
+            return bool(layers and any(layer for layer in layers))
+
+        expected_layers = int(getattr(self, "num_layers", 0) or 0)
+
+        pending_handles_by_group: dict[int, list[list[Any]]] = {}
+        pending_views_by_group: dict[int, list[list[Any]]] = {}
+        pending_backing_by_group: dict[int, list[list[Any]]] = {}
+        pending_chunk_ptrs_by_group: dict[int, list[Optional[torch.Tensor]]] = {}
+        materialize_index = (
+            self._is_dsa_two_groups()
+            and self._sparse_decode_requires_index_materialization(
+                request,
+                True,
+            )
+        )
+        skip_index_hot_state = self._is_dsa_two_groups() and not materialize_index
+
+        groups: list[tuple[int, list[list], list[list]]] = [
+            (0, request.cached_memory_objs, request.cached_shared_handles),
+        ]
+        required_latent_chunks = self._shared_required_chunk_count(
+            request.cached_starts,
+            request.cached_ends,
+            request.cached_memory_objs,
+        )
+        missing_latent_layers = self._missing_shared_layer_cache_coverage(
+            request.cached_memory_objs,
+            expected_layers,
+            required_latent_chunks,
+        )
+        if missing_latent_layers:
+            raise RuntimeError(
+                "Shared CPU sparse decode cannot mark request state "
+                "hot-reusable with incomplete MLA latent state: "
+                f"req_id={request.req_id}, kv_group=0, "
+                f"missing_layers={missing_latent_layers}"
+            )
+        required_index_chunks = max(
+            required_latent_chunks,
+            self._shared_required_chunk_count(
+                request.cached_starts_indexer,
+                request.cached_ends_indexer,
+                request.cached_memory_objs_indexer,
+            ),
+        )
+        missing_index_layers = self._missing_shared_layer_cache_coverage(
+            request.cached_memory_objs_indexer,
+            expected_layers,
+            required_index_chunks,
+        )
+        if materialize_index and missing_index_layers:
+            raise RuntimeError(
+                "Shared CPU sparse decode cannot mark request state "
+                "hot-reusable without complete materialized DSA index state: "
+                f"req_id={request.req_id}, kv_group=1, "
+                f"missing_layers={missing_index_layers}"
+            )
+        if materialize_index and request.cached_memory_objs_indexer:
+            groups.append(
+                (
+                    1,
+                    request.cached_memory_objs_indexer,
+                    request.cached_shared_handles_indexer,
+                )
+            )
+
+        for kv_group, layers, handles in groups:
+            if not layer_has_entries(layers):
+                continue
+            required_token_count = (
+                state.token_count
+                if state.token_count > 0
+                else self._shared_retrieve_token_count_for_request(request)
+            )
+            range_starts = (
+                request.cached_starts
+                if kv_group == 0
+                else request.cached_starts_indexer
+            )
+            range_ends = (
+                request.cached_ends
+                if kv_group == 0
+                else request.cached_ends_indexer
+            )
+            if (range_starts or range_ends) and not self._cached_ranges_cover_prefix(
+                range_starts,
+                range_ends,
+                required_token_count,
+            ):
+                cached_ranges = list(zip(range_starts, range_ends, strict=False))
+                raise RuntimeError(
+                    "Shared CPU sparse decode cannot mark request state "
+                    "hot-reusable with non-contiguous prefix coverage: "
+                    f"req_id={request.req_id}, kv_group={kv_group}, "
+                    f"token_count={required_token_count}, "
+                    f"cached_ranges={cached_ranges}"
+                )
+            chunk_ptrs = (
+                request.cached_chunk_ptrs_npu
+                if kv_group == 0
+                else request.cached_chunk_ptrs_npu_indexer
+            )
+            missing_pointer_layers = self._missing_shared_pointer_cache_layers(
+                layers,
+                chunk_ptrs,
+                required_latent_chunks if kv_group == 0 else required_index_chunks,
+            )
+            if missing_pointer_layers:
+                raise RuntimeError(
+                    "Shared CPU sparse decode cannot mark request state "
+                    "hot-reusable before NPU pointer-cache install: "
+                    f"req_id={request.req_id}, kv_group={kv_group}, "
+                    f"missing_layers={missing_pointer_layers}"
+                )
+            if layer_has_entries(handles):
+                pending_handles_by_group[kv_group] = handles
+            if is_rank0:
+                pending_backing_by_group[kv_group] = layers
+            else:
+                pending_views_by_group[kv_group] = layers
+            if chunk_ptrs:
+                pending_chunk_ptrs_by_group[kv_group] = chunk_ptrs
+
+        has_shared_request = bool(
+            pending_views_by_group or pending_backing_by_group
+        )
+        if has_shared_request:
+            if state.token_count <= 0:
+                state.token_count = self._shared_retrieve_token_count_for_request(
+                    request
+                )
+            replaced_views_by_group = {
+                kv_group: state.shared_views_by_group[kv_group]
+                for kv_group in pending_views_by_group
+                if kv_group in state.shared_views_by_group
+            }
+            replaced_backing_by_group = {
+                kv_group: state.rank0_backing_objs_by_group[kv_group]
+                for kv_group in pending_backing_by_group
+                if kv_group in state.rank0_backing_objs_by_group
+            }
+            state.shared_handles_by_group.update(pending_handles_by_group)
+            state.shared_views_by_group.update(pending_views_by_group)
+            state.rank0_backing_objs_by_group.update(pending_backing_by_group)
+            state.shared_chunk_ptrs_npu_by_group.update(
+                pending_chunk_ptrs_by_group
+            )
+            state.req_id = request.req_id
+            state.shared_generation = generation
+            state.pointer_cache_generation = generation
+            state.request_scope_token = self._shared_request_scope_token(
+                request.req_id,
+                generation,
+                state.token_count,
+            )
+            state.shared_latent_status = (
+                "present" if layer_has_entries(request.cached_memory_objs)
+                else "missing"
+            )
+            state.shared_index_status = (
+                "present"
+                if (
+                    materialize_index
+                    and layer_has_entries(request.cached_memory_objs_indexer)
+                )
+                else "skipped"
+                if (
+                    getattr(request, "shared_index_skipped", False)
+                    or state.shared_index_status == "skipped"
+                    or skip_index_hot_state
+                )
+                else "missing"
+            )
+            state.shared_request_active = True
+            state.shared_validation_signature = (
+                self._shared_worker_validation_signature(
+                    state,
+                    request,
+                    current_generation=generation,
+                    pointer_generation=generation,
+                    materialize_index=materialize_index,
+                )
+            )
+            if is_rank0:
+                register_fn = getattr(
+                    engine,
+                    "register_shared_cpu_sparse_request",
+                    None,
+                )
+                if callable(register_fn):
+                    register_fn(
+                        request.req_id,
+                        token_count=state.token_count,
+                        phase=SPARSE_DECODE_SHARED_CPU_PHASE,
+                    )
+            self._release_replaced_shared_groups(
+                replaced_views_by_group,
+                pending_views_by_group,
+                rank0_backing=False,
+            )
+            self._release_replaced_shared_groups(
+                replaced_backing_by_group,
+                pending_backing_by_group,
+                rank0_backing=True,
+            )
 
     def _should_invalidate_worker_retrieve_state(
         self, request: ReqMeta, token_count: int
@@ -2049,14 +3666,31 @@ class LMCacheConnectorV1Impl:
         if state is None:
             return False
         if request.is_sparse_decode:
+            if state.shared_request_active:
+                engine = getattr(self, "lmcache_engine", None)
+                generation = int(
+                    getattr(engine, "shared_cpu_cache_generation", 0) or 0
+                )
+                expected_scope_token = self._shared_request_scope_token(
+                    request.req_id,
+                    generation,
+                    token_count,
+                )
+                if state.request_scope_token != expected_scope_token:
+                    return True
+            if state.cached_starts and state.cached_starts[0] != 0:
+                return True
             if (
                 request.load_spec is not None
                 and request.load_spec.lmcache_cached_tokens > state.token_count
             ):
                 return True
-            # Sparse decode retrieves a sliding window (e.g. 2048 tokens) while
-            # warm cache covers the full prompt — window < cached_ends is normal.
-            if state.token_count and len(request.token_ids) < state.token_count:
+            # Sparse decode metadata is keyed by the full LMCache-hit prefix.
+            # A shorter current prefix means the cached request state is stale.
+            if state.token_count and (
+                token_count < state.token_count
+                or len(request.token_ids) < state.token_count
+            ):
                 return True
             return False
         if state.cached_ends and token_count < state.cached_ends[-1]:
@@ -2074,6 +3708,7 @@ class LMCacheConnectorV1Impl:
         state = self._worker_retrieve_state.get(request.req_id)
         if state is None or not (state.metadata_warm or state.cached_keys):
             return None
+        self._validate_shared_worker_retrieve_state(state, request)
         request.cached_keys = state.cached_keys
         request.cached_starts = state.cached_starts
         request.cached_ends = state.cached_ends
@@ -2081,6 +3716,7 @@ class LMCacheConnectorV1Impl:
         request.cached_tensors = state.cached_tensors
         request.cached_chunk_dev_ptrs = state.cached_chunk_dev_ptrs
         request.cached_chunk_ptrs_npu = state.cached_chunk_ptrs_npu
+        request.cached_shared_handles = state.cached_shared_handles
         request.cached_keys_indexer = state.cached_keys_indexer
         request.cached_starts_indexer = state.cached_starts_indexer
         request.cached_ends_indexer = state.cached_ends_indexer
@@ -2088,11 +3724,17 @@ class LMCacheConnectorV1Impl:
         request.cached_tensors_indexer = state.cached_tensors_indexer
         request.cached_chunk_dev_ptrs_indexer = state.cached_chunk_dev_ptrs_indexer
         request.cached_chunk_ptrs_npu_indexer = state.cached_chunk_ptrs_npu_indexer
+        request.cached_shared_handles_indexer = state.cached_shared_handles_indexer
         return state
 
     def _request_has_retrieve_tensor_cache(self, request: ReqMeta) -> bool:
         num_layers = self._num_layers_for_group(0)
         tensors = request.cached_tensors
+        if num_layers <= 0:
+            if tensors and any(tensors):
+                return True
+            mem = request.cached_memory_objs
+            return bool(mem and any(mem))
         if tensors and len(tensors) == num_layers and any(tensors):
             return True
         mem = request.cached_memory_objs
@@ -2130,6 +3772,7 @@ class LMCacheConnectorV1Impl:
         dst_tensors: list[list],
         dst_chunk_dev_ptrs: list[list[int]],
         dst_chunk_ptrs_npu: list[Optional[torch.Tensor]],
+        dst_shared_handles: list[list[Any]],
         src_starts: list[int],
         src_ends: list[int],
         src_keys: list[list],
@@ -2137,6 +3780,8 @@ class LMCacheConnectorV1Impl:
         src_tensors: list[list],
         src_chunk_dev_ptrs: list[list[int]],
         src_chunk_ptrs_npu: list[Optional[torch.Tensor]],
+        src_shared_handles: list[list[Any]],
+        require_pointer_cache: bool = False,
     ) -> int:
         if not src_starts or not src_ends:
             return 0
@@ -2148,13 +3793,63 @@ class LMCacheConnectorV1Impl:
         ):
             if chunk_range in existing_ranges:
                 continue
-            dst_starts.append(chunk_range[0])
-            dst_ends.append(chunk_range[1])
             existing_ranges.add(chunk_range)
             append_indices.append(chunk_idx)
 
         if not append_indices:
             return 0
+
+        def selected_ptrs_from_source(src_ptrs: torch.Tensor) -> Optional[torch.Tensor]:
+            if not isinstance(src_ptrs, torch.Tensor):
+                return None
+            if any(chunk_idx >= int(src_ptrs.numel()) for chunk_idx in append_indices):
+                return None
+            if (
+                append_indices[0] == 0
+                and append_indices[-1] == len(append_indices) - 1
+            ):
+                return src_ptrs[: len(append_indices)]
+            if append_indices[-1] - append_indices[0] + 1 == len(append_indices):
+                return src_ptrs[append_indices[0] : append_indices[-1] + 1]
+            return None
+
+        def select_layer_ptr_tensors() -> Optional[list[torch.Tensor]]:
+            if not src_chunk_ptrs_npu:
+                return None
+            selected_by_layer: list[torch.Tensor] = []
+            for src_ptrs in src_chunk_ptrs_npu:
+                selected = selected_ptrs_from_source(src_ptrs)
+                if selected is None:
+                    return None
+                selected_by_layer.append(selected)
+            return selected_by_layer
+
+        selected_ptrs_by_layer = select_layer_ptr_tensors()
+        source_layer_count = max(
+            len(src_memory_objs or []),
+            len(src_tensors or []),
+            len(src_keys or []),
+        )
+
+        def can_append_layer_ptr_tensors() -> bool:
+            if selected_ptrs_by_layer is None:
+                return False
+            if require_pointer_cache and len(selected_ptrs_by_layer) < source_layer_count:
+                return False
+            for layer_id in range(len(selected_ptrs_by_layer)):
+                if layer_id >= len(dst_chunk_ptrs_npu):
+                    continue
+                existing = dst_chunk_ptrs_npu[layer_id]
+                if existing is not None and not isinstance(existing, torch.Tensor):
+                    return False
+            return True
+
+        if require_pointer_cache and not can_append_layer_ptr_tensors():
+            return 0
+
+        for chunk_idx in append_indices:
+            dst_starts.append(src_starts[chunk_idx])
+            dst_ends.append(src_ends[chunk_idx])
 
         def append_layer_values(dst: list, src: list) -> None:
             if not src:
@@ -2169,11 +3864,32 @@ class LMCacheConnectorV1Impl:
         append_layer_values(dst_memory_objs, src_memory_objs)
         append_layer_values(dst_tensors, src_tensors)
         append_layer_values(dst_chunk_dev_ptrs, src_chunk_dev_ptrs)
+        append_layer_values(dst_shared_handles, src_shared_handles)
 
-        if dst_chunk_ptrs_npu:
-            dst_chunk_ptrs_npu.clear()
-        if src_chunk_ptrs_npu and not dst_chunk_ptrs_npu:
-            dst_chunk_ptrs_npu.extend(None for _ in range(len(src_chunk_ptrs_npu)))
+        def append_layer_ptr_tensors() -> bool:
+            if not can_append_layer_ptr_tensors():
+                return False
+            if not dst_chunk_ptrs_npu:
+                dst_chunk_ptrs_npu.extend(
+                    None for _ in range(len(src_chunk_ptrs_npu))
+                )
+            while len(dst_chunk_ptrs_npu) < len(src_chunk_ptrs_npu):
+                dst_chunk_ptrs_npu.append(None)
+
+            for layer_id, selected in enumerate(selected_ptrs_by_layer):
+                existing = dst_chunk_ptrs_npu[layer_id]
+                dst_chunk_ptrs_npu[layer_id] = (
+                    selected
+                    if existing is None
+                    else torch.cat((existing, selected))
+                )
+            return True
+
+        if not append_layer_ptr_tensors():
+            if dst_chunk_ptrs_npu:
+                dst_chunk_ptrs_npu.clear()
+            if src_chunk_ptrs_npu and not dst_chunk_ptrs_npu:
+                dst_chunk_ptrs_npu.extend(None for _ in range(len(src_chunk_ptrs_npu)))
         return len(append_indices)
 
     def _merge_store_cache_into_worker_state(
@@ -2181,6 +3897,18 @@ class LMCacheConnectorV1Impl:
         state: WorkerRetrieveState,
         request: ReqMeta,
     ) -> int:
+        _retrieve_cache_kwargs(request, kv_group=0, dsa_two_groups=False)
+        _retrieve_cache_kwargs(request, kv_group=1, dsa_two_groups=True)
+        require_pointer_cache = (
+            self._is_decode_window_save_request(request)
+            and bool(
+                getattr(
+                    getattr(self, "lmcache_engine", None),
+                    "enable_shared_cpu_cache",
+                    False,
+                )
+            )
+        )
         merged_chunks = self._merge_cache_group_by_ranges(
             dst_starts=state.cached_starts,
             dst_ends=state.cached_ends,
@@ -2189,6 +3917,7 @@ class LMCacheConnectorV1Impl:
             dst_tensors=state.cached_tensors,
             dst_chunk_dev_ptrs=state.cached_chunk_dev_ptrs,
             dst_chunk_ptrs_npu=state.cached_chunk_ptrs_npu,
+            dst_shared_handles=state.cached_shared_handles,
             src_starts=request.cached_starts,
             src_ends=request.cached_ends,
             src_keys=request.cached_keys,
@@ -2196,6 +3925,8 @@ class LMCacheConnectorV1Impl:
             src_tensors=request.cached_tensors,
             src_chunk_dev_ptrs=request.cached_chunk_dev_ptrs,
             src_chunk_ptrs_npu=request.cached_chunk_ptrs_npu,
+            src_shared_handles=request.cached_shared_handles,
+            require_pointer_cache=require_pointer_cache,
         )
         merged_chunks += self._merge_cache_group_by_ranges(
             dst_starts=state.cached_starts_indexer,
@@ -2205,6 +3936,7 @@ class LMCacheConnectorV1Impl:
             dst_tensors=state.cached_tensors_indexer,
             dst_chunk_dev_ptrs=state.cached_chunk_dev_ptrs_indexer,
             dst_chunk_ptrs_npu=state.cached_chunk_ptrs_npu_indexer,
+            dst_shared_handles=state.cached_shared_handles_indexer,
             src_starts=request.cached_starts_indexer,
             src_ends=request.cached_ends_indexer,
             src_keys=request.cached_keys_indexer,
@@ -2212,6 +3944,8 @@ class LMCacheConnectorV1Impl:
             src_tensors=request.cached_tensors_indexer,
             src_chunk_dev_ptrs=request.cached_chunk_dev_ptrs_indexer,
             src_chunk_ptrs_npu=request.cached_chunk_ptrs_npu_indexer,
+            src_shared_handles=request.cached_shared_handles_indexer,
+            require_pointer_cache=require_pointer_cache,
         )
         return merged_chunks
 
@@ -2219,13 +3953,23 @@ class LMCacheConnectorV1Impl:
         self,
         request: ReqMeta,
         tokens: torch.Tensor,
-        mask: torch.Tensor,
+        mask: Optional[torch.Tensor],
         *,
         kv_group: int,
         dsa_two_groups: bool,
     ) -> tuple[Optional[str], bool]:
+        engine = self.lmcache_engine
+        if (
+            engine is not None
+            and getattr(engine, "enable_shared_cpu_cache", False)
+            and getattr(engine, "storage_manager", None) is None
+        ):
+            is_passive_fn = getattr(engine, "_is_passive", None)
+            if callable(is_passive_fn) and is_passive_fn():
+                return None, False
+
         ensure_metadata = getattr(
-            self.lmcache_engine, "_ensure_retrieve_chunk_metadata", None
+            engine, "_ensure_retrieve_chunk_metadata", None
         )
         if ensure_metadata is None:
             return None, False
@@ -2271,20 +4015,128 @@ class LMCacheConnectorV1Impl:
         if not self._request_has_retrieve_tensor_cache(request):
             return
 
+        if (
+            self._is_decode_window_save_request(request)
+            and self._decode_window_save_uses_shared_cpu()
+        ):
+            # Rank0 is the only worker that owns newly saved shared CPU backing
+            # objects during decode-window save. If it privately merges those
+            # chunks into its hot sparse state, the next decode step can diverge:
+            # rank0 takes the cached path while passive ranks wait for a fresh
+            # broadcast. Leave all ranks on the old scope; the next sparse load
+            # invalidates it and refreshes shared handles once, in ordered TP
+            # collective flow.
+            logger.debug(
+                "Skipping shared CPU decode-window worker-state merge so the "
+                "next sparse load refreshes handles on every TP rank: req_id=%s "
+                "window=[%s,%s)",
+                request.req_id,
+                getattr(request, "decode_window_start", None),
+                getattr(request, "decode_window_end", None),
+            )
+            return
+
         location = self._resolve_store_retrieve_location(request)
         existing_state = self._worker_retrieve_state.get(request.req_id)
         if existing_state is not None and (
             existing_state.metadata_warm or existing_state.cached_keys
         ):
-            merged_chunks = self._merge_store_cache_into_worker_state(
-                existing_state, request
+            if (
+                self._is_decode_window_save_request(request)
+                and not self._decode_window_save_is_next_expected(request)
+            ):
+                logger.debug(
+                    "Skipping decode-window warm-state merge for out-of-order "
+                    "window: req_id=%s window_start=%s",
+                    request.req_id,
+                    getattr(request, "decode_window_start", None),
+                )
+                return
+            if (
+                self._is_decode_window_save_request(request)
+                and not self._decode_window_save_store_cache_ready(request)
+            ):
+                logger.debug(
+                    "Skipping decode-window warm-state merge before shared CPU "
+                    "store cache is fully pointer-ready: req_id=%s",
+                    request.req_id,
+                )
+                return
+            rollback_snapshot = (
+                self._snapshot_worker_retrieve_cache_state(existing_state)
+                if existing_state.shared_request_active
+                else None
             )
-            existing_state.location = location or existing_state.location
-            existing_state.metadata_warm = True
-            existing_state.token_count = max(
-                existing_state.token_count,
+            try:
+                merged_chunks = self._merge_store_cache_into_worker_state(
+                    existing_state, request
+                )
+                existing_state.location = location or existing_state.location
+                existing_state.metadata_warm = True
+                next_token_count = max(
+                    existing_state.token_count,
+                    len(request.token_ids),
+                    request.cached_ends[-1] if request.cached_ends else 0,
+                )
+                if self._is_decode_window_save_request(request):
+                    next_token_count = min(
+                        next_token_count,
+                        self._cached_prefix_covered_token_count(
+                            existing_state.cached_starts,
+                            existing_state.cached_ends,
+                        ),
+                    )
+                existing_state.token_count = next_token_count
+                if existing_state.shared_request_active:
+                    self._validate_decode_save_shared_pointer_cache(
+                        existing_state,
+                        request,
+                    )
+                    engine = getattr(self, "lmcache_engine", None)
+                    generation = int(
+                        getattr(engine, "shared_cpu_cache_generation", 0) or 0
+                    )
+                    existing_state.shared_chunk_ptrs_npu_by_group[0] = (
+                        existing_state.cached_chunk_ptrs_npu
+                    )
+                    if existing_state.cached_chunk_ptrs_npu_indexer:
+                        existing_state.shared_chunk_ptrs_npu_by_group[1] = (
+                            existing_state.cached_chunk_ptrs_npu_indexer
+                        )
+                    existing_state.shared_generation = generation
+                    existing_state.pointer_cache_generation = generation
+                    existing_state.request_scope_token = (
+                        self._shared_request_scope_token(
+                            request.req_id,
+                            generation,
+                            existing_state.token_count,
+                        )
+                    )
+                    existing_state.shared_validation_signature = None
+            except Exception:
+                if rollback_snapshot is not None:
+                    self._restore_worker_retrieve_cache_state(
+                        existing_state,
+                        rollback_snapshot,
+                    )
+                raise
+            return
+
+        if (
+            self._is_decode_window_save_request(request)
+            and not self._cached_ranges_cover_prefix(
+                request.cached_starts,
+                request.cached_ends,
                 len(request.token_ids),
-                request.cached_ends[-1] if request.cached_ends else 0,
+            )
+        ):
+            logger.debug(
+                "Skipping worker retrieve-state seed for decode-window save "
+                "without full-prefix cache coverage: req_id=%s ranges=%s "
+                "token_count=%d",
+                request.req_id,
+                list(zip(request.cached_starts, request.cached_ends, strict=False)),
+                len(request.token_ids),
             )
             return
 
@@ -2305,9 +4157,13 @@ class LMCacheConnectorV1Impl:
     ) -> None:
         if not hasattr(self, "_worker_retrieve_state"):
             return
+        _retrieve_cache_kwargs(request, kv_group=0, dsa_two_groups=False)
+        _retrieve_cache_kwargs(request, kv_group=1, dsa_two_groups=True)
         if not metadata_warm and not request.cached_keys:
             return
-        self._worker_retrieve_state[request.req_id] = WorkerRetrieveState(
+        old_state = self._worker_retrieve_state.get(request.req_id)
+        new_state = WorkerRetrieveState(
+            req_id=request.req_id,
             cached_keys=request.cached_keys,
             cached_starts=request.cached_starts,
             cached_ends=request.cached_ends,
@@ -2315,6 +4171,7 @@ class LMCacheConnectorV1Impl:
             cached_tensors=request.cached_tensors,
             cached_chunk_dev_ptrs=request.cached_chunk_dev_ptrs,
             cached_chunk_ptrs_npu=request.cached_chunk_ptrs_npu,
+            cached_shared_handles=request.cached_shared_handles,
             cached_keys_indexer=request.cached_keys_indexer,
             cached_starts_indexer=request.cached_starts_indexer,
             cached_ends_indexer=request.cached_ends_indexer,
@@ -2322,10 +4179,45 @@ class LMCacheConnectorV1Impl:
             cached_tensors_indexer=request.cached_tensors_indexer,
             cached_chunk_dev_ptrs_indexer=request.cached_chunk_dev_ptrs_indexer,
             cached_chunk_ptrs_npu_indexer=request.cached_chunk_ptrs_npu_indexer,
+            cached_shared_handles_indexer=request.cached_shared_handles_indexer,
             location=location,
             metadata_warm=metadata_warm,
             token_count=token_count,
         )
+        if old_state is not None:
+            if not new_state.cached_shared_handles:
+                new_state.cached_shared_handles = old_state.cached_shared_handles
+            if not new_state.cached_shared_handles_indexer:
+                new_state.cached_shared_handles_indexer = (
+                    old_state.cached_shared_handles_indexer
+                )
+            new_state.shared_handles_by_group = self._copy_shared_layer_map(
+                old_state.shared_handles_by_group
+            )
+            new_state.shared_views_by_group = self._copy_shared_layer_map(
+                old_state.shared_views_by_group
+            )
+            new_state.shared_chunk_ptrs_npu_by_group = self._copy_shared_ptr_map(
+                old_state.shared_chunk_ptrs_npu_by_group
+            )
+            new_state.rank0_backing_objs_by_group = self._copy_shared_layer_map(
+                old_state.rank0_backing_objs_by_group
+            )
+            new_state.shared_latent_status = old_state.shared_latent_status
+            new_state.shared_index_status = old_state.shared_index_status
+            new_state.shared_generation = old_state.shared_generation
+            new_state.pointer_cache_generation = (
+                old_state.pointer_cache_generation
+            )
+            new_state.shared_request_active = old_state.shared_request_active
+            new_state.request_scope_token = old_state.request_scope_token
+            new_state.shared_validation_signature = None
+        try:
+            self._record_shared_worker_retrieve_state(new_state, request)
+        except Exception:
+            self._release_unstored_shared_request_objects(request, old_state)
+            raise
+        self._worker_retrieve_state[request.req_id] = new_state
 
     def _finalize_worker_retrieve_state_from_metadata(
         self, metadata: LMCacheConnectorMetadata
@@ -2344,11 +4236,23 @@ class LMCacheConnectorV1Impl:
             metadata_warm = (
                 existing.metadata_warm if existing is not None else True
             )
+            token_count = len(request.token_ids)
+            if request.load_spec is not None:
+                token_count = int(request.load_spec.lmcache_cached_tokens)
+            if (
+                existing is not None
+                and self._shared_worker_retrieve_state_is_current(
+                    existing,
+                    request,
+                    token_count,
+                )
+            ):
+                continue
             self._save_worker_retrieve_state_from_request(
                 request,
                 location=location,
                 metadata_warm=metadata_warm or bool(request.cached_keys),
-                token_count=len(request.token_ids),
+                token_count=token_count,
             )
 
     def _sparse_decode_retrieve_warm_kwargs(
@@ -2366,10 +4270,24 @@ class LMCacheConnectorV1Impl:
             bound_state.metadata_warm
             and bound_state.cached_keys
             and bound_state.cached_ends
-            and token_count <= bound_state.cached_ends[-1]
+            and token_count <= bound_state.token_count
+            and (not bound_state.cached_starts or bound_state.cached_starts[0] == 0)
         ):
             warm_kwargs["_retrieve_metadata_warm"] = True
         return warm_kwargs
+
+    @staticmethod
+    def _prime_dense_prefix_retrievers(
+        layerwise_retriever: Generator[Optional[torch.Tensor], None, None],
+        indexer_retriever: Optional[Generator[Optional[torch.Tensor], None, None]],
+    ) -> None:
+        """Prime dense prefix retrievers without breaking two-group ordering."""
+        next(layerwise_retriever)
+        if indexer_retriever is not None:
+            next(indexer_retriever)
+        next(layerwise_retriever)
+        if indexer_retriever is not None:
+            next(indexer_retriever)
 
     @_lmcache_nvtx_annotate
     def register_kv_caches(self, kv_caches: dict[str, torch.Tensor]):
@@ -2378,8 +4296,8 @@ class LMCacheConnectorV1Impl:
         #  not called, we should consider removing it.
         assert len(self.kv_caches) == 0 and len(kv_caches) > 0
         self.kv_caches = kv_caches
-        self._build_kv_layer_groups()
         self._refresh_kvcaches_list()
+        self._build_kv_layer_groups()
         self._manager.post_init()
 
     @_lmcache_nvtx_annotate
@@ -2429,6 +4347,9 @@ class LMCacheConnectorV1Impl:
         self._drain_layerwise_retrievers()
         self._layerwise_requests = []
         self._layerwise_sparse_req_ids = []
+        self._layerwise_waited_groups = set()
+        self._layerwise_sparse_indexer_sent_layers = set()
+        self._layerwise_required_wait_groups_cache = None
 
         load_count = sum(
             1
@@ -2507,7 +4428,7 @@ class LMCacheConnectorV1Impl:
             ):
                 logger.warning(
                     "Request %s: retrieve_len=%d exceeds slot_mapping len=%d "
-                    "(KV scatter will be incomplete → garbage). "
+                    "(KV scatter will be incomplete -> garbage). "
                     "Often chunked-prefill metadata out of sync with lookup_hit.",
                     request.req_id,
                     token_count,
@@ -2522,6 +4443,8 @@ class LMCacheConnectorV1Impl:
                 # NOTE(Jiayi): Perform blending before layerwise prefix caching
                 if self.enable_blending:
                     # TODO(Jiayi): Need to make prefix caching and blending compatible
+                    if token_mask is None:
+                        token_mask = torch.ones(token_count, dtype=torch.bool)
                     self.blender.blend(
                         retrieve_tokens,
                         token_mask,
@@ -2545,6 +4468,16 @@ class LMCacheConnectorV1Impl:
                         bound_state = None
 
                     dsa_two_groups = self._is_dsa_two_groups()
+                    shared_cpu_enabled = bool(
+                        getattr(
+                            self.lmcache_engine,
+                            "enable_shared_cpu_cache",
+                            False,
+                        )
+                    )
+                    shared_cpu_preflight_state: Optional[dict[str, Any]] = (
+                        {} if shared_cpu_enabled and dsa_two_groups else None
+                    )
                     latent_cache = _retrieve_cache_kwargs(
                         request, kv_group=0, dsa_two_groups=dsa_two_groups
                     )
@@ -2556,8 +4489,23 @@ class LMCacheConnectorV1Impl:
                         "sync": sync,
                         "kv_group": 0,
                         "req_id": request.req_id,
+                        "request_configs": request.request_configs,
+                        "shared_cpu_phase": SPARSE_DECODE_SHARED_CPU_PHASE,
+                        "shared_cpu_request_ordinal": idx,
                         **latent_cache,
                     }
+                    if shared_cpu_enabled and bound_state is not None:
+                        existing_layers = (
+                            bound_state.rank0_backing_objs_by_group.get(0)
+                        )
+                        if existing_layers:
+                            retrieve_kwargs[
+                                "shared_cpu_existing_rank0_backing_layers"
+                            ] = existing_layers
+                    if shared_cpu_preflight_state is not None:
+                        retrieve_kwargs["shared_cpu_request_preflight_state"] = (
+                            shared_cpu_preflight_state
+                        )
                     retrieve_kwargs.update(
                         self._sparse_decode_retrieve_warm_kwargs(
                             request, token_count, bound_state
@@ -2591,19 +4539,16 @@ class LMCacheConnectorV1Impl:
                             _dsa_debug_minmax_count(slot_mapping),
                             request.load_spec.vllm_cached_tokens,
                             request.load_spec.lmcache_cached_tokens,
-                            len(request.cached_keys)
-                            if request.cached_keys is not None else None,
-                            len(request.cached_starts)
-                            if request.cached_starts is not None else None,
-                            len(request.cached_ends)
-                            if request.cached_ends is not None else None,
-                            len(request.cached_tensors)
-                            if request.cached_tensors is not None else None,
-                            len(request.cached_chunk_ptrs_npu)
-                            if request.cached_chunk_ptrs_npu is not None else None,
+                            len(getattr(request, "cached_keys", [])),
+                            len(getattr(request, "cached_starts", [])),
+                            len(getattr(request, "cached_ends", [])),
+                            len(getattr(request, "cached_tensors", [])),
+                            len(getattr(request, "cached_chunk_ptrs_npu", [])),
                             bool(retrieve_kwargs.get("_retrieve_metadata_warm")),
                             bound_state is not None,
-                            _dsa_debug_shape(request.decode_ret_mask),
+                            _dsa_debug_shape(
+                                getattr(request, "decode_ret_mask", None)
+                            ),
                         )
 
                     layerwise_retriever = (
@@ -2621,18 +4566,140 @@ class LMCacheConnectorV1Impl:
                     )
                     metadata_warm = bool(kwargs_metadata_warm or request.cached_keys)
 
-                    # Sparse decode reloads latent KV from LMCache warm cache only.
-                    # Indexer KV stays in vLLM's GPU cache from prefill; prefix
-                    # hit (non-sparse branch below) loads both groups.
                     indexer_retriever = None
+                    indexer_skipped = False
+                    if dsa_two_groups:
+                        indexer_kvcaches = self._kvcaches_for_group(1)
+                        materialize_index = (
+                            self._sparse_decode_requires_index_materialization(
+                                request,
+                                shared_cpu_enabled,
+                            )
+                        )
+                        if (
+                            shared_cpu_enabled
+                            and not materialize_index
+                        ):
+                            indexer_skipped = True
+                        elif (
+                            shared_cpu_enabled
+                            and materialize_index
+                            and self._shared_sparse_decode_indexer_is_resident(
+                                request,
+                                bound_state,
+                                token_count,
+                            )
+                        ):
+                            logger.debug(
+                                "Skipping shared CPU DSA index retrieve for "
+                                "resident live sparse decode state: req_id=%s "
+                                "token_count=%d",
+                                request.req_id,
+                                token_count,
+                            )
+                        elif not materialize_index:
+                            indexer_skipped = True
+                        elif not indexer_kvcaches:
+                            if shared_cpu_enabled:
+                                raise RuntimeError(
+                                    "Shared CPU sparse decode with "
+                                    "dsa_two_groups=true requires DSA index "
+                                    "kvcaches for kv_group=1."
+                                )
+                        else:
+                            latent_sparse_slots = (
+                                slot_mapping[0]
+                                if isinstance(slot_mapping, list)
+                                else slot_mapping
+                            )
+                            request_indexer_slots = (
+                                request.indexer_slot_mapping[0]
+                                if request.indexer_slot_mapping
+                                else None
+                            )
+                            if (
+                                request_indexer_slots is not None
+                                and request_indexer_slots.device.type
+                                != torch.device(self.device).type
+                            ):
+                                request.indexer_slot_mapping[0] = (
+                                    request_indexer_slots.to(
+                                        device=self.device, dtype=torch.long
+                                    )
+                                )
+                                request_indexer_slots = (
+                                    request.indexer_slot_mapping[0]
+                                )
+                            idx_slot = self._sparse_indexer_slot_mapping(
+                                attn_metadata,
+                                latent_sparse_slots,
+                                request.load_spec.lmcache_cached_tokens,
+                                request_indexer_slots=request_indexer_slots,
+                                strict=shared_cpu_enabled,
+                            )
+                            assert idx_slot is not None
+                            indexer_cache = _retrieve_cache_kwargs(
+                                request,
+                                kv_group=1,
+                                dsa_two_groups=dsa_two_groups,
+                            )
+                            indexer_kwargs: dict[str, Any] = {
+                                "kvcaches": indexer_kvcaches,
+                                "slot_mapping": idx_slot,
+                                "vllm_cached_tokens": request.load_spec.vllm_cached_tokens,
+                                "lmcache_cached_tokens": request.load_spec.lmcache_cached_tokens,
+                                "sync": sync,
+                                "kv_group": 1,
+                                "req_id": request.req_id,
+                                "request_configs": request.request_configs,
+                                "shared_cpu_phase": SPARSE_DECODE_SHARED_CPU_PHASE,
+                                "shared_cpu_request_ordinal": idx,
+                                **indexer_cache,
+                            }
+                            if shared_cpu_enabled and bound_state is not None:
+                                existing_layers = (
+                                    bound_state.rank0_backing_objs_by_group.get(1)
+                                )
+                                if existing_layers:
+                                    indexer_kwargs[
+                                        "shared_cpu_existing_rank0_backing_layers"
+                                    ] = existing_layers
+                            if shared_cpu_preflight_state is not None:
+                                indexer_kwargs[
+                                    "shared_cpu_request_preflight_state"
+                                ] = shared_cpu_preflight_state
+                            indexer_kwargs.update(
+                                self._sparse_decode_retrieve_warm_kwargs(
+                                    request, token_count, bound_state
+                                )
+                            )
+                            if request.decode_ret_mask is not None:
+                                indexer_kwargs["ret_mask"] = request.decode_ret_mask
+                            indexer_retriever = (
+                                self.lmcache_engine.retrieve_layer_head_token_wise(
+                                    retrieve_tokens,
+                                    token_mask,
+                                    **indexer_kwargs,
+                                )
+                            )
+                            next(indexer_retriever)
 
-
-                    self._save_worker_retrieve_state_from_request(
-                        request,
-                        location=location,
-                        metadata_warm=metadata_warm,
-                        token_count=token_count,
-                    )
+                    if indexer_skipped:
+                        request.shared_index_skipped = True
+                        self._clear_request_indexer_cache(request)
+                    if shared_cpu_enabled:
+                        logger.debug(
+                            "Deferring shared CPU sparse retrieve state save "
+                            "until pointer-cache install completes: req_id=%s",
+                            request.req_id,
+                        )
+                    else:
+                        self._save_worker_retrieve_state_from_request(
+                            request,
+                            location=location,
+                            metadata_warm=metadata_warm,
+                            token_count=token_count,
+                        )
                     self.layerwise_retrievers.append(
                         (layerwise_retriever, indexer_retriever)
                     )
@@ -2652,10 +4719,9 @@ class LMCacheConnectorV1Impl:
                         sync=sync,
                         kv_group=0,
                         req_id=request.req_id,
+                        request_configs=request.request_configs,
+                        shared_cpu_request_ordinal=idx,
                     )
-                    # NOTE: retrieve for two layers at the first layer
-                    next(layerwise_retriever)
-                    next(layerwise_retriever)
 
                     # Two-group DSA: also retrieve the indexer group (kv_group=1)
                     # for the same latent hit token count, scattering into vLLM's
@@ -2663,10 +4729,22 @@ class LMCacheConnectorV1Impl:
                     # latent-only (this branch is prefill/prefix, not sparse).
                     indexer_retriever = None
                     idx_slot = None
-                    if (
-                        self._is_dsa_two_groups()
-                        and self._kvcaches_for_group(1)
-                    ):
+                    if self._is_dsa_two_groups():
+                        shared_cpu_enabled = bool(
+                            getattr(
+                                self.lmcache_engine,
+                                "enable_shared_cpu_cache",
+                                False,
+                            )
+                        )
+                        indexer_kvcaches = self._kvcaches_for_group(1)
+                        if shared_cpu_enabled and not indexer_kvcaches:
+                            raise RuntimeError(
+                                "Shared CPU dense prefix with "
+                                "dsa_two_groups=true requires DSA index "
+                                "kvcaches for kv_group=1."
+                            )
+                    if self._is_dsa_two_groups() and self._kvcaches_for_group(1):
                         indexer_layer_name = (
                             self._indexer_layer_names[0]
                             if self._indexer_layer_names
@@ -2686,6 +4764,21 @@ class LMCacheConnectorV1Impl:
                                 lmcache_cached_tokens,
                                 indexer_layer_name,
                             )
+                        if (
+                            idx_slot is None
+                            and bool(
+                                getattr(
+                                    self.lmcache_engine,
+                                    "enable_shared_cpu_cache",
+                                    False,
+                                )
+                            )
+                        ):
+                            raise RuntimeError(
+                                "Shared CPU dense prefix with "
+                                "dsa_two_groups=true could not resolve DSA "
+                                "index slot mapping for kv_group=1."
+                            )
                         if idx_slot is not None:
                             indexer_retriever = self.lmcache_engine.retrieve_layer(
                                 retrieve_tokens,
@@ -2696,9 +4789,17 @@ class LMCacheConnectorV1Impl:
                                 sync=sync,
                                 kv_group=1,
                                 req_id=request.req_id,
+                                request_configs=request.request_configs,
+                                shared_cpu_request_ordinal=idx,
                             )
-                            next(indexer_retriever)
-                            next(indexer_retriever)
+
+                    # Prime the same two-step window as the legacy dense path,
+                    # but interleave groups so shared-cache collectives remain
+                    # layer-major: latent L0, index L0, latent L1, index L1.
+                    self._prime_dense_prefix_retrievers(
+                        layerwise_retriever,
+                        indexer_retriever,
+                    )
 
                     dsa_two_groups = self._is_dsa_two_groups()
                     prefix_location, metadata_warm = (
@@ -2867,6 +4968,7 @@ class LMCacheConnectorV1Impl:
         token_start_index: list = None,
         request_ids: list = None,
         target_slot_mapping=None,
+        payload_event=None,
     ) -> None:
         """Blocking until the KV for a specific layer is loaded into vLLM's
         paged buffer.
@@ -2880,6 +4982,9 @@ class LMCacheConnectorV1Impl:
             request_ids: req_id for each selected_tokens row (duplicates allowed).
             target_slot_mapping: optional batched physical destination slots,
                 row-aligned with selected_tokens.
+            payload_event: optional producer event recorded by vLLM after
+                selected_tokens/target_slot_mapping were built. LMCache waits on
+                this before row-selecting from those tensors.
         """
         if self.layerwise_retrievers and logger.isEnabledFor(10):
             logger.debug("Waiting for layer %d to be loaded", self.current_layer)
@@ -2924,12 +5029,20 @@ class LMCacheConnectorV1Impl:
 
         selected_rows = None
         if selected_tokens is not None:
+            # After this wait, row selection and connector-side packing are
+            # ordered by the current stream; the load stream later waits on it.
+            _dsa_wait_payload_event(payload_event)
             selected_rows = (
                 int(selected_tokens.shape[0])
                 if hasattr(selected_tokens, "shape")
                 and len(selected_tokens.shape) > 0
                 else len(selected_tokens)
             )
+
+        wait_group = self._layerwise_wait_group(layer_name)
+        parsed_layer_id = None
+        parsed_layer_id_loaded = False
+        sparse_indexer_sent_layers = None
 
         idx = 0
         decode_row = 0
@@ -2996,17 +5109,20 @@ class LMCacheConnectorV1Impl:
                         target_slot_mapping_payload = _sparse_payload_value(
                             target_slot_mapping_per_req
                         )
-                        if _DSA_RECORD_PAYLOAD_EVENT and (
-                            _dsa_has_device_tensor(selected_tokens_payload)
-                            or _dsa_has_device_tensor(target_slot_mapping_payload)
-                        ):
+                        local_payload_event = (
+                            _dsa_record_payload_event_if_needed(
+                                selected_tokens_payload,
+                                target_slot_mapping_payload,
+                            )
+                            if rows_of_req is not None
+                            else None
+                        )
+                        if local_payload_event is not None:
                             payload = {
                                 "selected_token_ids": selected_tokens_payload,
                                 "target_slot_mapping": target_slot_mapping_payload,
+                                "payload_event": local_payload_event,
                             }
-                            payload_event = _dsa_record_current_stream_event()
-                            if payload_event is not None:
-                                payload["payload_event"] = payload_event
                         else:
                             payload = (
                                 selected_tokens_payload,
@@ -3024,33 +5140,100 @@ class LMCacheConnectorV1Impl:
                                 else _row_select(token_start_index, rows)
                             )
                         )
-                ret_token_mask = layerwise_retriever.send(
+                        selected_tokens_payload = _sparse_payload_value(
+                            selected_tokens_per_req
+                        )
+                        token_start_payload = _sparse_payload_value(
+                            token_start_index_per_req
+                        )
+                        local_payload_event = (
+                            _dsa_record_payload_event_if_needed(
+                                selected_tokens_payload,
+                                token_start_payload,
+                            )
+                            if rows_of_req is not None
+                            else None
+                        )
+                        if local_payload_event is not None:
+                            payload = {
+                                "selected_token_ids": selected_tokens_payload,
+                                "token_start_index": token_start_payload,
+                                "payload_event": local_payload_event,
+                            }
+                        else:
+                            selected_tokens_per_req = selected_tokens_payload
+                            token_start_index_per_req = token_start_payload
+                sparse_payload = (
                     payload
                     if payload is not None
                     else (selected_tokens_per_req, token_start_index_per_req)
                 )
+                indexer_sent_key = (
+                    (request.req_id, self.current_layer)
+                    if indexer_retriever is not None
+                    else None
+                )
                 if indexer_retriever is not None:
-                    indexer_retriever.send(
-                        payload
-                        if payload is not None
-                        else (selected_tokens_per_req, token_start_index_per_req)
-                    )
+                    if not parsed_layer_id_loaded:
+                        parsed_layer_id = self._layerwise_layer_id_from_name(
+                            layer_name
+                        )
+                        parsed_layer_id_loaded = True
+                    if sparse_indexer_sent_layers is None:
+                        sparse_indexer_sent_layers = getattr(
+                            self,
+                            "_layerwise_sparse_indexer_sent_layers",
+                            None,
+                        )
+                        if sparse_indexer_sent_layers is None:
+                            sparse_indexer_sent_layers = set()
+                            self._layerwise_sparse_indexer_sent_layers = (
+                                sparse_indexer_sent_layers
+                            )
+                if wait_group == 1:
+                    ret_token_mask = None
+                    if (
+                        indexer_retriever is not None
+                        and sparse_indexer_sent_layers is not None
+                        and (
+                            parsed_layer_id is None
+                            or parsed_layer_id == self.current_layer
+                        )
+                        and indexer_sent_key not in sparse_indexer_sent_layers
+                    ):
+                        indexer_retriever.send((None, 0))
+                        sparse_indexer_sent_layers.add(indexer_sent_key)
+                else:
+                    ret_token_mask = layerwise_retriever.send(sparse_payload)
+                    if (
+                        indexer_retriever is not None
+                        and sparse_indexer_sent_layers is not None
+                        and indexer_sent_key not in sparse_indexer_sent_layers
+                    ):
+                        indexer_ret_mask = indexer_retriever.send((None, 0))
+                        sparse_indexer_sent_layers.add(indexer_sent_key)
+                        if ret_token_mask is None:
+                            ret_token_mask = indexer_ret_mask
                 decode_row += row_count
             else:
-                ret_token_mask = next(layerwise_retriever)
-                # Advance the indexer retriever in lockstep for two-group
-                # prefix retrieve. Its ret_mask is not reported to the
-                # scheduler; only the latent mask is.
-                if indexer_retriever is not None:
-                    next(indexer_retriever)
+                if wait_group == 1:
+                    if indexer_retriever is not None:
+                        next(indexer_retriever)
+                    ret_token_mask = None
+                else:
+                    ret_token_mask = next(layerwise_retriever)
 
-            if self.current_layer == self.num_layers - 1 and not request.is_sparse_decode:
+            if (
+                wait_group == 0
+                and self.current_layer == self.num_layers - 1
+                and not request.is_sparse_decode
+            ):
                 assert ret_token_mask is not None
                 num_retrieved_tokens = ret_token_mask.sum().item()
                 logger.info("Retrieved %d tokens", num_retrieved_tokens)
             idx += 1
 
-        if self.layerwise_retrievers:
+        if self.layerwise_retrievers and self._layerwise_wait_should_advance(wait_group):
             self.current_layer += 1
             if self.current_layer >= self.num_layers:
                 if metadata is None:
@@ -3069,13 +5252,43 @@ class LMCacheConnectorV1Impl:
         return world_size > 1
 
     @staticmethod
-    def _drain_layerwise_storer_fully(storer) -> None:
+    def _advance_layerwise_storer_once(storer) -> None:
         if storer is None:
             return
         try:
-            while True:
-                next(storer)
+            next(storer)
         except StopIteration:
+            pass
+
+    def _layerwise_storer_drain_limit(self) -> int:
+        engine = getattr(self, "lmcache_engine", None)
+        num_layers = int(getattr(engine, "num_layers", 0) or 0)
+        if num_layers <= 0:
+            num_layers = len(getattr(self, "_latent_layer_names", []) or [])
+        if num_layers <= 0:
+            num_layers = len(getattr(self, "kv_caches", {}) or {})
+        return max(num_layers + 2, 2)
+
+    def _drain_layerwise_storer_fully(self, storer) -> bool:
+        if storer is None:
+            return True
+        for _ in range(self._layerwise_storer_drain_limit()):
+            try:
+                next(storer)
+            except StopIteration:
+                return True
+        logger.warning(
+            "Layerwise storer did not finish after bounded drain; closing it"
+        )
+        return False
+
+    @staticmethod
+    def _close_layerwise_storer(storer) -> None:
+        if storer is None:
+            return
+        try:
+            storer.close()
+        except (GeneratorExit, RuntimeError, ValueError):
             pass
 
     def _flush_deferred_latent_store(
@@ -3085,16 +5298,23 @@ class LMCacheConnectorV1Impl:
     ) -> None:
         """Run a full latent store_layer after indexer layers finish (TP>1)."""
         pending_key = self._layerwise_save_storer_key(request, 0)
-        if pending_key not in self._deferred_latent_pending:
+        legacy_pending_key = request.req_id
+        if (
+            pending_key not in self._deferred_latent_pending
+            and legacy_pending_key not in self._deferred_latent_pending
+        ):
             return
+        self._note_decode_window_save_seen(request)
         if save_spec is None or not save_spec.can_save_latent:
             self._deferred_latent_pending.discard(pending_key)
+            self._deferred_latent_pending.discard(legacy_pending_key)
             return
 
         self._refresh_kvcaches_list()
         kvcaches = self._kvcaches_for_group(0)
         if not kvcaches:
             self._deferred_latent_pending.discard(pending_key)
+            self._deferred_latent_pending.discard(legacy_pending_key)
             return
 
         token_ids = request.token_ids
@@ -3120,6 +5340,7 @@ class LMCacheConnectorV1Impl:
             skip_leading_tokens = save_spec.skip_leading_tokens
             if skip_leading_tokens == len(token_ids):
                 self._deferred_latent_pending.discard(pending_key)
+                self._deferred_latent_pending.discard(legacy_pending_key)
                 return
             skip_leading_tokens = (
                 skip_leading_tokens
@@ -3140,8 +5361,15 @@ class LMCacheConnectorV1Impl:
             "decode_window_start": getattr(request, "decode_window_start", None),
             "decode_window_end": getattr(request, "decode_window_end", None),
             "decode_window_size": getattr(request, "decode_window_size", None),
+            "request_configs": request.request_configs,
         }
-
+        if request.is_sparse_decode or self._is_decode_window_save_request(request):
+            store_kwargs["cached_chunk_dev_ptrs"] = _ensure_list_attr(
+                request, "cached_chunk_dev_ptrs"
+            )
+            store_kwargs["cached_chunk_ptrs_npu"] = _ensure_list_attr(
+                request, "cached_chunk_ptrs_npu"
+            )
 
         storer = self.lmcache_engine.store_layer(
             token_ids,
@@ -3153,8 +5381,12 @@ class LMCacheConnectorV1Impl:
             req_id=request.req_id,
             **store_kwargs,
         )
-        self._drain_layerwise_storer_fully(storer)
+        latent_completed = self._drain_layerwise_storer_fully(storer)
+        self._close_layerwise_storer(storer)
+        if latent_completed:
+            self._record_decode_window_save_group_completed(request, 0)
         self._deferred_latent_pending.discard(pending_key)
+        self._deferred_latent_pending.discard(legacy_pending_key)
         indexer_required = (
             self._is_decode_window_save_request(request)
             and getattr(save_spec, "can_save_indexer", False)
@@ -3220,6 +5452,7 @@ class LMCacheConnectorV1Impl:
                 save_spec is None or not save_spec.can_save
             ) and self.kv_role != "kv_producer":
                 continue
+            self._note_decode_window_save_seen(request)
 
             # Per-group gating: in two-group mode, skip indexer save if
             # can_save_indexer is False, and skip latent save if
@@ -3274,9 +5507,9 @@ class LMCacheConnectorV1Impl:
                     and (key == storer_key or key not in active_keys)
                 ]
                 for stale_key in stale_keys:
-                    self._drain_layerwise_storer_fully(
-                        self._layerwise_save_storers.pop(stale_key)
-                    )
+                    stale_storer = self._layerwise_save_storers.pop(stale_key)
+                    self._drain_layerwise_storer_fully(stale_storer)
+                    self._close_layerwise_storer(stale_storer)
                 if stale_keys:
                     layerwise_storer = None
             if layerwise_storer is None:
@@ -3302,24 +5535,22 @@ class LMCacheConnectorV1Impl:
                     )
 
                 # Latent save matches dev-qzy: use scheduler request.slot_mapping
-                # (cumulative across chunked-prefill steps). Indexer save still
-                # uses per-layer attn metadata + chunk-local padding below.
+                # (cumulative across chunked-prefill steps). Indexer save must
+                # use the active layer's attention metadata because it is the
+                # source view for the indexer KV buffer. Retrieve can use the
+                # request-level mapping as its destination view.
 
                 # Two-group DSA: for indexer layers, use the indexer group's
                 # slot mapping. vLLM may pass a per-layer metadata dict; the
                 # indexer metadata stores this as "slot_mapping", while the
                 # latent metadata stores it as "indexer_slot_mapping".
                 if is_indexer_layer:
-                    idx_slot = None
-                    if (
-                        self._is_decode_window_save_request(request)
-                        and request.indexer_slot_mapping
-                    ):
-                        idx_slot = request.indexer_slot_mapping[0]
-                    if idx_slot is None:
-                        idx_slot = self._indexer_slot_mapping_from_attn_metadata(
-                            attn_metadata, layer_name
-                        )
+                    idx_slot = self._indexer_save_slot_mapping(
+                        request,
+                        attn_metadata,
+                        layer_name,
+                        len(token_ids),
+                    )
                     if idx_slot is not None:
                         slot_mapping = idx_slot.to(
                             device=self.device, dtype=torch.long
@@ -3382,8 +5613,9 @@ class LMCacheConnectorV1Impl:
                 )
                 # TODO (Jiayi): need to make layerwise storing
                 # compatible with disagg spec
-                # dev-qzy passes only the core cached_* fields to store_layer.
-                # Indexer-only sparse ptr fields stay on the latent/sparse path.
+                # Keep store_layer kwargs minimal: shared cached_* state plus
+                # request_configs for cache-key salting. Indexer-only sparse
+                # ptr fields stay on the latent/sparse path.
                 store_kwargs: dict[str, Any] = {
                     "cached_keys": request.cached_keys,
                     "cached_starts": request.cached_starts,
@@ -3398,7 +5630,18 @@ class LMCacheConnectorV1Impl:
                     "decode_window_size": getattr(
                         request, "decode_window_size", None
                     ),
+                    "request_configs": request.request_configs,
                 }
+                if (
+                    request.is_sparse_decode
+                    or self._is_decode_window_save_request(request)
+                ):
+                    store_kwargs["cached_chunk_dev_ptrs"] = _ensure_list_attr(
+                        request, "cached_chunk_dev_ptrs"
+                    )
+                    store_kwargs["cached_chunk_ptrs_npu"] = _ensure_list_attr(
+                        request, "cached_chunk_ptrs_npu"
+                    )
                 # Indexer-only extras. Latent (kv_group=0) matches dev-qzy and
                 # does not pass kv_group or indexer cached_* fields.
                 if dsa_two_groups and kv_group == 1:
@@ -3476,9 +5719,17 @@ class LMCacheConnectorV1Impl:
                 raise
 
             if indexer_group_last:
-                self._drain_layerwise_storer_fully(layerwise_storer)
+                indexer_completed = self._drain_layerwise_storer_fully(
+                    layerwise_storer
+                )
                 self._layerwise_save_storers.pop(storer_key, None)
+                self._close_layerwise_storer(layerwise_storer)
                 layerwise_storer = None
+                if indexer_completed:
+                    self._record_decode_window_save_group_completed(
+                        request,
+                        kv_group,
+                    )
 
             if (
                 indexer_group_last
@@ -3527,7 +5778,18 @@ class LMCacheConnectorV1Impl:
                         storer_key, None
                     )
                     if layerwise_storer is not None:
-                        self._drain_layerwise_storer_fully(layerwise_storer)
+                        if self._is_decode_window_save_request(request):
+                            save_completed = self._drain_layerwise_storer_fully(
+                                layerwise_storer
+                            )
+                        else:
+                            self._advance_layerwise_storer_once(layerwise_storer)
+                            save_completed = True
+                        self._close_layerwise_storer(layerwise_storer)
+                        if save_completed:
+                            self._record_decode_window_save_group_completed(
+                                request, _kv_group
+                            )
                 self._maybe_seed_worker_retrieve_state_from_store(request)
                 self._mark_decode_window_save_completed(request)
                 self._maybe_lookup_unpin_for_request(request)
@@ -3614,6 +5876,7 @@ class LMCacheConnectorV1Impl:
                 request_configs=request.request_configs,
                 req_id=request.req_id,
             )
+            self._record_decode_window_save_group_completed(request, 0)
             self._mark_decode_window_save_completed(request)
 
             # Update skip_leading_tokens only on last rank to ensure
@@ -3916,6 +6179,24 @@ class LMCacheConnectorV1Impl:
             )
             if req_meta is None:
                 return
+            if (
+                self._is_dsa_two_groups()
+                and bool(
+                    self._shared_cpu_config_value(
+                        "enable_shared_cpu_cache", False
+                    )
+                )
+                and getattr(req_meta.save_spec, "can_save_indexer", False) is False
+            ):
+                logger.warning(
+                    "Skipping decode-window save for request %s because "
+                    "dsa_two_groups requires matching DSA index slots for "
+                    "shared CPU decode-save correctness: window=[%d,%d)",
+                    tracker.req_id,
+                    window_start,
+                    window_end,
+                )
+                return
 
             meta.add_request(req_meta)
             tracker.decode_window_save_next_start = window_end
@@ -4142,6 +6423,11 @@ class LMCacheConnectorV1Impl:
                 request_tracker.num_saved_tokens = min(
                     request_tracker.num_saved_tokens, tokens_to_keep
                 )
+                request_tracker.decode_window_save_committed_end = min(
+                    request_tracker.decode_window_save_committed_end,
+                    tokens_to_keep,
+                )
+                request_tracker.decode_window_save_next_start = None
 
             # Pass all_token_ids for preempted requests to restore
             # token_ids correctly for chunk key computation
@@ -4172,16 +6458,15 @@ class LMCacheConnectorV1Impl:
                 lmcache_cached_for_sparse = request_tracker.prompt_len
                 if self._decode_window_save_window_size > 0:
                     token_len = len(request_tracker.token_ids)
-                    current_window_start = (
-                        (token_len - 1)
-                        // self._decode_window_save_window_size
-                        * self._decode_window_save_window_size
-                        if token_len > 0
-                        else 0
-                    )
+                    save_frontier = request_tracker.decode_window_save_next_start
+                    if save_frontier is None:
+                        save_frontier = self._init_decode_window_save_start(
+                            request_tracker
+                        )
+                    save_frontier = min(int(save_frontier), token_len)
                     lmcache_cached_for_sparse = min(
                         request_tracker.decode_window_save_committed_end,
-                        current_window_start,
+                        save_frontier,
                         token_len,
                     )
                 load_spec = LoadSpec(

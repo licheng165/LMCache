@@ -29,6 +29,8 @@ from lmcache.v1.metadata import LMCacheMetadata
 logger = init_logger(__name__)
 
 NONE_HASH = 0
+DSA_INDEX_CACHE_SCHEMA_TAG = "lmcache.tag.dsa_idx"
+DSA_INDEX_CACHE_SCHEMA = "v2"
 
 # Type alias for process_tokens return value
 # (start_index, end_index, cache_engine_key｜hash)
@@ -54,6 +56,7 @@ class TokenDatabase(metaclass=abc.ABCMeta):
     ):
         global NONE_HASH
 
+        self.config = config
         hash_algorithm: str = (
             config.pre_caching_hash_algorithm if config is not None else "builtin"
         )
@@ -210,6 +213,20 @@ class TokenDatabase(metaclass=abc.ABCMeta):
         kv_group: int = 0,
     ):
         assert self.metadata is not None
+        config = getattr(self, "config", None)
+        dtypes = self.metadata.get_dtypes()
+        if 0 <= kv_group < len(dtypes):
+            kv_dtype = dtypes[kv_group]
+        elif len(dtypes) == 1:
+            kv_dtype = dtypes[0]
+        else:
+            raise ValueError(
+                "KV group dtype metadata is unavailable for cache key: "
+                f"kv_group={kv_group}, num_dtypes={len(dtypes)}"
+            )
+        if kv_group == 1 and bool(getattr(config, "dsa_two_groups", False)):
+            request_configs = dict(request_configs or {})
+            request_configs[DSA_INDEX_CACHE_SCHEMA_TAG] = DSA_INDEX_CACHE_SCHEMA
         # When save_only_first_rank is enabled (for MLA), we deliberately
         # collapse the CacheEngineKey.world_size to 1 so that cache keys
         # become world-size agnostic across compatible deployments.
@@ -218,7 +235,7 @@ class TokenDatabase(metaclass=abc.ABCMeta):
             self.metadata.world_size if not self.save_only_first_rank else 1,
             self.metadata.worker_id,
             chunk_hash,
-            self.metadata.kv_dtype,
+            kv_dtype,
             request_configs,
             kv_group=kv_group,
         )
@@ -534,7 +551,9 @@ class SegmentTokenDatabase(TokenDatabase):
                             start_idx,
                             end_idx,
                             self._make_key_by_hash(
-                                self._hash_tokens(token_chunk), request_configs
+                                self._hash_tokens(token_chunk),
+                                request_configs,
+                                kv_group=kv_group,
                             ),
                         )
                     else:

@@ -245,6 +245,36 @@ class TestKVLayerGroupsManager:
         assert len(manager.kv_layer_groups) == 1
         assert manager.kv_layer_groups[0].layer_names == ["layer_0", "layer_1"]
 
+    def test_build_kv_layer_groups_one_tensor_tuple(self):
+        """DSA indexer KV groups register as one-tensor tuples."""
+        manager = KVLayerGroupsManager()
+
+        kv_caches = {
+            "model.layers.0.self_attn.indexer.k_cache": (
+                torch.randn(32, 128, 1, 128, dtype=torch.bfloat16),
+            ),
+            "model.layers.1.self_attn.indexer.k_cache": (
+                torch.randn(32, 128, 1, 128, dtype=torch.bfloat16),
+            ),
+        }
+
+        manager.build_kv_layer_groups(kv_caches)
+
+        assert len(manager.kv_layer_groups) == 1
+        group = manager.kv_layer_groups[0]
+        assert group.layer_names == [
+            "model.layers.0.self_attn.indexer.k_cache",
+            "model.layers.1.self_attn.indexer.k_cache",
+        ]
+        # Ascend's patched manager flattens one-tensor tuple groups into the
+        # runtime storage shape, while the upstream manager keeps tuple count.
+        assert group.shape in (
+            torch.Size([1, 32, 128, 1, 128]),
+            torch.Size([32, 128, 128]),
+        )
+        assert group.dtype == torch.bfloat16
+        assert group.hidden_dim_size == 128
+
     def test_get_group_methods_after_build(self):
         """Test get_group_by_layer_idx and get_group_by_layer_name."""
         manager = KVLayerGroupsManager()

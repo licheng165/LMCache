@@ -97,9 +97,22 @@ void free_pinned_numa_ptr(uintptr_t ptr, size_t size) {
 }
 
 uintptr_t alloc_shm_pinned_ptr(size_t size, const std::string& shm_name) {
-  int fd = shm_open(shm_name.c_str(), O_CREAT | O_RDWR, 0600);
+  if (size == 0)
+    throw std::runtime_error("alloc_shm_pinned_ptr requires size > 0 for " +
+                             shm_name);
+  if (shm_name.empty())
+    throw std::runtime_error("alloc_shm_pinned_ptr requires a shm_name");
+
+  int fd = shm_open(shm_name.c_str(), O_CREAT | O_EXCL | O_RDWR, 0600);
   if (fd < 0)
-    throw std::runtime_error(std::string("shm_open failed: ") +
+    throw std::runtime_error(std::string("shm_open create failed for ") +
+                             shm_name +
+                             " (shared CPU cache segment already exists or "
+                             "cannot be created; this usually means a live "
+                             "name collision or stale segment from an unclean "
+                             "shutdown, so choose a unique "
+                             "shared_cpu_cache_name or unlink the stale "
+                             "segment before restart): " +
                              strerror(errno));
 
   if (ftruncate(fd, size) != 0) {
@@ -129,8 +142,45 @@ uintptr_t alloc_shm_pinned_ptr(size_t size, const std::string& shm_name) {
   return reinterpret_cast<uintptr_t>(ptr);
 }
 
+uintptr_t attach_shm_pinned_ptr(size_t size, const std::string& shm_name,
+                                bool writable) {
+  if (size == 0)
+    throw std::runtime_error("attach_shm_pinned_ptr requires size > 0 for " +
+                             shm_name);
+  if (shm_name.empty())
+    throw std::runtime_error("attach_shm_pinned_ptr requires a shm_name");
+
+  int fd = shm_open(shm_name.c_str(), writable ? O_RDWR : O_RDONLY, 0600);
+  if (fd < 0)
+    throw std::runtime_error(std::string("shm_open attach failed for ") +
+                             shm_name + ": " + strerror(errno));
+
+  int prot = writable ? (PROT_READ | PROT_WRITE) : PROT_READ;
+  void* ptr = mmap(nullptr, size, prot, MAP_SHARED, fd, 0);
+  close(fd);
+  if (ptr == MAP_FAILED) {
+    throw std::runtime_error(std::string("mmap attach failed for ") + shm_name +
+                             ": " + strerror(errno));
+  }
+
+  cudaError_t st = cudaHostRegister(ptr, size, 0);
+  if (st != cudaSuccess) {
+    munmap(ptr, size);
+    throw std::runtime_error(std::string("cudaHostRegister attach failed for ") +
+                             shm_name + ": " + cudaGetErrorString(st));
+  }
+
+  return reinterpret_cast<uintptr_t>(ptr);
+}
+
 void free_shm_pinned_ptr(uintptr_t ptr, size_t size,
                          const std::string& shm_name) {
+  if (ptr == 0)
+    throw std::runtime_error("free_shm_pinned_ptr requires non-null ptr");
+  if (size == 0)
+    throw std::runtime_error("free_shm_pinned_ptr requires size > 0 for " +
+                             shm_name);
+
   void* p = reinterpret_cast<void*>(ptr);
   cudaError_t st = cudaHostUnregister(p);
   if (st != cudaSuccess) {
@@ -144,4 +194,30 @@ void free_shm_pinned_ptr(uintptr_t ptr, size_t size,
     throw std::runtime_error(std::string("munmap failed: ") + strerror(errno));
   }
   shm_unlink(shm_name.c_str());
+}
+
+void detach_shm_pinned_ptr(uintptr_t ptr, size_t size) {
+  if (ptr == 0)
+    throw std::runtime_error("detach_shm_pinned_ptr requires non-null ptr");
+  if (size == 0)
+    throw std::runtime_error("detach_shm_pinned_ptr requires size > 0");
+
+  void* p = reinterpret_cast<void*>(ptr);
+  cudaError_t st = cudaHostUnregister(p);
+  if (st != cudaSuccess) {
+    munmap(p, size);
+    throw std::runtime_error(std::string("cudaHostUnregister detach failed: ") +
+                             cudaGetErrorString(st));
+  }
+  if (munmap(p, size) != 0) {
+    throw std::runtime_error(std::string("munmap detach failed: ") +
+                             strerror(errno));
+  }
+}
+
+void unlink_shm(const std::string& shm_name) {
+  if (shm_unlink(shm_name.c_str()) != 0 && errno != ENOENT) {
+    throw std::runtime_error(std::string("shm_unlink failed for ") + shm_name +
+                             ": " + strerror(errno));
+  }
 }

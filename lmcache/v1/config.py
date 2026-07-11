@@ -56,6 +56,11 @@ _DEPRECATED_CONFIGS = {
     "external_backends": (
         "external_backends is deprecated, use storage_plugins instead"
     ),
+    "save_indexer_only_first_rank": (
+        "save_indexer_only_first_rank is deprecated; use "
+        "extra_config.save_only_first_rank to control both MLA latent and "
+        "DSA index first-rank storage policy"
+    ),
 }
 
 # Single configuration definition center - add new config items only here
@@ -285,6 +290,8 @@ _CONFIG_DEFINITIONS: dict[str, dict[str, Any]] = {
         "default": False,
         "env_converter": _to_bool,
     },
+    # Deprecated compatibility only. With dsa_two_groups=true, the DSA index
+    # first-rank policy follows extra_config.save_only_first_rank.
     "save_indexer_only_first_rank": {
         "type": bool,
         "default": False,
@@ -293,6 +300,36 @@ _CONFIG_DEFINITIONS: dict[str, dict[str, Any]] = {
     "dsa_two_groups": {
         "type": bool,
         "default": False,
+        "env_converter": _to_bool,
+    },
+    "enable_shared_cpu_cache": {
+        "type": bool,
+        "default": False,
+        "env_converter": _to_bool,
+    },
+    "shared_cpu_cache_strict": {
+        "type": bool,
+        "default": True,
+        "env_converter": _to_bool,
+    },
+    "shared_cpu_cache_name": {
+        "type": Optional[str],
+        "default": None,
+        "env_converter": str,
+    },
+    "shared_cpu_cache_size_gb": {
+        "type": Optional[float],
+        "default": None,
+        "env_converter": float,
+    },
+    "shared_cpu_materialize_index_on_decode_cold": {
+        "type": bool,
+        "default": True,
+        "env_converter": _to_bool,
+    },
+    "shared_cpu_cache_passive_writable": {
+        "type": Optional[bool],
+        "default": None,
         "env_converter": _to_bool,
     },
     "blocking_timeout_secs": {"type": int, "default": 10, "env_converter": int},
@@ -560,6 +597,59 @@ def _validate_config(self):
                 "enable_blending=True"
             )
             self.save_unfull_chunk = True
+
+    extra_config = self.extra_config or {}
+    enable_shared_cpu_cache = bool(
+        extra_config.get(
+            "enable_shared_cpu_cache",
+            getattr(self, "enable_shared_cpu_cache", False),
+        )
+    )
+    shared_cpu_config_context = (
+        " shared_cpu_config={"
+        f"enable_shared_cpu_cache={enable_shared_cpu_cache}, "
+        f"local_cpu={self.local_cpu}, "
+        f"max_local_cpu_size={self.max_local_cpu_size}, "
+        "shared_cpu_cache_name="
+        f"{extra_config.get('shared_cpu_cache_name', getattr(self, 'shared_cpu_cache_name', None))!r}, "
+        "shared_cpu_cache_size_gb="
+        f"{extra_config.get('shared_cpu_cache_size_gb', getattr(self, 'shared_cpu_cache_size_gb', None))!r}, "
+        f"shm_name={extra_config.get('shm_name')!r}"
+        "}"
+    )
+    if enable_shared_cpu_cache:
+        if not self.local_cpu:
+            raise ValueError(
+                "enable_shared_cpu_cache requires local_cpu=true so rank0 "
+                "LocalCPUBackend can be the shm-backed publication store."
+                + shared_cpu_config_context
+            )
+        if self.max_local_cpu_size <= 0:
+            raise ValueError(
+                "enable_shared_cpu_cache requires max_local_cpu_size > 0 "
+                "on rank0."
+                + shared_cpu_config_context
+            )
+        shared_size_gb = extra_config.get(
+            "shared_cpu_cache_size_gb",
+            getattr(self, "shared_cpu_cache_size_gb", None),
+        )
+        if shared_size_gb is not None and float(shared_size_gb) <= 0:
+            raise ValueError(
+                "shared_cpu_cache_size_gb must be positive when set."
+                + shared_cpu_config_context
+            )
+        shared_name = extra_config.get(
+            "shared_cpu_cache_name",
+            getattr(self, "shared_cpu_cache_name", None),
+        )
+        shm_name = extra_config.get("shm_name")
+        if shared_name and shm_name and shared_name != shm_name:
+            raise ValueError(
+                "shared_cpu_cache_name and shm_name refer to the same shared "
+                "slab and must not conflict."
+                + shared_cpu_config_context
+            )
 
     if self.enable_p2p:
         assert self.enable_controller
