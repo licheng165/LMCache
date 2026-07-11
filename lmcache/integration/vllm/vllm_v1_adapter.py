@@ -6455,7 +6455,15 @@ class LMCacheConnectorV1Impl:
                     request_tracker.seed_sparse_decode_tokens(
                         list(request.all_token_ids)
                     )
-                lmcache_cached_for_sparse = request_tracker.prompt_len
+                # Sparse direct decode should only retrieve the prefix whose
+                # boundary is also used by SFA scratch_remap. Keep the final
+                # partial prompt chunk in the live vLLM tail by default; the
+                # sparse direct path does not carry per-chunk sizes.
+                lmcache_cached_for_sparse = (
+                    request_tracker.prompt_len
+                    // self._lmcache_chunk_size
+                    * self._lmcache_chunk_size
+                )
                 if self._decode_window_save_window_size > 0:
                     token_len = len(request_tracker.token_ids)
                     save_frontier = request_tracker.decode_window_save_next_start
