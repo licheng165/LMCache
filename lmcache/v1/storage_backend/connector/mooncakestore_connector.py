@@ -461,6 +461,9 @@ class MooncakestoreConnector(RemoteConnector):
         memory_obj.meta.shape = actual_shape
         if memory_obj.meta.shapes:
             memory_obj.meta.shapes = [actual_shape]
+        refresh_metadata_view = getattr(memory_obj, "refresh_metadata_view", None)
+        if callable(refresh_metadata_view):
+            refresh_metadata_view()
 
         return memory_obj
 

@@ -502,9 +502,13 @@ class TensorMemoryObj(MemoryObj):
         self.valid = True
         self.lock = threading.Lock()
         self.parent_allocator = parent_allocator
-        # Calculate the prefix sum of the group sizes
-        # If there are two groups, the prefix sum will be
-        # [0, size_of_group_1, size_of_group_1 + size_of_group_2]
+        self.group_prefix_sum: list[int] = []
+        self.refresh_metadata_view()
+
+    def refresh_metadata_view(self) -> None:
+        # Calculate the prefix sum of the group sizes. If there are two
+        # groups, the prefix sum will be:
+        # [0, size_of_group_1, size_of_group_1 + size_of_group_2].
         self.group_prefix_sum = [0]
         if self.meta.shapes is not None and self.meta.dtypes is not None:
             size_in_bytes = 0
@@ -1674,6 +1678,7 @@ class PagedTensorMemoryAllocator(MemoryAllocatorInterface):
         if shapes != self.shapes:
             size_in_bytes = get_size_bytes(shapes, dtypes)
             free_block.raw_data = free_block.raw_data[:size_in_bytes]
+        free_block.refresh_metadata_view()
 
         # TODO (Jiayi): need a flag to drop these debug ops
         # NOTE (Jiayi): the following code is not thread-safe but
@@ -1726,6 +1731,7 @@ class PagedTensorMemoryAllocator(MemoryAllocatorInterface):
             if shapes != self.shapes:
                 size_in_bytes = get_size_bytes(shapes, dtypes)
                 free_block.raw_data = free_block.raw_data[:size_in_bytes]
+            free_block.refresh_metadata_view()
 
             allocated_blocks.append(free_block)
 
