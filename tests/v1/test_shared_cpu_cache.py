@@ -14,6 +14,7 @@ from lmcache.v1.cache_engine import LMCacheEngine, LMCacheEngineBuilder
 from lmcache.v1.memory_management import (
     MemoryFormat,
     MemoryObjMetadata,
+    PagedTensorMemoryAllocator,
     TensorMemoryObj,
 )
 from lmcache.v1.shared_cpu_cache import (
@@ -1110,6 +1111,44 @@ def test_shared_chunk_handle_preserves_key_and_cached_positions():
     assert decoded.offset == 128
     assert decoded.logical_size == 16
     assert decoded.physical_size == 64
+
+
+def test_shared_chunk_handle_uses_refreshed_partial_page_logical_size():
+    full_shape = torch.Size([32, 8])
+    partial_shape = torch.Size([19, 8])
+    dtype = torch.bfloat16
+    fmt = MemoryFormat.KV_T2D
+    full_bytes = full_shape.numel() * dtype.itemsize
+    partial_bytes = partial_shape.numel() * dtype.itemsize
+    tensor_buffer = torch.zeros(full_bytes * 2, dtype=torch.uint8, device="cpu")
+    allocator = PagedTensorMemoryAllocator(tensor_buffer, [full_shape], [dtype], fmt)
+
+    full = allocator.allocate(full_shape, dtype, fmt)
+    assert full is not None
+    allocator.free(full)
+
+    partial = allocator.allocate(partial_shape, dtype, fmt)
+    assert partial is not None
+
+    handle = SharedChunkHandle.from_memory_obj(
+        request_id="req-1",
+        phase="dense_prefix",
+        key=_make_key(),
+        layer_id=0,
+        kv_group=0,
+        chunk_index=0,
+        shm_name="/lmcache-test",
+        memory_obj=partial,
+        generation=7,
+        producer_rank=0,
+    )
+
+    assert handle.shape == partial_shape
+    assert handle.logical_size == partial_bytes
+    assert handle.logical_size == handle.shape.numel() * handle.dtype.itemsize
+
+    allocator.free(partial)
+    allocator.close()
 
 
 def test_shared_chunk_handle_rejects_missing_required_field():
