@@ -3178,6 +3178,7 @@ class LMCacheEngine:
             next(mem_obj_consumer)
 
             to_count_down = []
+            retrieved_by_location: dict[str, list[MemoryObj]] = defaultdict(list)
             for layer_id in range(self.num_layers):
                 tasks = [next(get_generator) for get_generator in get_generators]
                 for task in tasks:
@@ -3191,8 +3192,10 @@ class LMCacheEngine:
                     yield None
 
                 mem_objs_layer = []
-                for task in tasks:
-                    mem_objs_layer.extend(task.result())
+                for segment, task in zip(segments, tasks, strict=True):
+                    segment_mem_objs = task.result()
+                    mem_objs_layer.extend(segment_mem_objs)
+                    retrieved_by_location[segment[0]].extend(segment_mem_objs)
                 mem_obj_consumer.send(mem_objs_layer)
                 to_count_down.extend(mem_objs_layer)
 
@@ -3202,7 +3205,8 @@ class LMCacheEngine:
             next(mem_obj_consumer)
 
             # Unpin disk-loaded staging objects after device-side sync is enqueued.
-            self._maybe_unpin_retrieved_objs(to_count_down, None)
+            for location, mem_objs in retrieved_by_location.items():
+                self._maybe_unpin_retrieved_objs(mem_objs, location)
         else:
             # If no cache are found, we still need to yield to avoid
             # `StopIteration`
