@@ -841,6 +841,108 @@ class TestWorkerRetrieveState:
         assert backing_obj.released == 1
         assert state.cached_memory_objs == []
 
+    def test_tp1_shared_state_cleanup_keeps_local_cpu_hot_cache_reference(self):
+        class BorrowedLocalCPUObj:
+            def __init__(self):
+                self.ref_count = 1
+                self.pin_count = 0
+                self.valid = True
+
+            @property
+            def is_pinned(self):
+                return self.pin_count > 0
+
+            def ref_count_up(self):
+                self.ref_count += 1
+
+            def ref_count_down(self):
+                self.ref_count -= 1
+                if self.ref_count == 0 and self.pin_count == 0:
+                    self.valid = False
+
+            def pin(self):
+                self.pin_count += 1
+                return True
+
+            def unpin(self):
+                self.pin_count -= 1
+                if self.ref_count == 0 and self.pin_count == 0:
+                    self.valid = False
+                return True
+
+            @property
+            def tensor(self):
+                return object() if self.valid else None
+
+        impl = _make_impl()
+        impl.lmcache_engine = SimpleNamespace(
+            enable_shared_cpu_cache=True,
+            shared_cpu_cache_generation=9,
+            store_location="LocalCPUBackend",
+            metadata=SimpleNamespace(
+                world_size=1,
+                is_first_rank=lambda: True,
+            ),
+        )
+        borrowed_obj = BorrowedLocalCPUObj()
+        hot_cache = {"k": borrowed_obj}
+        request = _make_store_request(
+            token_count=256,
+            start=0,
+            end=256,
+            key="k",
+            tensor="tensor",
+        )
+        request.cached_memory_objs = [[borrowed_obj]]
+        request.cached_tensors = [[borrowed_obj.tensor]]
+
+        impl._maybe_seed_worker_retrieve_state_from_store(request)
+
+        seeded_state = impl._worker_retrieve_state["req-1"]
+        assert seeded_state.shared_request_active is False
+        assert seeded_state.rank0_backing_objs_by_group == {0: [[borrowed_obj]]}
+        assert borrowed_obj.ref_count == 2
+        assert borrowed_obj.pin_count == 1
+
+        impl._retain_rank0_store_seed_state(seeded_state)
+        assert borrowed_obj.ref_count == 2
+        assert borrowed_obj.pin_count == 1
+
+        request.is_sparse_decode = True
+        request.load_spec = LoadSpec(
+            vllm_cached_tokens=0,
+            lmcache_cached_tokens=256,
+            can_load=True,
+        )
+        request.cached_chunk_ptrs_npu = ["latent-ptrs"]
+        impl._save_worker_retrieve_state_from_request(
+            request,
+            location="LocalCPUBackend",
+            metadata_warm=True,
+            token_count=256,
+        )
+
+        state = impl._worker_retrieve_state["req-1"]
+        assert state.shared_request_active is True
+        assert state.rank0_backing_objs_by_group == {0: [[borrowed_obj]]}
+        assert borrowed_obj.ref_count == 2
+        assert borrowed_obj.pin_count == 1
+
+        impl._drop_worker_retrieve_state("req-1")
+
+        assert borrowed_obj.ref_count == 1
+        assert borrowed_obj.pin_count == 0
+        assert borrowed_obj.valid is True
+        assert hot_cache["k"].tensor is not None
+
+        second_hit = hot_cache["k"]
+        second_hit.ref_count_up()
+        assert second_hit.ref_count == 2
+        assert second_hit.tensor is not None
+        second_hit.ref_count_down()
+        assert second_hit.ref_count == 1
+        assert second_hit.valid is True
+
     def test_save_releases_replaced_passive_shared_views(self):
         class FakeMemObj:
             def __init__(self):

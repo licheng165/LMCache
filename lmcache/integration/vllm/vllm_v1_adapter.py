@@ -3370,6 +3370,69 @@ class LMCacheConnectorV1Impl:
         for attr, value in snapshot.items():
             setattr(state, attr, value)
 
+    @staticmethod
+    def _retain_rank0_store_seed_objects(
+        borrowed_by_group: dict[int, list[list[Any]]],
+        existing_by_group: dict[int, list[list[Any]]],
+    ) -> list[Any]:
+        """Acquire the request ref/pin missing from prefill store seeding."""
+        existing_ids = {
+            id(mem_obj)
+            for layers in existing_by_group.values()
+            for layer_objs in layers
+            for mem_obj in layer_objs
+        }
+        retained: list[Any] = []
+        try:
+            for kv_group, layers in borrowed_by_group.items():
+                for layer_id, layer_objs in enumerate(layers):
+                    for chunk_index, mem_obj in enumerate(layer_objs):
+                        if id(mem_obj) in existing_ids:
+                            continue
+                        mem_obj.ref_count_up()
+                        try:
+                            is_valid = getattr(mem_obj, "is_valid", None)
+                            if callable(is_valid) and not is_valid():
+                                raise RuntimeError(
+                                    "Cannot retain an invalidated LocalCPU MemoryObj "
+                                    "while seeding shared CPU store state: "
+                                    f"kv_group={kv_group}, layer_id={layer_id}, "
+                                    f"chunk_index={chunk_index}"
+                                )
+                            if mem_obj.pin() is False:
+                                raise RuntimeError(
+                                    "MemoryObj.pin() returned False while seeding "
+                                    "shared CPU store state: "
+                                    f"kv_group={kv_group}, layer_id={layer_id}, "
+                                    f"chunk_index={chunk_index}"
+                                )
+                        except Exception:
+                            mem_obj.ref_count_down()
+                            raise
+                        retained.append(mem_obj)
+            return retained
+        except Exception:
+            LMCacheConnectorV1Impl._release_retained_rank0_store_seed_objects(retained)
+            raise
+
+    @staticmethod
+    def _release_retained_rank0_store_seed_objects(mem_objs: list[Any]) -> None:
+        for mem_obj in reversed(mem_objs):
+            try:
+                mem_obj.unpin()
+            except Exception as exc:
+                logger.warning(
+                    "Failed to roll back rank0 shared backing pin: %s",
+                    exc,
+                )
+            try:
+                mem_obj.ref_count_down()
+            except Exception as exc:
+                logger.warning(
+                    "Failed to roll back rank0 shared backing reference: %s",
+                    exc,
+                )
+
     def _release_unstored_shared_request_objects(
         self,
         request: ReqMeta,
@@ -4002,6 +4065,41 @@ class LMCacheConnectorV1Impl:
         )
         return location, metadata_warm
 
+    def _retain_rank0_store_seed_state(self, state: WorkerRetrieveState) -> None:
+        """Give rank0 prefill-store objects explicit request ownership."""
+        engine = getattr(self, "lmcache_engine", None)
+        if engine is None or not getattr(engine, "enable_shared_cpu_cache", False):
+            return
+        metadata = getattr(engine, "metadata", None)
+        is_first_rank_fn = getattr(metadata, "is_first_rank", None)
+        if not callable(is_first_rank_fn) or not is_first_rank_fn():
+            return
+
+        store_seed_by_group = {
+            0: [list(layer_objs) for layer_objs in state.cached_memory_objs]
+        }
+        if state.cached_memory_objs_indexer:
+            store_seed_by_group[1] = [
+                list(layer_objs) for layer_objs in state.cached_memory_objs_indexer
+            ]
+        store_seed_by_group = {
+            kv_group: layers
+            for kv_group, layers in store_seed_by_group.items()
+            if any(layers)
+        }
+        if not store_seed_by_group:
+            return
+
+        retained = self._retain_rank0_store_seed_objects(
+            store_seed_by_group,
+            state.rank0_backing_objs_by_group,
+        )
+        try:
+            state.rank0_backing_objs_by_group.update(store_seed_by_group)
+        except Exception:
+            self._release_retained_rank0_store_seed_objects(retained)
+            raise
+
     def _maybe_seed_worker_retrieve_state_from_store(
         self, request: ReqMeta
     ) -> None:
@@ -4113,6 +4211,7 @@ class LMCacheConnectorV1Impl:
                         )
                     )
                     existing_state.shared_validation_signature = None
+                self._retain_rank0_store_seed_state(existing_state)
             except Exception:
                 if rollback_snapshot is not None:
                     self._restore_worker_retrieve_cache_state(
@@ -4146,6 +4245,9 @@ class LMCacheConnectorV1Impl:
             metadata_warm=True,
             token_count=len(request.token_ids),
         )
+        state = self._worker_retrieve_state.get(request.req_id)
+        if state is not None:
+            self._retain_rank0_store_seed_state(state)
 
     def _save_worker_retrieve_state_from_request(
         self,
