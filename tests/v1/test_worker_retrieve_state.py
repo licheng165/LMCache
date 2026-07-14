@@ -164,45 +164,6 @@ class TestWorkerRetrieveState:
         assert state.shared_request_active is True
         assert state.request_scope_token == "req-1:3"
 
-    def test_mark_shared_index_skipped_waits_for_latent_before_active(self):
-        state = WorkerRetrieveState()
-
-        LMCacheConnectorV1Impl._mark_shared_index_skipped(
-            state,
-            "req-1",
-            generation=7,
-            token_count=512,
-        )
-
-        assert state.shared_index_status == "skipped"
-        assert state.shared_latent_status == "missing"
-        assert state.shared_generation == 7
-        assert state.pointer_cache_generation == 0
-        assert state.shared_request_active is False
-        assert state.request_scope_token is None
-        assert state.shared_validation_signature is None
-
-    def test_mark_shared_index_skipped_keeps_active_latent_state(self):
-        state = WorkerRetrieveState(
-            shared_latent_status="present",
-            shared_validation_signature=("old",),
-        )
-
-        LMCacheConnectorV1Impl._mark_shared_index_skipped(
-            state,
-            "req-1",
-            generation=7,
-            token_count=512,
-        )
-
-        assert state.shared_index_status == "skipped"
-        assert state.shared_latent_status == "present"
-        assert state.shared_generation == 7
-        assert state.pointer_cache_generation == 7
-        assert state.shared_request_active is True
-        assert state.request_scope_token == "req-1:7:512"
-        assert state.shared_validation_signature is None
-
     def test_sparse_decode_index_materialization_policy_for_shared_cpu_kv_both(self):
         impl = _make_impl()
         impl.config = SimpleNamespace(dsa_two_groups=True)

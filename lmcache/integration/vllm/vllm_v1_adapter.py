@@ -150,19 +150,8 @@ def _dsa_debug_minmax_count(value: Any) -> Any:
         return f"{type(value).__name__}:minmax_failed:{exc}"
 
 
-def _env_flag(name: str, default: str = "0") -> bool:
-    return os.environ.get(name, default).lower() in ("1", "true", "yes", "on")
-
-
 def _sparse_slot_mapping_len(prompt_tokens: int) -> int:
     return min(SPARSE_DECODE_RETRIEVE_TOKENS, prompt_tokens)
-
-
-def _am_get(attn_metadata, key, default=None):
-    """Read a field from attn_metadata that may be a dict or an object."""
-    if isinstance(attn_metadata, dict):
-        return attn_metadata.get(key, default)
-    return getattr(attn_metadata, key, default)
 
 
 def _ensure_list_attr(obj: Any, name: str) -> list:
@@ -1906,24 +1895,6 @@ class LMCacheConnectorV1Impl:
         )
 
     @staticmethod
-    def _mark_shared_index_skipped(
-        state: Optional[WorkerRetrieveState],
-        req_id: str,
-        generation: int,
-        token_count: int,
-    ) -> None:
-        if state is None:
-            return
-        state.req_id = req_id
-        state.shared_index_status = "skipped"
-        state.shared_generation = generation
-        state.shared_validation_signature = None
-        if state.shared_latent_status == "present":
-            state.shared_request_active = True
-            state.pointer_cache_generation = generation
-            state.request_scope_token = f"{req_id}:{generation}:{token_count}"
-
-    @staticmethod
     def _shared_request_scope_token(
         req_id: str,
         generation: int,
@@ -2168,27 +2139,6 @@ class LMCacheConnectorV1Impl:
         return (req_id, kv_group)
 
     @staticmethod
-    def _latent_slot_mapping_from_attn_metadata(
-        attn_metadata, layer_name: Optional[str] = None
-    ) -> Optional[torch.Tensor]:
-        """Return MLA latent slot mapping from per-layer vLLM attention metadata."""
-        if isinstance(attn_metadata, dict):
-            if layer_name is not None:
-                meta = attn_metadata.get(layer_name)
-                if meta is not None:
-                    slot_mapping = getattr(meta, "slot_mapping", None)
-                    if slot_mapping is not None:
-                        return slot_mapping
-            for name, meta in attn_metadata.items():
-                if "indexer" in name:
-                    continue
-                slot_mapping = getattr(meta, "slot_mapping", None)
-                if slot_mapping is not None:
-                    return slot_mapping
-            return None
-        return getattr(attn_metadata, "slot_mapping", None)
-
-    @staticmethod
     def _indexer_slot_mapping_from_attn_metadata(
         attn_metadata, layer_name: Optional[str] = None
     ) -> Optional[torch.Tensor]:
@@ -2279,8 +2229,6 @@ class LMCacheConnectorV1Impl:
         Mirrors the save path's indexer slot logic and handles both vLLM's
         per-layer metadata dict and single-object metadata forms.
         """
-        attn_slot = _am_get(attn_metadata, "slot_mapping", None)
-        idx_attr = _am_get(attn_metadata, "indexer_slot_mapping", None)
         candidates: list[tuple[str, torch.Tensor]] = []
 
         def add_candidate(source: str, slot_mapping) -> None:
@@ -2426,15 +2374,6 @@ class LMCacheConnectorV1Impl:
         if idx_slot is None or idx_slot.numel() == 0:
             return latent_sparse_slots
         return idx_slot
-
-    def _layer_index_from_name(self, layer_name: str) -> int:
-        layer_map = getattr(self, "_kv_layer_name_to_index", None)
-        if layer_map is None:
-            self._refresh_kvcaches_list()
-            layer_map = getattr(self, "_kv_layer_name_to_index", {})
-        if layer_name in layer_map:
-            return int(layer_map[layer_name])
-        return max(0, min(self.current_layer - 1, self.num_layers - 1))
 
     # TODO(chunxiaozheng): in the latest lmcache_connector, we use `register_kv_caches`
     #  to init self.kv_caches, we keep it in order to be compatible with old versions
@@ -3274,19 +3213,6 @@ class LMCacheConnectorV1Impl:
                     f"req_id={request.req_id}, kv_group=1, "
                     f"missing_layers={missing_index_layers}"
                 )
-
-    @staticmethod
-    def _missing_required_shared_layers(
-        layers: list[list[Any]],
-        expected_layers: int,
-    ) -> list[int]:
-        if expected_layers <= 0:
-            return []
-        missing = []
-        for layer_id in range(expected_layers):
-            if layer_id >= len(layers) or not layers[layer_id]:
-                missing.append(layer_id)
-        return missing
 
     @staticmethod
     def _copy_shared_layer_map(
@@ -4166,9 +4092,7 @@ class LMCacheConnectorV1Impl:
                 else None
             )
             try:
-                merged_chunks = self._merge_store_cache_into_worker_state(
-                    existing_state, request
-                )
+                self._merge_store_cache_into_worker_state(existing_state, request)
                 existing_state.location = location or existing_state.location
                 existing_state.metadata_warm = True
                 next_token_count = max(
@@ -4562,9 +4486,6 @@ class LMCacheConnectorV1Impl:
                             self._drop_worker_retrieve_state(request.req_id)
                         bound_state = self._bind_worker_retrieve_state_to_request(
                             request
-                        )
-                        worker_state = self._worker_retrieve_state.get(
-                            request.req_id
                         )
                     else:
                         bound_state = None

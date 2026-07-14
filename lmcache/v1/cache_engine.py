@@ -59,7 +59,6 @@ from lmcache.v1.metadata import LMCacheMetadata
 from lmcache.v1.pin_monitor import PinMonitor
 from lmcache.v1.shared_cpu_cache import (
     SharedChunkHandle,
-    SharedCPUCacheError,
     SharedHandleEnvelope,
     SharedSlabMapping,
 )
