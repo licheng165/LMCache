@@ -44,6 +44,7 @@ def _make_scheduler_impl() -> LMCacheConnectorV1Impl:
     impl.config.save_decode_cache = False
     impl.config.save_full_chunk_in_decode = False
     impl.config.dsa_two_groups = False
+    impl.config.use_layerwise = True
     impl.config.priority_limit = None
     impl.kv_role = "kv_both"
     impl.force_skip_save = False

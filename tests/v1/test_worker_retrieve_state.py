@@ -1992,6 +1992,77 @@ class TestWorkerRetrieveState:
         assert state.cached_shared_handles == [["h0", "h1"]]
         assert state.token_count == 8192
 
+    def test_store_seed_full_chunk_replaces_partial_at_same_start(self):
+        impl = _make_impl()
+        impl.config = SimpleNamespace(dsa_two_groups=False)
+        impl._latent_kvcaches = [object()]
+        impl._manager = SimpleNamespace(
+            lmcache_engine=SimpleNamespace(
+                enable_shared_cpu_cache=False,
+                storage_manager=None,
+                store_location="LocalCPUBackend",
+            ),
+        )
+        partial = _make_store_request(
+            token_count=100,
+            start=0,
+            end=100,
+            key="partial-key",
+            tensor="partial-tensor",
+        )
+        full = _make_store_request(
+            token_count=256,
+            start=0,
+            end=256,
+            key="full-key",
+            tensor="full-tensor",
+        )
+
+        impl._maybe_seed_worker_retrieve_state_from_store(partial)
+        impl._maybe_seed_worker_retrieve_state_from_store(full)
+
+        state = impl._worker_retrieve_state["req-1"]
+        assert state.cached_starts == [0]
+        assert state.cached_ends == [256]
+        assert state.cached_keys == [["full-key"]]
+        assert state.cached_tensors == [["full-tensor"]]
+        assert state.token_count == 256
+
+    def test_store_seed_partial_does_not_replace_full_at_same_start(self):
+        impl = _make_impl()
+        impl.config = SimpleNamespace(dsa_two_groups=False)
+        impl._latent_kvcaches = [object()]
+        impl._manager = SimpleNamespace(
+            lmcache_engine=SimpleNamespace(
+                enable_shared_cpu_cache=False,
+                storage_manager=None,
+                store_location="LocalCPUBackend",
+            ),
+        )
+        full = _make_store_request(
+            token_count=256,
+            start=0,
+            end=256,
+            key="full-key",
+            tensor="full-tensor",
+        )
+        stale_partial = _make_store_request(
+            token_count=100,
+            start=0,
+            end=100,
+            key="partial-key",
+            tensor="partial-tensor",
+        )
+
+        impl._maybe_seed_worker_retrieve_state_from_store(full)
+        impl._maybe_seed_worker_retrieve_state_from_store(stale_partial)
+
+        state = impl._worker_retrieve_state["req-1"]
+        assert state.cached_starts == [0]
+        assert state.cached_ends == [256]
+        assert state.cached_keys == [["full-key"]]
+        assert state.cached_tensors == [["full-tensor"]]
+
     def test_decode_save_merge_extends_pointer_cache_and_scope_token(self):
         impl = _make_impl()
         impl.lmcache_engine = SimpleNamespace(

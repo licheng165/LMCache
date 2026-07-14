@@ -222,6 +222,44 @@ def _build_slot_mapping(
     return slots[:num_tokens]
 
 
+def _build_slot_mapping_window(
+    block_ids: list[int],
+    block_size: int,
+    token_start: int,
+    token_end: int,
+) -> torch.Tensor:
+    """Build slots for one absolute token window without expanding the prefix."""
+    if block_size <= 0:
+        raise ValueError(f"block_size must be positive, got {block_size}")
+    if token_start < 0 or token_end < token_start:
+        raise ValueError(
+            "Invalid slot-mapping token window: "
+            f"start={token_start}, end={token_end}"
+        )
+    if token_end == token_start:
+        return torch.empty(0, dtype=torch.long)
+
+    first_block = token_start // block_size
+    end_block = utils.cdiv(token_end, block_size)
+    if end_block > len(block_ids):
+        raise ValueError(
+            "Slot-mapping token window exceeds allocated blocks: "
+            f"start={token_start}, end={token_end}, block_size={block_size}, "
+            f"required_blocks={end_block}, allocated_blocks={len(block_ids)}"
+        )
+
+    selected_block_ids = torch.tensor(
+        block_ids[first_block:end_block], dtype=torch.long
+    )
+    block_offsets = torch.arange(block_size, dtype=torch.long)
+    slots = (
+        block_offsets.reshape((1, block_size))
+        + selected_block_ids.reshape((-1, 1)) * block_size
+    ).flatten()
+    local_start = token_start - first_block * block_size
+    return slots[local_start : local_start + token_end - token_start]
+
+
 def _dsa_payload_event_list(payload_event: Any) -> list[Any]:
     if payload_event is None:
         return []
@@ -709,6 +747,13 @@ class ReqMeta:
     # Single-element list; sparse decode reuses tracker.sparse_slot_mapping by reference.
     slot_mapping: list[torch.Tensor] = field(default_factory=list)
     indexer_slot_mapping: list[torch.Tensor] = field(default_factory=list)
+    # Save-only mappings for the exact sparse-layerwise write window. Chunk
+    # ranges remain absolute; the worker/connector subtracts this base before
+    # indexing these tensors.
+    save_slot_mapping: list[torch.Tensor] = field(default_factory=list)
+    save_indexer_slot_mapping: list[torch.Tensor] = field(default_factory=list)
+    save_slot_mapping_base: Optional[int] = None
+    windowed_sparse_save: bool = False
 
     # key of cached object
     cached_keys: list[list] = field(default_factory=list)
@@ -783,6 +828,7 @@ class ReqMeta:
         window_start: int,
         window_end: int,
         window_size: int,
+        windowed_sparse_layerwise_save: bool = False,
     ) -> Optional["ReqMeta"]:
         """Create isolated metadata for a decode-window save."""
         if window_start < 0 or window_end <= window_start:
@@ -817,21 +863,56 @@ class ReqMeta:
                 )
             else:
                 indexer_slot_mapping = [
-                    _build_slot_mapping(
-                        tracker.allocated_block_ids_indexer,
-                        block_size,
-                        len(token_ids),
+                    (
+                        _build_slot_mapping_window(
+                            tracker.allocated_block_ids_indexer,
+                            block_size,
+                            window_start,
+                            window_end,
+                        )
+                        if windowed_sparse_layerwise_save
+                        else _build_slot_mapping(
+                            tracker.allocated_block_ids_indexer,
+                            block_size,
+                            len(token_ids),
+                        )
                     )
                 ]
+
+        save_slot_mapping: list[torch.Tensor] = []
+        save_indexer_slot_mapping: list[torch.Tensor] = []
+        if windowed_sparse_layerwise_save:
+            save_slot_mapping = [
+                _build_slot_mapping_window(
+                    tracker.allocated_block_ids,
+                    block_size,
+                    window_start,
+                    window_end,
+                )
+            ]
+            if indexer_slot_mapping:
+                save_indexer_slot_mapping = indexer_slot_mapping
+
+        slot_mapping = (
+            save_slot_mapping
+            if windowed_sparse_layerwise_save
+            else [
+                _build_slot_mapping(
+                    tracker.allocated_block_ids, block_size, len(token_ids)
+                )
+            ]
+        )
 
         return ReqMeta(
             req_id=tracker.req_id,
             token_ids=token_ids,
-            slot_mapping=[
-                _build_slot_mapping(
-                    tracker.allocated_block_ids, block_size, len(token_ids)
-                )
-            ],
+            slot_mapping=slot_mapping,
+            save_slot_mapping=save_slot_mapping,
+            save_indexer_slot_mapping=save_indexer_slot_mapping,
+            save_slot_mapping_base=(
+                window_start if windowed_sparse_layerwise_save else None
+            ),
+            windowed_sparse_save=windowed_sparse_layerwise_save,
             is_last_prefill=True,
             save_spec=SaveSpec(
                 window_start,
@@ -860,6 +941,8 @@ class ReqMeta:
         is_sparse_decode: bool = False,
         save_full_chunk_in_decode: bool = False,
         dsa_two_groups: bool = False,
+        windowed_sparse_layerwise_save: bool = False,
+        save_entire_prefix: bool = False,
     ) -> Optional["ReqMeta"]:
         """Create the request metadata from a request tracker.
 
@@ -870,6 +953,10 @@ class ReqMeta:
             load_spec (Optional[LoadSpec]): the load spec for KV cache loading.
             discard_partial_chunks (bool): whether to discard partial chunks.
             save_decode_cache (bool): whether to save the cache in decode phase.
+            windowed_sparse_layerwise_save (bool): build exact save-only slot
+                mappings and preserve chunked-prefill tails.
+            save_entire_prefix (bool): retain a full source mapping for producer
+                roles that intentionally resend the complete prefix.
 
         Returns:
             the request metadata if we need to perform load/save
@@ -916,13 +1003,27 @@ class ReqMeta:
             and input_token_len > tracker.num_saved_tokens
             and input_token_len < chunk_boundary
         )
+        # Sparse layerwise chunked prefill must preserve every scheduled tail.
+        # vLLM is free to release that tail before a later crossing chunk is
+        # formed. A later longer partial/full chunk has a different hash and is
+        # stored by rewinding to the LMCache chunk boundary.
+        allow_sparse_layerwise_prefill_progress = (
+            windowed_sparse_layerwise_save
+            and input_token_len <= tracker.prompt_len
+            and input_token_len > tracker.num_saved_tokens
+        )
         skip_by_tracker = bool(tracker.skip_save)
         skip_by_chunk_boundary = (
             tracker.num_saved_tokens > 0
             and input_token_len < chunk_boundary
             and not allow_final_prefill_partial_save
+            and not allow_sparse_layerwise_prefill_progress
         )
-        skip_by_decode_phase = bool(tracker.is_decode_phase and not save_decode_cache)
+        skip_by_decode_phase = bool(
+            tracker.is_decode_phase
+            and not save_decode_cache
+            and not allow_sparse_layerwise_prefill_progress
+        )
         skip_by_request_config = bool(request_skip)
 
         skip_save = tracker.disagg_spec is None and (
@@ -941,6 +1042,7 @@ class ReqMeta:
             tracker.is_decode_phase
             and save_full_chunk_in_decode
             and not skip_save
+            and not allow_sparse_layerwise_prefill_progress
         ):
             # Only save if we've crossed a full chunk boundary since last save
             new_boundary = (
@@ -959,7 +1061,9 @@ class ReqMeta:
         # NOTE(vladnosiv): for the input_token_len chunk prefill,
         # we are required to discard partial chunks,
         # as new tokens will be added in the next iteration.
-        if not is_last_prefill or discard_partial_chunks:
+        if allow_sparse_layerwise_prefill_progress:
+            num_tokens_to_save = input_token_len
+        elif not is_last_prefill or discard_partial_chunks:
             num_tokens_to_save = (
                 input_token_len // lmcache_chunk_size * lmcache_chunk_size
             )
@@ -1060,6 +1164,43 @@ class ReqMeta:
                 block_size,
             )
 
+        windowed_sparse_save = (
+            windowed_sparse_layerwise_save
+            and not is_sparse_decode
+            and not skip_save
+        )
+        use_windowed_save_mapping = (
+            windowed_sparse_save and not save_entire_prefix
+        )
+        save_slot_mapping: list[torch.Tensor] = []
+        save_indexer_slot_mapping: list[torch.Tensor] = []
+        save_slot_mapping_base: Optional[int] = None
+        if use_windowed_save_mapping:
+            save_slot_mapping_base = (
+                skip_leading_tokens // lmcache_chunk_size * lmcache_chunk_size
+            )
+            save_end = len(token_ids)
+            save_slot_mapping = [
+                _build_slot_mapping_window(
+                    tracker.allocated_block_ids,
+                    block_size,
+                    save_slot_mapping_base,
+                    save_end,
+                )
+            ]
+            if dsa_two_groups and tracker.allocated_block_ids_indexer:
+                save_indexer_slot_mapping = [
+                    _build_slot_mapping_window(
+                        tracker.allocated_block_ids_indexer,
+                        block_size,
+                        save_slot_mapping_base,
+                        save_end,
+                    )
+                ]
+
+        needs_full_slots = bool(
+            (load_spec is not None and load_spec.can_load) or save_entire_prefix
+        )
         if is_sparse_decode and load_spec is not None:
             num_slots = _sparse_slot_mapping_len(load_spec.lmcache_cached_tokens)
             current_slots = (
@@ -1075,6 +1216,8 @@ class ReqMeta:
                     )
                 )
             slot_mapping = tracker.sparse_slot_mapping
+        elif use_windowed_save_mapping and not needs_full_slots:
+            slot_mapping = save_slot_mapping
         else:
             slot_mapping = [
                 _build_slot_mapping(
@@ -1114,13 +1257,16 @@ class ReqMeta:
                     )
                 indexer_slot_mapping = tracker.sparse_indexer_slot_mapping
             elif not is_sparse_decode:
-                indexer_slot_mapping = [
-                    _build_slot_mapping(
-                        tracker.allocated_block_ids_indexer,
-                        block_size,
-                        len(token_ids),
-                    )
-                ]
+                if use_windowed_save_mapping and not needs_full_slots:
+                    indexer_slot_mapping = save_indexer_slot_mapping
+                else:
+                    indexer_slot_mapping = [
+                        _build_slot_mapping(
+                            tracker.allocated_block_ids_indexer,
+                            block_size,
+                            len(token_ids),
+                        )
+                    ]
         if load_spec is not None and load_spec.can_load:
             logger.debug(
                 "Scheduled to load %d tokens (%d cached in vLLM) for request %s",
@@ -1186,6 +1332,10 @@ class ReqMeta:
             token_ids=token_ids,
             slot_mapping=slot_mapping,
             indexer_slot_mapping=indexer_slot_mapping,
+            save_slot_mapping=save_slot_mapping,
+            save_indexer_slot_mapping=save_indexer_slot_mapping,
+            save_slot_mapping_base=save_slot_mapping_base,
+            windowed_sparse_save=windowed_sparse_save,
             is_last_prefill=is_last_prefill,
             is_sparse_decode=is_sparse_decode,
             save_spec=save_spec,
@@ -2307,13 +2457,11 @@ class LMCacheConnectorV1Impl:
         layer_name: Optional[str],
         token_count: int,
     ) -> Optional[torch.Tensor]:
-        """Return indexer save slots from the active layer metadata.
+        """Return generic indexer save slots from active layer metadata.
 
-        DSA indexer save is reading the current indexer-layer KV buffer, so the
-        source slots must come from the attention metadata for that layer. The
-        request-level indexer_slot_mapping may be a full/cumulative scheduler
-        destination used by retrieve; using it for save can publish cache chunks
-        that differ from the cold prefill state.
+        Sparse layerwise saves bypass this helper and use the scheduler's exact
+        per-request save window. Other paths retain the existing metadata-based
+        behavior.
         """
         if (
             self._is_decode_window_save_request(request)
@@ -2556,6 +2704,73 @@ class LMCacheConnectorV1Impl:
     @staticmethod
     def _is_decode_window_save_request(request: ReqMeta) -> bool:
         return bool(getattr(request, "is_decode_window_save", False))
+
+    def _windowed_sparse_layerwise_save_enabled(self) -> bool:
+        config = getattr(self, "config", None)
+        use_layerwise = getattr(
+            self,
+            "use_layerwise",
+            getattr(config, "use_layerwise", False),
+        )
+        return bool(
+            use_layerwise
+            and getattr(self, "enable_sparse_attention", False)
+        )
+
+    def _windowed_sparse_save_mapping(
+        self,
+        request: ReqMeta,
+        kv_group: int,
+        expected_base: int,
+    ) -> Optional[torch.Tensor]:
+        """Return the request-local save mapping for the selected KV group."""
+        if not self._windowed_sparse_layerwise_save_enabled():
+            return None
+        if not bool(getattr(request, "windowed_sparse_save", False)):
+            return None
+        # Disaggregated producers intentionally resend the whole prefix. Use
+        # their request-owned full mapping rather than batched attention
+        # metadata, which can belong to another request in the same forward.
+        if (
+            self.kv_role == "kv_producer"
+            and not self._is_decode_window_save_request(request)
+        ):
+            mapping_attr = (
+                "indexer_slot_mapping" if kv_group == 1 else "slot_mapping"
+            )
+            mappings = getattr(request, mapping_attr, None)
+            base = 0
+        else:
+            mapping_attr = (
+                "save_indexer_slot_mapping"
+                if kv_group == 1
+                else "save_slot_mapping"
+            )
+            mappings = getattr(request, mapping_attr, None)
+            base = getattr(request, "save_slot_mapping_base", None)
+        if not mappings or base is None:
+            raise RuntimeError(
+                "Sparse layerwise save is missing its request-local slot mapping: "
+                f"req_id={request.req_id}, kv_group={kv_group}, "
+                f"mapping_attr={mapping_attr}, base={base}"
+            )
+        if int(base) != int(expected_base):
+            raise RuntimeError(
+                "Sparse layerwise save slot-mapping base does not match the "
+                "store range: "
+                f"req_id={request.req_id}, kv_group={kv_group}, "
+                f"mapping_base={base}, store_base={expected_base}"
+            )
+        expected_tokens = len(request.token_ids) - int(base)
+        mapping = mappings[0]
+        if mapping.numel() != expected_tokens:
+            raise RuntimeError(
+                "Sparse layerwise save slot mapping has the wrong length: "
+                f"req_id={request.req_id}, kv_group={kv_group}, "
+                f"mapping_tokens={mapping.numel()}, expected_tokens={expected_tokens}, "
+                f"range=[{base}, {len(request.token_ids)})"
+            )
+        return mapping
 
     def _layerwise_save_range(self, request: ReqMeta) -> tuple[int, int]:
         if self._is_decode_window_save_request(request):
@@ -3775,14 +3990,40 @@ class LMCacheConnectorV1Impl:
         if not src_starts or not src_ends:
             return 0
 
-        existing_ranges = set(zip(dst_starts, dst_ends, strict=False))
+        replace_at: Optional[int] = None
+        for src_start, src_end in zip(src_starts, src_ends, strict=False):
+            for dst_index, (dst_start, dst_end) in enumerate(
+                zip(dst_starts, dst_ends, strict=False)
+            ):
+                if dst_start == src_start and src_end > dst_end:
+                    replace_at = dst_index
+                    break
+            if replace_at is not None:
+                break
+
+        existing_ranges = set(
+            zip(
+                dst_starts if replace_at is None else dst_starts[:replace_at],
+                dst_ends if replace_at is None else dst_ends[:replace_at],
+                strict=False,
+            )
+        )
+        existing_ends_by_start: dict[int, int] = {}
+        for start, end in existing_ranges:
+            existing_ends_by_start[start] = max(
+                existing_ends_by_start.get(start, -1), end
+            )
         append_indices: list[int] = []
         for chunk_idx, chunk_range in enumerate(
             zip(src_starts, src_ends, strict=False)
         ):
             if chunk_range in existing_ranges:
                 continue
+            chunk_start, chunk_end = chunk_range
+            if existing_ends_by_start.get(chunk_start, -1) >= chunk_end:
+                continue
             existing_ranges.add(chunk_range)
+            existing_ends_by_start[chunk_start] = chunk_end
             append_indices.append(chunk_idx)
 
         if not append_indices:
@@ -3823,7 +4064,10 @@ class LMCacheConnectorV1Impl:
         def can_append_layer_ptr_tensors() -> bool:
             if selected_ptrs_by_layer is None:
                 return False
-            if require_pointer_cache and len(selected_ptrs_by_layer) < source_layer_count:
+            if (
+                require_pointer_cache
+                and len(selected_ptrs_by_layer) < source_layer_count
+            ):
                 return False
             for layer_id in range(len(selected_ptrs_by_layer)):
                 if layer_id >= len(dst_chunk_ptrs_npu):
@@ -3835,6 +4079,27 @@ class LMCacheConnectorV1Impl:
 
         if require_pointer_cache and not can_append_layer_ptr_tensors():
             return 0
+
+        if replace_at is not None:
+            del dst_starts[replace_at:]
+            del dst_ends[replace_at:]
+
+            def truncate_layer_values(dst: list) -> None:
+                for layer_values in dst or []:
+                    if isinstance(layer_values, list):
+                        del layer_values[replace_at:]
+
+            for dst_layers in (
+                dst_keys,
+                dst_memory_objs,
+                dst_tensors,
+                dst_chunk_dev_ptrs,
+                dst_shared_handles,
+            ):
+                truncate_layer_values(dst_layers)
+            for layer_id, ptrs in enumerate(dst_chunk_ptrs_npu or []):
+                if isinstance(ptrs, torch.Tensor):
+                    dst_chunk_ptrs_npu[layer_id] = ptrs[:replace_at]
 
         for chunk_idx in append_indices:
             dst_starts.append(src_starts[chunk_idx])
@@ -4016,6 +4281,7 @@ class LMCacheConnectorV1Impl:
         if not store_seed_by_group:
             return
 
+        previous_backing_by_group = dict(state.rank0_backing_objs_by_group)
         retained = self._retain_rank0_store_seed_objects(
             store_seed_by_group,
             state.rank0_backing_objs_by_group,
@@ -4025,6 +4291,11 @@ class LMCacheConnectorV1Impl:
         except Exception:
             self._release_retained_rank0_store_seed_objects(retained)
             raise
+        self._release_replaced_shared_groups(
+            previous_backing_by_group,
+            store_seed_by_group,
+            rank0_backing=True,
+        )
 
     def _maybe_seed_worker_retrieve_state_from_store(
         self, request: ReqMeta
@@ -5371,6 +5642,16 @@ class LMCacheConnectorV1Impl:
                 * self._lmcache_chunk_size
             )
 
+        windowed_slot_mapping = self._windowed_sparse_save_mapping(
+            request,
+            kv_group=0,
+            expected_base=skip_leading_tokens,
+        )
+        if windowed_slot_mapping is not None:
+            slot_mapping = windowed_slot_mapping.to(
+                device=self.device, dtype=torch.long
+            )
+
         store_mask = torch.ones(len(token_ids), dtype=torch.bool)
         store_mask[:skip_leading_tokens] = False
 
@@ -5380,12 +5661,18 @@ class LMCacheConnectorV1Impl:
             "cached_ends": request.cached_ends,
             "cached_memory_objs": request.cached_memory_objs,
             "cached_tensors": request.cached_tensors,
+            "cached_shared_handles": _ensure_list_attr(
+                request, "cached_shared_handles"
+            ),
             "decode_window_save": self._is_decode_window_save_request(request),
             "decode_window_start": getattr(request, "decode_window_start", None),
             "decode_window_end": getattr(request, "decode_window_end", None),
             "decode_window_size": getattr(request, "decode_window_size", None),
             "request_configs": request.request_configs,
         }
+        if windowed_slot_mapping is not None:
+            store_kwargs["slot_mapping_base"] = skip_leading_tokens
+            store_kwargs["windowed_sparse_save"] = True
         if request.is_sparse_decode or self._is_decode_window_save_request(request):
             store_kwargs["cached_chunk_dev_ptrs"] = _ensure_list_attr(
                 request, "cached_chunk_dev_ptrs"
@@ -5557,35 +5844,6 @@ class LMCacheConnectorV1Impl:
                         device=self.device, dtype=torch.long
                     )
 
-                # Latent save matches dev-qzy: use scheduler request.slot_mapping
-                # (cumulative across chunked-prefill steps). Indexer save must
-                # use the active layer's attention metadata because it is the
-                # source view for the indexer KV buffer. Retrieve can use the
-                # request-level mapping as its destination view.
-
-                # Two-group DSA: for indexer layers, use the indexer group's
-                # slot mapping. vLLM may pass a per-layer metadata dict; the
-                # indexer metadata stores this as "slot_mapping", while the
-                # latent metadata stores it as "indexer_slot_mapping".
-                if is_indexer_layer:
-                    idx_slot = self._indexer_save_slot_mapping(
-                        request,
-                        attn_metadata,
-                        layer_name,
-                        len(token_ids),
-                    )
-                    if idx_slot is not None:
-                        slot_mapping = idx_slot.to(
-                            device=self.device, dtype=torch.long
-                        )
-                    if idx_slot is None:
-                        logger.warning(
-                            "Skipping DSA indexer save for layer %s: "
-                            "indexer slot mapping is unavailable",
-                            layer_name,
-                        )
-                        continue
-
                 if (
                     self.kv_role == "kv_producer"
                     and not self._is_decode_window_save_request(request)
@@ -5604,7 +5862,38 @@ class LMCacheConnectorV1Impl:
                         * self._lmcache_chunk_size
                     )
 
-                if is_indexer_layer:
+                windowed_slot_mapping = self._windowed_sparse_save_mapping(
+                    request,
+                    kv_group=kv_group,
+                    expected_base=skip_leading_tokens,
+                )
+                if windowed_slot_mapping is not None:
+                    slot_mapping = windowed_slot_mapping.to(
+                        device=self.device, dtype=torch.long
+                    )
+                elif is_indexer_layer:
+                    # Generic layerwise indexer save still follows the active
+                    # layer metadata. Sparse layerwise mode uses the exact
+                    # per-request scheduler window above so batched requests
+                    # cannot borrow one another's slots.
+                    idx_slot = self._indexer_save_slot_mapping(
+                        request,
+                        attn_metadata,
+                        layer_name,
+                        len(token_ids),
+                    )
+                    if idx_slot is None:
+                        logger.warning(
+                            "Skipping DSA indexer save for layer %s: "
+                            "indexer slot mapping is unavailable",
+                            layer_name,
+                        )
+                        continue
+                    slot_mapping = idx_slot.to(
+                        device=self.device, dtype=torch.long
+                    )
+
+                if is_indexer_layer and windowed_slot_mapping is None:
                     slot_mapping = self._pad_chunk_local_slot_mapping(
                         slot_mapping,
                         total_tokens=len(token_ids),
@@ -5645,6 +5934,9 @@ class LMCacheConnectorV1Impl:
                     "cached_ends": request.cached_ends,
                     "cached_memory_objs": request.cached_memory_objs,
                     "cached_tensors": request.cached_tensors,
+                    "cached_shared_handles": _ensure_list_attr(
+                        request, "cached_shared_handles"
+                    ),
                     "decode_window_save": self._is_decode_window_save_request(request),
                     "decode_window_start": getattr(
                         request, "decode_window_start", None
@@ -5655,6 +5947,9 @@ class LMCacheConnectorV1Impl:
                     ),
                     "request_configs": request.request_configs,
                 }
+                if windowed_slot_mapping is not None:
+                    store_kwargs["slot_mapping_base"] = skip_leading_tokens
+                    store_kwargs["windowed_sparse_save"] = True
                 if (
                     request.is_sparse_decode
                     or self._is_decode_window_save_request(request)
@@ -6199,6 +6494,9 @@ class LMCacheConnectorV1Impl:
                 window_start,
                 window_end,
                 window_size,
+                windowed_sparse_layerwise_save=(
+                    self._windowed_sparse_layerwise_save_enabled()
+                ),
             )
             if req_meta is None:
                 return
@@ -6291,6 +6589,10 @@ class LMCacheConnectorV1Impl:
                     self.config, "save_full_chunk_in_decode", False
                 ),
                 dsa_two_groups=getattr(self.config, "dsa_two_groups", False),
+                windowed_sparse_layerwise_save=(
+                    self._windowed_sparse_layerwise_save_enabled()
+                ),
+                save_entire_prefix=self.kv_role == "kv_producer",
             )
             if req_meta is not None:
                 meta.add_request(req_meta)
@@ -6343,6 +6645,10 @@ class LMCacheConnectorV1Impl:
                         self.config, "save_full_chunk_in_decode", False
                     ),
                     dsa_two_groups=getattr(self.config, "dsa_two_groups", False),
+                    windowed_sparse_layerwise_save=(
+                        self._windowed_sparse_layerwise_save_enabled()
+                    ),
+                    save_entire_prefix=self.kv_role == "kv_producer",
                 )
                 if req_meta is not None:
                     req_meta.resumed_from_preemption = req.resumed_from_preemption
@@ -6518,6 +6824,10 @@ class LMCacheConnectorV1Impl:
                     self.config, "save_full_chunk_in_decode", False
                 ),
                 dsa_two_groups=getattr(self.config, "dsa_two_groups", False),
+                windowed_sparse_layerwise_save=(
+                    self._windowed_sparse_layerwise_save_enabled()
+                ),
+                save_entire_prefix=self.kv_role == "kv_producer",
             )
             if req_meta is not None:
                 req_meta.resumed_from_preemption = preempted

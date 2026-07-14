@@ -95,6 +95,16 @@ def test_shared_cpu_cache_dense_layerwise_contract_is_engine_level():
     assert config.enable_sparse_attention is False
 
 
+def test_sparse_layerwise_requires_partial_chunk_storage():
+    config = LMCacheEngineConfig.from_defaults(
+        use_layerwise=True,
+        enable_sparse_attention=True,
+        save_unfull_chunk=False,
+    )
+    with pytest.raises(ValueError, match="save_unfull_chunk=true"):
+        config.validate()
+
+
 def test_shared_cpu_cache_passive_writable_defaults_to_auto():
     config = LMCacheEngineConfig.from_defaults()
     assert config.shared_cpu_cache_passive_writable is None
