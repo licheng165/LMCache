@@ -840,6 +840,7 @@ class TestWorkerRetrieveState:
             enable_shared_cpu_cache=True,
             shared_cpu_cache_generation=9,
             store_location="LocalCPUBackend",
+            lookup_unpin=lambda _req_id: None,
             metadata=SimpleNamespace(
                 world_size=1,
                 is_first_rank=lambda: True,

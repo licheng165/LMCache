@@ -1009,6 +1009,7 @@ class ReqMeta:
         # stored by rewinding to the LMCache chunk boundary.
         allow_sparse_layerwise_prefill_progress = (
             windowed_sparse_layerwise_save
+            and not is_sparse_decode
             and input_token_len <= tracker.prompt_len
             and input_token_len > tracker.num_saved_tokens
         )
