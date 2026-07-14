@@ -658,9 +658,12 @@ class _FakeLocalCPUBackend:
     def __init__(self, *, free_bytes: int, hot_cache: dict):
         self.hot_cache = hot_cache
         self.cpu_lock = nullcontext()
+        pin_allocator = SimpleNamespace(
+            address_manager=_FakeAddressManager(free_bytes),
+        )
         self.memory_allocator = SimpleNamespace(
             buffer=torch.empty(1024, dtype=torch.uint8),
-            address_manager=_FakeAddressManager(free_bytes),
+            pin_allocator=pin_allocator,
             align_bytes=64,
         )
 
@@ -929,6 +932,18 @@ def test_runtime_capacity_details_exclude_required_hot_chunks_from_evictable():
     assert details["non_shm_hot_chunk_count"] == 0
     assert details["active_sparse_requests"] == 2
     assert details["fits"] is True
+
+
+def test_capacity_snapshot_reads_nested_pin_allocator_free_space():
+    engine = _make_engine_for_sparse_capacity(max_local_cpu_size=1)
+    backend = _FakeLocalCPUBackend(free_bytes=768, hot_cache={})
+    engine._shared_local_cpu_backend = lambda: backend
+
+    snapshot = engine._shared_cpu_capacity_snapshot()
+
+    assert snapshot["slab_bytes"] == 1024
+    assert snapshot["free_bytes"] == 768
+    assert snapshot["allocated_bytes"] == 0
 
 
 def test_runtime_capacity_counts_non_shm_hot_hits_as_required_bytes():

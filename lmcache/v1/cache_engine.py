@@ -1249,6 +1249,14 @@ class LMCacheEngine:
             )
         return local_cpu_backend
 
+    @staticmethod
+    def _shared_cpu_allocator_address_manager(root_allocator: Any) -> Any:
+        address_manager = getattr(root_allocator, "address_manager", None)
+        if address_manager is not None:
+            return address_manager
+        pin_allocator = getattr(root_allocator, "pin_allocator", None)
+        return getattr(pin_allocator, "address_manager", None)
+
     def _shared_cpu_capacity_snapshot(self) -> dict[str, Any]:
         try:
             local_cpu_backend = self._shared_local_cpu_backend()
@@ -1258,7 +1266,9 @@ class LMCacheEngine:
             buffer = getattr(root_allocator, "buffer", None)
             if buffer is not None:
                 snapshot["slab_bytes"] = int(buffer.numel())
-            address_manager = getattr(root_allocator, "address_manager", None)
+            address_manager = self._shared_cpu_allocator_address_manager(
+                root_allocator
+            )
             if address_manager is not None:
                 get_free_size = getattr(address_manager, "get_free_size", None)
                 if callable(get_free_size):
@@ -1416,7 +1426,7 @@ class LMCacheEngine:
         buffer = getattr(root_allocator, "buffer", None)
         slab_size = int(buffer.numel()) if buffer is not None else None
         free_bytes = 0
-        address_manager = getattr(root_allocator, "address_manager", None)
+        address_manager = self._shared_cpu_allocator_address_manager(root_allocator)
         if address_manager is not None:
             get_free_size = getattr(address_manager, "get_free_size", None)
             if callable(get_free_size):
