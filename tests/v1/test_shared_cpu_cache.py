@@ -25,6 +25,27 @@ from lmcache.v1.shared_cpu_cache import (
     SharedHandleEnvelope,
     SharedSlabMapping,
 )
+from lmcache.v1.storage_backend.connector.base_connector import RemoteConnector
+
+
+class _FakeRemoteConnector(RemoteConnector):
+    async def exists(self, key):  # pragma: no cover - not used by these tests
+        return False
+
+    def exists_sync(self, key):  # pragma: no cover - not used by these tests
+        return False
+
+    async def get(self, key):  # pragma: no cover - not used by these tests
+        return None
+
+    async def put(self, key, memory_obj):  # pragma: no cover - not used by these tests
+        return None
+
+    async def list(self):  # pragma: no cover - not used by these tests
+        return []
+
+    async def close(self):  # pragma: no cover - not used by these tests
+        return None
 
 
 def _make_key(kv_group: int = 0) -> CacheEngineKey:
@@ -1148,6 +1169,49 @@ def test_shared_chunk_handle_uses_refreshed_partial_page_logical_size():
     assert handle.logical_size == handle.shape.numel() * handle.dtype.itemsize
 
     allocator.free(partial)
+    allocator.close()
+
+
+def test_shared_chunk_handle_uses_refreshed_remote_partial_chunk_size():
+    full_shape = torch.Size([2, 1, 256, 9, 8])
+    partial_tokens = 147
+    dtype = torch.bfloat16
+    full_bytes = full_shape.numel() * dtype.itemsize
+    single_token_size = full_bytes // full_shape[2]
+    partial_bytes = partial_tokens * single_token_size
+    tensor_buffer = torch.zeros(full_bytes * 2, dtype=torch.uint8, device="cpu")
+    allocator = PagedTensorMemoryAllocator(tensor_buffer, [full_shape], [dtype])
+
+    full = allocator.allocate(full_shape, dtype, MemoryFormat.KV_MLA_FMT)
+    assert full is not None
+    allocator.free(full)
+
+    memory_obj = allocator.allocate(full_shape, dtype, MemoryFormat.KV_MLA_FMT)
+    assert memory_obj is not None
+
+    connector = object.__new__(_FakeRemoteConnector)
+    connector.full_chunk_size_bytes = full_bytes
+    connector.single_token_size = single_token_size
+    memory_obj = connector.reshape_partial_chunk(memory_obj, partial_bytes)
+
+    handle = SharedChunkHandle.from_memory_obj(
+        request_id="req-1",
+        phase="dense_prefix",
+        key=_make_key(),
+        layer_id=0,
+        kv_group=0,
+        chunk_index=0,
+        shm_name="/lmcache-test",
+        memory_obj=memory_obj,
+        generation=7,
+        producer_rank=0,
+    )
+
+    assert handle.shape[2] == partial_tokens
+    assert handle.logical_size == partial_bytes
+    assert handle.logical_size == handle.shape.numel() * handle.dtype.itemsize
+
+    allocator.free(memory_obj)
     allocator.close()
 
 
