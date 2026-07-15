@@ -2016,7 +2016,10 @@ class TestWorkerRetrieveState:
             "prepared_sparse_source",
             "ret_mask",
         }
-        assert kwargs["prepared_sparse_source"].total_tokens == 256
+        prepared_source = kwargs["prepared_sparse_source"]
+        assert prepared_source.total_tokens == 256
+        assert prepared_source.chunk_token_counts == (256,)
+        assert prepared_source.pointer_device == torch.device("cpu")
         assert req.cached_keys == []
         assert req.cached_tensors == []
         impl._drain_layerwise_retrievers()

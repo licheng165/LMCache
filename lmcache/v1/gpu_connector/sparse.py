@@ -10,56 +10,12 @@ from typing import Optional
 import torch
 
 
-def _tensor_layout_signature(tensor: torch.Tensor) -> tuple:
-    return (
-        tuple(int(dim) for dim in tensor.shape),
-        tuple(int(stride) for stride in tensor.stride()),
-        tensor.dtype,
-        str(tensor.device),
-        int(tensor.element_size()),
-    )
-
-
 @dataclass(frozen=True, slots=True)
 class PreparedSparseSourceLayer:
     """Stable CPU source and pointer table for one sparse cache layer."""
 
     tensors: tuple[torch.Tensor, ...]
     chunk_ptrs_npu: torch.Tensor
-    layout_signature: tuple
-
-
-class PreparedSparseLayoutKey:
-    """Exact layout identity with a cached hash for per-step plan lookup."""
-
-    __slots__ = ("signature", "_hash")
-
-    def __init__(self, signature: tuple) -> None:
-        self.signature = signature
-        self._hash = hash(signature)
-
-    def __hash__(self) -> int:
-        return self._hash
-
-    def __eq__(self, other: object) -> bool:
-        if self is other:
-            return True
-        if not isinstance(other, PreparedSparseLayoutKey):
-            return NotImplemented
-        return self.signature == other.signature
-
-
-_PREPARED_SPARSE_LAYOUT_KEYS: dict[tuple, PreparedSparseLayoutKey] = {}
-
-
-def _prepared_sparse_layout_key(signature: tuple) -> PreparedSparseLayoutKey:
-    key = _PREPARED_SPARSE_LAYOUT_KEYS.get(signature)
-    if key is not None:
-        return key
-    return _PREPARED_SPARSE_LAYOUT_KEYS.setdefault(
-        signature,
-        PreparedSparseLayoutKey(signature),
-    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -68,15 +24,8 @@ class PreparedSparseSource:
 
     layers: tuple[PreparedSparseSourceLayer, ...]
     total_tokens: int
-    layout_signature: tuple
-    layout_key: PreparedSparseLayoutKey = field(init=False, repr=False)
-
-    def __post_init__(self) -> None:
-        object.__setattr__(
-            self,
-            "layout_key",
-            _prepared_sparse_layout_key(self.layout_signature),
-        )
+    chunk_token_counts: tuple[int, ...] = field(default_factory=tuple)
+    pointer_device: Optional[torch.device] = None
 
 
 def build_prepared_sparse_source(
@@ -85,6 +34,8 @@ def build_prepared_sparse_source(
     *,
     num_layers: int,
     total_tokens: int,
+    chunk_token_counts: Optional[Sequence[int]] = None,
+    expected_pointer_device: Optional[torch.device] = None,
 ) -> Optional[PreparedSparseSource]:
     """Seal a complete layer cache into immutable hot-path source metadata.
 
@@ -93,6 +44,8 @@ def build_prepared_sparse_source(
         cached_chunk_ptrs_npu: NPU pointer tables in layer-major order.
         num_layers: Exact layer count required for a complete binding.
         total_tokens: Number of valid source tokens represented by the cache.
+        chunk_token_counts: Request-owned token coverage for each CPU chunk.
+        expected_pointer_device: Accelerator device that owns pointer tables.
 
     Returns:
         A prepared source, or ``None`` while bootstrap data is incomplete.
@@ -112,7 +65,17 @@ def build_prepared_sparse_source(
     if len(cached_chunk_ptrs_npu) != num_layers:
         return None
 
+    normalized_chunk_counts: tuple[int, ...] = ()
+    if chunk_token_counts is not None:
+        normalized_chunk_counts = tuple(int(count) for count in chunk_token_counts)
+        if any(count <= 0 for count in normalized_chunk_counts):
+            raise ValueError("Prepared sparse chunk token counts must be positive.")
+        covered_tokens = sum(normalized_chunk_counts)
+        if covered_tokens < total_tokens:
+            return None
+
     layers: list[PreparedSparseSourceLayer] = []
+    pointer_device: Optional[torch.device] = None
     for layer_id in range(num_layers):
         layer_tensors = cached_tensors[layer_id]
         if isinstance(layer_tensors, torch.Tensor):
@@ -151,18 +114,40 @@ def build_prepared_sparse_source(
                 f"layer_id={layer_id}, pointers={chunk_ptrs_npu.numel()}, "
                 f"chunks={len(tensors)}"
             )
+        if normalized_chunk_counts and len(normalized_chunk_counts) != len(tensors):
+            raise ValueError(
+                "Prepared sparse chunk coverage does not match CPU chunks: "
+                f"layer_id={layer_id}, coverage={len(normalized_chunk_counts)}, "
+                f"chunks={len(tensors)}"
+            )
+        if pointer_device is None:
+            pointer_device = chunk_ptrs_npu.device
+        elif chunk_ptrs_npu.device != pointer_device:
+            raise ValueError(
+                "Prepared sparse pointer tables must share one device: "
+                f"layer_id={layer_id}, device={chunk_ptrs_npu.device}, "
+                f"expected={pointer_device}"
+            )
+        if (
+            expected_pointer_device is not None
+            and (
+                chunk_ptrs_npu.device.type != expected_pointer_device.type
+                or (
+                    expected_pointer_device.index is not None
+                    and chunk_ptrs_npu.device.index != expected_pointer_device.index
+                )
+            )
+        ):
+            raise ValueError(
+                "Prepared sparse pointer table is on the wrong device: "
+                f"layer_id={layer_id}, device={chunk_ptrs_npu.device}, "
+                f"expected={expected_pointer_device}"
+            )
 
-        layer_signature = (
-            tuple(_tensor_layout_signature(tensor) for tensor in tensors),
-            chunk_ptrs_npu.dtype,
-            str(chunk_ptrs_npu.device),
-            int(chunk_ptrs_npu.numel()),
-        )
         layers.append(
             PreparedSparseSourceLayer(
                 tensors=tensors,
                 chunk_ptrs_npu=chunk_ptrs_npu,
-                layout_signature=layer_signature,
             )
         )
 
@@ -170,5 +155,6 @@ def build_prepared_sparse_source(
     return PreparedSparseSource(
         layers=layer_tuple,
         total_tokens=int(total_tokens),
-        layout_signature=tuple(layer.layout_signature for layer in layer_tuple),
+        chunk_token_counts=normalized_chunk_counts,
+        pointer_device=pointer_device,
     )

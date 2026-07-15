@@ -4424,11 +4424,34 @@ class LMCacheConnectorV1Impl:
                 kv_group=kv_group,
                 dsa_two_groups=dsa_two_groups,
             )
+            cached_starts = cache["cached_starts"]
+            cached_ends = cache["cached_ends"]
+            chunk_token_counts = None
+            if cached_starts and len(cached_starts) == len(cached_ends):
+                if not self._cached_ranges_cover_prefix(
+                    cached_starts,
+                    cached_ends,
+                    token_count,
+                ):
+                    continue
+                chunk_token_counts = tuple(
+                    int(end) - int(start)
+                    for start, end in zip(
+                        cached_starts,
+                        cached_ends,
+                        strict=False,
+                    )
+                )
+            expected_pointer_device = getattr(self, "device", None)
+            if expected_pointer_device is not None:
+                expected_pointer_device = torch.device(expected_pointer_device)
             source = build_prepared_sparse_source(
                 cache["cached_tensors"],
                 cache["cached_chunk_ptrs_npu"],
                 num_layers=self._num_layers_for_group(kv_group),
                 total_tokens=token_count,
+                chunk_token_counts=chunk_token_counts,
+                expected_pointer_device=expected_pointer_device,
             )
             if source is not None:
                 prepared[kv_group] = source

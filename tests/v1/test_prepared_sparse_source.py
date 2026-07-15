@@ -23,22 +23,16 @@ def test_build_prepared_sparse_source_seals_complete_layers() -> None:
         pointer_tables,
         num_layers=2,
         total_tokens=6,
+        chunk_token_counts=(4, 2),
+        expected_pointer_device=torch.device("cpu"),
     )
 
     assert source is not None
     assert source.total_tokens == 6
     assert source.layers[0].tensors == tuple(tensors[0])
     assert source.layers[1].chunk_ptrs_npu is pointer_tables[1]
-    assert len(source.layout_signature) == 2
-
-    same_layout = build_prepared_sparse_source(
-        tensors,
-        pointer_tables,
-        num_layers=2,
-        total_tokens=6,
-    )
-    assert same_layout is not None
-    assert same_layout.layout_key is source.layout_key
+    assert source.chunk_token_counts == (4, 2)
+    assert source.pointer_device == torch.device("cpu")
 
 
 def test_build_prepared_sparse_source_waits_for_complete_bootstrap() -> None:
@@ -59,6 +53,30 @@ def test_build_prepared_sparse_source_rejects_partial_pointer_coverage() -> None
             [torch.tensor([101], dtype=torch.int64)],
             num_layers=1,
             total_tokens=6,
+        )
+
+
+def test_build_prepared_sparse_source_waits_for_token_coverage() -> None:
+    source = build_prepared_sparse_source(
+        [[torch.zeros(4)]],
+        [torch.tensor([101], dtype=torch.int64)],
+        num_layers=1,
+        total_tokens=4,
+        chunk_token_counts=(3,),
+    )
+
+    assert source is None
+
+
+def test_build_prepared_sparse_source_rejects_wrong_pointer_device() -> None:
+    with pytest.raises(ValueError, match="wrong device"):
+        build_prepared_sparse_source(
+            [[torch.zeros(4)]],
+            [torch.tensor([101], dtype=torch.int64)],
+            num_layers=1,
+            total_tokens=4,
+            chunk_token_counts=(4,),
+            expected_pointer_device=torch.device("cuda"),
         )
 
 
