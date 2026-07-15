@@ -308,11 +308,14 @@ class TestAscendEngineWarmColdMetadata:
     def test_stale_location_rechecked_when_not_using_tensor_cache(self) -> None:
         engine = AscendLMCacheEngine.__new__(AscendLMCacheEngine)
         engine.storage_manager = MagicMock()
-        engine.storage_manager.contains.return_value = "LocalCPUBackend"
         engine.retrieve_locations = ["LocalCPUBackend", "RemoteBackend"]
         engine.num_layers = 2
 
         cached_keys: list[list] = [[MagicMock()], [MagicMock()]]
+        engine.storage_manager.batched_contains.return_value = (
+            len(cached_keys),
+            {"LocalCPUBackend": [layer[0] for layer in cached_keys]},
+        )
         cached_starts = [0]
         cached_ends = [256]
         ret_mask = torch.zeros(256, dtype=torch.bool)
@@ -332,7 +335,8 @@ class TestAscendEngineWarmColdMetadata:
             retrieve_kwargs=retrieve_kwargs,
         )
 
-        engine.storage_manager.contains.assert_called_once()
+        engine.storage_manager.batched_contains.assert_called_once()
+        engine.storage_manager.contains.assert_not_called()
         assert location == "LocalCPUBackend"
         assert retrieve_kwargs["cached_retrieve_location"] == "LocalCPUBackend"
 
@@ -425,8 +429,8 @@ class TestSparseDecodeTokenMask:
         )
 
         assert len(retrieve_tokens) == request.load_spec.lmcache_cached_tokens
-        assert token_mask.numel() == request.load_spec.lmcache_cached_tokens
-        assert token_mask.eq(True).all()
+        assert token_mask is None
+        assert request.decode_token_mask is None
 
     def test_sparse_retrieve_tokens_cover_lmcache_prefix(self) -> None:
         impl = make_worker_impl()
