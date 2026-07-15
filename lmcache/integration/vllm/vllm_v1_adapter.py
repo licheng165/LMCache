@@ -87,6 +87,61 @@ except ValueError:
 _PD_STAGE_TRACE_REQUEST_ID = os.environ.get(
     "VLLM_PD_STAGE_TRACE_REQUEST_ID", ""
 )
+_PD_STAGE_TRACE_SYNC_NPU = os.environ.get(
+    "VLLM_PD_STAGE_TRACE_SYNC_NPU", "0"
+).lower() in ("1", "true", "yes", "on")
+
+
+@dataclass
+class _PDLookupTrace:
+    request_id: str
+    prompt_tokens: int
+    started_ns: int
+    scheduler_calls: int = 1
+    cache_poll_ns: int = 0
+    cache_poll_calls: int = 0
+    cache_poll_max_ns: int = 0
+    prepare_ns: int = 0
+    submit_ns: int = 0
+    scheduler_call_ns: int = 0
+    mode: str = "unknown"
+
+
+def _start_pd_stage_trace_detail(trace: Any) -> int:
+    if not _PD_STAGE_TRACE_ENABLED or not isinstance(trace, dict):
+        return 0
+    if _PD_STAGE_TRACE_SYNC_NPU and hasattr(torch, "npu"):
+        torch.npu.synchronize()
+    return time.perf_counter_ns()
+
+
+def _record_pd_stage_trace_detail(
+    trace: Any,
+    phase: str,
+    started_ns: int,
+    layer_name: str,
+    wait_group: int,
+) -> None:
+    if not started_ns or not isinstance(trace, dict):
+        return
+    if _PD_STAGE_TRACE_SYNC_NPU and hasattr(torch, "npu"):
+        torch.npu.synchronize()
+    elapsed_ns = time.perf_counter_ns() - started_ns
+    phase = f"adapter_{phase}_g{wait_group}"
+
+    totals = trace.get("internal_ns")
+    counts = trace.get("internal_counts")
+    maxima = trace.get("internal_max_ns")
+    slowest_layers = trace.get("internal_slowest_layer")
+    trace_maps = (totals, counts, maxima, slowest_layers)
+    if not all(isinstance(item, dict) for item in trace_maps):
+        return
+
+    totals[phase] = totals.get(phase, 0) + elapsed_ns
+    counts[phase] = counts.get(phase, 0) + 1
+    if elapsed_ns > maxima.get(phase, 0):
+        maxima[phase] = elapsed_ns
+        slowest_layers[phase] = layer_name
 
 
 def _pd_stage_trace_start_load(func):
@@ -1496,6 +1551,138 @@ class LMCacheConnectorV1Impl:
             getattr(self.lmcache_engine, "metadata", None),
         )
 
+    def _begin_pd_lookup_trace(
+        self,
+        request_id: str,
+        prompt_tokens: int,
+        started_ns: int,
+    ) -> Optional[_PDLookupTrace]:
+        if not _PD_STAGE_TRACE_ENABLED:
+            return None
+
+        sequence = getattr(self, "_pd_lookup_sequence", 0)
+        self._pd_lookup_sequence = sequence + 1
+        if sequence % _PD_STAGE_TRACE_EVERY:
+            return None
+        if (
+            _PD_STAGE_TRACE_REQUEST_ID
+            and _PD_STAGE_TRACE_REQUEST_ID != request_id
+        ):
+            return None
+
+        trace = _PDLookupTrace(
+            request_id=request_id,
+            prompt_tokens=prompt_tokens,
+            started_ns=started_ns,
+        )
+        traces = getattr(self, "_pd_lookup_traces", None)
+        if traces is None:
+            traces = {}
+            self._pd_lookup_traces = traces
+        traces[request_id] = trace
+        return trace
+
+    @staticmethod
+    def _record_pd_lookup_poll(
+        trace: Optional[_PDLookupTrace], elapsed_ns: int
+    ) -> None:
+        if trace is None:
+            return
+        trace.cache_poll_ns += elapsed_ns
+        trace.cache_poll_calls += 1
+        trace.cache_poll_max_ns = max(trace.cache_poll_max_ns, elapsed_ns)
+
+    def _record_pd_lookup_submit(
+        self,
+        trace: Optional[_PDLookupTrace],
+        prepare_ns: int,
+        submit_ns: int,
+        result: Optional[int],
+    ) -> None:
+        if trace is None:
+            return
+        trace.prepare_ns += prepare_ns
+        trace.submit_ns += submit_ns
+        trace.mode = "async" if result is None else "sync"
+        logger.info(
+            "[PD_STAGE_TRACE] scope=lookup phase=submit request=%s "
+            "prompt_tokens=%d mode=%s prepare_ms=%.3f submit_ms=%.3f "
+            "initial_cache_poll_ms=%.3f status=%s",
+            trace.request_id,
+            trace.prompt_tokens,
+            trace.mode,
+            prepare_ns / 1_000_000,
+            submit_ns / 1_000_000,
+            trace.cache_poll_ns / 1_000_000,
+            "pending" if result is None else "complete",
+        )
+
+    def _finish_pd_lookup_call(
+        self,
+        trace: Optional[_PDLookupTrace],
+        call_started_ns: int,
+        result: Optional[int],
+        result_source: str,
+    ) -> None:
+        if trace is None:
+            return
+
+        ended_ns = time.perf_counter_ns()
+        trace.scheduler_call_ns += ended_ns - call_started_ns
+        if result is None:
+            return
+
+        pending_ns = ended_ns - trace.started_ns
+        logger.info(
+            "[PD_STAGE_TRACE] scope=lookup phase=complete request=%s "
+            "prompt_tokens=%d hit_tokens=%d mode=%s result_source=%s "
+            "pending_ms=%.3f pending_idle_ms=%.3f scheduler_calls=%d "
+            "scheduler_call_total_ms=%.3f submit_ms=%.3f prepare_ms=%.3f "
+            "cache_poll_total_ms=%.3f cache_poll_calls=%d "
+            "cache_poll_max_ms=%.3f",
+            trace.request_id,
+            trace.prompt_tokens,
+            result,
+            trace.mode,
+            result_source,
+            pending_ns / 1_000_000,
+            max(0, pending_ns - trace.scheduler_call_ns) / 1_000_000,
+            trace.scheduler_calls,
+            trace.scheduler_call_ns / 1_000_000,
+            trace.submit_ns / 1_000_000,
+            trace.prepare_ns / 1_000_000,
+            trace.cache_poll_ns / 1_000_000,
+            trace.cache_poll_calls,
+            trace.cache_poll_max_ns / 1_000_000,
+        )
+        traces = getattr(self, "_pd_lookup_traces", None)
+        if traces is not None and traces.get(trace.request_id) is trace:
+            traces.pop(trace.request_id, None)
+
+    def _cancel_pd_lookup_trace(self, request_id: str, reason: str) -> None:
+        traces = getattr(self, "_pd_lookup_traces", None)
+        if not traces:
+            return
+        trace = traces.pop(request_id, None)
+        if trace is None:
+            return
+        pending_ns = time.perf_counter_ns() - trace.started_ns
+        logger.info(
+            "[PD_STAGE_TRACE] scope=lookup phase=cancel request=%s "
+            "prompt_tokens=%d mode=%s reason=%s pending_ms=%.3f "
+            "scheduler_calls=%d scheduler_call_total_ms=%.3f "
+            "cache_poll_total_ms=%.3f cache_poll_calls=%d",
+            trace.request_id,
+            trace.prompt_tokens,
+            trace.mode,
+            reason,
+            pending_ns / 1_000_000,
+            trace.scheduler_calls,
+            trace.scheduler_call_ns / 1_000_000,
+            trace.cache_poll_ns / 1_000_000,
+            trace.cache_poll_calls,
+        )
+
     def _begin_pd_stage_trace(self) -> Optional[dict[str, Any]]:
         if not _PD_STAGE_TRACE_ENABLED:
             return None
@@ -1620,16 +1807,45 @@ class LMCacheConnectorV1Impl:
         trace["emitted"] = True
 
         internal_parts = []
+        adapter_parts = []
+        nested_parts = []
         internal_ns = trace["internal_ns"]
+        adapter_accounted_ns = 0
         for phase, total_ns in sorted(
             internal_ns.items(), key=lambda item: item[1], reverse=True
         ):
+            if phase.startswith("adapter_"):
+                adapter_accounted_ns += total_ns
             count = trace["internal_counts"].get(phase, 0)
             max_ns = trace["internal_max_ns"].get(phase, 0)
             slowest_layer = trace["internal_slowest_layer"].get(phase, -1)
-            internal_parts.append(
+            part = (
                 f"{phase}:{total_ns / 1_000_000:.3f}/"
                 f"{count}/{max_ns / 1_000_000:.3f}@{slowest_layer}"
+            )
+            internal_parts.append(part)
+            if phase.startswith("adapter_"):
+                adapter_parts.append(part)
+            else:
+                nested_parts.append(part)
+
+        if _PD_STAGE_TRACE_ENABLED:
+            logger.info(
+                "[PD_STAGE_TRACE] scope=layer_wait_detail step=%d "
+                "requests=%s timing_mode=%s layer_wait_total_ms=%.3f "
+                "adapter_accounted_ms=%.3f adapter_unattributed_ms=%.3f "
+                "adapter=total_ms/count/max_ms@layer[%s] "
+                "nested_connector=total_ms/count/max_ms@layer[%s]",
+                trace["step"],
+                trace["requests"],
+                "sync_npu_detail"
+                if _PD_STAGE_TRACE_SYNC_NPU
+                else "host_no_sync_detail",
+                trace["wait_ns"] / 1_000_000,
+                adapter_accounted_ns / 1_000_000,
+                max(0, trace["wait_ns"] - adapter_accounted_ns) / 1_000_000,
+                "|".join(adapter_parts) or "none",
+                "|".join(nested_parts) or "none",
             )
 
         wait_by_group = trace["wait_by_group_ns"]
@@ -1638,6 +1854,7 @@ class LMCacheConnectorV1Impl:
             "requests=%s start_load_ms=%.3f layer_wait_total_ms=%.3f "
             "layer_wait_calls=%d group0_wait_ms=%.3f group1_wait_ms=%.3f "
             "slowest_layer=%s slowest_group=%d slowest_wait_ms=%.3f "
+            "adapter_accounted_ms=%.3f adapter_unattributed_ms=%.3f "
             "lifecycle_ms=%.3f internal=total_ms/count/max_ms@layer[%s] "
             "error=%s",
             trace["step"],
@@ -1650,6 +1867,8 @@ class LMCacheConnectorV1Impl:
             trace["slowest_layer"],
             trace["slowest_group"],
             trace["slowest_wait_ns"] / 1_000_000,
+            adapter_accounted_ns / 1_000_000,
+            max(0, trace["wait_ns"] - adapter_accounted_ns) / 1_000_000,
             (time.perf_counter_ns() - trace["start_ns"]) / 1_000_000,
             "|".join(internal_parts) or "none",
             error or "none",
@@ -1730,6 +1949,8 @@ class LMCacheConnectorV1Impl:
         # Role-specific initialization
         if role == KVConnectorRole.SCHEDULER:
             self._unfinished_requests: dict[str, "Request"] = {}
+            self._pd_lookup_traces: dict[str, _PDLookupTrace] = {}
+            self._pd_lookup_sequence = 0
         else:
             self.use_layerwise = config.use_layerwise
             self.enable_blending = config.enable_blending
@@ -5527,6 +5748,9 @@ class LMCacheConnectorV1Impl:
         if not self.layerwise_retrievers:
             return
 
+        pd_stage_trace = getattr(self, "_pd_stage_trace_state", None)
+        wait_group = self._layerwise_wait_group(layer_name)
+        request_mapping_started_ns = _start_pd_stage_trace_detail(pd_stage_trace)
         metadata: Optional[LMCacheConnectorMetadata] = None
 
         layerwise_requests = getattr(self, "_layerwise_requests", None)
@@ -5561,12 +5785,27 @@ class LMCacheConnectorV1Impl:
                 rows_of_req = {}
                 for row, rid in enumerate(request_ids):
                     rows_of_req.setdefault(rid, []).append(row)
+        _record_pd_stage_trace_detail(
+            pd_stage_trace,
+            "request_mapping",
+            request_mapping_started_ns,
+            layer_name,
+            wait_group,
+        )
 
         selected_rows = None
         if selected_tokens is not None:
             # After this wait, row selection and connector-side packing are
             # ordered by the current stream; the load stream later waits on it.
+            payload_event_started_ns = _start_pd_stage_trace_detail(pd_stage_trace)
             _dsa_wait_payload_event(payload_event)
+            _record_pd_stage_trace_detail(
+                pd_stage_trace,
+                "payload_event",
+                payload_event_started_ns,
+                layer_name,
+                wait_group,
+            )
             selected_rows = (
                 int(selected_tokens.shape[0])
                 if hasattr(selected_tokens, "shape")
@@ -5574,7 +5813,6 @@ class LMCacheConnectorV1Impl:
                 else len(selected_tokens)
             )
 
-        wait_group = self._layerwise_wait_group(layer_name)
         parsed_layer_id = None
         parsed_layer_id_loaded = False
         sparse_indexer_sent_layers = None
@@ -5593,6 +5831,9 @@ class LMCacheConnectorV1Impl:
                 break
             layerwise_retriever, indexer_retriever = self.layerwise_retrievers[idx]
             if request.is_sparse_decode:
+                payload_build_started_ns = _start_pd_stage_trace_detail(
+                    pd_stage_trace
+                )
                 payload = None
                 rows = None
                 row_count = 1
@@ -5725,6 +5966,16 @@ class LMCacheConnectorV1Impl:
                             self._layerwise_sparse_indexer_sent_layers = (
                                 sparse_indexer_sent_layers
                             )
+                _record_pd_stage_trace_detail(
+                    pd_stage_trace,
+                    "payload_build",
+                    payload_build_started_ns,
+                    layer_name,
+                    wait_group,
+                )
+                retriever_dispatch_started_ns = _start_pd_stage_trace_detail(
+                    pd_stage_trace
+                )
                 if wait_group == 1:
                     ret_token_mask = None
                     if (
@@ -5751,12 +6002,22 @@ class LMCacheConnectorV1Impl:
                             ret_token_mask = indexer_ret_mask
                 decode_row += row_count
             else:
+                retriever_dispatch_started_ns = _start_pd_stage_trace_detail(
+                    pd_stage_trace
+                )
                 if wait_group == 1:
                     if indexer_retriever is not None:
                         next(indexer_retriever)
                     ret_token_mask = None
                 else:
                     ret_token_mask = next(layerwise_retriever)
+            _record_pd_stage_trace_detail(
+                pd_stage_trace,
+                "retriever_dispatch",
+                retriever_dispatch_started_ns,
+                layer_name,
+                wait_group,
+            )
 
             if (
                 wait_group == 0
@@ -5768,7 +6029,10 @@ class LMCacheConnectorV1Impl:
                 logger.info("Retrieved %d tokens", num_retrieved_tokens)
             idx += 1
 
-        if self.layerwise_retrievers and self._layerwise_wait_should_advance(wait_group):
+        advance_started_ns = _start_pd_stage_trace_detail(pd_stage_trace)
+        if self.layerwise_retrievers and self._layerwise_wait_should_advance(
+            wait_group
+        ):
             self.current_layer += 1
             if self.current_layer >= self.num_layers:
                 if metadata is None:
@@ -5776,6 +6040,13 @@ class LMCacheConnectorV1Impl:
                     assert isinstance(metadata, LMCacheConnectorMetadata)
                 self._finalize_worker_retrieve_state_from_metadata(metadata)
                 self._drain_layerwise_retrievers()
+        _record_pd_stage_trace_detail(
+            pd_stage_trace,
+            "advance",
+            advance_started_ns,
+            layer_name,
+            wait_group,
+        )
 
         return
 
@@ -6505,19 +6776,52 @@ class LMCacheConnectorV1Impl:
         # lookup_client is always initialized for scheduler role
         assert self.lookup_client is not None
 
-        if (
-            num_external_hit_tokens := self.lookup_client.lookup_cache(lookup_id=req_id)
-        ) != -1:
+        lookup_call_started_ns = (
+            time.perf_counter_ns() if _PD_STAGE_TRACE_ENABLED else 0
+        )
+        lookup_traces = getattr(self, "_pd_lookup_traces", None)
+        lookup_trace = (
+            lookup_traces.get(req_id) if lookup_traces is not None else None
+        )
+        if lookup_trace is not None:
+            lookup_trace.scheduler_calls += 1
+
+        cache_poll_started_ns = (
+            time.perf_counter_ns() if _PD_STAGE_TRACE_ENABLED else 0
+        )
+        num_external_hit_tokens = self.lookup_client.lookup_cache(
+            lookup_id=req_id
+        )
+        cache_poll_ns = (
+            time.perf_counter_ns() - cache_poll_started_ns
+            if cache_poll_started_ns
+            else 0
+        )
+
+        if num_external_hit_tokens != -1:
+            self._record_pd_lookup_poll(lookup_trace, cache_poll_ns)
             # -1 means no result cached
             # None or int means ongoing (async) or cached result
             logger.debug(
                 f"Found {num_external_hit_tokens} hit tokens for request"
                 f" {req_id} in the lookup cache."
             )
+            lookup_result_source = "cache"
         else:
+            if lookup_trace is not None:
+                self._cancel_pd_lookup_trace(req_id, "lookup_restarted")
+            lookup_trace = self._begin_pd_lookup_trace(
+                req_id,
+                request.num_tokens,
+                lookup_call_started_ns,
+            )
+            self._record_pd_lookup_poll(lookup_trace, cache_poll_ns)
             logger.debug(
                 "Looking up cache for the first time for request %s!",
                 req_id,
+            )
+            prepare_started_ns = (
+                time.perf_counter_ns() if lookup_trace is not None else 0
             )
             self._requests_priority[req_id] = getattr(request, "priority", 0)
 
@@ -6537,11 +6841,38 @@ class LMCacheConnectorV1Impl:
             if self.skip_last_n_tokens > 0:
                 token_ids = token_ids[: -self.skip_last_n_tokens]
 
+            prepare_ns = (
+                time.perf_counter_ns() - prepare_started_ns
+                if prepare_started_ns
+                else 0
+            )
+            submit_started_ns = (
+                time.perf_counter_ns() if lookup_trace is not None else 0
+            )
             num_external_hit_tokens = self.lookup_client.lookup(
                 token_ids,
                 lookup_id=req_id,
                 request_configs=request_configs,
             )
+            submit_ns = (
+                time.perf_counter_ns() - submit_started_ns
+                if submit_started_ns
+                else 0
+            )
+            self._record_pd_lookup_submit(
+                lookup_trace,
+                prepare_ns,
+                submit_ns,
+                num_external_hit_tokens,
+            )
+            lookup_result_source = "submit"
+
+        self._finish_pd_lookup_call(
+            lookup_trace,
+            lookup_call_started_ns,
+            num_external_hit_tokens,
+            lookup_result_source,
+        )
 
         if num_external_hit_tokens is None:
             logger.debug(
@@ -7091,6 +7422,12 @@ class LMCacheConnectorV1Impl:
             self._drop_layerwise_save_storers(request.request_id)
 
         self._drop_worker_retrieve_state(request.request_id)
+        self._cancel_pd_lookup_trace(
+            request.request_id,
+            "aborted"
+            if request.status == RequestStatus.FINISHED_ABORTED
+            else "request_finished",
+        )
 
         # Cleanup if request was aborted
         if request.status == RequestStatus.FINISHED_ABORTED and self.async_loading:
