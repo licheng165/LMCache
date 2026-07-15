@@ -218,7 +218,9 @@ class TestWorkerRetrieveState:
             is True
         )
 
-    def test_sparse_decode_index_materialization_policy_for_kv_both_disagg_metadata(self):
+    def test_sparse_decode_index_materialization_policy_for_kv_both_disagg_metadata(
+        self,
+    ):
         impl = _make_impl()
         impl.config = SimpleNamespace(dsa_two_groups=True)
         impl.kv_role = "kv_both"
@@ -1954,6 +1956,71 @@ class TestWorkerRetrieveState:
         assert captured_kwargs[0]["ret_mask"] is req.decode_ret_mask
         assert captured_kwargs[1]["ret_mask"] is req.decode_ret_mask
 
+    def test_sparse_decode_start_uses_minimal_prepared_kwargs(self):
+        req = make_sparse_req_meta("req-1", token_count=256)
+        req.cached_keys = [["layer-key"]]
+        req.cached_starts = [0]
+        req.cached_ends = [256]
+        req.cached_tensors = [[torch.zeros(256)]]
+        req.cached_chunk_ptrs_npu = [torch.tensor([123], dtype=torch.long)]
+        impl, _, _ = make_worker_connector([req], use_layerwise=True)
+        impl.config.dsa_two_groups = False
+        impl.num_layers = 1
+        impl.kv_caches = {
+            "model.layers.0.self_attn.attn.k_cache": torch.zeros(1),
+        }
+        impl._refresh_kvcaches_list()
+        impl.layerwise_retrievers = []
+        impl._layerwise_retriever_is_sparse = []
+        impl._stats_monitor = SimpleNamespace(
+            update_interval_vllm_hit_tokens=lambda *_args: None,
+            update_interval_prompt_tokens=lambda *_args: None,
+        )
+        captured_kwargs = []
+
+        class _FakeEngine:
+            enable_shared_cpu_cache = False
+
+            def retrieve_layer_head_token_wise(self, tokens, mask, **kwargs):
+                captured_kwargs.append(kwargs)
+
+                def _retriever():
+                    yield kwargs.get("ret_mask")
+                    while True:
+                        yield kwargs.get("ret_mask")
+
+                return _retriever()
+
+        impl.lmcache_engine = _FakeEngine()
+        impl._save_worker_retrieve_state_from_request(
+            req,
+            location="LocalCPUBackend",
+            metadata_warm=True,
+            token_count=256,
+        )
+        req.cached_keys = []
+        req.cached_starts = []
+        req.cached_ends = []
+        req.cached_tensors = []
+        req.cached_chunk_ptrs_npu = []
+
+        impl.start_load_kv(SimpleNamespace(attn_metadata=SimpleNamespace()))
+
+        assert len(captured_kwargs) == 1
+        kwargs = captured_kwargs[0]
+        assert set(kwargs) <= {
+            "kvcaches",
+            "slot_mapping",
+            "sync",
+            "kv_group",
+            "prepared_sparse_source",
+            "ret_mask",
+        }
+        assert kwargs["prepared_sparse_source"].total_tokens == 256
+        assert req.cached_keys == []
+        assert req.cached_tensors == []
+        impl._drain_layerwise_retrievers()
+
     def test_store_seed_merges_chunked_prefill_hot_cache(self):
         impl = _make_impl()
         impl.config = SimpleNamespace(dsa_two_groups=False)
@@ -2803,7 +2870,6 @@ class TestWorkerRetrieveState:
 
     def test_warm_kwargs_only_when_prefix_unchanged(self):
         impl = _make_impl()
-        request = _make_request()
         state = WorkerRetrieveState(
             cached_keys=[["k"]],
             cached_starts=[0],
@@ -2813,11 +2879,11 @@ class TestWorkerRetrieveState:
             token_count=256,
         )
 
-        warm = impl._sparse_decode_retrieve_warm_kwargs(request, 256, state)
+        warm = impl._sparse_decode_bootstrap_reuse_kwargs(256, state)
         assert warm["_retrieve_metadata_warm"] is True
         assert warm["cached_retrieve_location"] == "local"
 
-        extended = impl._sparse_decode_retrieve_warm_kwargs(request, 512, state)
+        extended = impl._sparse_decode_bootstrap_reuse_kwargs(512, state)
         assert "_retrieve_metadata_warm" not in extended
         assert extended["cached_retrieve_location"] == "local"
 
@@ -2839,7 +2905,7 @@ class TestWorkerRetrieveState:
             token_count=512,
         )
 
-        warm = impl._sparse_decode_retrieve_warm_kwargs(request, 512, state)
+        warm = impl._sparse_decode_bootstrap_reuse_kwargs(512, state)
 
         assert "_retrieve_metadata_warm" not in warm
         assert warm["cached_retrieve_location"] == "local"
@@ -2861,7 +2927,9 @@ class TestWorkerRetrieveState:
         )
         assert impl._should_invalidate_worker_retrieve_state(_make_request(), 128)
 
-    def test_sparse_decode_selected_transfer_does_not_invalidate_full_prompt_cache(self):
+    def test_sparse_decode_selected_transfer_does_not_invalidate_full_prompt_cache(
+        self,
+    ):
         impl = _make_impl()
         impl._worker_retrieve_state["req-1"] = WorkerRetrieveState(
             cached_keys=[["k"]],
