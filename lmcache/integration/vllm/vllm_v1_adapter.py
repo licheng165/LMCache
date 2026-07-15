@@ -2,9 +2,11 @@
 # Standard
 from collections.abc import Iterable
 from dataclasses import dataclass, field
+from functools import wraps
 from types import SimpleNamespace
 from typing import TYPE_CHECKING, Any, Generator, Optional, Union
 import os
+import time
 
 # Third Party
 from vllm.config import (
@@ -63,6 +65,78 @@ SPARSE_DECODE_RETRIEVE_TOKENS = int(
     os.environ.get("LMCACHE_SPARSE_DECODE_RETRIEVE_TOKENS", "2048")
 )
 SPARSE_DECODE_SHARED_CPU_PHASE = "sparse_decode_bootstrap"
+
+_PD_STAGE_TRACE_ENABLED = os.environ.get("VLLM_PD_STAGE_TRACE", "0").lower() in (
+    "1",
+    "true",
+    "yes",
+    "on",
+)
+try:
+    _PD_STAGE_TRACE_EVERY = max(
+        1, int(os.environ.get("VLLM_PD_STAGE_TRACE_EVERY", "1"))
+    )
+except ValueError:
+    _PD_STAGE_TRACE_EVERY = 1
+try:
+    _PD_STAGE_TRACE_SLOW_MS = max(
+        0.0, float(os.environ.get("VLLM_PD_STAGE_TRACE_SLOW_MS", "1000"))
+    )
+except ValueError:
+    _PD_STAGE_TRACE_SLOW_MS = 1000.0
+_PD_STAGE_TRACE_REQUEST_ID = os.environ.get(
+    "VLLM_PD_STAGE_TRACE_REQUEST_ID", ""
+)
+
+
+def _pd_stage_trace_start_load(func):
+    if not _PD_STAGE_TRACE_ENABLED:
+        return func
+
+    @wraps(func)
+    def wrapped(self, *args, **kwargs):
+        trace = self._begin_pd_stage_trace()
+        error = None
+        try:
+            return func(self, *args, **kwargs)
+        except Exception as exc:
+            error = type(exc).__name__
+            raise
+        finally:
+            self._finish_pd_stage_trace_start_load(trace, error)
+
+    return wrapped
+
+
+def _pd_stage_trace_layer_wait(func):
+    if not _PD_STAGE_TRACE_ENABLED:
+        return func
+
+    @wraps(func)
+    def wrapped(self, layer_name, *args, **kwargs):
+        trace = getattr(self, "_pd_stage_trace_state", None)
+        if trace is None:
+            return func(self, layer_name, *args, **kwargs)
+
+        wait_group = self._layerwise_wait_group(layer_name)
+        wait_started_ns = time.perf_counter_ns()
+        error = None
+        try:
+            return func(self, layer_name, *args, **kwargs)
+        except Exception as exc:
+            error = type(exc).__name__
+            raise
+        finally:
+            elapsed_ns = time.perf_counter_ns() - wait_started_ns
+            self._record_pd_stage_trace_layer_wait(
+                trace,
+                layer_name,
+                wait_group,
+                elapsed_ns,
+                error,
+            )
+
+    return wrapped
 
 
 def _dsa_debug_enabled() -> bool:
@@ -1420,6 +1494,165 @@ class LMCacheConnectorV1Impl:
             utils.get_version(),
             VLLM_VERSION,
             getattr(self.lmcache_engine, "metadata", None),
+        )
+
+    def _begin_pd_stage_trace(self) -> Optional[dict[str, Any]]:
+        if not _PD_STAGE_TRACE_ENABLED:
+            return None
+
+        previous_trace = getattr(self, "_pd_stage_trace_state", None)
+        if previous_trace is not None and not previous_trace.get("emitted"):
+            self._emit_pd_stage_trace_summary(previous_trace, "next_start")
+
+        step = getattr(self, "_pd_stage_trace_step", 0)
+        self._pd_stage_trace_step = step + 1
+        self._pd_stage_trace_state = None
+        if step % _PD_STAGE_TRACE_EVERY:
+            return None
+
+        try:
+            metadata = self._parent._get_connector_metadata()
+            requests = list(getattr(metadata, "requests", ()))
+        except Exception:
+            requests = []
+        request_ids = [request.req_id for request in requests]
+        if (
+            _PD_STAGE_TRACE_REQUEST_ID
+            and _PD_STAGE_TRACE_REQUEST_ID not in request_ids
+        ):
+            return None
+
+        request_parts = []
+        for request in requests[:8]:
+            load_spec = getattr(request, "load_spec", None)
+            request_parts.append(
+                f"{request.req_id}:tokens={len(request.token_ids)}:cached="
+                f"{getattr(load_spec, 'lmcache_cached_tokens', 0) or 0}:sparse="
+                f"{int(bool(getattr(request, 'is_sparse_decode', False)))}"
+            )
+        if len(requests) > 8:
+            request_parts.append(f"...+{len(requests) - 8}")
+
+        trace: dict[str, Any] = {
+            "step": step,
+            "requests": ";".join(request_parts) or "none",
+            "start_ns": time.perf_counter_ns(),
+            "start_load_ms": 0.0,
+            "wait_calls": 0,
+            "wait_ns": 0,
+            "wait_by_group_ns": {},
+            "slowest_wait_ns": 0,
+            "slowest_layer": "none",
+            "slowest_group": -1,
+            "internal_ns": {},
+            "internal_counts": {},
+            "internal_max_ns": {},
+            "internal_slowest_layer": {},
+            "emitted": False,
+        }
+        self._pd_stage_trace_state = trace
+        return trace
+
+    def _finish_pd_stage_trace_start_load(
+        self,
+        trace: Optional[dict[str, Any]],
+        error: Optional[str],
+    ) -> None:
+        if trace is None:
+            return
+        trace["start_load_ms"] = (
+            time.perf_counter_ns() - trace["start_ns"]
+        ) / 1_000_000
+        logger.info(
+            "[PD_STAGE_TRACE] scope=lmcache step=%d phase=start_load "
+            "requests=%s duration_ms=%.3f retrievers=%d error=%s",
+            trace["step"],
+            trace["requests"],
+            trace["start_load_ms"],
+            len(getattr(self, "layerwise_retrievers", ())),
+            error or "none",
+        )
+        if error is not None or not getattr(self, "layerwise_retrievers", None):
+            self._emit_pd_stage_trace_summary(trace, error)
+
+    def _record_pd_stage_trace_layer_wait(
+        self,
+        trace: dict[str, Any],
+        layer_name: str,
+        wait_group: int,
+        elapsed_ns: int,
+        error: Optional[str],
+    ) -> None:
+        if trace is not getattr(self, "_pd_stage_trace_state", None):
+            return
+        trace["wait_calls"] += 1
+        trace["wait_ns"] += elapsed_ns
+        by_group = trace["wait_by_group_ns"]
+        by_group[wait_group] = by_group.get(wait_group, 0) + elapsed_ns
+        if elapsed_ns > trace["slowest_wait_ns"]:
+            trace["slowest_wait_ns"] = elapsed_ns
+            trace["slowest_layer"] = layer_name
+            trace["slowest_group"] = wait_group
+
+        elapsed_ms = elapsed_ns / 1_000_000
+        if elapsed_ms >= _PD_STAGE_TRACE_SLOW_MS:
+            logger.info(
+                "[PD_STAGE_TRACE] scope=lmcache step=%d phase=layer_wait_slow "
+                "requests=%s layer=%s kv_group=%d duration_ms=%.3f error=%s",
+                trace["step"],
+                trace["requests"],
+                layer_name,
+                wait_group,
+                elapsed_ms,
+                error or "none",
+            )
+
+        if error is not None or not getattr(self, "layerwise_retrievers", None):
+            self._emit_pd_stage_trace_summary(trace, error)
+
+    def _emit_pd_stage_trace_summary(
+        self,
+        trace: dict[str, Any],
+        error: Optional[str] = None,
+    ) -> None:
+        if trace.get("emitted"):
+            return
+        trace["emitted"] = True
+
+        internal_parts = []
+        internal_ns = trace["internal_ns"]
+        for phase, total_ns in sorted(
+            internal_ns.items(), key=lambda item: item[1], reverse=True
+        ):
+            count = trace["internal_counts"].get(phase, 0)
+            max_ns = trace["internal_max_ns"].get(phase, 0)
+            slowest_layer = trace["internal_slowest_layer"].get(phase, -1)
+            internal_parts.append(
+                f"{phase}:{total_ns / 1_000_000:.3f}/"
+                f"{count}/{max_ns / 1_000_000:.3f}@{slowest_layer}"
+            )
+
+        wait_by_group = trace["wait_by_group_ns"]
+        logger.info(
+            "[PD_STAGE_TRACE] scope=lmcache step=%d phase=load_summary "
+            "requests=%s start_load_ms=%.3f layer_wait_total_ms=%.3f "
+            "layer_wait_calls=%d group0_wait_ms=%.3f group1_wait_ms=%.3f "
+            "slowest_layer=%s slowest_group=%d slowest_wait_ms=%.3f "
+            "lifecycle_ms=%.3f internal=total_ms/count/max_ms@layer[%s] "
+            "error=%s",
+            trace["step"],
+            trace["requests"],
+            trace["start_load_ms"],
+            trace["wait_ns"] / 1_000_000,
+            trace["wait_calls"],
+            wait_by_group.get(0, 0) / 1_000_000,
+            wait_by_group.get(1, 0) / 1_000_000,
+            trace["slowest_layer"],
+            trace["slowest_group"],
+            trace["slowest_wait_ns"] / 1_000_000,
+            (time.perf_counter_ns() - trace["start_ns"]) / 1_000_000,
+            "|".join(internal_parts) or "none",
+            error or "none",
         )
 
     def _apply_extra_config(
@@ -4599,6 +4832,7 @@ class LMCacheConnectorV1Impl:
         self._manager.post_init()
 
     @_lmcache_nvtx_annotate
+    @_pd_stage_trace_start_load
     def start_load_kv(self, forward_context: "ForwardContext", **kwargs) -> None:
         """Start loading the KV cache from the connector buffer to vLLM's
         paged KV buffer.
@@ -4654,6 +4888,7 @@ class LMCacheConnectorV1Impl:
             for req in metadata.requests
             if req.load_spec is not None and req.load_spec.can_load
         )
+        pd_stage_trace = getattr(self, "_pd_stage_trace_state", None)
         gpu_connector = getattr(self.lmcache_engine, "gpu_connector", None)
         if gpu_connector is not None and hasattr(
             gpu_connector, "set_layerwise_staging_concurrency"
@@ -4789,6 +5024,8 @@ class LMCacheConnectorV1Impl:
                         "shared_cpu_request_ordinal": idx,
                         **latent_cache,
                     }
+                    if pd_stage_trace is not None:
+                        retrieve_kwargs["_pd_stage_trace"] = pd_stage_trace
                     if shared_cpu_enabled and bound_state is not None:
                         existing_layers = (
                             bound_state.rank0_backing_objs_by_group.get(0)
@@ -4951,6 +5188,8 @@ class LMCacheConnectorV1Impl:
                                 "shared_cpu_request_ordinal": idx,
                                 **indexer_cache,
                             }
+                            if pd_stage_trace is not None:
+                                indexer_kwargs["_pd_stage_trace"] = pd_stage_trace
                             if shared_cpu_enabled and bound_state is not None:
                                 existing_layers = (
                                     bound_state.rank0_backing_objs_by_group.get(1)
@@ -5256,6 +5495,7 @@ class LMCacheConnectorV1Impl:
         return missing_blocks
 
     @_lmcache_nvtx_annotate
+    @_pd_stage_trace_layer_wait
     def wait_for_layer_load(
         self,
         layer_name: str,
