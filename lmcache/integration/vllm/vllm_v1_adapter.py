@@ -1808,14 +1808,22 @@ class LMCacheConnectorV1Impl:
 
         internal_parts = []
         adapter_parts = []
+        adapter_detail_parts = []
         nested_parts = []
         internal_ns = trace["internal_ns"]
         adapter_accounted_ns = 0
+        payload_build_ns = 0
+        payload_detail_ns = 0
         for phase, total_ns in sorted(
             internal_ns.items(), key=lambda item: item[1], reverse=True
         ):
-            if phase.startswith("adapter_"):
+            is_adapter_detail = phase.startswith("adapter_detail_")
+            if phase.startswith("adapter_") and not is_adapter_detail:
                 adapter_accounted_ns += total_ns
+            if phase.startswith("adapter_payload_build_g"):
+                payload_build_ns += total_ns
+            elif phase.startswith("adapter_detail_payload_"):
+                payload_detail_ns += total_ns
             count = trace["internal_counts"].get(phase, 0)
             max_ns = trace["internal_max_ns"].get(phase, 0)
             slowest_layer = trace["internal_slowest_layer"].get(phase, -1)
@@ -1824,7 +1832,9 @@ class LMCacheConnectorV1Impl:
                 f"{count}/{max_ns / 1_000_000:.3f}@{slowest_layer}"
             )
             internal_parts.append(part)
-            if phase.startswith("adapter_"):
+            if is_adapter_detail:
+                adapter_detail_parts.append(part)
+            elif phase.startswith("adapter_"):
                 adapter_parts.append(part)
             else:
                 nested_parts.append(part)
@@ -1834,7 +1844,10 @@ class LMCacheConnectorV1Impl:
                 "[PD_STAGE_TRACE] scope=layer_wait_detail step=%d "
                 "requests=%s timing_mode=%s layer_wait_total_ms=%.3f "
                 "adapter_accounted_ms=%.3f adapter_unattributed_ms=%.3f "
+                "payload_build_ms=%.3f payload_detail_accounted_ms=%.3f "
+                "payload_detail_unattributed_ms=%.3f "
                 "adapter=total_ms/count/max_ms@layer[%s] "
+                "adapter_detail=total_ms/count/max_ms@layer[%s] "
                 "nested_connector=total_ms/count/max_ms@layer[%s]",
                 trace["step"],
                 trace["requests"],
@@ -1844,7 +1857,11 @@ class LMCacheConnectorV1Impl:
                 trace["wait_ns"] / 1_000_000,
                 adapter_accounted_ns / 1_000_000,
                 max(0, trace["wait_ns"] - adapter_accounted_ns) / 1_000_000,
+                payload_build_ns / 1_000_000,
+                payload_detail_ns / 1_000_000,
+                max(0, payload_build_ns - payload_detail_ns) / 1_000_000,
                 "|".join(adapter_parts) or "none",
+                "|".join(adapter_detail_parts) or "none",
                 "|".join(nested_parts) or "none",
             )
 
@@ -5851,8 +5868,18 @@ class LMCacheConnectorV1Impl:
                                 f"layer={layer_name} req={request.req_id} "
                                 f"rows={[row]} selected_rows={selected_rows}"
                             )
+                        selected_row_select_started_ns = (
+                            _start_pd_stage_trace_detail(pd_stage_trace)
+                        )
                         selected_tokens_per_req = _single_row_select(
                             selected_tokens, row
+                        )
+                        _record_pd_stage_trace_detail(
+                            pd_stage_trace,
+                            "detail_payload_selected_single_row_select",
+                            selected_row_select_started_ns,
+                            layer_name,
+                            wait_group,
                         )
                     else:
                         if request.req_id not in rows_of_req:
@@ -5869,8 +5896,21 @@ class LMCacheConnectorV1Impl:
                                 f"layer={layer_name} req={request.req_id} "
                                 f"rows={rows} selected_rows={selected_rows}"
                             )
+                        selected_row_select_started_ns = (
+                            _start_pd_stage_trace_detail(pd_stage_trace)
+                        )
                         selected_tokens_per_req = _row_select(selected_tokens, rows)
+                        _record_pd_stage_trace_detail(
+                            pd_stage_trace,
+                            "detail_payload_selected_multi_row_select",
+                            selected_row_select_started_ns,
+                            layer_name,
+                            wait_group,
+                        )
                     if target_slot_mapping is not None:
+                        target_row_select_started_ns = (
+                            _start_pd_stage_trace_detail(pd_stage_trace)
+                        )
                         if rows_of_req is None:
                             target_slot_mapping_per_req = _single_row_select(
                                 target_slot_mapping, row
@@ -5879,11 +5919,45 @@ class LMCacheConnectorV1Impl:
                             target_slot_mapping_per_req = _row_select(
                                 target_slot_mapping, rows
                             )
+                        _record_pd_stage_trace_detail(
+                            pd_stage_trace,
+                            (
+                                "detail_payload_target_single_row_select"
+                                if rows_of_req is None
+                                else "detail_payload_target_multi_row_select"
+                            ),
+                            target_row_select_started_ns,
+                            layer_name,
+                            wait_group,
+                        )
+                        selected_normalize_started_ns = (
+                            _start_pd_stage_trace_detail(pd_stage_trace)
+                        )
                         selected_tokens_payload = _sparse_payload_value(
                             selected_tokens_per_req
                         )
+                        _record_pd_stage_trace_detail(
+                            pd_stage_trace,
+                            "detail_payload_selected_sparse_payload_value",
+                            selected_normalize_started_ns,
+                            layer_name,
+                            wait_group,
+                        )
+                        target_normalize_started_ns = (
+                            _start_pd_stage_trace_detail(pd_stage_trace)
+                        )
                         target_slot_mapping_payload = _sparse_payload_value(
                             target_slot_mapping_per_req
+                        )
+                        _record_pd_stage_trace_detail(
+                            pd_stage_trace,
+                            "detail_payload_target_sparse_payload_value",
+                            target_normalize_started_ns,
+                            layer_name,
+                            wait_group,
+                        )
+                        event_record_started_ns = _start_pd_stage_trace_detail(
+                            pd_stage_trace
                         )
                         local_payload_event = (
                             _dsa_record_payload_event_if_needed(
@@ -5892,6 +5966,16 @@ class LMCacheConnectorV1Impl:
                             )
                             if rows_of_req is not None
                             else None
+                        )
+                        _record_pd_stage_trace_detail(
+                            pd_stage_trace,
+                            "detail_payload_record_event",
+                            event_record_started_ns,
+                            layer_name,
+                            wait_group,
+                        )
+                        container_build_started_ns = _start_pd_stage_trace_detail(
+                            pd_stage_trace
                         )
                         if local_payload_event is not None:
                             payload = {
@@ -5906,21 +5990,67 @@ class LMCacheConnectorV1Impl:
                                 target_slot_mapping_payload,
                             )
                         token_start_index_per_req = None
+                        _record_pd_stage_trace_detail(
+                            pd_stage_trace,
+                            "detail_payload_container_build",
+                            container_build_started_ns,
+                            layer_name,
+                            wait_group,
+                        )
                     else:
-                        token_start_index_per_req = (
-                            0
-                            if token_start_index is None
-                            else (
-                                _single_row_select(token_start_index, row)
-                                if rows_of_req is None
-                                else _row_select(token_start_index, rows)
+                        if token_start_index is None:
+                            token_start_index_per_req = 0
+                        else:
+                            token_start_row_select_started_ns = (
+                                _start_pd_stage_trace_detail(pd_stage_trace)
                             )
+                            if rows_of_req is None:
+                                token_start_index_per_req = _single_row_select(
+                                    token_start_index, row
+                                )
+                            else:
+                                token_start_index_per_req = _row_select(
+                                    token_start_index, rows
+                                )
+                            _record_pd_stage_trace_detail(
+                                pd_stage_trace,
+                                (
+                                    "detail_payload_token_start_single_row_select"
+                                    if rows_of_req is None
+                                    else "detail_payload_token_start_multi_row_select"
+                                ),
+                                token_start_row_select_started_ns,
+                                layer_name,
+                                wait_group,
+                            )
+                        selected_normalize_started_ns = (
+                            _start_pd_stage_trace_detail(pd_stage_trace)
                         )
                         selected_tokens_payload = _sparse_payload_value(
                             selected_tokens_per_req
                         )
+                        _record_pd_stage_trace_detail(
+                            pd_stage_trace,
+                            "detail_payload_selected_sparse_payload_value",
+                            selected_normalize_started_ns,
+                            layer_name,
+                            wait_group,
+                        )
+                        token_start_normalize_started_ns = (
+                            _start_pd_stage_trace_detail(pd_stage_trace)
+                        )
                         token_start_payload = _sparse_payload_value(
                             token_start_index_per_req
+                        )
+                        _record_pd_stage_trace_detail(
+                            pd_stage_trace,
+                            "detail_payload_token_start_sparse_payload_value",
+                            token_start_normalize_started_ns,
+                            layer_name,
+                            wait_group,
+                        )
+                        event_record_started_ns = _start_pd_stage_trace_detail(
+                            pd_stage_trace
                         )
                         local_payload_event = (
                             _dsa_record_payload_event_if_needed(
@@ -5929,6 +6059,16 @@ class LMCacheConnectorV1Impl:
                             )
                             if rows_of_req is not None
                             else None
+                        )
+                        _record_pd_stage_trace_detail(
+                            pd_stage_trace,
+                            "detail_payload_record_event",
+                            event_record_started_ns,
+                            layer_name,
+                            wait_group,
+                        )
+                        container_build_started_ns = _start_pd_stage_trace_detail(
+                            pd_stage_trace
                         )
                         if local_payload_event is not None:
                             payload = {
@@ -5939,6 +6079,16 @@ class LMCacheConnectorV1Impl:
                         else:
                             selected_tokens_per_req = selected_tokens_payload
                             token_start_index_per_req = token_start_payload
+                        _record_pd_stage_trace_detail(
+                            pd_stage_trace,
+                            "detail_payload_container_build",
+                            container_build_started_ns,
+                            layer_name,
+                            wait_group,
+                        )
+                metadata_build_started_ns = _start_pd_stage_trace_detail(
+                    pd_stage_trace
+                )
                 sparse_payload = (
                     payload
                     if payload is not None
@@ -5966,6 +6116,13 @@ class LMCacheConnectorV1Impl:
                             self._layerwise_sparse_indexer_sent_layers = (
                                 sparse_indexer_sent_layers
                             )
+                _record_pd_stage_trace_detail(
+                    pd_stage_trace,
+                    "detail_payload_metadata_build",
+                    metadata_build_started_ns,
+                    layer_name,
+                    wait_group,
+                )
                 _record_pd_stage_trace_detail(
                     pd_stage_trace,
                     "payload_build",
