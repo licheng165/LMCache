@@ -44,6 +44,7 @@ def _make_scheduler_impl() -> LMCacheConnectorV1Impl:
     impl.config.save_decode_cache = False
     impl.config.save_full_chunk_in_decode = False
     impl.config.dsa_two_groups = False
+    impl.config.use_layerwise = True
     impl.config.priority_limit = None
     impl.kv_role = "kv_both"
     impl.force_skip_save = False
@@ -78,6 +79,48 @@ class TestBuildConnectorMetaSparseSyntheticLoadSpec:
     def test_sparse_decode_steps_synthesize_load_spec_and_sparse_tokens(self) -> None:
         impl = _make_scheduler_impl()
         req_id = "sparse-req"
+        prompt_len = 256
+        vllm_req = _make_vllm_request(req_id, prompt_len, prompt_len + 1, 999)
+
+        impl._unfinished_requests[req_id] = vllm_req
+        tracker = RequestTracker(
+            req_id=req_id,
+            prompt_len=prompt_len,
+            token_ids=list(range(prompt_len)),
+            allocated_block_ids=list(range(16)),
+            num_saved_tokens=prompt_len,
+        )
+        tracker.is_decode_phase = True
+        tracker.sparse_token_ids = list(range(prompt_len))
+        impl._request_trackers[req_id] = tracker
+
+        scheduler_output = StubSchedulerOutput(
+            finished_req_ids=set(),
+            scheduled_new_reqs=[],
+            scheduled_cached_reqs=StubCachedRequestData(
+                req_ids=[req_id],
+                new_token_ids=[[999]],
+                new_block_ids=[[16]],
+            ),
+            num_scheduled_tokens={req_id: 1},
+        )
+
+        meta = impl.build_connector_meta(scheduler_output)
+        assert len(meta.requests) == 1
+        req_meta = meta.requests[0]
+
+        assert req_meta.is_sparse_decode
+        assert req_meta.load_spec is not None
+        assert req_meta.load_spec.can_load is True
+        assert req_meta.load_spec.lmcache_cached_tokens == prompt_len
+        assert req_meta.token_ids == list(range(prompt_len))
+        assert req_meta.save_spec is not None
+        assert req_meta.save_spec.can_save is False
+        assert req_meta.cached_keys == []
+
+    def test_sparse_decode_does_not_load_partial_only_prompt(self) -> None:
+        impl = _make_scheduler_impl()
+        req_id = "sparse-partial"
         prompt_len = 128
         vllm_req = _make_vllm_request(req_id, prompt_len, prompt_len + 1, 999)
 
@@ -105,17 +148,17 @@ class TestBuildConnectorMetaSparseSyntheticLoadSpec:
         )
 
         meta = impl.build_connector_meta(scheduler_output)
-        assert len(meta.requests) == 1
         req_meta = meta.requests[0]
 
         assert req_meta.is_sparse_decode
         assert req_meta.load_spec is not None
-        assert req_meta.load_spec.can_load is True
-        assert req_meta.load_spec.lmcache_cached_tokens == prompt_len
-        assert req_meta.token_ids == list(range(prompt_len))
-        assert req_meta.cached_keys == []
+        assert req_meta.load_spec.can_load is False
+        assert req_meta.load_spec.lmcache_cached_tokens == 0
+        assert req_meta.token_ids == []
+        assert req_meta.save_spec is not None
+        assert req_meta.save_spec.can_save is False
 
-    def test_sparse_decode_seeds_full_prompt_when_tracker_is_chunked(self) -> None:
+    def test_sparse_decode_seeds_prompt_but_loads_aligned_prefix(self) -> None:
         impl = _make_scheduler_impl()
         req_id = "sparse-req"
         prompt_len = 18879
@@ -153,25 +196,35 @@ class TestBuildConnectorMetaSparseSyntheticLoadSpec:
 
         assert req_meta.is_sparse_decode
         assert req_meta.load_spec is not None
-        assert req_meta.load_spec.lmcache_cached_tokens == prompt_len
-        assert len(req_meta.token_ids) == prompt_len
+        aligned_prompt_len = prompt_len - prompt_len % impl._lmcache_chunk_size
+        assert req_meta.load_spec.lmcache_cached_tokens == aligned_prompt_len
+        assert len(req_meta.token_ids) == aligned_prompt_len
         assert req_meta.token_ids[0] == 0
-        assert req_meta.token_ids[-1] == prompt_len - 1
-        assert len(tracker.sparse_token_ids) == prompt_len
+        assert req_meta.token_ids[-1] == aligned_prompt_len - 1
+        assert len(tracker.sparse_token_ids) == aligned_prompt_len
+        assert req_meta.save_spec is not None
+        assert req_meta.save_spec.can_save is False
 
     def test_multi_step_sparse_decode_reuses_tracker_sparse_token_ids(self) -> None:
         impl = _make_scheduler_impl()
         req_id = "sparse-req"
-        prompt_len = 64
+        prompt_len = 256
         sparse_tokens = list(range(prompt_len))
-        vllm_req = _make_vllm_request(req_id, prompt_len, prompt_len + 2, 1001)
+        prompt = list(range(prompt_len))
+        vllm_req = SimpleNamespace(
+            request_id=req_id,
+            num_prompt_tokens=prompt_len,
+            prompt_token_ids=prompt,
+            num_computed_tokens=prompt_len + 2,
+            all_token_ids=prompt + [1000, 1001],
+        )
 
         impl._unfinished_requests[req_id] = vllm_req
         tracker = RequestTracker(
             req_id=req_id,
             prompt_len=prompt_len,
             token_ids=list(range(prompt_len)) + [1000],
-            allocated_block_ids=list(range(10)),
+            allocated_block_ids=list(range(17)),
             num_saved_tokens=prompt_len,
         )
         tracker.is_decode_phase = True
@@ -184,7 +237,7 @@ class TestBuildConnectorMetaSparseSyntheticLoadSpec:
             scheduled_cached_reqs=StubCachedRequestData(
                 req_ids=[req_id],
                 new_token_ids=[[1001]],
-                new_block_ids=[[10]],
+                new_block_ids=[[]],
             ),
             num_scheduled_tokens={req_id: 1},
         )
@@ -193,6 +246,8 @@ class TestBuildConnectorMetaSparseSyntheticLoadSpec:
         req_meta = meta.requests[0]
         assert req_meta.token_ids == sparse_tokens
         assert tracker.sparse_token_ids == sparse_tokens
+        assert req_meta.save_spec is not None
+        assert req_meta.save_spec.can_save is False
 
     def test_decode_window_sparse_load_uses_committed_window_end(self) -> None:
         impl = _make_scheduler_impl()

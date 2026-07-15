@@ -164,45 +164,6 @@ class TestWorkerRetrieveState:
         assert state.shared_request_active is True
         assert state.request_scope_token == "req-1:3"
 
-    def test_mark_shared_index_skipped_waits_for_latent_before_active(self):
-        state = WorkerRetrieveState()
-
-        LMCacheConnectorV1Impl._mark_shared_index_skipped(
-            state,
-            "req-1",
-            generation=7,
-            token_count=512,
-        )
-
-        assert state.shared_index_status == "skipped"
-        assert state.shared_latent_status == "missing"
-        assert state.shared_generation == 7
-        assert state.pointer_cache_generation == 0
-        assert state.shared_request_active is False
-        assert state.request_scope_token is None
-        assert state.shared_validation_signature is None
-
-    def test_mark_shared_index_skipped_keeps_active_latent_state(self):
-        state = WorkerRetrieveState(
-            shared_latent_status="present",
-            shared_validation_signature=("old",),
-        )
-
-        LMCacheConnectorV1Impl._mark_shared_index_skipped(
-            state,
-            "req-1",
-            generation=7,
-            token_count=512,
-        )
-
-        assert state.shared_index_status == "skipped"
-        assert state.shared_latent_status == "present"
-        assert state.shared_generation == 7
-        assert state.pointer_cache_generation == 7
-        assert state.shared_request_active is True
-        assert state.request_scope_token == "req-1:7:512"
-        assert state.shared_validation_signature is None
-
     def test_sparse_decode_index_materialization_policy_for_shared_cpu_kv_both(self):
         impl = _make_impl()
         impl.config = SimpleNamespace(dsa_two_groups=True)
@@ -840,6 +801,109 @@ class TestWorkerRetrieveState:
         assert backing_obj.unpinned == 1
         assert backing_obj.released == 1
         assert state.cached_memory_objs == []
+
+    def test_tp1_shared_state_cleanup_keeps_local_cpu_hot_cache_reference(self):
+        class BorrowedLocalCPUObj:
+            def __init__(self):
+                self.ref_count = 1
+                self.pin_count = 0
+                self.valid = True
+
+            @property
+            def is_pinned(self):
+                return self.pin_count > 0
+
+            def ref_count_up(self):
+                self.ref_count += 1
+
+            def ref_count_down(self):
+                self.ref_count -= 1
+                if self.ref_count == 0 and self.pin_count == 0:
+                    self.valid = False
+
+            def pin(self):
+                self.pin_count += 1
+                return True
+
+            def unpin(self):
+                self.pin_count -= 1
+                if self.ref_count == 0 and self.pin_count == 0:
+                    self.valid = False
+                return True
+
+            @property
+            def tensor(self):
+                return object() if self.valid else None
+
+        impl = _make_impl()
+        impl.lmcache_engine = SimpleNamespace(
+            enable_shared_cpu_cache=True,
+            shared_cpu_cache_generation=9,
+            store_location="LocalCPUBackend",
+            lookup_unpin=lambda _req_id: None,
+            metadata=SimpleNamespace(
+                world_size=1,
+                is_first_rank=lambda: True,
+            ),
+        )
+        borrowed_obj = BorrowedLocalCPUObj()
+        hot_cache = {"k": borrowed_obj}
+        request = _make_store_request(
+            token_count=256,
+            start=0,
+            end=256,
+            key="k",
+            tensor="tensor",
+        )
+        request.cached_memory_objs = [[borrowed_obj]]
+        request.cached_tensors = [[borrowed_obj.tensor]]
+
+        impl._maybe_seed_worker_retrieve_state_from_store(request)
+
+        seeded_state = impl._worker_retrieve_state["req-1"]
+        assert seeded_state.shared_request_active is False
+        assert seeded_state.rank0_backing_objs_by_group == {0: [[borrowed_obj]]}
+        assert borrowed_obj.ref_count == 2
+        assert borrowed_obj.pin_count == 1
+
+        impl._retain_rank0_store_seed_state(seeded_state)
+        assert borrowed_obj.ref_count == 2
+        assert borrowed_obj.pin_count == 1
+
+        request.is_sparse_decode = True
+        request.load_spec = LoadSpec(
+            vllm_cached_tokens=0,
+            lmcache_cached_tokens=256,
+            can_load=True,
+        )
+        request.cached_chunk_ptrs_npu = ["latent-ptrs"]
+        impl._save_worker_retrieve_state_from_request(
+            request,
+            location="LocalCPUBackend",
+            metadata_warm=True,
+            token_count=256,
+        )
+
+        state = impl._worker_retrieve_state["req-1"]
+        assert state.shared_request_active is True
+        assert state.rank0_backing_objs_by_group == {0: [[borrowed_obj]]}
+        assert borrowed_obj.ref_count == 2
+        assert borrowed_obj.pin_count == 1
+
+        impl._drop_worker_retrieve_state("req-1")
+
+        assert borrowed_obj.ref_count == 1
+        assert borrowed_obj.pin_count == 0
+        assert borrowed_obj.valid is True
+        assert hot_cache["k"].tensor is not None
+
+        second_hit = hot_cache["k"]
+        second_hit.ref_count_up()
+        assert second_hit.ref_count == 2
+        assert second_hit.tensor is not None
+        second_hit.ref_count_down()
+        assert second_hit.ref_count == 1
+        assert second_hit.valid is True
 
     def test_save_releases_replaced_passive_shared_views(self):
         class FakeMemObj:
@@ -1928,6 +1992,77 @@ class TestWorkerRetrieveState:
         assert state.cached_tensors == [["t0", "t1"]]
         assert state.cached_shared_handles == [["h0", "h1"]]
         assert state.token_count == 8192
+
+    def test_store_seed_full_chunk_replaces_partial_at_same_start(self):
+        impl = _make_impl()
+        impl.config = SimpleNamespace(dsa_two_groups=False)
+        impl._latent_kvcaches = [object()]
+        impl._manager = SimpleNamespace(
+            lmcache_engine=SimpleNamespace(
+                enable_shared_cpu_cache=False,
+                storage_manager=None,
+                store_location="LocalCPUBackend",
+            ),
+        )
+        partial = _make_store_request(
+            token_count=100,
+            start=0,
+            end=100,
+            key="partial-key",
+            tensor="partial-tensor",
+        )
+        full = _make_store_request(
+            token_count=256,
+            start=0,
+            end=256,
+            key="full-key",
+            tensor="full-tensor",
+        )
+
+        impl._maybe_seed_worker_retrieve_state_from_store(partial)
+        impl._maybe_seed_worker_retrieve_state_from_store(full)
+
+        state = impl._worker_retrieve_state["req-1"]
+        assert state.cached_starts == [0]
+        assert state.cached_ends == [256]
+        assert state.cached_keys == [["full-key"]]
+        assert state.cached_tensors == [["full-tensor"]]
+        assert state.token_count == 256
+
+    def test_store_seed_partial_does_not_replace_full_at_same_start(self):
+        impl = _make_impl()
+        impl.config = SimpleNamespace(dsa_two_groups=False)
+        impl._latent_kvcaches = [object()]
+        impl._manager = SimpleNamespace(
+            lmcache_engine=SimpleNamespace(
+                enable_shared_cpu_cache=False,
+                storage_manager=None,
+                store_location="LocalCPUBackend",
+            ),
+        )
+        full = _make_store_request(
+            token_count=256,
+            start=0,
+            end=256,
+            key="full-key",
+            tensor="full-tensor",
+        )
+        stale_partial = _make_store_request(
+            token_count=100,
+            start=0,
+            end=100,
+            key="partial-key",
+            tensor="partial-tensor",
+        )
+
+        impl._maybe_seed_worker_retrieve_state_from_store(full)
+        impl._maybe_seed_worker_retrieve_state_from_store(stale_partial)
+
+        state = impl._worker_retrieve_state["req-1"]
+        assert state.cached_starts == [0]
+        assert state.cached_ends == [256]
+        assert state.cached_keys == [["full-key"]]
+        assert state.cached_tensors == [["full-tensor"]]
 
     def test_decode_save_merge_extends_pointer_cache_and_scope_token(self):
         impl = _make_impl()

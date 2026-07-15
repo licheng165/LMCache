@@ -99,6 +99,7 @@ def _make_connector(requests):
     connector._manager = _FakeManager(engine)
     connector.kv_role = "kv_producer"
     connector.use_layerwise = True
+    connector.enable_sparse_attention = False
     connector.config = SimpleNamespace(dsa_two_groups=False)
     connector.device = "cpu"
     connector.config = SimpleNamespace(dsa_two_groups=False)
@@ -471,6 +472,95 @@ def test_decode_window_reqmeta_saves_latent_and_indexer() -> None:
     assert req_meta.indexer_slot_mapping[0].tolist() == list(range(8, 16))
 
 
+def test_sparse_layerwise_prefill_saves_exact_tail_with_local_mappings() -> None:
+    tracker = RequestTracker(
+        req_id="req-chunked",
+        prompt_len=20,
+        token_ids=list(range(19)),
+        allocated_block_ids=[10, 11, 12, 13, 14],
+        allocated_block_ids_indexer=[20, 21, 22, 23, 24],
+        num_saved_tokens=10,
+    )
+    # A one-token chunked-prefill update can set this heuristic too early.
+    tracker.is_decode_phase = True
+
+    req_meta = ReqMeta.from_request_tracker(
+        tracker,
+        block_size=4,
+        lmcache_chunk_size=8,
+        discard_partial_chunks=True,
+        save_decode_cache=False,
+        dsa_two_groups=True,
+        windowed_sparse_layerwise_save=True,
+    )
+
+    assert req_meta is not None
+    assert req_meta.save_spec is not None
+    assert req_meta.save_spec.can_save is True
+    assert tracker.num_saved_tokens == 19
+    assert req_meta.token_ids == list(range(19))
+    assert req_meta.windowed_sparse_save is True
+    assert req_meta.save_slot_mapping_base == 8
+    assert req_meta.save_slot_mapping[0].tolist() == list(range(48, 59))
+    assert req_meta.save_indexer_slot_mapping[0].tolist() == list(range(88, 99))
+    assert req_meta.slot_mapping[0] is req_meta.save_slot_mapping[0]
+    assert (
+        req_meta.indexer_slot_mapping[0]
+        is req_meta.save_indexer_slot_mapping[0]
+    )
+
+
+def test_sparse_layerwise_producer_keeps_full_source_mapping() -> None:
+    tracker = RequestTracker(
+        req_id="req-producer",
+        prompt_len=20,
+        token_ids=list(range(19)),
+        allocated_block_ids=[10, 11, 12, 13, 14],
+        num_saved_tokens=10,
+    )
+
+    req_meta = ReqMeta.from_request_tracker(
+        tracker,
+        block_size=4,
+        lmcache_chunk_size=8,
+        windowed_sparse_layerwise_save=True,
+        save_entire_prefix=True,
+    )
+
+    assert req_meta is not None
+    assert tracker.num_saved_tokens == 19
+    assert req_meta.windowed_sparse_save is True
+    assert req_meta.slot_mapping[0].numel() == 19
+    assert req_meta.save_slot_mapping_base is None
+    assert req_meta.save_slot_mapping == []
+
+
+def test_decode_window_reqmeta_builds_only_windowed_save_slots() -> None:
+    tracker = RequestTracker(
+        req_id="req-window-local",
+        prompt_len=0,
+        token_ids=list(range(16)),
+        allocated_block_ids=[10, 11, 12, 13],
+        allocated_block_ids_indexer=[20, 21, 22, 23],
+    )
+
+    req_meta = ReqMeta.from_decode_window_save(
+        tracker,
+        block_size=4,
+        window_start=8,
+        window_end=16,
+        window_size=8,
+        windowed_sparse_layerwise_save=True,
+    )
+
+    assert req_meta is not None
+    assert req_meta.slot_mapping[0].numel() == 8
+    assert req_meta.indexer_slot_mapping[0].numel() == 8
+    assert req_meta.save_slot_mapping_base == 8
+    assert req_meta.save_slot_mapping[0].tolist() == list(range(48, 56))
+    assert req_meta.save_indexer_slot_mapping[0].tolist() == list(range(88, 96))
+
+
 def test_sparse_decode_reqmeta_extends_tokens_to_lmcache_hit() -> None:
     tracker = RequestTracker(
         req_id="req-sparse",
@@ -490,12 +580,15 @@ def test_sparse_decode_reqmeta_extends_tokens_to_lmcache_hit() -> None:
             can_load=True,
         ),
         is_sparse_decode=True,
+        windowed_sparse_layerwise_save=True,
     )
 
     assert req_meta is not None
     assert req_meta.token_ids == list(range(8))
     assert tracker.sparse_token_ids == list(range(8))
     assert req_meta.slot_mapping[0].tolist() == list(range(8))
+    assert req_meta.windowed_sparse_save is False
+    assert req_meta.save_slot_mapping == []
 
 
 def test_layerwise_save_skips_requests_that_cannot_save() -> None:
@@ -671,3 +764,87 @@ def test_chunked_indexer_save_pads_layer_metadata_slots() -> None:
             dtype=torch.bool,
         ),
     )
+
+
+def test_sparse_layerwise_indexer_save_uses_request_local_window() -> None:
+    request = _make_req("req-batched")
+    request.token_ids = list(range(16))
+    request.slot_mapping = [torch.arange(16, dtype=torch.long)]
+    request.save_spec = SaveSpec(
+        skip_leading_tokens=8,
+        can_save=True,
+        can_save_latent=True,
+        can_save_indexer=True,
+    )
+    request.windowed_sparse_save = True
+    request.save_slot_mapping_base = 8
+    request.save_slot_mapping = [torch.arange(500, 508, dtype=torch.long)]
+    request.save_indexer_slot_mapping = [
+        torch.arange(600, 608, dtype=torch.long)
+    ]
+    _init_indexer_cache_fields(request)
+
+    connector, _, engine = _make_connector([request])
+    connector.kv_role = "kv_both"
+    connector.enable_sparse_attention = True
+    connector.config = SimpleNamespace(dsa_two_groups=True, use_layerwise=True)
+    indexer_layer_name = "model.layers.0.self_attn.indexer.k_cache"
+    connector.kv_caches = {
+        "model.layers.0.self_attn.attn": torch.zeros(1),
+        indexer_layer_name: torch.zeros(1),
+    }
+    metadata_slots = torch.arange(200, 208, dtype=torch.long)
+    attn_metadata = {
+        indexer_layer_name: SimpleNamespace(slot_mapping=metadata_slots),
+    }
+
+    connector.save_kv_layer(indexer_layer_name, torch.zeros(1), attn_metadata)
+
+    assert engine.store_calls == ["req-batched"]
+    kwargs = engine.store_kwargs[0]
+    assert kwargs["kv_group"] == 1
+    assert kwargs["offset"] == 8
+    assert kwargs["slot_mapping_base"] == 8
+    assert kwargs["windowed_sparse_save"] is True
+    assert torch.equal(kwargs["slot_mapping"], request.save_indexer_slot_mapping[0])
+    assert not torch.equal(kwargs["slot_mapping"], metadata_slots)
+
+
+def test_sparse_layerwise_producer_indexer_uses_request_full_mapping() -> None:
+    request = _make_req("req-producer-batched")
+    request.token_ids = list(range(16))
+    request.slot_mapping = [torch.arange(500, 516, dtype=torch.long)]
+    request.indexer_slot_mapping = [
+        torch.arange(600, 616, dtype=torch.long)
+    ]
+    request.save_spec = SaveSpec(
+        skip_leading_tokens=0,
+        can_save=True,
+        can_save_latent=True,
+        can_save_indexer=True,
+    )
+    request.windowed_sparse_save = True
+    _init_indexer_cache_fields(request)
+
+    connector, _, engine = _make_connector([request])
+    connector.enable_sparse_attention = True
+    connector.config = SimpleNamespace(dsa_two_groups=True, use_layerwise=True)
+    indexer_layer_name = "model.layers.0.self_attn.indexer.k_cache"
+    connector.kv_caches = {
+        "model.layers.0.self_attn.attn": torch.zeros(1),
+        indexer_layer_name: torch.zeros(1),
+    }
+    metadata_slots = torch.arange(200, 216, dtype=torch.long)
+    attn_metadata = {
+        indexer_layer_name: SimpleNamespace(slot_mapping=metadata_slots),
+    }
+
+    connector.save_kv_layer(indexer_layer_name, torch.zeros(1), attn_metadata)
+
+    assert engine.store_calls == ["req-producer-batched"]
+    kwargs = engine.store_kwargs[0]
+    assert kwargs["offset"] == 0
+    assert kwargs["slot_mapping_base"] == 0
+    assert kwargs["windowed_sparse_save"] is True
+    assert torch.equal(kwargs["slot_mapping"], request.indexer_slot_mapping[0])
+    assert not torch.equal(kwargs["slot_mapping"], metadata_slots)

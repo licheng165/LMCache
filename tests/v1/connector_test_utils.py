@@ -16,7 +16,6 @@ from lmcache.integration.vllm.vllm_v1_adapter import (
     LoadSpec,
     ReqMeta,
     SaveSpec,
-    WorkerRetrieveState,
 )
 
 
@@ -87,6 +86,7 @@ def make_worker_connector(
     connector._manager = _FakeManager(fake_engine)
     connector.kv_role = kv_role
     connector.use_layerwise = use_layerwise
+    connector.enable_blending = False
     connector.device = "cpu"
     connector._lmcache_chunk_size = 256
     connector._layerwise_save_storers = {}

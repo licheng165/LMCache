@@ -7,6 +7,7 @@ import shlex
 import subprocess
 import tempfile
 import time
+from types import SimpleNamespace
 
 # Third Party
 import pytest
@@ -17,7 +18,8 @@ from lmcache.utils import (
     mock_up_broadcast_fn,
     mock_up_broadcast_object_fn,
 )
-from lmcache.v1.cache_engine import LMCacheEngineBuilder
+import lmcache.v1.cache_engine as cache_engine_module
+from lmcache.v1.cache_engine import LMCacheEngine, LMCacheEngineBuilder
 from lmcache.v1.config import LMCacheEngineConfig
 from lmcache.v1.event_manager import EventStatus, EventType
 
@@ -49,6 +51,112 @@ def get_expected_count(token_len, save_unfull_chunk, chunk_size):
     if save_unfull_chunk:
         return token_len
     return (token_len // chunk_size) * chunk_size
+
+
+@pytest.mark.parametrize(
+    ("chunk_locations", "expected_cleanup_locations"),
+    [
+        (
+            ("LocalCPUBackend", "LocalCPUBackend"),
+            ["LocalCPUBackend"],
+        ),
+        (
+            ("LocalCPUBackend", "RemoteBackend"),
+            ["LocalCPUBackend", "RemoteBackend"],
+        ),
+    ],
+)
+def test_layerwise_retrieve_preserves_cleanup_locations(
+    monkeypatch,
+    chunk_locations,
+    expected_cleanup_locations,
+):
+    class FakeKey:
+        def __init__(self, chunk_id):
+            self.chunk_id = chunk_id
+
+        def split_layers(self, num_layers):
+            return [SimpleNamespace(chunk_id=self.chunk_id) for _ in range(num_layers)]
+
+    class FakeMemoryObj:
+        def __init__(self, location, layer_id):
+            self.location = location
+            self.layer_id = layer_id
+            self.ref_count_down_calls = 0
+
+        def ref_count_down(self):
+            self.ref_count_down_calls += 1
+
+    class FakeStorageManager:
+        def __init__(self):
+            self.returned = []
+
+        def contains(self, key, _retrieve_locations):
+            return chunk_locations[key.chunk_id]
+
+        def layerwise_batched_get(self, keys, location=None):
+            for layer_id, layer_keys in enumerate(keys):
+                mem_objs = [
+                    FakeMemoryObj(location, layer_id) for _ in layer_keys
+                ]
+                self.returned.extend(mem_objs)
+                yield SimpleNamespace(result=lambda objs=mem_objs: objs)
+
+    class FakeGPUConnector:
+        @staticmethod
+        def batched_to_gpu(_starts, _ends, **_kwargs):
+            def consume():
+                yield
+                for _ in range(2):
+                    yield
+                yield
+
+            return consume()
+
+    monkeypatch.setattr(cache_engine_module, "CacheEngineKey", FakeKey)
+    monkeypatch.setattr(
+        cache_engine_module,
+        "assert_layerwise_gpu_connector",
+        lambda _connector: None,
+    )
+
+    engine = LMCacheEngine.__new__(LMCacheEngine)
+    engine.num_layers = 2
+    engine.retrieve_locations = list(dict.fromkeys(chunk_locations))
+    engine.storage_manager = FakeStorageManager()
+    engine.gpu_connector = FakeGPUConnector()
+    engine.token_database = SimpleNamespace(
+        process_tokens=lambda **_kwargs: iter(
+            [(0, 1, FakeKey(0)), (1, 2, FakeKey(1))]
+        )
+    )
+    engine.stats_monitor = SimpleNamespace(
+        on_retrieve_request=lambda _num_tokens: "monitor-id",
+        on_retrieve_finished=lambda _monitor_id, _num_tokens: None,
+    )
+    engine.is_healthy = lambda: True
+    engine._get_req_id = lambda _kwargs: "req"
+    engine._should_use_shared_layerwise_retrieve = lambda _kv_group: False
+    engine._is_passive = lambda: False
+    cleanup_calls = []
+    engine._maybe_unpin_retrieved_objs = (
+        lambda mem_objs, location: cleanup_calls.append(
+            (location, list(mem_objs))
+        )
+    )
+
+    list(engine.retrieve_layer([1, 2]))
+
+    assert [location for location, _ in cleanup_calls] == (
+        expected_cleanup_locations
+    )
+    for location, mem_objs in cleanup_calls:
+        assert mem_objs
+        assert all(mem_obj.location == location for mem_obj in mem_objs)
+    assert all(
+        mem_obj.ref_count_down_calls == 1
+        for mem_obj in engine.storage_manager.returned
+    )
 
 
 @pytest.mark.parametrize("save_unfull_chunk", [False, True])

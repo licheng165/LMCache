@@ -598,6 +598,17 @@ def _validate_config(self):
             )
             self.save_unfull_chunk = True
 
+    if (
+        self.use_layerwise
+        and self.enable_sparse_attention
+        and not self.save_unfull_chunk
+    ):
+        raise ValueError(
+            "use_layerwise=true with enable_sparse_attention=true requires "
+            "save_unfull_chunk=true. Chunked-prefill tail KV must remain "
+            "retrievable until a longer partial or full LMCache chunk replaces it."
+        )
+
     extra_config = self.extra_config or {}
     enable_shared_cpu_cache = bool(
         extra_config.get(
