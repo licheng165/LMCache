@@ -339,6 +339,9 @@ class LoadSpec:
     lmcache_cached_tokens: int
     # Whether the scheduler allow us to load the tokens
     can_load: bool
+    # Full prompt hit accompanied by a final-hidden artifact. The decoder can
+    # cold-start the sparse path without recomputing the last prompt token.
+    bootstrap_sample: bool = False
 
 
 @dataclass
@@ -2542,7 +2545,11 @@ class LMCacheConnectorV1Impl:
         is_sparse_decode: bool,
     ) -> bool:
         """True when vLLM expects the last prompt token to be recomputed, not loaded."""
-        if is_sparse_decode or load_spec is None:
+        if (
+            is_sparse_decode
+            or load_spec is None
+            or load_spec.bootstrap_sample
+        ):
             return False
         return (
             load_spec.lmcache_cached_tokens >= prompt_len
@@ -6437,8 +6444,15 @@ class LMCacheConnectorV1Impl:
         # a better support for this case.
         need_to_allocate = num_external_hit_tokens - num_computed_tokens
 
-        # In, full-prompt-hit case, we need to recompute the last token
-        if num_external_hit_tokens == request.num_tokens:
+        bootstrap_sample = bool(
+            self.enable_sparse_attention
+            and getattr(request, "bootstrap_sample_pending", False)
+            and num_external_hit_tokens == request.num_tokens
+        )
+
+        # In the ordinary full-prompt-hit case, recompute the last token. A
+        # validated final-hidden handoff makes all prompt tokens authoritative.
+        if num_external_hit_tokens == request.num_tokens and not bootstrap_sample:
             need_to_allocate -= 1
 
         # Check if hit tokens meet the minimum for retrieve
@@ -6474,6 +6488,7 @@ class LMCacheConnectorV1Impl:
             vllm_cached_tokens=num_computed_tokens,
             lmcache_cached_tokens=num_external_hit_tokens,
             can_load=False,
+            bootstrap_sample=bootstrap_sample,
         )
 
         if below_min_retrieve or need_to_allocate <= 0:
@@ -6537,6 +6552,7 @@ class LMCacheConnectorV1Impl:
             if (
                 self.load_specs[request.request_id].lmcache_cached_tokens
                 == request.num_tokens
+                and not self.load_specs[request.request_id].bootstrap_sample
             )
             else 0
         )
@@ -6697,6 +6713,18 @@ class LMCacheConnectorV1Impl:
             )
             self._request_trackers[request.req_id] = request_tracker
 
+            is_bootstrap_sample = bool(
+                load_spec is not None and load_spec.bootstrap_sample
+            )
+            if is_bootstrap_sample:
+                # The D node has no target-model prefill/attention call before
+                # sampling. Enter the sparse cold-load path immediately so the
+                # compact latent table is used only as retrieval scratch while
+                # the complete DSA index is materialized.
+                request_tracker.seed_sparse_decode_tokens(
+                    list(request_tracker.token_ids)
+                )
+
             req_meta = ReqMeta.from_request_tracker(
                 request_tracker,
                 self._block_size,
@@ -6704,6 +6732,7 @@ class LMCacheConnectorV1Impl:
                 load_spec=load_spec,
                 discard_partial_chunks=self._discard_partial_chunks,
                 save_decode_cache=self.config.save_decode_cache,
+                is_sparse_decode=is_bootstrap_sample,
                 save_full_chunk_in_decode=getattr(
                     self.config, "save_full_chunk_in_decode", False
                 ),
@@ -6832,6 +6861,7 @@ class LMCacheConnectorV1Impl:
                 full_hit_adj = (
                     lmcache_cached_tokens == len(request.all_token_ids)
                     and lmcache_cached_tokens > load_spec.vllm_cached_tokens
+                    and not load_spec.bootstrap_sample
                 )
                 if full_hit_adj:
                     expected -= 1
@@ -6984,6 +7014,18 @@ class LMCacheConnectorV1Impl:
             return_params = {
                 "first_tok": request._output_token_ids[0],
             }
+
+        if params is not None and params.get("ret_final_hidden", False):
+            final_hidden = getattr(request, "captured_final_hidden", None)
+            if final_hidden is None:
+                logger.warning(
+                    "Request %s asked for final hidden state, but the model "
+                    "runner did not return one.",
+                    request.request_id,
+                )
+            else:
+                return_params = return_params or {}
+                return_params["bootstrap_final_hidden"] = final_hidden
 
         if self.config.get_extra_config_value(
             "enable_cache_usage_details_in_response", False
