@@ -6718,6 +6718,113 @@ class LMCacheConnectorV1Impl:
             return False
         return len(tracker.token_ids) > tracker.prompt_len
 
+    def _decode_window_save_skip_reason(self, tracker: RequestTracker) -> str:
+        """Describe why the authoritative eligibility check rejected a save."""
+        window_size = getattr(self, "_decode_window_save_window_size", 0)
+        if window_size <= 0:
+            return "window_disabled"
+        if self.kv_role == "kv_consumer":
+            return "kv_consumer"
+        if tracker.disagg_spec is not None:
+            return "disaggregated_request"
+        if tracker.skip_save:
+            return "tracker_skip_save"
+        if (tracker.request_configs or {}).get("lmcache.skip_save", False):
+            return "request_skip_save"
+        if not tracker.is_decode_phase:
+            return "not_decode_phase"
+        if len(tracker.token_ids) <= tracker.prompt_len:
+            return "no_decode_tokens"
+        return "unknown"
+
+    def _trace_decode_window_decision(
+        self,
+        tracker: RequestTracker,
+        decision: Optional[str] = None,
+        reason: Optional[str] = None,
+    ) -> None:
+        if not _mtp_dw_diag_enabled():
+            return
+        should_save = self._should_decode_window_save(tracker)
+        eligibility_reason = (
+            "eligible"
+            if should_save
+            else self._decode_window_save_skip_reason(tracker)
+        )
+        tracker_len = len(tracker.token_ids)
+        window_size = int(getattr(self, "_decode_window_save_window_size", 0) or 0)
+        next_start = tracker.decode_window_save_next_start
+        next_end = (
+            int(next_start) + window_size
+            if next_start is not None and window_size > 0
+            else None
+        )
+        states = getattr(self, "_mtp_dw_window_decision_states", None)
+        if states is None:
+            states = {}
+            self._mtp_dw_window_decision_states = states
+        state = states.setdefault(
+            tracker.req_id,
+            {
+                "signature": None,
+                "near": set(),
+                "reached": set(),
+                "forced": set(),
+            },
+        )
+        signature = (should_save, eligibility_reason, next_start)
+        if decision is None:
+            if state["signature"] is None:
+                decision = "initial"
+            elif should_save and next_end is not None:
+                if tracker_len >= next_end and next_end not in state["reached"]:
+                    decision = "boundary_reached"
+                    state["reached"].add(next_end)
+                elif (
+                    tracker_len >= next_end - 4
+                    and next_end not in state["near"]
+                ):
+                    decision = "near_boundary"
+                    state["near"].add(next_end)
+                elif state["signature"] != signature:
+                    decision = "eligible"
+            elif state["signature"] != signature:
+                decision = "blocked"
+        state["signature"] = signature
+        if decision is None:
+            return
+        if reason is None:
+            if not should_save:
+                reason = eligibility_reason
+            elif next_end is not None and tracker_len < next_end:
+                reason = "awaiting_frontier"
+            else:
+                reason = "ready"
+        if decision == "blocked":
+            forced_key = (decision, reason, next_start)
+            if forced_key in state["forced"]:
+                return
+            state["forced"].add(forced_key)
+        _mtp_dw_event(
+            "meta",
+            req=str(tracker.req_id),
+            event="window_decision",
+            decision=decision,
+            reason=reason,
+            skip_reason=(
+                reason if not should_save or decision == "blocked" else None
+            ),
+            frontier=tracker_len,
+            tracker_len=tracker_len,
+            prompt_len=tracker.prompt_len,
+            next_start=(int(next_start) if next_start is not None else None),
+            next_end=next_end,
+            committed_end=int(tracker.decode_window_save_committed_end),
+            num_saved_tokens=int(tracker.num_saved_tokens),
+            is_decode_phase=bool(tracker.is_decode_phase),
+            should_save=should_save,
+        )
+
     def _init_decode_window_save_start(self, tracker: RequestTracker) -> int:
         if tracker.decode_window_save_next_start is not None:
             return tracker.decode_window_save_next_start
@@ -6743,10 +6850,12 @@ class LMCacheConnectorV1Impl:
         tracker: RequestTracker,
     ) -> None:
         if not self._should_decode_window_save(tracker):
+            self._trace_decode_window_decision(tracker)
             return
 
         window_size = self._decode_window_save_window_size
         next_start = self._init_decode_window_save_start(tracker)
+        self._trace_decode_window_decision(tracker)
 
         while len(tracker.token_ids) >= next_start + window_size:
             window_start = next_start
@@ -6762,6 +6871,9 @@ class LMCacheConnectorV1Impl:
                 ),
             )
             if req_meta is None:
+                self._trace_decode_window_decision(
+                    tracker, decision="blocked", reason="metadata_unavailable"
+                )
                 return
             if _mtp_dw_diag_enabled():
                 slot_mapping = (
@@ -6827,8 +6939,16 @@ class LMCacheConnectorV1Impl:
                     window_start,
                     window_end,
                 )
+                self._trace_decode_window_decision(
+                    tracker,
+                    decision="blocked",
+                    reason="missing_indexer_slots",
+                )
                 return
 
+            self._trace_decode_window_decision(
+                tracker, decision="emitted", reason="window_ready"
+            )
             meta.add_request(req_meta)
             tracker.decode_window_save_next_start = window_end
             next_start = window_end
@@ -6852,7 +6972,15 @@ class LMCacheConnectorV1Impl:
         meta = LMCacheConnectorMetadata()
 
         for finished_req_id in scheduler_output.finished_req_ids:
-            self._request_trackers.pop(finished_req_id, None)
+            tracker = self._request_trackers.pop(finished_req_id, None)
+            if tracker is not None:
+                self._trace_decode_window_decision(
+                    tracker, decision="request_finish", reason="request_finished"
+                )
+            if _mtp_dw_diag_enabled():
+                states = getattr(self, "_mtp_dw_window_decision_states", None)
+                if states is not None:
+                    states.pop(finished_req_id, None)
             self._unfinished_requests.pop(finished_req_id, None)
 
         # We should load KV for:

@@ -13,6 +13,7 @@ import torch
 pytest.importorskip("vllm")
 
 # First Party
+from lmcache.integration.vllm import vllm_v1_adapter as adapter_module
 from lmcache.integration.vllm.vllm_v1_adapter import (
     LMCacheConnectorV1Impl,
     RequestTracker,
@@ -73,6 +74,113 @@ def _make_vllm_request(
         num_computed_tokens=num_computed,
         all_token_ids=prompt + [decode_token],
     )
+
+
+def test_decode_window_decisions_cover_second_window_and_finish(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    impl = _make_scheduler_impl()
+    impl._decode_window_save_window_size = 256
+    tracker = RequestTracker(
+        req_id="window-progress",
+        prompt_len=256,
+        token_ids=list(range(400)),
+        allocated_block_ids=list(range(64)),
+        num_saved_tokens=256,
+    )
+    tracker.is_decode_phase = True
+    tracker.decode_window_save_next_start = 256
+    events: list[dict] = []
+    monkeypatch.setenv("VLLM_ASCEND_MTP_DW_DIAG", "1")
+    monkeypatch.setattr(
+        adapter_module,
+        "_mtp_dw_event",
+        lambda _stage, **fields: events.append(fields),
+    )
+
+    impl._trace_decode_window_decision(tracker)
+    tracker.token_ids.extend(range(400, 508))
+    impl._trace_decode_window_decision(tracker)
+    tracker.token_ids.extend(range(508, 512))
+    impl._trace_decode_window_decision(tracker)
+    impl._trace_decode_window_decision(
+        tracker, decision="emitted", reason="window_ready"
+    )
+    tracker.decode_window_save_next_start = 512
+    tracker.token_ids.extend(range(512, 764))
+    impl._trace_decode_window_decision(tracker)
+    tracker.token_ids.extend(range(764, 768))
+    impl._trace_decode_window_decision(tracker)
+    impl._trace_decode_window_decision(
+        tracker, decision="request_finish", reason="request_finished"
+    )
+
+    decisions = [event["decision"] for event in events]
+    assert decisions == [
+        "initial",
+        "near_boundary",
+        "boundary_reached",
+        "emitted",
+        "near_boundary",
+        "boundary_reached",
+        "request_finish",
+    ]
+    assert events[-2]["next_end"] == 768
+    assert events[-2]["tracker_len"] == 768
+    assert events[-1]["reason"] == "request_finished"
+
+
+def test_decode_window_decision_reports_blocked_unfinished_request(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    impl = _make_scheduler_impl()
+    impl._decode_window_save_window_size = 256
+    tracker = RequestTracker(
+        req_id="window-blocked",
+        prompt_len=256,
+        token_ids=list(range(256)),
+        allocated_block_ids=list(range(16)),
+        num_saved_tokens=256,
+    )
+    events: list[dict] = []
+    monkeypatch.setenv("VLLM_ASCEND_MTP_DW_DIAG", "1")
+    monkeypatch.setattr(
+        adapter_module,
+        "_mtp_dw_event",
+        lambda _stage, **fields: events.append(fields),
+    )
+
+    impl._trace_decode_window_decision(tracker)
+    impl._trace_decode_window_decision(
+        tracker, decision="request_finish", reason="request_finished"
+    )
+
+    assert events[0]["decision"] == "initial"
+    assert events[0]["reason"] == "not_decode_phase"
+    assert events[0]["should_save"] is False
+    assert events[1]["decision"] == "request_finish"
+    assert events[1]["tracker_len"] == 256
+
+
+def test_decode_window_call_site_allocates_no_state_when_diag_disabled(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    impl = _make_scheduler_impl()
+    impl._decode_window_save_window_size = 256
+    tracker = RequestTracker(
+        req_id="window-disabled-diag",
+        prompt_len=256,
+        token_ids=list(range(256)),
+        allocated_block_ids=list(range(16)),
+        num_saved_tokens=256,
+    )
+    meta = MagicMock()
+    monkeypatch.delenv("VLLM_ASCEND_MTP_DW_DIAG", raising=False)
+
+    impl._add_decode_window_save_metas(meta, tracker)
+
+    assert not hasattr(impl, "_mtp_dw_window_decision_states")
+    meta.add_request.assert_not_called()
 
 
 class TestBuildConnectorMetaSparseSyntheticLoadSpec:
