@@ -7,7 +7,12 @@ LMCacheAsyncLookupClient/Server.
 
 # Standard
 from collections import namedtuple
+from datetime import datetime, timezone
 from typing import Any
+import os
+import threading
+import time
+import traceback
 
 # Third Party
 import msgspec
@@ -27,6 +32,15 @@ from lmcache.v1.rpc_utils import (
 logger = init_logger(__name__)
 
 SocketParams = namedtuple("SocketParams", ["socket_path", "rank"])
+
+
+def _utc_timestamp() -> str:
+    return datetime.now(timezone.utc).isoformat(timespec="milliseconds")
+
+
+def _caller_location() -> str:
+    caller = traceback.extract_stack(limit=3)[0]
+    return f"{caller.filename}:{caller.lineno}:{caller.name}"
 
 
 class ZmqReqRepClientTransport(RpcClientTransport):
@@ -74,22 +88,29 @@ class ZmqReqRepClientTransport(RpcClientTransport):
     def _recreate_all_sockets(self) -> None:
         """Recreate all sockets after a failure."""
         for rank_idx in range(self._world_size):
+            params = self.socket_params[rank_idx]
             old_socket = self.sockets[rank_idx]
             if old_socket is not None:
                 try:
                     old_socket.close(linger=0)
                 except zmq.ZMQError as e:
                     logger.warning(
-                        "ZMQ error closing old socket for rank %s: %s",
+                        "ZMQ error closing old socket: timestamp=%s "
+                        "socket_index=%s rank=%s endpoint=%s error=%s",
+                        _utc_timestamp(),
                         rank_idx,
+                        params.rank,
+                        params.socket_path,
                         e,
                     )
                 except AttributeError:
                     pass
 
-            params = self.socket_params[rank_idx]
             logger.info(
-                "Recreating socket for rank %s with path %s",
+                "Recreating socket: timestamp=%s socket_index=%s "
+                "rank=%s endpoint=%s",
+                _utc_timestamp(),
+                rank_idx,
                 params.rank,
                 params.socket_path,
             )
@@ -105,31 +126,53 @@ class ZmqReqRepClientTransport(RpcClientTransport):
         sending. On timeout or ZMQ error, recreates all
         sockets and returns an empty list.
         """
+        started_at = _utc_timestamp()
+        started = time.perf_counter()
         encoded = [self.encoder.encode(m) for m in msg]
         results: list[bytes] = []
-        failed_rank = -1
+        failed_socket_idx = -1
+        sent_count = 0
+        phase = "send"
         try:
             for i in range(self._world_size):
-                failed_rank = i
+                failed_socket_idx = i
                 self.sockets[i].send_multipart(encoded, copy=False)
+                sent_count += 1
 
+            phase = "recv"
             for i in range(self._world_size):
-                failed_rank = i
+                failed_socket_idx = i
                 resp = self.sockets[i].recv()
                 results.append(resp)
-        except zmq.Again as e:
-            logger.error(
-                "Timeout occurred for rank %s, recreating all sockets. Error: %s",
-                failed_rank,
-                e,
-            )
-            self._recreate_all_sockets()
-            return []
         except zmq.ZMQError as e:
-            logger.error(
-                "ZMQ error for rank %s: %s, recreating all sockets",
-                failed_rank,
+            params = (
+                self.socket_params[failed_socket_idx]
+                if 0 <= failed_socket_idx < self._world_size
+                else None
+            )
+            failure = "Timeout occurred" if isinstance(e, zmq.Again) else "ZMQ error"
+            logger.exception(
+                "%s for rank %s; recreating all sockets: failed_at=%s "
+                "started_at=%s elapsed_ms=%.3f phase=%s socket_index=%s "
+                "endpoint=%s timeout_ms=%s world_size=%s sent=%s received=%s "
+                "pid=%s thread=%s caller=%s error=%s",
+                failure,
+                params.rank if params is not None else "unknown",
+                _utc_timestamp(),
+                started_at,
+                (time.perf_counter() - started) * 1000,
+                phase,
+                failed_socket_idx,
+                params.socket_path if params is not None else "unknown",
+                self.timeout_ms,
+                self._world_size,
+                sent_count,
+                len(results),
+                os.getpid(),
+                threading.current_thread().name,
+                _caller_location(),
                 e,
+                stack_info=True,
             )
             self._recreate_all_sockets()
             return []
