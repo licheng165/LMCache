@@ -648,6 +648,53 @@ class TestWorkerRetrieveState:
         engine.release_shared_cpu_sparse_request.assert_called_once_with("req-1")
         assert state.shared_request_active is False
 
+    def test_finished_worker_request_releases_request_owned_cache_state(self):
+        class FakeMemObj:
+            def __init__(self, pinned: bool = False):
+                self.released = 0
+                self.unpinned = 0
+                self.is_pinned = pinned
+
+            def ref_count_down(self):
+                self.released += 1
+
+            def unpin(self):
+                self.unpinned += 1
+                self.is_pinned = False
+
+        storer_closed: list[bool] = []
+
+        def storer():
+            try:
+                yield
+            finally:
+                storer_closed.append(True)
+
+        layerwise_storer = storer()
+        next(layerwise_storer)
+        passive_view = FakeMemObj()
+        backing_obj = FakeMemObj(pinned=True)
+        engine = MagicMock()
+        impl = _make_impl()
+        impl._manager = SimpleNamespace(lmcache_engine=engine)
+        impl._layerwise_save_storers = {("req-1", 0): layerwise_storer}
+        impl._worker_retrieve_state = {
+            "req-1": WorkerRetrieveState(
+                shared_views_by_group={0: [[passive_view]]},
+                rank0_backing_objs_by_group={0: [[backing_obj]]},
+            )
+        }
+
+        impl._release_finished_worker_requests({"req-1"})
+
+        assert impl._layerwise_save_storers == {}
+        assert impl._worker_retrieve_state == {}
+        assert storer_closed == [True]
+        assert passive_view.released == 1
+        assert backing_obj.unpinned == 1
+        assert backing_obj.released == 1
+        engine.lookup_unpin.assert_called_once_with("req-1")
+
     def test_save_transfers_active_shared_state_without_releasing(self):
         class FakeMemObj:
             def __init__(self):

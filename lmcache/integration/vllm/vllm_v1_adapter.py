@@ -3061,6 +3061,12 @@ class LMCacheConnectorV1Impl:
                 )
         self._release_request_lookup_pins(req_id)
 
+    def _release_finished_worker_requests(self, req_ids: Iterable[str]) -> None:
+        """Release request-owned cache state in the worker process."""
+        for req_id in req_ids:
+            self._drop_layerwise_save_storers(req_id)
+            self._drop_worker_retrieve_state(req_id)
+
     @staticmethod
     def _release_shared_worker_retrieve_state(
         state: WorkerRetrieveState,
@@ -6917,15 +6923,9 @@ class LMCacheConnectorV1Impl:
         request: "Request",
         block_ids: list[int],
     ) -> tuple[bool, Optional[dict[str, Any]]]:
-        # Layerwise save uses request-scoped generators. If request finishes
-        # without entering wait_for_save (abort/error/evict path), make sure
-        # we release the generator entry to avoid leaking state.
-        if getattr(self, "use_layerwise", False) and hasattr(
-            self, "_layerwise_save_storers"
-        ):
-            self._drop_layerwise_save_storers(request.request_id)
-
-        self._drop_worker_retrieve_state(request.request_id)
+        # This callback runs in the scheduler process. Worker-owned state is
+        # released when the same request ID reaches worker-side get_finished().
+        self._release_request_lookup_pins(request.request_id)
 
         # Cleanup if request was aborted
         if request.status == RequestStatus.FINISHED_ABORTED and self.async_loading:

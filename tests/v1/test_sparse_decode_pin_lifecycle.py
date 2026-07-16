@@ -44,14 +44,18 @@ class TestSparseDecodePinLifecycle:
         connector.wait_for_save()
         assert engine.unpinned == ["req-prefill", "req-prefill"]
 
-    def test_request_finished_releases_pins(self) -> None:
+    def test_scheduler_request_finished_only_releases_lookup_pins(self) -> None:
         sparse = make_sparse_req_meta("req-finish")
         connector, _, engine = make_worker_connector([sparse])
         connector.wait_for_save()
         assert engine.unpinned == []
+        connector._drop_layerwise_save_storers = MagicMock()
+        connector._drop_worker_retrieve_state = MagicMock()
 
         connector.request_finished(make_stub_request("req-finish"), [])
         assert engine.unpinned == ["req-finish"]
+        connector._drop_layerwise_save_storers.assert_not_called()
+        connector._drop_worker_retrieve_state.assert_not_called()
 
     def test_drop_worker_retrieve_state_releases_pins(self) -> None:
         impl = make_worker_impl()
