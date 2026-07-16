@@ -2,9 +2,10 @@
 # Standard
 from collections.abc import Iterable
 from dataclasses import dataclass, field
+import json
+import os
 from types import SimpleNamespace
 from typing import TYPE_CHECKING, Any, Generator, Optional, Union
-import os
 
 # Third Party
 from vllm.config import (
@@ -68,6 +69,102 @@ SPARSE_DECODE_RETRIEVE_TOKENS = int(
 )
 SPARSE_DECODE_SHARED_CPU_PHASE = "sparse_decode_bootstrap"
 
+
+def _mtp_dw_diag_enabled() -> bool:
+    return os.environ.get("VLLM_ASCEND_MTP_DW_DIAG", "0") == "1"
+
+
+def _mtp_dw_event(stage: str, **fields: Any) -> None:
+    if not _mtp_dw_diag_enabled():
+        return
+    payload = {"schema": 1, "stage": stage, "owner": "lmcache"}
+    payload.update(fields)
+    logger.info("[MTP_DW] %s", json.dumps(payload, separators=(",", ":")))
+
+
+def _dsa_debug_enabled() -> bool:
+    return os.environ.get("VLLM_ASCEND_DSA_SHRINK_DEBUG", "0").lower() in (
+        "1",
+        "true",
+        "yes",
+        "on",
+    )
+
+
+def _dsa_debug_summary_enabled() -> bool:
+    return os.environ.get(
+        "VLLM_ASCEND_DSA_SHRINK_DEBUG_MODE", "fail_only"
+    ).lower() in ("summary", "trace", "verbose", "all")
+
+
+def _dsa_debug_limit() -> int:
+    try:
+        return max(1, int(os.environ.get("VLLM_ASCEND_DSA_SHRINK_DEBUG_LIMIT", "8")))
+    except ValueError:
+        return 8
+
+
+def _dsa_debug_should_log(owner: Any, site: str) -> bool:
+    if not _dsa_debug_enabled():
+        return False
+    if not _dsa_debug_summary_enabled():
+        return False
+    counts = getattr(owner, "_dsa_shrink_debug_counts", None)
+    if counts is None:
+        counts = {}
+        setattr(owner, "_dsa_shrink_debug_counts", counts)
+    count = counts.get(site, 0)
+    if count >= _dsa_debug_limit():
+        return False
+    counts[site] = count + 1
+    return True
+
+
+def _dsa_debug_shape(value: Any) -> Any:
+    if value is None:
+        return None
+    shape = getattr(value, "shape", None)
+    if shape is not None:
+        return tuple(shape)
+    try:
+        return len(value)
+    except TypeError:
+        return type(value).__name__
+
+
+def _dsa_debug_sample(value: Any, limit: Optional[int] = None) -> Any:
+    if value is None:
+        return None
+    limit = _dsa_debug_limit() if limit is None else limit
+    try:
+        if isinstance(value, torch.Tensor):
+            if value.numel() == 0:
+                return []
+            return value.detach().reshape(-1)[:limit].to(device="cpu").tolist()
+        return list(value[:limit])
+    except Exception as exc:
+        return f"{type(value).__name__}:sample_failed:{exc}"
+
+
+def _dsa_debug_minmax_count(value: Any) -> Any:
+    if value is None:
+        return None
+    try:
+        if isinstance(value, torch.Tensor):
+            if value.numel() == 0:
+                return None
+            flat = value.detach().reshape(-1)
+            return (
+                flat.min().to(device="cpu").item(),
+                flat.max().to(device="cpu").item(),
+                int(flat.numel()),
+            )
+        seq = list(value)
+        if not seq:
+            return None
+        return (min(seq), max(seq), len(seq))
+    except Exception as exc:
+        return f"{type(value).__name__}:minmax_failed:{exc}"
 
 def _sparse_slot_mapping_len(prompt_tokens: int) -> int:
     return min(SPARSE_DECODE_RETRIEVE_TOKENS, prompt_tokens)
@@ -2789,6 +2886,18 @@ class LMCacheConnectorV1Impl:
         if groups is None:
             return
         groups.add(self._layerwise_save_storer_key(request, kv_group))
+        _mtp_dw_event(
+            "store",
+            req=request.req_id,
+            event="group_complete",
+            frontier=len(request.token_ids),
+            window_start=request.decode_window_start,
+            window_end=request.decode_window_end,
+            kv_group=kv_group,
+            required_groups=sorted(
+                self._decode_window_save_required_groups(request)
+            ),
+        )
 
     def _note_decode_window_save_seen(self, request: ReqMeta) -> None:
         if not self._is_decode_window_save_request(request):
@@ -2990,6 +3099,18 @@ class LMCacheConnectorV1Impl:
         if completed is None:
             return
         completed[request.req_id] = max(completed.get(request.req_id, 0), window_end)
+        _mtp_dw_event(
+            "commit",
+            req=request.req_id,
+            event="publish_completed",
+            frontier=len(request.token_ids),
+            window_start=request.decode_window_start,
+            window_end=window_end,
+            required_groups=sorted(
+                self._decode_window_save_required_groups(request)
+            ),
+            completed_end=completed[request.req_id],
+        )
         expected = getattr(self, "_decode_window_save_expected_start", None)
         if expected is not None:
             expected[request.req_id] = max(
@@ -3039,10 +3160,33 @@ class LMCacheConnectorV1Impl:
                 committed_end = min(committed_end, len(tracker.token_ids))
                 if window_size > 0:
                     committed_end = committed_end // window_size * window_size
+            committed_before = tracker.decode_window_save_committed_end
             tracker.decode_window_save_committed_end = max(
-                tracker.decode_window_save_committed_end,
-                committed_end,
+                committed_before, committed_end
             )
+            _mtp_dw_event(
+                "commit",
+                req=req_id,
+                event="frontier_update",
+                frontier=len(tracker.token_ids),
+                window_start=max(
+                    0,
+                    tracker.decode_window_save_committed_end - window_size,
+                ),
+                window_end=tracker.decode_window_save_committed_end,
+                committed_before=committed_before,
+                committed_after=tracker.decode_window_save_committed_end,
+                completed_end=int(window_end),
+            )
+            if tracker.decode_window_save_committed_end < committed_before:
+                _mtp_dw_event(
+                    "fail",
+                    req=req_id,
+                    frontier=len(tracker.token_ids),
+                    invariant="committed_frontier_monotonic",
+                    committed_before=committed_before,
+                    committed_after=tracker.decode_window_save_committed_end,
+                )
 
     def _prune_worker_retrieve_state(self, active_req_ids: set[str]) -> None:
         if not hasattr(self, "_worker_retrieve_state"):
@@ -6619,6 +6763,53 @@ class LMCacheConnectorV1Impl:
             )
             if req_meta is None:
                 return
+            if _mtp_dw_diag_enabled():
+                slot_mapping = (
+                    req_meta.slot_mapping[0].detach().cpu().reshape(-1)
+                    if req_meta.slot_mapping
+                    else torch.empty(0, dtype=torch.long)
+                )
+                _mtp_dw_event(
+                    "config",
+                    req=tracker.req_id,
+                    event="decode_window",
+                    frontier=len(tracker.token_ids),
+                    window_start=window_start,
+                    window_end=window_end,
+                    window_size=window_size,
+                    chunk_size=self._lmcache_chunk_size,
+                )
+                _mtp_dw_event(
+                    "meta",
+                    req=tracker.req_id,
+                    frontier=len(tracker.token_ids),
+                    prompt_frontier=tracker.prompt_len,
+                    committed_end=tracker.decode_window_save_committed_end,
+                    window_start=window_start,
+                    window_end=window_end,
+                    window_size=window_size,
+                    slot_count=int(slot_mapping.numel()),
+                    slot_min=(
+                        int(slot_mapping.min()) if slot_mapping.numel() else None
+                    ),
+                    slot_max=(
+                        int(slot_mapping.max()) if slot_mapping.numel() else None
+                    ),
+                    slot_sample=slot_mapping[:8].tolist(),
+                )
+                if (
+                    window_end > len(tracker.token_ids)
+                    or window_end - window_start != window_size
+                ):
+                    _mtp_dw_event(
+                        "fail",
+                        req=tracker.req_id,
+                        frontier=len(tracker.token_ids),
+                        window_start=window_start,
+                        window_end=window_end,
+                        invariant="synthetic_window_frontier",
+                        window_size=window_size,
+                    )
             if (
                 self._is_dsa_two_groups()
                 and bool(
