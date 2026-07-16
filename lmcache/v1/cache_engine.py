@@ -155,6 +155,7 @@ class LMCacheEngine:
         self.shared_cpu_cache_mapping: Optional[SharedSlabMapping] = None
         self.shared_cpu_cache_passive_allocator = None
         self._shared_cpu_active_sparse_requests: dict[str, dict[str, Any]] = {}
+        self._sampled_lookup_local_fallback_logged = False
         self._validate_shared_cpu_cache_contract()
         self._prepare_shared_cpu_cache_name()
 
@@ -1226,12 +1227,35 @@ class LMCacheEngine:
             return [0, 1]
         return [0]
 
-    def _use_sampled_scheduler_lookup(self) -> bool:
+    def _sampled_scheduler_lookup_requested(self) -> bool:
         config = getattr(self, "config", None)
         return bool(
             getattr(config, "experimental_sampled_layerwise_lookup", False)
             and getattr(self, "use_layerwise", False)
         )
+
+    def _use_sampled_scheduler_lookup(self) -> bool:
+        if not self._sampled_scheduler_lookup_requested():
+            return False
+
+        assert self.storage_manager is not None
+        has_remote_backend = any(
+            backend_name == "RemoteBackend"
+            for backend_name, _ in self.storage_manager.get_active_storage_backends(
+                search_range=["RemoteBackend"]
+            )
+        )
+        if has_remote_backend:
+            return True
+
+        if not getattr(self, "_sampled_lookup_local_fallback_logged", False):
+            logger.warning(
+                "experimental_sampled_layerwise_lookup is enabled without an "
+                "active RemoteBackend; falling back to regular layerwise "
+                "LocalCPU lookup."
+            )
+            self._sampled_lookup_local_fallback_logged = True
+        return False
 
     def _sampled_scheduler_keys(
         self,
@@ -3637,7 +3661,12 @@ class LMCacheEngine:
         assert self.storage_manager is not None
 
         if self.use_layerwise:
-            if self._use_sampled_scheduler_lookup():
+            experimental_lookup_enabled = self._sampled_scheduler_lookup_requested()
+            if experimental_lookup_enabled:
+                use_remote_sampling = self._use_sampled_scheduler_lookup()
+                lookup_search_range = (
+                    ["RemoteBackend"] if use_remote_sampling else search_range
+                )
                 async_lookup_server = getattr(
                     self.storage_manager,
                     "async_lookup_server",
@@ -3645,27 +3674,26 @@ class LMCacheEngine:
                 )
                 if async_lookup_server is None:
                     logger.error(
-                        "Experimental sampled async lookup has no response "
-                        "server: lookup_id=%s",
+                        "Layerwise async lookup has no response server: lookup_id=%s",
                         lookup_id,
                     )
                     return
 
-                async def run_sampled_lookup() -> None:
+                async def run_layerwise_lookup() -> None:
                     try:
                         result = await asyncio.to_thread(
                             self.lookup,
                             tokens=tokens,
                             hashes=hashes,
                             offsets=offsets,
-                            search_range=["RemoteBackend"],
+                            search_range=lookup_search_range,
                             lookup_id=lookup_id,
                             pin=pin,
                             request_configs=request_configs,
                         )
                     except Exception:
                         logger.exception(
-                            "Experimental sampled async lookup failed: lookup_id=%s",
+                            "Layerwise async lookup failed: lookup_id=%s",
                             lookup_id,
                         )
                         result = 0
@@ -3675,7 +3703,7 @@ class LMCacheEngine:
                     )
 
                 asyncio.run_coroutine_threadsafe(
-                    run_sampled_lookup(),
+                    run_layerwise_lookup(),
                     self.storage_manager.loop,
                 )
                 return

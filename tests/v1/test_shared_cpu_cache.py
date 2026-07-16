@@ -83,6 +83,8 @@ class _FakeLayerwiseStorageManager:
         return key in self.present
 
     def batched_contains(self, keys, search_range=None, pin=False):
+        if search_range and "LocalCPUBackend" not in search_range:
+            return 0, {}
         if self.block_mapping is not None:
             if pin:
                 self.pinned.extend(keys)
@@ -108,6 +110,14 @@ class _FakeLayerwiseStorageManager:
 
     def touch_cache(self):
         return None
+
+    def get_active_storage_backends(self, location=None, search_range=None):
+        for backend_name, backend in self.storage_backends.items():
+            if location and backend_name != location:
+                continue
+            if search_range and backend_name not in search_range:
+                continue
+            yield backend_name, backend
 
 
 def test_layerwise_chunk_fully_stored_repairs_partial_cache() -> None:
@@ -285,6 +295,7 @@ class _RecordingRemoteSampleStorageManager:
         self.present = set(present)
         self.calls = []
         self.unpinned = []
+        self.storage_backends = {"RemoteBackend": self}
 
     def batched_contains(self, keys, search_range=None, pin=False):
         keys = list(keys)
@@ -302,6 +313,13 @@ class _RecordingRemoteSampleStorageManager:
 
     def touch_cache(self):
         return None
+
+    def get_active_storage_backends(self, location=None, search_range=None):
+        if location and location != "RemoteBackend":
+            return
+        if search_range and "RemoteBackend" not in search_range:
+            return
+        yield "RemoteBackend", self
 
 
 def _sampled_keys_for_chunk(token_db, chunk_index, num_layers=4):
@@ -374,6 +392,23 @@ def test_sampled_lookup_can_select_partial_tail_chunk() -> None:
     ]
 
 
+def test_sampled_lookup_without_remote_falls_back_to_local_cpu() -> None:
+    token_db = _FakeLookupTokenDatabase()
+    latent_layers = token_db._make_key_by_hash(0xABC, kv_group=0).split_layers(2)
+    index_layers = token_db._make_key_by_hash(0xABC, kv_group=1).split_layers(2)
+    engine = _make_dsa_lookup_engine([*latent_layers, *index_layers])
+    engine.storage_manager.storage_backends = {
+        "LocalCPUBackend": engine.storage_manager
+    }
+    engine.config.experimental_sampled_layerwise_lookup = True
+
+    assert engine.lookup([1, 2, 3], lookup_id="req", pin=True) == 3
+    assert engine.lookup_pins["req"]["LocalCPUBackend"] == [
+        *latent_layers,
+        *index_layers,
+    ]
+
+
 def test_layerwise_lookup_requires_dsa_index_group_before_hit() -> None:
     token_db = _FakeLookupTokenDatabase()
     latent_layers = token_db._make_key_by_hash(0xABC, kv_group=0).split_layers(2)
@@ -436,13 +471,35 @@ def test_layerwise_lookup_unpins_current_partial_group_on_pin_race() -> None:
     ]
 
 
-def test_async_lookup_prefetch_layerwise_fails_closed_with_zero_hit() -> None:
-    class _FakeAsyncLookupServer:
-        def __init__(self):
-            self.responses = []
+class _FakeAsyncLookupServer:
+    def __init__(self):
+        self.responses = []
 
-        def send_response_to_scheduler(self, lookup_id, num_hit_tokens):
-            self.responses.append((lookup_id, num_hit_tokens))
+    def send_response_to_scheduler(self, lookup_id, num_hit_tokens):
+        self.responses.append((lookup_id, num_hit_tokens))
+
+
+async def _run_lookup_inline(func, *args, **kwargs):
+    return func(*args, **kwargs)
+
+
+def _submit_lookup_inline(coro, _loop):
+    asyncio.run(coro)
+    return SimpleNamespace()
+
+
+def _install_inline_async_lookup(monkeypatch) -> None:
+    monkeypatch.setattr(
+        "lmcache.v1.cache_engine.asyncio.to_thread",
+        _run_lookup_inline,
+    )
+    monkeypatch.setattr(
+        "lmcache.v1.cache_engine.asyncio.run_coroutine_threadsafe",
+        _submit_lookup_inline,
+    )
+
+
+def test_async_lookup_prefetch_layerwise_fails_closed_with_zero_hit() -> None:
 
     engine = object.__new__(LMCacheEngine)
     async_lookup_server = _FakeAsyncLookupServer()
@@ -462,20 +519,6 @@ def test_async_lookup_prefetch_layerwise_fails_closed_with_zero_hit() -> None:
 
 
 def test_async_sampled_layerwise_lookup_returns_remote_result(monkeypatch) -> None:
-    class _FakeAsyncLookupServer:
-        def __init__(self):
-            self.responses = []
-
-        def send_response_to_scheduler(self, lookup_id, num_hit_tokens):
-            self.responses.append((lookup_id, num_hit_tokens))
-
-    async def run_inline(func, *args, **kwargs):
-        return func(*args, **kwargs)
-
-    def submit_inline(coro, _loop):
-        asyncio.run(coro)
-        return SimpleNamespace()
-
     token_db = _FakeMultiChunkLookupTokenDatabase()
     first_keys = _sampled_keys_for_chunk(token_db, 0)
     tail_keys = _sampled_keys_for_chunk(token_db, 3)
@@ -483,14 +526,7 @@ def test_async_sampled_layerwise_lookup_returns_remote_result(monkeypatch) -> No
     async_lookup_server = _FakeAsyncLookupServer()
     engine.storage_manager.async_lookup_server = async_lookup_server
     engine.storage_manager.loop = object()
-    monkeypatch.setattr(
-        "lmcache.v1.cache_engine.asyncio.to_thread",
-        run_inline,
-    )
-    monkeypatch.setattr(
-        "lmcache.v1.cache_engine.asyncio.run_coroutine_threadsafe",
-        submit_inline,
-    )
+    _install_inline_async_lookup(monkeypatch)
 
     engine.async_lookup_and_prefetch(
         lookup_id="req",
@@ -500,6 +536,32 @@ def test_async_sampled_layerwise_lookup_returns_remote_result(monkeypatch) -> No
     )
 
     assert async_lookup_server.responses == [("req", 14)]
+
+
+def test_async_sampled_lookup_without_remote_falls_back_to_local_cpu(
+    monkeypatch,
+) -> None:
+    token_db = _FakeLookupTokenDatabase()
+    latent_layers = token_db._make_key_by_hash(0xABC, kv_group=0).split_layers(2)
+    index_layers = token_db._make_key_by_hash(0xABC, kv_group=1).split_layers(2)
+    engine = _make_dsa_lookup_engine([*latent_layers, *index_layers])
+    engine.storage_manager.storage_backends = {
+        "LocalCPUBackend": engine.storage_manager
+    }
+    engine.config.experimental_sampled_layerwise_lookup = True
+    async_lookup_server = _FakeAsyncLookupServer()
+    engine.storage_manager.async_lookup_server = async_lookup_server
+    engine.storage_manager.loop = object()
+    _install_inline_async_lookup(monkeypatch)
+
+    engine.async_lookup_and_prefetch(
+        lookup_id="req",
+        hashes=[0xABC],
+        offsets=[3],
+        pin=False,
+    )
+
+    assert async_lookup_server.responses == [("req", 3)]
 
 
 class _CaptureTokenDatabase:
