@@ -14,6 +14,7 @@ from lmcache.v1.cache_engine import LMCacheEngine, LMCacheEngineBuilder
 from lmcache.v1.memory_management import (
     MemoryFormat,
     MemoryObjMetadata,
+    PagedTensorMemoryAllocator,
     TensorMemoryObj,
 )
 from lmcache.v1.shared_cpu_cache import (
@@ -24,6 +25,27 @@ from lmcache.v1.shared_cpu_cache import (
     SharedHandleEnvelope,
     SharedSlabMapping,
 )
+from lmcache.v1.storage_backend.connector.base_connector import RemoteConnector
+
+
+class _FakeRemoteConnector(RemoteConnector):
+    async def exists(self, key):  # pragma: no cover - not used by these tests
+        return False
+
+    def exists_sync(self, key):  # pragma: no cover - not used by these tests
+        return False
+
+    async def get(self, key):  # pragma: no cover - not used by these tests
+        return None
+
+    async def put(self, key, memory_obj):  # pragma: no cover - not used by these tests
+        return None
+
+    async def list(self):  # pragma: no cover - not used by these tests
+        return []
+
+    async def close(self):  # pragma: no cover - not used by these tests
+        return None
 
 
 def _make_key(kv_group: int = 0) -> CacheEngineKey:
@@ -636,9 +658,12 @@ class _FakeLocalCPUBackend:
     def __init__(self, *, free_bytes: int, hot_cache: dict):
         self.hot_cache = hot_cache
         self.cpu_lock = nullcontext()
+        pin_allocator = SimpleNamespace(
+            address_manager=_FakeAddressManager(free_bytes),
+        )
         self.memory_allocator = SimpleNamespace(
             buffer=torch.empty(1024, dtype=torch.uint8),
-            address_manager=_FakeAddressManager(free_bytes),
+            pin_allocator=pin_allocator,
             align_bytes=64,
         )
 
@@ -909,6 +934,18 @@ def test_runtime_capacity_details_exclude_required_hot_chunks_from_evictable():
     assert details["fits"] is True
 
 
+def test_capacity_snapshot_reads_nested_pin_allocator_free_space():
+    engine = _make_engine_for_sparse_capacity(max_local_cpu_size=1)
+    backend = _FakeLocalCPUBackend(free_bytes=768, hot_cache={})
+    engine._shared_local_cpu_backend = lambda: backend
+
+    snapshot = engine._shared_cpu_capacity_snapshot()
+
+    assert snapshot["slab_bytes"] == 1024
+    assert snapshot["free_bytes"] == 768
+    assert snapshot["allocated_bytes"] == 0
+
+
 def test_runtime_capacity_counts_non_shm_hot_hits_as_required_bytes():
     engine = _make_engine_for_sparse_capacity(max_local_cpu_size=1)
     hot_key = _make_key()
@@ -1110,6 +1147,87 @@ def test_shared_chunk_handle_preserves_key_and_cached_positions():
     assert decoded.offset == 128
     assert decoded.logical_size == 16
     assert decoded.physical_size == 64
+
+
+def test_shared_chunk_handle_uses_refreshed_partial_page_logical_size():
+    full_shape = torch.Size([32, 8])
+    partial_shape = torch.Size([19, 8])
+    dtype = torch.bfloat16
+    fmt = MemoryFormat.KV_T2D
+    full_bytes = full_shape.numel() * dtype.itemsize
+    partial_bytes = partial_shape.numel() * dtype.itemsize
+    tensor_buffer = torch.zeros(full_bytes * 2, dtype=torch.uint8, device="cpu")
+    allocator = PagedTensorMemoryAllocator(tensor_buffer, [full_shape], [dtype], fmt)
+
+    full = allocator.allocate(full_shape, dtype, fmt)
+    assert full is not None
+    allocator.free(full)
+
+    partial = allocator.allocate(partial_shape, dtype, fmt)
+    assert partial is not None
+
+    handle = SharedChunkHandle.from_memory_obj(
+        request_id="req-1",
+        phase="dense_prefix",
+        key=_make_key(),
+        layer_id=0,
+        kv_group=0,
+        chunk_index=0,
+        shm_name="/lmcache-test",
+        memory_obj=partial,
+        generation=7,
+        producer_rank=0,
+    )
+
+    assert handle.shape == partial_shape
+    assert handle.logical_size == partial_bytes
+    assert handle.logical_size == handle.shape.numel() * handle.dtype.itemsize
+
+    allocator.free(partial)
+    allocator.close()
+
+
+def test_shared_chunk_handle_uses_refreshed_remote_partial_chunk_size():
+    full_shape = torch.Size([2, 1, 256, 9, 8])
+    partial_tokens = 147
+    dtype = torch.bfloat16
+    full_bytes = full_shape.numel() * dtype.itemsize
+    single_token_size = full_bytes // full_shape[2]
+    partial_bytes = partial_tokens * single_token_size
+    tensor_buffer = torch.zeros(full_bytes * 2, dtype=torch.uint8, device="cpu")
+    allocator = PagedTensorMemoryAllocator(tensor_buffer, [full_shape], [dtype])
+
+    full = allocator.allocate(full_shape, dtype, MemoryFormat.KV_MLA_FMT)
+    assert full is not None
+    allocator.free(full)
+
+    memory_obj = allocator.allocate(full_shape, dtype, MemoryFormat.KV_MLA_FMT)
+    assert memory_obj is not None
+
+    connector = object.__new__(_FakeRemoteConnector)
+    connector.full_chunk_size_bytes = full_bytes
+    connector.single_token_size = single_token_size
+    memory_obj = connector.reshape_partial_chunk(memory_obj, partial_bytes)
+
+    handle = SharedChunkHandle.from_memory_obj(
+        request_id="req-1",
+        phase="dense_prefix",
+        key=_make_key(),
+        layer_id=0,
+        kv_group=0,
+        chunk_index=0,
+        shm_name="/lmcache-test",
+        memory_obj=memory_obj,
+        generation=7,
+        producer_rank=0,
+    )
+
+    assert handle.shape[2] == partial_tokens
+    assert handle.logical_size == partial_bytes
+    assert handle.logical_size == handle.shape.numel() * handle.dtype.itemsize
+
+    allocator.free(memory_obj)
+    allocator.close()
 
 
 def test_shared_chunk_handle_rejects_missing_required_field():

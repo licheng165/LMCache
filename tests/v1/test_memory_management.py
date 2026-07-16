@@ -142,6 +142,40 @@ def test_tensor_allocator(use_paging):
     allocator.close()
 
 
+def test_paged_allocator_refreshes_size_for_reused_partial_pages():
+    full_shape = torch.Size([32, 8])
+    partial_shape = torch.Size([19, 8])
+    dtype = torch.bfloat16
+    fmt = MemoryFormat.KV_T2D
+    full_bytes = full_shape.numel() * dtype.itemsize
+    partial_bytes = partial_shape.numel() * dtype.itemsize
+    tensor_buffer = torch.zeros(full_bytes * 2, dtype=torch.uint8, device="cpu")
+
+    allocator = PagedTensorMemoryAllocator(tensor_buffer, [full_shape], [dtype], fmt)
+
+    full = allocator.allocate(full_shape, dtype, fmt)
+    assert full is not None
+    assert full.get_size() == full_bytes
+    allocator.free(full)
+
+    partial = allocator.allocate(partial_shape, dtype, fmt)
+    assert partial is not None
+    assert partial.get_shape() == partial_shape
+    assert partial.get_size() == partial_bytes
+    assert partial.raw_data.numel() == partial_bytes
+    allocator.free(partial)
+
+    batched = allocator.batched_allocate(partial_shape, dtype, 1, fmt)
+    assert batched is not None
+    assert batched[0].get_shape() == partial_shape
+    assert batched[0].get_size() == partial_bytes
+    assert batched[0].raw_data.numel() == partial_bytes
+    allocator.batched_free(batched)
+
+    assert allocator.memcheck()
+    allocator.close()
+
+
 @pytest.mark.parametrize(
     "alloc_cls",
     [
