@@ -387,12 +387,14 @@ class StorageManager:
         memory_objs: List[MemoryObj],
         transfer_spec=None,
         location: Optional[str] = None,
-    ) -> None:
+    ) -> list[Future]:
         """
         Non-blocking function to batched put the memory objects into the
         storage backends.
         Do not store if the same object is being stored (handled here by
         storage manager) or has been stored (handled by storage backend).
+
+        Returns futures for backends that require persistence completion.
         """
         # The dictionary from backend cname to objects and keys
         obj_dict: dict[
@@ -407,6 +409,7 @@ class StorageManager:
             memory_objs,
         )
 
+        required_futures: list[Future] = []
         for backend_name, backend in self.storage_backends.items():
             if location and backend_name != location:
                 continue
@@ -426,11 +429,18 @@ class StorageManager:
             # NOTE: the handling of exists_in_put_tasks
             # is done in the backend
             ks, objs = obj_dict[cname]
-            backend.batched_submit_put_task(ks, objs, transfer_spec=transfer_spec)
+            requires_completion = backend.requires_put_completion()
+            submitted = backend.batched_submit_put_task(
+                ks, objs, transfer_spec=transfer_spec
+            )
+            if requires_completion and submitted:
+                required_futures.extend(submitted)
 
-        for cname, (ks, objs) in obj_dict.items():
+        for _, objs in obj_dict.values():
             for memory_obj in objs:
                 memory_obj.ref_count_down()
+
+        return required_futures
 
     def get(
         self,

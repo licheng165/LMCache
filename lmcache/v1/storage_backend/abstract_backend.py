@@ -65,6 +65,10 @@ class StorageBackendInterface(metaclass=abc.ABCMeta):
         """
         raise NotImplementedError
 
+    def requires_put_completion(self) -> bool:
+        """Whether callers must wait for this backend's put futures."""
+        return False
+
     # NOTE (Jiayi): Using batched interface allows the underlying implementation
     # have more flexibility to do optimizations.
     @abc.abstractmethod

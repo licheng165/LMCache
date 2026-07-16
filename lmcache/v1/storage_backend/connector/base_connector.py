@@ -277,6 +277,10 @@ class RemoteConnector(metaclass=abc.ABCMeta):
         """
         return False
 
+    def requires_put_completion(self) -> bool:
+        """Whether callers must wait for remote persistence."""
+        return False
+
     async def batched_put(
         self, keys: List[CacheEngineKey], memory_objs: List[MemoryObj]
     ):

@@ -206,6 +206,12 @@ class RemoteBackend(StorageBackendInterface):
         with self.lock:
             return key in self.put_tasks
 
+    def requires_put_completion(self) -> bool:
+        return (
+            self.connection is not None
+            and self.connection.requires_put_completion()
+        )
+
     def put_callback(self, future: Future, key: CacheEngineKey):
         with self.lock:
             self.put_tasks.discard(key)
@@ -281,7 +287,7 @@ class RemoteBackend(StorageBackendInterface):
         memory_objs: List[MemoryObj],
         transfer_spec: Any = None,
         on_complete_callback: Optional[Callable[[CacheEngineKey], None]] = None,
-    ) -> None:
+    ) -> Optional[List[Future]]:
         """
         Submit batched put tasks to store KV caches to remote storage.
 
@@ -292,10 +298,10 @@ class RemoteBackend(StorageBackendInterface):
             logger.warning(
                 "Connection is None in batched_submit_put_task, returning None"
             )
-            return
+            return None
         if self.connection.support_batched_put():
             if self._mla_worker_id_as0_mode:
-                return
+                return None
 
             # First, increment reference counts for all objects
             for memory_obj in memory_objs:
@@ -328,11 +334,18 @@ class RemoteBackend(StorageBackendInterface):
                 self.loop,
             )
             future.add_done_callback(batched_done_callback)
+            return [future] if self.requires_put_completion() else None
         else:
+            futures: List[Future] = []
             for key, memory_obj in zip(keys, memory_objs, strict=False):
-                self.submit_put_task(
-                    key, memory_obj, on_complete_callback=on_complete_callback
+                futures.append(
+                    self.submit_put_task(
+                        key,
+                        memory_obj,
+                        on_complete_callback=on_complete_callback,
+                    )
                 )
+            return futures if self.requires_put_completion() else None
 
     @_lmcache_nvtx_annotate
     def get_blocking(
