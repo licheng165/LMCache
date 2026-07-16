@@ -4,6 +4,7 @@ from collections import defaultdict
 from dataclasses import replace
 from contextlib import nullcontext
 from types import SimpleNamespace
+import asyncio
 import sys
 
 import pytest
@@ -26,6 +27,7 @@ from lmcache.v1.shared_cpu_cache import (
     SharedSlabMapping,
 )
 from lmcache.v1.storage_backend.connector.base_connector import RemoteConnector
+from lmcache.v1.storage_backend.local_cpu_backend import LocalCPUPrefixGetResult
 
 
 class _FakeRemoteConnector(RemoteConnector):
@@ -230,6 +232,31 @@ class _FakeLookupTokenDatabase:
         )
 
 
+class _FakeMultiChunkLookupTokenDatabase(_FakeLookupTokenDatabase):
+    chunk_ends = (4, 8, 12, 14)
+
+    def process_tokens(
+        self,
+        tokens=None,
+        hashes=None,
+        offsets=None,
+        request_configs=None,
+    ):
+        del tokens, hashes, offsets
+        start = 0
+        for chunk_index, end in enumerate(self.chunk_ends):
+            yield (
+                start,
+                end,
+                self._make_key_by_hash(
+                    0x100 + chunk_index,
+                    request_configs,
+                    kv_group=0,
+                ),
+            )
+            start = end
+
+
 class _FakeLookupStatsMonitor:
     def on_lookup_request(self, _num_tokens):
         return object()
@@ -251,6 +278,100 @@ def _make_dsa_lookup_engine(present):
     engine.num_layers = 2
     engine.config = SimpleNamespace(dsa_two_groups=True)
     return engine
+
+
+class _RecordingRemoteSampleStorageManager:
+    def __init__(self, present):
+        self.present = set(present)
+        self.calls = []
+        self.unpinned = []
+
+    def batched_contains(self, keys, search_range=None, pin=False):
+        keys = list(keys)
+        self.calls.append((keys, search_range, pin))
+        hit = 0
+        for key in keys:
+            if key not in self.present:
+                break
+            hit += 1
+        mapping = {"RemoteBackend": keys[:hit]} if hit else {}
+        return hit, mapping
+
+    def batched_unpin(self, keys, locations=None):
+        self.unpinned.append((list(keys), locations))
+
+    def touch_cache(self):
+        return None
+
+
+def _sampled_keys_for_chunk(token_db, chunk_index, num_layers=4):
+    sampled = []
+    for kv_group in (0, 1):
+        group_key = token_db._make_key_by_hash(
+            0x100 + chunk_index,
+            kv_group=kv_group,
+        )
+        layer_keys = group_key.split_layers(num_layers)
+        sampled.extend((layer_keys[0], layer_keys[-1]))
+    return sampled
+
+
+def _make_sampled_lookup_engine(present):
+    engine = _make_dsa_lookup_engine([])
+    engine.token_database = _FakeMultiChunkLookupTokenDatabase()
+    engine.storage_manager = _RecordingRemoteSampleStorageManager(present)
+    engine.retrieve_locations = ["LocalCPUBackend"]
+    engine.num_layers = 4
+    engine.config.experimental_sampled_layerwise_lookup = True
+    return engine
+
+
+def test_sampled_lookup_uses_remote_first_and_reverse_tail_probes() -> None:
+    token_db = _FakeMultiChunkLookupTokenDatabase()
+    first_keys = _sampled_keys_for_chunk(token_db, 0)
+    winner_keys = _sampled_keys_for_chunk(token_db, 2)
+    engine = _make_sampled_lookup_engine([*first_keys, *winner_keys])
+
+    assert engine.lookup(list(range(14)), lookup_id="req", pin=True) == 12
+
+    calls = engine.storage_manager.calls
+    assert [call[0] for call in calls[:3]] == [
+        first_keys,
+        _sampled_keys_for_chunk(token_db, 3),
+        _sampled_keys_for_chunk(token_db, 2),
+    ]
+    assert all(call[1] == ["RemoteBackend"] for call in calls)
+    assert calls[-1] == (
+        [*first_keys, *winner_keys],
+        ["RemoteBackend"],
+        True,
+    )
+    assert engine.lookup_pins["req"]["RemoteBackend"] == [
+        *first_keys,
+        *winner_keys,
+    ]
+
+
+def test_sampled_lookup_returns_zero_after_first_chunk_miss() -> None:
+    engine = _make_sampled_lookup_engine([])
+
+    assert engine.lookup(list(range(14)), lookup_id="req", pin=False) == 0
+
+    assert len(engine.storage_manager.calls) == 1
+    assert engine.storage_manager.calls[0][1] == ["RemoteBackend"]
+
+
+def test_sampled_lookup_can_select_partial_tail_chunk() -> None:
+    token_db = _FakeMultiChunkLookupTokenDatabase()
+    first_keys = _sampled_keys_for_chunk(token_db, 0)
+    tail_keys = _sampled_keys_for_chunk(token_db, 3)
+    engine = _make_sampled_lookup_engine([*first_keys, *tail_keys])
+
+    assert engine.lookup(list(range(14)), lookup_id="req", pin=False) == 14
+    assert [call[0] for call in engine.storage_manager.calls] == [
+        first_keys,
+        tail_keys,
+    ]
 
 
 def test_layerwise_lookup_requires_dsa_index_group_before_hit() -> None:
@@ -338,6 +459,47 @@ def test_async_lookup_prefetch_layerwise_fails_closed_with_zero_hit() -> None:
     )
 
     assert async_lookup_server.responses == [("req", 0)]
+
+
+def test_async_sampled_layerwise_lookup_returns_remote_result(monkeypatch) -> None:
+    class _FakeAsyncLookupServer:
+        def __init__(self):
+            self.responses = []
+
+        def send_response_to_scheduler(self, lookup_id, num_hit_tokens):
+            self.responses.append((lookup_id, num_hit_tokens))
+
+    async def run_inline(func, *args, **kwargs):
+        return func(*args, **kwargs)
+
+    def submit_inline(coro, _loop):
+        asyncio.run(coro)
+        return SimpleNamespace()
+
+    token_db = _FakeMultiChunkLookupTokenDatabase()
+    first_keys = _sampled_keys_for_chunk(token_db, 0)
+    tail_keys = _sampled_keys_for_chunk(token_db, 3)
+    engine = _make_sampled_lookup_engine([*first_keys, *tail_keys])
+    async_lookup_server = _FakeAsyncLookupServer()
+    engine.storage_manager.async_lookup_server = async_lookup_server
+    engine.storage_manager.loop = object()
+    monkeypatch.setattr(
+        "lmcache.v1.cache_engine.asyncio.to_thread",
+        run_inline,
+    )
+    monkeypatch.setattr(
+        "lmcache.v1.cache_engine.asyncio.run_coroutine_threadsafe",
+        submit_inline,
+    )
+
+    engine.async_lookup_and_prefetch(
+        lookup_id="req",
+        hashes=[0x100, 0x101, 0x102, 0x103],
+        offsets=[4, 4, 4, 2],
+        pin=False,
+    )
+
+    assert async_lookup_server.responses == [("req", 14)]
 
 
 class _CaptureTokenDatabase:
@@ -1000,7 +1162,9 @@ def test_runtime_capacity_details_report_failure_before_materialization():
         chunk_token_lengths=[1],
     )
 
-    assert details["required_bytes"] == engine._shared_cpu_estimated_physical_chunk_bytes(
+    assert details[
+        "required_bytes"
+    ] == engine._shared_cpu_estimated_physical_chunk_bytes(
         0,
         num_tokens=1,
     )
@@ -1040,6 +1204,99 @@ def test_rank0_resolver_rematerializes_non_shm_hot_cache_hit():
     assert materialized_from == [hot_obj]
     assert hot_obj.ref_count_down_count == 1
     assert materialized_obj.is_pinned
+
+
+def test_rank0_resolver_scatters_remote_suffix_in_token_order():
+    keys = [replace(_make_key(), chunk_hash=0x200 + i) for i in range(4)]
+    local_first = _FakeResolvableMemoryObj()
+    remote_second = _FakeResolvableMemoryObj()
+    remote_third = _FakeResolvableMemoryObj()
+    remote_fourth = _FakeResolvableMemoryObj()
+    staged_second = _FakeResolvableMemoryObj()
+    staged_third = _FakeResolvableMemoryObj()
+    staged_fourth = _FakeResolvableMemoryObj()
+
+    class _MissingLocalBackend:
+        def get_blocking(self, _key):
+            return None
+
+    class _RemoteStorageManager:
+        def __init__(self):
+            self.calls = []
+
+        def batched_get(self, fetch_keys, location=None):
+            self.calls.append((list(fetch_keys), location))
+            return [remote_second, remote_third, remote_fourth]
+
+    storage_manager = _RemoteStorageManager()
+    engine = object.__new__(LMCacheEngine)
+    engine.storage_manager = storage_manager
+    engine._shared_local_cpu_backend = lambda: _MissingLocalBackend()
+    shared_objs = {
+        local_first,
+        staged_second,
+        staged_third,
+        staged_fourth,
+    }
+    engine._is_rank0_shared_mem_obj = lambda obj: obj in shared_objs
+    engine._validate_rank0_shared_mem_obj = lambda *args, **kwargs: None
+    staged_by_source = {
+        remote_second: staged_second,
+        remote_third: staged_third,
+        remote_fourth: staged_fourth,
+    }
+    engine._materialize_shared_rank0_copy = lambda **kwargs: staged_by_source[
+        kwargs["src_obj"]
+    ]
+
+    resolved = engine._resolve_shared_rank0_layer_mem_objs(
+        req_id="req-1",
+        phase="sparse_decode_bootstrap",
+        layer_id=0,
+        kv_group=0,
+        keys_layer=keys,
+        local_prefix=LocalCPUPrefixGetResult(
+            [local_first],
+            [1, 2, 3],
+            keys[1:],
+        ),
+    )
+
+    assert resolved == [
+        local_first,
+        staged_second,
+        staged_third,
+        staged_fourth,
+    ]
+    assert storage_manager.calls == [(keys[1:], "RemoteBackend")]
+    assert remote_second.ref_count_down_count == 1
+    assert remote_third.ref_count_down_count == 1
+    assert remote_fourth.ref_count_down_count == 1
+    assert all(obj.is_pinned for obj in resolved)
+
+
+def test_rank0_resolver_releases_prefetched_hits_on_alignment_error():
+    keys = [replace(_make_key(), chunk_hash=0x300 + i) for i in range(2)]
+    local_obj = _FakeResolvableMemoryObj()
+    engine = object.__new__(LMCacheEngine)
+    engine.storage_manager = object()
+    engine._shared_local_cpu_backend = lambda: object()
+
+    with pytest.raises(ValueError, match="not aligned"):
+        engine._resolve_shared_rank0_layer_mem_objs(
+            req_id="req-1",
+            phase="sparse_decode_bootstrap",
+            layer_id=0,
+            kv_group=0,
+            keys_layer=keys,
+            local_prefix=LocalCPUPrefixGetResult(
+                [local_obj],
+                [0],
+                [keys[0]],
+            ),
+        )
+
+    assert local_obj.ref_count_down_count == 1
 
 
 def test_rank0_handle_builder_rejects_partial_publication():

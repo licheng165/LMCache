@@ -107,6 +107,11 @@ _CONFIG_DEFINITIONS: dict[str, dict[str, Any]] = {
         "default": False,
         "env_converter": _to_bool,
     },
+    "experimental_sampled_layerwise_lookup": {
+        "type": bool,
+        "default": False,
+        "env_converter": _to_bool,
+    },
     # Blending configurations
     "enable_blending": {
         "type": bool,
@@ -616,15 +621,21 @@ def _validate_config(self):
             getattr(self, "enable_shared_cpu_cache", False),
         )
     )
+    shared_cpu_cache_name = extra_config.get(
+        "shared_cpu_cache_name",
+        getattr(self, "shared_cpu_cache_name", None),
+    )
+    shared_cpu_cache_size_gb = extra_config.get(
+        "shared_cpu_cache_size_gb",
+        getattr(self, "shared_cpu_cache_size_gb", None),
+    )
     shared_cpu_config_context = (
         " shared_cpu_config={"
         f"enable_shared_cpu_cache={enable_shared_cpu_cache}, "
         f"local_cpu={self.local_cpu}, "
         f"max_local_cpu_size={self.max_local_cpu_size}, "
-        "shared_cpu_cache_name="
-        f"{extra_config.get('shared_cpu_cache_name', getattr(self, 'shared_cpu_cache_name', None))!r}, "
-        "shared_cpu_cache_size_gb="
-        f"{extra_config.get('shared_cpu_cache_size_gb', getattr(self, 'shared_cpu_cache_size_gb', None))!r}, "
+        f"shared_cpu_cache_name={shared_cpu_cache_name!r}, "
+        f"shared_cpu_cache_size_gb={shared_cpu_cache_size_gb!r}, "
         f"shm_name={extra_config.get('shm_name')!r}"
         "}"
     )
@@ -641,25 +652,35 @@ def _validate_config(self):
                 "on rank0."
                 + shared_cpu_config_context
             )
-        shared_size_gb = extra_config.get(
-            "shared_cpu_cache_size_gb",
-            getattr(self, "shared_cpu_cache_size_gb", None),
-        )
+        shared_size_gb = shared_cpu_cache_size_gb
         if shared_size_gb is not None and float(shared_size_gb) <= 0:
             raise ValueError(
                 "shared_cpu_cache_size_gb must be positive when set."
                 + shared_cpu_config_context
             )
-        shared_name = extra_config.get(
-            "shared_cpu_cache_name",
-            getattr(self, "shared_cpu_cache_name", None),
-        )
+        shared_name = shared_cpu_cache_name
         shm_name = extra_config.get("shm_name")
         if shared_name and shm_name and shared_name != shm_name:
             raise ValueError(
                 "shared_cpu_cache_name and shm_name refer to the same shared "
                 "slab and must not conflict."
                 + shared_cpu_config_context
+            )
+
+    if self.experimental_sampled_layerwise_lookup:
+        required_flags = {
+            "use_layerwise": self.use_layerwise,
+            "enable_sparse_attention": self.enable_sparse_attention,
+            "dsa_two_groups": self.dsa_two_groups,
+            "enable_shared_cpu_cache": enable_shared_cpu_cache,
+        }
+        missing_flags = [
+            name for name, enabled in required_flags.items() if not enabled
+        ]
+        if missing_flags:
+            raise ValueError(
+                "experimental_sampled_layerwise_lookup requires "
+                + ", ".join(f"{name}=true" for name in missing_flags)
             )
 
     if self.enable_p2p:

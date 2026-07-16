@@ -509,6 +509,24 @@ class MooncakestoreConnector(RemoteConnector):
         """
         return True
 
+    def support_batched_contains(self) -> bool:
+        return bool(
+            getattr(self.config, "experimental_sampled_layerwise_lookup", False)
+            and callable(getattr(self.store, "batch_is_exist", None))
+        )
+
+    def batched_contains(self, keys: List[CacheEngineKey]) -> int:
+        if not keys:
+            return 0
+
+        results = self.store.batch_is_exist([key.to_string() for key in keys])
+        hit_count = 0
+        for result in results:
+            if result != 1:
+                break
+            hit_count += 1
+        return hit_count
+
     def support_batched_get_non_blocking(self) -> bool:
         """
         Mooncake only supports batched_get / batch_get_into, not per-key get().

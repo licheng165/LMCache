@@ -8,6 +8,7 @@ after remote fetch, and store scenarios (CPU + Mooncake).
 
 # Standard
 from collections import OrderedDict
+from types import SimpleNamespace
 import asyncio
 
 # Third Party
@@ -124,7 +125,9 @@ def _make_layer_key(layer_id: int, chunk_hash: int = 0xabc) -> LayerCacheEngineK
     )
 
 
-def _make_chunk_keys(num_layers: int, num_chunks: int = 1) -> list[list[LayerCacheEngineKey]]:
+def _make_chunk_keys(
+    num_layers: int, num_chunks: int = 1
+) -> list[list[LayerCacheEngineKey]]:
     """Layer-major keys: keys[layer_id][chunk_idx]."""
     keys_per_layer: list[list[LayerCacheEngineKey]] = []
     for layer_id in range(num_layers):
@@ -456,3 +459,30 @@ class TestMooncakeConnectorBatchedGetNonBlockingFallback:
         assert len(result) == 2
         assert result[0].obj_id == 1
         assert result[1].obj_id == 2
+
+
+class TestMooncakeConnectorBatchedContains:
+    def test_uses_batch_is_exist_with_prefix_semantics(self):
+        from lmcache.v1.storage_backend.connector.mooncakestore_connector import (
+            MooncakestoreConnector,
+        )
+
+        class _Store:
+            def __init__(self):
+                self.keys = []
+
+            def batch_is_exist(self, keys):
+                self.keys = list(keys)
+                return [1, 1, 0, 1]
+
+        conn = object.__new__(MooncakestoreConnector)
+        conn.store = _Store()
+        keys = [_make_layer_key(layer_id) for layer_id in range(4)]
+
+        conn.config = SimpleNamespace(experimental_sampled_layerwise_lookup=False)
+        assert not conn.support_batched_contains()
+
+        conn.config.experimental_sampled_layerwise_lookup = True
+        assert conn.support_batched_contains()
+        assert conn.batched_contains(keys) == 2
+        assert conn.store.keys == [key.to_string() for key in keys]

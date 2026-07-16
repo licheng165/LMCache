@@ -14,10 +14,12 @@ from lmcache.v1.lookup_client.mooncake_lookup_client import MooncakeLookupClient
 class _FakeStore:
     def __init__(self, rets=None):
         self.keys = None
+        self.calls = []
         self.rets = rets
 
     def batch_is_exist(self, keys):
         self.keys = keys
+        self.calls.append(list(keys))
         return self.rets if self.rets is not None else [1 for _ in keys]
 
 
@@ -50,6 +52,48 @@ class _FakeTokenDatabase:
             request_configs=request_configs,
             kv_group=kv_group,
         )
+
+
+class _FakeMultiChunkTokenDatabase(_FakeTokenDatabase):
+    chunk_ends = (4, 8, 12, 14)
+
+    def process_tokens(self, token_ids, request_configs=None):
+        del token_ids
+        start = 0
+        for chunk_index, end in enumerate(self.chunk_ends):
+            yield (
+                start,
+                end,
+                self._make_key_by_hash(
+                    0x100 + chunk_index,
+                    request_configs,
+                    kv_group=0,
+                ),
+            )
+            start = end
+
+
+class _PresentStore(_FakeStore):
+    def __init__(self, present):
+        super().__init__()
+        self.present = set(present)
+
+    def batch_is_exist(self, keys):
+        self.keys = keys
+        self.calls.append(list(keys))
+        return [1 if key in self.present else 0 for key in keys]
+
+
+def _sampled_string_keys(token_db, chunk_index, num_layers=4):
+    sampled = []
+    for kv_group in (0, 1):
+        group_key = token_db._make_key_by_hash(
+            0x100 + chunk_index,
+            kv_group=kv_group,
+        )
+        layer_keys = group_key.split_layers(num_layers)
+        sampled.extend((layer_keys[0].to_string(), layer_keys[-1].to_string()))
+    return sampled
 
 
 def test_mooncake_lookup_passes_request_configs_to_cache_keys():
@@ -104,3 +148,25 @@ def test_mooncake_lookup_layerwise_checks_all_layers_and_groups():
 
     client.store = _FakeStore(rets=[1, 1, 1, 1])
     assert client.lookup([1, 2, 3]) == 3
+
+
+def test_mooncake_sampled_lookup_reverse_scans_first_and_last_layers():
+    token_db = _FakeMultiChunkTokenDatabase(kv_group=0)
+    first_keys = _sampled_string_keys(token_db, 0)
+    winner_keys = _sampled_string_keys(token_db, 2)
+    client = MooncakeLookupClient.__new__(MooncakeLookupClient)
+    client.config = SimpleNamespace(
+        dsa_two_groups=True,
+        use_layerwise=True,
+        experimental_sampled_layerwise_lookup=True,
+    )
+    client.metadata = SimpleNamespace(kv_shape=(4, 1, 256, 1, 1))
+    client.store = _PresentStore([*first_keys, *winner_keys])
+    client.token_database = token_db
+
+    assert client.lookup(list(range(14))) == 12
+    assert client.store.calls == [
+        first_keys,
+        _sampled_string_keys(token_db, 3),
+        winner_keys,
+    ]

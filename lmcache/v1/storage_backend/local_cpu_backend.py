@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # Standard
 from concurrent.futures import Future
+from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Callable, List, Optional, Sequence, Union
 import threading
 import time
@@ -33,6 +34,37 @@ if TYPE_CHECKING:
     from lmcache.v1.cache_controller.worker import LMCacheWorker
 
 logger = init_logger(__name__)
+
+
+@dataclass
+class LocalCPUPrefixGetResult:
+    local_memory_objs: List[Optional[MemoryObj]]
+    remote_positions: List[int]
+    remote_keys: List[CacheEngineKey]
+
+    def validate(self, keys: Sequence[CacheEngineKey]) -> None:
+        local_count = len(self.local_memory_objs)
+        expected_remote_positions = list(range(local_count, len(keys)))
+        if (
+            local_count > len(keys)
+            or any(memory_obj is None for memory_obj in self.local_memory_objs)
+            or self.remote_positions != expected_remote_positions
+            or self.remote_keys != list(keys[local_count:])
+        ):
+            raise ValueError("LocalCPU prefix result is not aligned with its keys")
+
+    def take_local(self, index: int) -> Optional[MemoryObj]:
+        if index >= len(self.local_memory_objs):
+            return None
+        memory_obj = self.local_memory_objs[index]
+        self.local_memory_objs[index] = None
+        return memory_obj
+
+    def release(self) -> None:
+        for index in range(len(self.local_memory_objs) - 1, -1, -1):
+            memory_obj = self.take_local(index)
+            if memory_obj is not None:
+                memory_obj.ref_count_down()
 
 
 class LocalCPUBackend(AllocatorBackendInterface):
@@ -212,6 +244,25 @@ class LocalCPUBackend(AllocatorBackendInterface):
             # ref count up themselves
             memory_obj.ref_count_up()
             return memory_obj
+
+    def batched_get_prefix_with_misses(
+        self,
+        keys: List[CacheEngineKey],
+    ) -> LocalCPUPrefixGetResult:
+        """Get the local prefix and report the remaining remote suffix."""
+        local_memory_objs: List[Optional[MemoryObj]] = []
+        with self.cpu_lock:
+            for position, key in enumerate(keys):
+                memory_obj = self.hot_cache.get(key)
+                if memory_obj is None:
+                    return LocalCPUPrefixGetResult(
+                        local_memory_objs,
+                        list(range(position, len(keys))),
+                        list(keys[position:]),
+                    )
+                memory_obj.ref_count_up()
+                local_memory_objs.append(memory_obj)
+        return LocalCPUPrefixGetResult(local_memory_objs, [], [])
 
     async def batched_get_non_blocking(
         self,

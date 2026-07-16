@@ -57,11 +57,16 @@ from lmcache.v1.memory_management import (  # noqa: E501
 )
 from lmcache.v1.metadata import LMCacheMetadata
 from lmcache.v1.pin_monitor import PinMonitor
+from lmcache.v1.sampled_lookup import (
+    find_last_sampled_hit,
+    first_last_layer_keys,
+)
 from lmcache.v1.shared_cpu_cache import (
     SharedChunkHandle,
     SharedHandleEnvelope,
     SharedSlabMapping,
 )
+from lmcache.v1.storage_backend.local_cpu_backend import LocalCPUPrefixGetResult
 from lmcache.v1.storage_backend.storage_manager import StorageManager
 from lmcache.v1.system_detection import NUMADetector, NUMAMapping
 from lmcache.v1.token_database import (
@@ -1221,6 +1226,92 @@ class LMCacheEngine:
             return [0, 1]
         return [0]
 
+    def _use_sampled_scheduler_lookup(self) -> bool:
+        config = getattr(self, "config", None)
+        return bool(
+            getattr(config, "experimental_sampled_layerwise_lookup", False)
+            and getattr(self, "use_layerwise", False)
+        )
+
+    def _sampled_scheduler_keys(
+        self,
+        base_key: CacheEngineKey,
+        *,
+        request_configs: Optional[dict],
+    ) -> list[CacheEngineKey]:
+        group_keys = [
+            self._lookup_key_for_kv_group(
+                base_key,
+                kv_group=kv_group,
+                request_configs=request_configs,
+            )
+            for kv_group in self._layerwise_lookup_kv_groups()
+        ]
+        return first_last_layer_keys(group_keys, self.num_layers)
+
+    def _sampled_scheduler_lookup(
+        self,
+        chunks: list[tuple[int, CacheEngineKey]],
+        *,
+        lookup_id: Optional[str],
+        pin: bool,
+        request_configs: Optional[dict],
+    ) -> int:
+        if not chunks:
+            return 0
+        assert self.storage_manager is not None
+
+        def remote_exists(keys: list[CacheEngineKey]) -> bool:
+            if not keys:
+                return False
+            hits, _ = self.storage_manager.batched_contains(
+                keys, ["RemoteBackend"], False
+            )
+            return hits == len(keys)
+
+        def chunk_exists(index: int) -> bool:
+            return remote_exists(
+                self._sampled_scheduler_keys(
+                    chunks[index][1],
+                    request_configs=request_configs,
+                )
+            )
+
+        winner_index = find_last_sampled_hit(
+            len(chunks),
+            chunk_exists,
+        )
+        if winner_index is None:
+            return 0
+
+        if pin:
+            assert lookup_id is not None, "lookup_id is required when pin is True"
+            first_keys = self._sampled_scheduler_keys(
+                chunks[0][1],
+                request_configs=request_configs,
+            )
+            winner_keys = self._sampled_scheduler_keys(
+                chunks[winner_index][1],
+                request_configs=request_configs,
+            )
+            pin_keys = list(dict.fromkeys([*first_keys, *winner_keys]))
+            hits, block_mapping = self.storage_manager.batched_contains(
+                pin_keys,
+                ["RemoteBackend"],
+                True,
+            )
+            if hits != len(pin_keys):
+                for location, location_keys in block_mapping.items():
+                    self.storage_manager.batched_unpin(
+                        location_keys,
+                        [location],
+                    )
+                return 0
+            for location, location_keys in block_mapping.items():
+                self.lookup_pins[lookup_id][location].extend(location_keys)
+
+        return chunks[winner_index][0]
+
     def _lookup_key_for_kv_group(
         self,
         base_key: CacheEngineKey,
@@ -1230,7 +1321,7 @@ class LMCacheEngine:
     ) -> CacheEngineKey:
         if kv_group == base_key.kv_group:
             return base_key
-        make_key = getattr(self.token_database, "_make_key_by_hash")
+        make_key = self.token_database._make_key_by_hash
         return make_key(
             base_key.chunk_hash,
             request_configs,
@@ -1642,7 +1733,7 @@ class LMCacheEngine:
                 f"kv_group={kv_group}, chunk_index={chunk_index}, "
                 f"fmt={mem_obj.get_memory_format()}, expected={expected_fmt}"
             )
-        slab_size = int(getattr(allocator, "buffer").numel())
+        slab_size = int(allocator.buffer.numel())
         offset = int(mem_obj.metadata.address)
         physical_size = int(mem_obj.metadata.phy_size)
         logical_size = int(mem_obj.get_size())
@@ -1685,22 +1776,43 @@ class LMCacheEngine:
         layer_id: int,
         kv_group: int,
         keys_layer: list[CacheEngineKey],
-        chunk_locations: list[str],
+        chunk_locations: Optional[list[str]] = None,
+        local_prefix: Optional[LocalCPUPrefixGetResult] = None,
     ) -> list[MemoryObj]:
         """Resolve one layer into rank0 shm-backed LocalCPU MemoryObjs.
 
-        The resolver is intentionally rank0-only. It checks LocalCPU hot_cache
-        first for every chunk, and only asks StorageManager for misses. The
-        returned objects each carry one caller reference and one request pin.
+        The resolver is intentionally rank0-only. Its normal path checks every
+        chunk in LocalCPU before using the planned backend. A supplied
+        ``local_prefix`` instead preserves one LocalCPU-prefix/remote-suffix
+        probe. Returned objects carry one caller reference and one request pin.
         """
-        assert self.storage_manager is not None
-        local_cpu_backend = self._shared_local_cpu_backend()
-        if len(keys_layer) != len(chunk_locations):
-            raise ValueError(
-                "Shared CPU cache location metadata length mismatch: "
-                f"layer_id={layer_id}, kv_group={kv_group}, "
-                f"keys={len(keys_layer)}, locations={len(chunk_locations)}"
-            )
+        try:
+            assert self.storage_manager is not None
+            local_cpu_backend = self._shared_local_cpu_backend()
+            if local_prefix is not None:
+                if chunk_locations is not None:
+                    raise ValueError(
+                        "Shared CPU resolver cannot combine location metadata "
+                        "with a LocalCPU prefix result"
+                    )
+                local_prefix.validate(keys_layer)
+                local_count = len(local_prefix.local_memory_objs)
+                resolved_chunk_locations = ["LocalCPUBackend"] * local_count + [
+                    "RemoteBackend"
+                ] * len(local_prefix.remote_positions)
+            elif chunk_locations is None or len(keys_layer) != len(chunk_locations):
+                raise ValueError(
+                    "Shared CPU cache location metadata length mismatch: "
+                    f"layer_id={layer_id}, kv_group={kv_group}, "
+                    f"keys={len(keys_layer)}, "
+                    f"locations={len(chunk_locations or [])}"
+                )
+            else:
+                resolved_chunk_locations = chunk_locations
+        except Exception:
+            if local_prefix is not None:
+                local_prefix.release()
+            raise
 
         resolved: list[Optional[MemoryObj]] = [None] * len(keys_layer)
         grouped_positions: dict[str, list[int]] = defaultdict(list)
@@ -1709,9 +1821,13 @@ class LMCacheEngine:
 
         try:
             for chunk_index, (key, planned_location) in enumerate(
-                zip(keys_layer, chunk_locations, strict=True)
+                zip(keys_layer, resolved_chunk_locations, strict=True)
             ):
-                hot_obj = local_cpu_backend.get_blocking(key)
+                hot_obj = (
+                    local_prefix.take_local(chunk_index)
+                    if local_prefix is not None
+                    else local_cpu_backend.get_blocking(key)
+                )
                 if hot_obj is not None:
                     if self._is_rank0_shared_mem_obj(hot_obj):
                         logger.debug(
@@ -1767,6 +1883,9 @@ class LMCacheEngine:
                     location=location,
                 )
                 if len(fetched) != len(fetch_keys):
+                    for fetched_obj in fetched:
+                        if fetched_obj is not None:
+                            fetched_obj.ref_count_down()
                     raise ValueError(
                         "Shared CPU cache backend returned unexpected result count: "
                         f"request_id={req_id}, phase={phase}, layer_id={layer_id}, "
@@ -1788,16 +1907,18 @@ class LMCacheEngine:
                     else:
                         if hot_obj is not None:
                             hot_obj.ref_count_down()
-                        materialized_obj = self._materialize_shared_rank0_copy(
-                            key=key,
-                            src_obj=fetched_obj,
-                            req_id=req_id,
-                            phase=phase,
-                            layer_id=layer_id,
-                            kv_group=kv_group,
-                            chunk_index=pos,
-                        )
-                        fetched_obj.ref_count_down()
+                        try:
+                            materialized_obj = self._materialize_shared_rank0_copy(
+                                key=key,
+                                src_obj=fetched_obj,
+                                req_id=req_id,
+                                phase=phase,
+                                layer_id=layer_id,
+                                kv_group=kv_group,
+                                chunk_index=pos,
+                            )
+                        finally:
+                            fetched_obj.ref_count_down()
                         acquired.append(materialized_obj)
                         resolved[pos] = materialized_obj
 
@@ -1814,18 +1935,19 @@ class LMCacheEngine:
                         f"capacity={self._shared_cpu_capacity_snapshot()}"
                     )
 
-            mem_objs = [obj for obj in resolved if obj is not None]
-            if len(mem_objs) != len(keys_layer):
-                missing = [
-                    i for i, obj in enumerate(resolved)
-                    if obj is None
-                ]
+            missing = [i for i, obj in enumerate(resolved) if obj is None]
+            if missing:
                 raise ValueError(
                     "Shared CPU cache failed to resolve all required chunks: "
                     f"request_id={req_id}, phase={phase}, layer_id={layer_id}, "
                     f"kv_group={kv_group}, missing_positions={missing}, "
                     f"capacity={self._shared_cpu_capacity_snapshot()}"
                 )
+
+            mem_objs: list[MemoryObj] = []
+            for obj in resolved:
+                assert obj is not None
+                mem_objs.append(obj)
 
             for chunk_index, mem_obj in enumerate(mem_objs):
                 mem_obj.pin()
@@ -1844,6 +1966,8 @@ class LMCacheEngine:
                 mem_obj.unpin()
             for mem_obj in reversed(acquired):
                 mem_obj.ref_count_down()
+            if local_prefix is not None:
+                local_prefix.release()
             raise
 
     def _retrieve_layer_shared_rank0(
@@ -3303,6 +3427,19 @@ class LMCacheEngine:
 
             # TODO: support batched_contains when layerwise is enabled
             if self.use_layerwise:
+                if self._use_sampled_scheduler_lookup():
+                    sampled_chunks: list[tuple[int, CacheEngineKey]] = []
+                    for _, end, key in chunk_info_iterator:
+                        assert isinstance(key, CacheEngineKey)
+                        sampled_chunks.append((end, key))
+                    res = self._sampled_scheduler_lookup(
+                        sampled_chunks,
+                        lookup_id=lookup_id,
+                        pin=pin,
+                        request_configs=request_configs,
+                    )
+                    return res
+
                 lookup_kv_groups = self._layerwise_lookup_kv_groups()
                 for start, end, key in chunk_info_iterator:
                     assert isinstance(key, CacheEngineKey)
@@ -3500,6 +3637,49 @@ class LMCacheEngine:
         assert self.storage_manager is not None
 
         if self.use_layerwise:
+            if self._use_sampled_scheduler_lookup():
+                async_lookup_server = getattr(
+                    self.storage_manager,
+                    "async_lookup_server",
+                    None,
+                )
+                if async_lookup_server is None:
+                    logger.error(
+                        "Experimental sampled async lookup has no response "
+                        "server: lookup_id=%s",
+                        lookup_id,
+                    )
+                    return
+
+                async def run_sampled_lookup() -> None:
+                    try:
+                        result = await asyncio.to_thread(
+                            self.lookup,
+                            tokens=tokens,
+                            hashes=hashes,
+                            offsets=offsets,
+                            search_range=["RemoteBackend"],
+                            lookup_id=lookup_id,
+                            pin=pin,
+                            request_configs=request_configs,
+                        )
+                    except Exception:
+                        logger.exception(
+                            "Experimental sampled async lookup failed: lookup_id=%s",
+                            lookup_id,
+                        )
+                        result = 0
+                    async_lookup_server.send_response_to_scheduler(
+                        lookup_id,
+                        result,
+                    )
+
+                asyncio.run_coroutine_threadsafe(
+                    run_sampled_lookup(),
+                    self.storage_manager.loop,
+                )
+                return
+
             message = (
                 "Async lookup/prefetch is not supported with layerwise cache "
                 "keys. Falling back to recompute for this request instead of "
