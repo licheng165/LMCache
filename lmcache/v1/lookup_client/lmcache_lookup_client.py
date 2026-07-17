@@ -1,8 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
 # Standard
+from datetime import datetime, timezone
 from typing import Optional, Union
 import json
 import threading
+import time
 
 # Third Party
 import torch
@@ -19,6 +21,10 @@ from lmcache.v1.rpc.transport import (
 )
 
 logger = init_logger(__name__)
+
+
+def _utc_timestamp() -> str:
+    return datetime.now(timezone.utc).isoformat(timespec="milliseconds")
 
 
 class LMCacheLookupClient(LookupClientInterface):
@@ -119,17 +125,39 @@ class LMCacheLookupClient(LookupClientInterface):
                 lookup_id,
                 request_configs_str,
             ]
+            lookup_mode = "hashes"
+            lookup_input_count = len(hashes)
         else:
             msg_buf = [
                 token_ids,
                 lookup_id,
                 request_configs_str,
             ]
+            lookup_mode = "tokens"
+            lookup_input_count = len(token_ids)
 
+        rpc_started_at = _utc_timestamp()
+        rpc_started = time.perf_counter()
         responses = self.transport.send_and_recv_all(msg_buf)
+        rpc_elapsed_ms = (time.perf_counter() - rpc_started) * 1000
 
         # Transport returns empty list on failure
         if not responses:
+            logger.error(
+                "Lookup RPC returned no responses: failed_at=%s started_at=%s "
+                "elapsed_ms=%.3f caller=LMCacheLookupClient.lookup "
+                "lookup_id=%s mode=%s input_count=%s token_count=%s "
+                "transport=%s timeout_ms=%s",
+                _utc_timestamp(),
+                rpc_started_at,
+                rpc_elapsed_ms,
+                lookup_id,
+                lookup_mode,
+                lookup_input_count,
+                len(token_ids),
+                type(self.transport).__name__,
+                self.config.lookup_timeout_ms,
+            )
             return 0
 
         results = [int.from_bytes(resp, "big") for resp in responses]
@@ -185,6 +213,7 @@ class LMCacheLookupServer:
 
         def process_request():
             while self.running:
+                lookup_id = "<unparsed>"
                 try:
                     result = self.transport.recv_request()
                     if result is None:
@@ -229,6 +258,20 @@ class LMCacheLookupServer:
                         json.loads(request_configs_str) if request_configs_str else None
                     )
 
+                    lookup_started_at = _utc_timestamp()
+                    lookup_started = time.perf_counter()
+                    lookup_mode = "tokens" if self.enable_blending else "hashes"
+                    lookup_input_count = len(data_frames[0])
+                    logger.info(
+                        "Lookup server processing started: started_at=%s "
+                        "caller=LMCacheLookupServer.process_request lookup_id=%s "
+                        "mode=%s input_count=%s client_timeout_ms=%s",
+                        lookup_started_at,
+                        lookup_id,
+                        lookup_mode,
+                        lookup_input_count,
+                        self.lmcache_engine.config.lookup_timeout_ms,
+                    )
                     if not self.enable_blending:
                         hashes = data_frames[0]
                         offsets = data_frames[1]
@@ -247,14 +290,41 @@ class LMCacheLookupServer:
                             pin=True,
                             request_configs=request_configs,
                         )
+                    lookup_elapsed_ms = (time.perf_counter() - lookup_started) * 1000
+                    log_lookup = (
+                        logger.warning
+                        if lookup_elapsed_ms
+                        >= self.lmcache_engine.config.lookup_timeout_ms
+                        else logger.debug
+                    )
+                    log_lookup(
+                        "Lookup server processing completed: completed_at=%s "
+                        "started_at=%s elapsed_ms=%.3f "
+                        "caller=LMCacheLookupServer.process_request lookup_id=%s "
+                        "mode=%s input_count=%s result_tokens=%s "
+                        "client_timeout_ms=%s",
+                        _utc_timestamp(),
+                        lookup_started_at,
+                        lookup_elapsed_ms,
+                        lookup_id,
+                        lookup_mode,
+                        lookup_input_count,
+                        lookup_result,
+                        self.lmcache_engine.config.lookup_timeout_ms,
+                    )
                     response = lookup_result.to_bytes(4, "big")
                     self.transport.send_response(identity, response)
                 except json.JSONDecodeError as e:
                     logger.error(f"Error decoding JSON in lookup request: {e}")
                 except UnicodeDecodeError as e:
                     logger.error(f"Error decoding UTF-8 in lookup request: {e}")
-                except Exception as e:
-                    logger.error(f"Error processing lookup request: {e}")
+                except Exception:
+                    logger.exception(
+                        "Error processing lookup request: failed_at=%s "
+                        "caller=LMCacheLookupServer.process_request lookup_id=%s",
+                        _utc_timestamp(),
+                        lookup_id,
+                    )
 
         logger.info("lmcache lookup server started")
         self.thread = threading.Thread(

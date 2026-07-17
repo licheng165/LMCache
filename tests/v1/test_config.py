@@ -105,6 +105,61 @@ def test_sparse_layerwise_requires_partial_chunk_storage():
         config.validate()
 
 
+def test_experimental_sampled_lookup_accepts_async_loading():
+    config = LMCacheEngineConfig.from_defaults(
+        use_layerwise=True,
+        enable_sparse_attention=True,
+        dsa_two_groups=True,
+        enable_async_loading=True,
+        save_unfull_chunk=True,
+        experimental_sampled_layerwise_lookup=True,
+        extra_config={"enable_shared_cpu_cache": True},
+    )
+
+    config.validate()
+
+    assert config.enable_async_loading is True
+
+
+def test_experimental_sampled_lookup_env_knob(monkeypatch):
+    monkeypatch.setenv("LMCACHE_EXPERIMENTAL_SAMPLED_LAYERWISE_LOOKUP", "true")
+
+    config = LMCacheEngineConfig.from_env()
+
+    assert config.experimental_sampled_layerwise_lookup is True
+
+
+@pytest.mark.parametrize(
+    ("overrides", "missing_flag"),
+    [
+        ({"use_layerwise": False}, "use_layerwise=true"),
+        ({"enable_sparse_attention": False}, "enable_sparse_attention=true"),
+        ({"dsa_two_groups": False}, "dsa_two_groups=true"),
+        (
+            {"extra_config": {"enable_shared_cpu_cache": False}},
+            "enable_shared_cpu_cache=true",
+        ),
+    ],
+)
+def test_experimental_sampled_lookup_validates_required_mode(
+    overrides,
+    missing_flag,
+):
+    kwargs = {
+        "use_layerwise": True,
+        "enable_sparse_attention": True,
+        "dsa_two_groups": True,
+        "save_unfull_chunk": True,
+        "experimental_sampled_layerwise_lookup": True,
+        "extra_config": {"enable_shared_cpu_cache": True},
+    }
+    kwargs.update(overrides)
+    config = LMCacheEngineConfig.from_defaults(**kwargs)
+
+    with pytest.raises(ValueError, match=missing_flag):
+        config.validate()
+
+
 def test_shared_cpu_cache_passive_writable_defaults_to_auto():
     config = LMCacheEngineConfig.from_defaults()
     assert config.shared_cpu_cache_passive_writable is None

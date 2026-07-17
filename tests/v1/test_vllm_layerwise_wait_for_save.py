@@ -626,7 +626,7 @@ def test_layerwise_save_passes_request_configs() -> None:
     assert engine.store_kwargs[0]["request_configs"] == request_configs
 
 
-def test_request_finished_closes_abandoned_layerwise_storer() -> None:
+def test_finished_worker_request_closes_abandoned_layerwise_storer() -> None:
     connector, _, engine = _make_connector([_make_req("req-1")])
     closed = []
 
@@ -640,18 +640,9 @@ def test_request_finished_closes_abandoned_layerwise_storer() -> None:
     storer = _abandoned_storer()
     next(storer)
     connector._layerwise_save_storers["req-1"] = storer
-    connector.async_loading = False
-    connector._request_trackers = {}
-    connector.config = SimpleNamespace(
-        dsa_two_groups=False,
-        get_extra_config_value=lambda _key, default=None: default,
-    )
 
-    request = SimpleNamespace(request_id="req-1", status=None)
-    should_free, return_params = connector.request_finished(request, [])
+    connector._release_finished_worker_requests({"req-1"})
 
-    assert should_free is False
-    assert return_params is None
     assert closed == [True]
     assert connector._layerwise_save_storers == {}
     assert engine.unpinned == ["req-1"]

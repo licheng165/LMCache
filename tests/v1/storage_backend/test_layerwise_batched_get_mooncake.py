@@ -8,6 +8,8 @@ after remote fetch, and store scenarios (CPU + Mooncake).
 
 # Standard
 from collections import OrderedDict
+from concurrent.futures import Future
+from types import SimpleNamespace
 import asyncio
 
 # Third Party
@@ -95,14 +97,20 @@ class MockRemoteBackend:
         self.batched_submit_put_task_calls: list[list[CacheEngineKey]] = []
         self._blocking_results = blocking_results
         self._call_idx = 0
+        self.put_future: Future = Future()
+        self.put_future.set_result(None)
 
     def get_allocator_backend(self):
         if self.local_cpu_backend is None:
             raise RuntimeError("local_cpu_backend required")
         return self.local_cpu_backend
 
+    def requires_put_completion(self) -> bool:
+        return True
+
     def batched_submit_put_task(self, keys, memory_objs, transfer_spec=None):
         self.batched_submit_put_task_calls.append(list(keys))
+        return [self.put_future]
 
     def batched_get_blocking(self, keys: list[CacheEngineKey]):
         self.batched_get_blocking_calls.append(list(keys))
@@ -124,7 +132,9 @@ def _make_layer_key(layer_id: int, chunk_hash: int = 0xabc) -> LayerCacheEngineK
     )
 
 
-def _make_chunk_keys(num_layers: int, num_chunks: int = 1) -> list[list[LayerCacheEngineKey]]:
+def _make_chunk_keys(
+    num_layers: int, num_chunks: int = 1
+) -> list[list[LayerCacheEngineKey]]:
     """Layer-major keys: keys[layer_id][chunk_idx]."""
     keys_per_layer: list[list[LayerCacheEngineKey]] = []
     for layer_id in range(num_layers):
@@ -421,12 +431,14 @@ class TestBatchedPutCpuAndMooncake:
         keys = [_make_layer_key(0)]
         objs = [MockMemoryObj(1)]
 
-        manager.batched_put(keys, objs)
+        futures = manager.batched_put(keys, objs)
 
         assert len(local_cpu.batched_submit_put_task_calls) == 1
         assert local_cpu.batched_submit_put_task_calls[0][0] == keys
         assert len(remote.batched_submit_put_task_calls) == 1
         assert remote.batched_submit_put_task_calls[0] == keys
+        assert futures == [remote.put_future]
+        assert objs[0].ref_count_down_calls == 1
 
 
 class TestMooncakeConnectorBatchedGetNonBlockingFallback:
@@ -456,3 +468,30 @@ class TestMooncakeConnectorBatchedGetNonBlockingFallback:
         assert len(result) == 2
         assert result[0].obj_id == 1
         assert result[1].obj_id == 2
+
+
+class TestMooncakeConnectorBatchedContains:
+    def test_uses_batch_is_exist_with_prefix_semantics(self):
+        from lmcache.v1.storage_backend.connector.mooncakestore_connector import (
+            MooncakestoreConnector,
+        )
+
+        class _Store:
+            def __init__(self):
+                self.keys = []
+
+            def batch_is_exist(self, keys):
+                self.keys = list(keys)
+                return [1, 1, 0, 1]
+
+        conn = object.__new__(MooncakestoreConnector)
+        conn.store = _Store()
+        keys = [_make_layer_key(layer_id) for layer_id in range(4)]
+
+        conn.config = SimpleNamespace(experimental_sampled_layerwise_lookup=False)
+        assert not conn.support_batched_contains()
+
+        conn.config.experimental_sampled_layerwise_lookup = True
+        assert conn.support_batched_contains()
+        assert conn.batched_contains(keys) == 2
+        assert conn.store.keys == [key.to_string() for key in keys]

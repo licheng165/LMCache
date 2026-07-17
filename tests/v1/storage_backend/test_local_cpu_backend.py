@@ -282,6 +282,33 @@ class TestLocalCPUBackend:
 
         local_cpu_backend.memory_allocator.close()
 
+    def test_batched_get_prefix_with_misses_stops_at_first_miss(
+        self,
+        local_cpu_backend,
+    ):
+        keys = [create_test_key(f"key_{i}") for i in range(4)]
+        first_obj = create_test_memory_obj()
+        third_obj = create_test_memory_obj()
+        local_cpu_backend.submit_put_task(keys[0], first_obj)
+        local_cpu_backend.submit_put_task(keys[2], third_obj)
+
+        before_first = first_obj.get_ref_count()
+        before_third = third_obj.get_ref_count()
+        result = local_cpu_backend.batched_get_prefix_with_misses(keys)
+
+        assert result.local_memory_objs == [first_obj]
+        assert result.remote_positions == [1, 2, 3]
+        assert result.remote_keys == keys[1:]
+        assert first_obj.get_ref_count() == before_first + 1
+        assert third_obj.get_ref_count() == before_third
+
+        first_obj.ref_count_down()
+        local_cpu_backend.remove(keys[0], force=True)
+        local_cpu_backend.remove(keys[2], force=True)
+        first_obj.ref_count_down()
+        third_obj.ref_count_down()
+        local_cpu_backend.memory_allocator.close()
+
     def test_pin_unpin(self, local_cpu_backend):
         """Test pin() and unpin() operations."""
         key = create_test_key("test_key")

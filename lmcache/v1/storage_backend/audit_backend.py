@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 # Standard
+from concurrent.futures import Future
 from typing import Any, Callable, List, Optional, Sequence
 import time
 
@@ -106,22 +107,26 @@ class AuditBackend(StorageBackendInterface):
             self._log_operation("EXISTS_IN_PUT_TASKS", start_time, key, False, error=e)
             raise
 
+    def requires_put_completion(self) -> bool:
+        return self.real_backend.requires_put_completion()
+
     def batched_submit_put_task(
         self,
         keys: Sequence[CacheEngineKey],
         memory_objs: List[MemoryObj],
         transfer_spec: Any = None,
         on_complete_callback: Optional[Callable[[CacheEngineKey], None]] = None,
-    ) -> None:
+    ) -> Optional[List[Future]]:
         sizes = [len(obj.byte_array) for obj in memory_objs]
         start_time = time.perf_counter()
         try:
-            self.real_backend.batched_submit_put_task(
+            futures = self.real_backend.batched_submit_put_task(
                 keys, memory_objs, transfer_spec, on_complete_callback
             )
             self._log_operation(
                 "BATCHED_SUBMIT_PUT_TASK", start_time, None, True, size=sum(sizes)
             )
+            return futures
         except Exception as e:
             self._log_operation(
                 "BATCHED_SUBMIT_PUT_TASK", start_time, None, False, error=e

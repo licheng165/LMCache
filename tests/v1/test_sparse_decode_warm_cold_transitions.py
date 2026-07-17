@@ -2,6 +2,7 @@
 """P0: sparse decode warm/cold path transitions at connector and cache-engine level."""
 
 # Standard
+from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 # Third Party
@@ -36,7 +37,123 @@ def _make_sparse_request(*, resumed: bool = False) -> ReqMeta:
 
 
 class TestConnectorWarmColdInvalidate:
-    def test_cold_bind_after_save_builds_warm_state(self) -> None:
+    def test_complete_layer_cache_is_resolved_without_legacy_binding(self) -> None:
+        impl = make_worker_impl()
+        impl._latent_kvcaches = [torch.zeros(1)]
+        request = _make_sparse_request()
+        request.cached_keys = [["layer-key"]]
+        request.cached_starts = [0]
+        request.cached_ends = [256]
+        request.cached_tensors = [[torch.zeros(256)]]
+        request.cached_chunk_ptrs_npu = [torch.tensor([123], dtype=torch.int64)]
+
+        impl._save_worker_retrieve_state_from_request(
+            request,
+            location="LocalCPUBackend",
+            metadata_warm=True,
+            token_count=256,
+        )
+
+        fresh = _make_sparse_request()
+        state = impl._worker_retrieve_state_for_request(fresh)
+
+        assert state is not None
+        assert state.prepared_sparse_sources[0].total_tokens == 256
+        assert fresh.cached_keys == []
+        assert fresh.cached_tensors == []
+
+        impl._drop_worker_retrieve_state(request.req_id)
+        assert state.prepared_sparse_sources == {}
+
+    def test_shared_store_seed_waits_for_collective_bootstrap(self) -> None:
+        impl = make_worker_impl()
+        impl._latent_kvcaches = [torch.zeros(1)]
+        request = _make_sparse_request()
+        request.cached_keys = [["layer-key"]]
+        request.cached_starts = [0]
+        request.cached_ends = [256]
+        request.cached_tensors = [[torch.zeros(256)]]
+        request.cached_chunk_ptrs_npu = [
+            torch.tensor([123], dtype=torch.int64)
+        ]
+        impl._save_worker_retrieve_state_from_request(
+            request,
+            location="LocalCPUBackend",
+            metadata_warm=True,
+            token_count=256,
+        )
+        state = impl._worker_retrieve_state[request.req_id]
+        impl.lmcache_engine = SimpleNamespace(enable_shared_cpu_cache=True)
+
+        assert impl._prepared_sparse_source(state, 0, 256) is None
+        state.shared_request_active = True
+        assert impl._prepared_sparse_source(state, 0, 256) is not None
+
+    def test_prepared_shared_state_skips_scope_string_rebuild(self) -> None:
+        impl = make_worker_impl()
+        impl._latent_kvcaches = [torch.zeros(1)]
+        request = _make_sparse_request()
+        request.cached_keys = [["layer-key"]]
+        request.cached_starts = [0]
+        request.cached_ends = [256]
+        request.cached_tensors = [[torch.zeros(256)]]
+        request.cached_chunk_ptrs_npu = [
+            torch.tensor([123], dtype=torch.int64)
+        ]
+        impl._save_worker_retrieve_state_from_request(
+            request,
+            location="LocalCPUBackend",
+            metadata_warm=True,
+            token_count=256,
+        )
+        state = impl._worker_retrieve_state[request.req_id]
+        state.shared_request_active = True
+        state.shared_generation = 7
+        impl.lmcache_engine = SimpleNamespace(
+            enable_shared_cpu_cache=True,
+            shared_cpu_cache_generation=7,
+        )
+        impl._shared_request_scope_token = MagicMock(
+            side_effect=AssertionError("prepared path rebuilt the scope string")
+        )
+
+        assert not impl._should_invalidate_worker_retrieve_state(request, 256)
+        impl._shared_request_scope_token.assert_not_called()
+
+    def test_prepared_shared_state_skips_cold_coverage_validation(self) -> None:
+        impl = make_worker_impl()
+        impl._latent_kvcaches = [torch.zeros(1)]
+        request = _make_sparse_request()
+        request.cached_keys = [["layer-key"]]
+        request.cached_starts = [0]
+        request.cached_ends = [256]
+        request.cached_tensors = [[torch.zeros(256)]]
+        request.cached_chunk_ptrs_npu = [
+            torch.tensor([123], dtype=torch.int64)
+        ]
+        impl._save_worker_retrieve_state_from_request(
+            request,
+            location="LocalCPUBackend",
+            metadata_warm=True,
+            token_count=256,
+        )
+        state = impl._worker_retrieve_state[request.req_id]
+        state.shared_request_active = True
+        state.shared_latent_status = "present"
+        state.shared_generation = 7
+        state.pointer_cache_generation = 7
+        impl.lmcache_engine = SimpleNamespace(
+            enable_shared_cpu_cache=True,
+            shared_cpu_cache_generation=7,
+        )
+        impl._cached_ranges_cover_prefix = MagicMock(
+            side_effect=AssertionError("prepared path repeated coverage validation")
+        )
+
+        assert impl._worker_retrieve_state_for_request(request) is state
+        impl._cached_ranges_cover_prefix.assert_not_called()
+
+    def test_store_binds_request_owned_cache_only_when_needed(self) -> None:
         impl = make_worker_impl()
         request = _make_sparse_request()
         request.cached_keys = [["layer-key"]]
@@ -51,11 +168,37 @@ class TestConnectorWarmColdInvalidate:
         )
 
         fresh = _make_sparse_request()
-        bound = impl._bind_worker_retrieve_state_to_request(fresh)
-        warm = impl._sparse_decode_retrieve_warm_kwargs(fresh, 256, bound)
+        bound = impl._worker_retrieve_state_for_request(fresh)
+        assert bound is not None
+        assert fresh.cached_keys == []
+        impl._bind_worker_retrieve_state_for_store(fresh)
+        warm = impl._sparse_decode_bootstrap_reuse_kwargs(256, bound)
 
+        assert fresh.cached_keys is bound.cached_keys
         assert warm["_retrieve_metadata_warm"] is True
         assert warm["cached_retrieve_location"] == "LocalCPUBackend"
+
+    def test_store_kwargs_resolve_the_requested_group_once(self) -> None:
+        impl = make_worker_impl()
+        impl.config = SimpleNamespace(dsa_two_groups=True)
+        impl.enable_sparse_attention = True
+        request = _make_sparse_request()
+        request.cached_keys = [["latent-key"]]
+        request.cached_keys_indexer = [["index-key"]]
+        request.cached_tensors = [["latent-tensor"]]
+        request.cached_tensors_indexer = [["index-tensor"]]
+        request.cached_chunk_ptrs_npu = ["latent-ptrs"]
+        request.cached_chunk_ptrs_npu_indexer = ["index-ptrs"]
+
+        kwargs = impl._layerwise_store_kwargs(request, 1)
+
+        assert kwargs["kv_group"] == 1
+        assert kwargs["cached_keys"] is request.cached_keys_indexer
+        assert kwargs["cached_tensors"] is request.cached_tensors_indexer
+        assert (
+            kwargs["cached_chunk_ptrs_npu"]
+            is request.cached_chunk_ptrs_npu_indexer
+        )
 
     def test_preemption_invalidates_then_cold_reload(self) -> None:
         impl = make_worker_impl()
@@ -74,7 +217,7 @@ class TestConnectorWarmColdInvalidate:
         impl._drop_worker_retrieve_state("req-1")
         assert "req-1" not in impl._worker_retrieve_state
 
-        rebound = impl._bind_worker_retrieve_state_to_request(_make_sparse_request())
+        rebound = impl._worker_retrieve_state_for_request(_make_sparse_request())
         assert rebound is None
 
     def test_token_rollback_invalidates_worker_state(self) -> None:
@@ -100,8 +243,8 @@ class TestConnectorWarmColdInvalidate:
             location="LocalCPUBackend",
             token_count=256,
         )
-        warm = impl._sparse_decode_retrieve_warm_kwargs(
-            _make_sparse_request(), 512, state
+        warm = impl._sparse_decode_bootstrap_reuse_kwargs(
+            512, state
         )
         assert "_retrieve_metadata_warm" not in warm
         assert warm["cached_retrieve_location"] == "LocalCPUBackend"
@@ -165,11 +308,14 @@ class TestAscendEngineWarmColdMetadata:
     def test_stale_location_rechecked_when_not_using_tensor_cache(self) -> None:
         engine = AscendLMCacheEngine.__new__(AscendLMCacheEngine)
         engine.storage_manager = MagicMock()
-        engine.storage_manager.contains.return_value = "LocalCPUBackend"
         engine.retrieve_locations = ["LocalCPUBackend", "RemoteBackend"]
         engine.num_layers = 2
 
         cached_keys: list[list] = [[MagicMock()], [MagicMock()]]
+        engine.storage_manager.batched_contains.return_value = (
+            len(cached_keys),
+            {"LocalCPUBackend": [layer[0] for layer in cached_keys]},
+        )
         cached_starts = [0]
         cached_ends = [256]
         ret_mask = torch.zeros(256, dtype=torch.bool)
@@ -189,7 +335,8 @@ class TestAscendEngineWarmColdMetadata:
             retrieve_kwargs=retrieve_kwargs,
         )
 
-        engine.storage_manager.contains.assert_called_once()
+        engine.storage_manager.batched_contains.assert_called_once()
+        engine.storage_manager.contains.assert_not_called()
         assert location == "LocalCPUBackend"
         assert retrieve_kwargs["cached_retrieve_location"] == "LocalCPUBackend"
 
@@ -277,11 +424,13 @@ class TestSparseDecodeTokenMask:
             request.load_spec.lmcache_cached_tokens,
             is_sparse_decode=True,
         )
-        token_mask = impl._load_token_mask_for_retrieve(request, len(retrieve_tokens), 256)
+        token_mask = impl._load_token_mask_for_retrieve(
+            request, len(retrieve_tokens), 256
+        )
 
         assert len(retrieve_tokens) == request.load_spec.lmcache_cached_tokens
-        assert token_mask.numel() == request.load_spec.lmcache_cached_tokens
-        assert token_mask.eq(True).all()
+        assert token_mask is None
+        assert request.decode_token_mask is None
 
     def test_sparse_retrieve_tokens_cover_lmcache_prefix(self) -> None:
         impl = make_worker_impl()

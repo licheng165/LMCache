@@ -434,19 +434,22 @@ class CacheEngineKey:
             )
         return keys
 
-    def get_first_layer(self) -> "LayerCacheEngineKey":
-        """Return the key for the first layer"""
-        key = LayerCacheEngineKey(
+    def get_layer(self, layer_id: int) -> "LayerCacheEngineKey":
+        """Return the key for one layer."""
+        return LayerCacheEngineKey(
             model_name=self.model_name,
             world_size=self.world_size,
             worker_id=self.worker_id,
             chunk_hash=self.chunk_hash,
             dtype=self.dtype,
             request_configs=self.request_configs,
-            layer_id=0,
+            layer_id=layer_id,
             kv_group=self.kv_group,
         )
-        return key
+
+    def get_first_layer(self) -> "LayerCacheEngineKey":
+        """Return the key for the first layer."""
+        return self.get_layer(0)
 
     @staticmethod
     def from_string(s):

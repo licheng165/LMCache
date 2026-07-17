@@ -11,6 +11,10 @@ from lmcache.utils import CacheEngineKey
 from lmcache.v1.config import LMCacheEngineConfig
 from lmcache.v1.lookup_client.abstract_client import LookupClientInterface
 from lmcache.v1.metadata import LMCacheMetadata
+from lmcache.v1.sampled_lookup import (
+    find_last_sampled_hit,
+    first_last_layer_keys,
+)
 
 logger = init_logger(__name__)
 
@@ -58,9 +62,8 @@ class MooncakeLookupClient(LookupClientInterface):
         request_configs: Optional[dict] = None,
     ) -> Optional[int]:
         # process token_ids to cacheengine keys
-        keys = []
         ends = []
-        chunk_key_counts = []
+        chunk_keys_by_chunk: list[list[str]] = []
         use_layerwise = bool(
             getattr(getattr(self, "config", None), "use_layerwise", False)
         )
@@ -70,6 +73,10 @@ class MooncakeLookupClient(LookupClientInterface):
         num_layers = int(
             getattr(getattr(self, "metadata", None), "kv_shape", (1,))[0]
         )
+        sampled_lookup = bool(
+            use_layerwise
+            and getattr(self.config, "experimental_sampled_layerwise_lookup", False)
+        )
 
         for start, end, key in self.token_database.process_tokens(
             token_ids, request_configs=request_configs
@@ -77,7 +84,7 @@ class MooncakeLookupClient(LookupClientInterface):
             assert isinstance(key, CacheEngineKey)
             group_keys = [key]
             if dsa_two_groups:
-                make_key = getattr(self.token_database, "_make_key_by_hash")
+                make_key = self.token_database._make_key_by_hash
                 index_key = make_key(
                     key.chunk_hash,
                     request_configs,
@@ -85,27 +92,47 @@ class MooncakeLookupClient(LookupClientInterface):
                 )
                 group_keys.append(index_key)
 
-            chunk_keys = []
-            for group_key in group_keys:
-                if use_layerwise:
-                    chunk_keys.extend(
-                        layer_key.to_string()
-                        for layer_key in group_key.split_layers(num_layers)
-                    )
-                else:
-                    chunk_keys.append(group_key.to_string())
-            keys.extend(chunk_keys)
-            chunk_key_counts.append(len(chunk_keys))
+            if sampled_lookup:
+                chunk_keys = [
+                    key.to_string()
+                    for key in first_last_layer_keys(group_keys, num_layers)
+                ]
+            elif use_layerwise:
+                chunk_keys = [
+                    layer_key.to_string()
+                    for group_key in group_keys
+                    for layer_key in group_key.split_layers(num_layers)
+                ]
+            else:
+                chunk_keys = [group_key.to_string() for group_key in group_keys]
+            chunk_keys_by_chunk.append(chunk_keys)
             ends.append(end)
+
+        if sampled_lookup:
+            def batch_exists(keys: list[str]) -> bool:
+                if not keys:
+                    return False
+                results = self.store.batch_is_exist(keys)
+                return len(results) == len(keys) and all(
+                    result == 1 for result in results
+                )
+
+            winner = find_last_sampled_hit(
+                len(chunk_keys_by_chunk),
+                lambda index: batch_exists(chunk_keys_by_chunk[index]),
+            )
+            return 0 if winner is None else ends[winner]
 
         # Use batch_is_exist to check all keys at once
         # rets is list of int: 1 = found, 0 = not found, -1 = error
+        keys = [key for chunk_keys in chunk_keys_by_chunk for key in chunk_keys]
         rets = self.store.batch_is_exist(keys)
 
         # Find the first key that doesn't exist (ret != 1)
         # This follows the same logic as cache engine's lookup method
         offset = 0
-        for chunk_idx, key_count in enumerate(chunk_key_counts):
+        for chunk_idx, chunk_keys in enumerate(chunk_keys_by_chunk):
+            key_count = len(chunk_keys)
             chunk_rets = rets[offset : offset + key_count]
             offset += key_count
             if len(chunk_rets) < key_count or any(

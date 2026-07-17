@@ -94,6 +94,9 @@ class InstrumentedRemoteConnector(RemoteConnector):
     def support_batched_put(self) -> bool:
         return self._connector.support_batched_put()
 
+    def requires_put_completion(self) -> bool:
+        return self._connector.requires_put_completion()
+
     def support_batched_get(self) -> bool:
         return self._connector.support_batched_get()
 
@@ -184,6 +187,8 @@ class InstrumentedRemoteConnector(RemoteConnector):
             await self._connector.batched_put(keys, memory_objs)
         except Exception as e:
             logger.warning(f"batched put error: {e}")
+            if self.requires_put_completion():
+                raise
         finally:
             for memory_obj in memory_objs:
                 memory_obj.ref_count_down()

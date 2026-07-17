@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # Standard
 from dataclasses import dataclass
-from typing import Any, List, Optional, no_type_check
+from typing import Any, Callable, List, Optional, no_type_check
 import asyncio
 import json
 import os
@@ -232,6 +232,7 @@ class MooncakestoreConnector(RemoteConnector):
         self.loop = loop
         self.local_cpu_backend = local_cpu_backend
         self.registered_buffer_ptr = None
+        self._inflight_put_tasks: set[asyncio.Task[Any]] = set()
 
         # Initialize ReplicateConfig
         self.replica_config = ReplicateConfig()
@@ -509,6 +510,24 @@ class MooncakestoreConnector(RemoteConnector):
         """
         return True
 
+    def support_batched_contains(self) -> bool:
+        return bool(
+            getattr(self.config, "experimental_sampled_layerwise_lookup", False)
+            and callable(getattr(self.store, "batch_is_exist", None))
+        )
+
+    def batched_contains(self, keys: List[CacheEngineKey]) -> int:
+        if not keys:
+            return 0
+
+        results = self.store.batch_is_exist([key.to_string() for key in keys])
+        hit_count = 0
+        for result in results:
+            if result != 1:
+                break
+            hit_count += 1
+        return hit_count
+
     def support_batched_get_non_blocking(self) -> bool:
         """
         Mooncake only supports batched_get / batch_get_into, not per-key get().
@@ -764,6 +783,63 @@ class MooncakestoreConnector(RemoteConnector):
     def support_batched_put(self) -> bool:
         return True
 
+    def requires_put_completion(self) -> bool:
+        return True
+
+    async def _run_blocking_put(
+        self,
+        operation: str,
+        func: Callable[..., Any],
+        args: tuple[Any, ...],
+        memory_objs: List[MemoryObj],
+    ) -> Any:
+        """Run a Mooncake put without releasing its source buffers early."""
+        for memory_obj in memory_objs:
+            memory_obj.ref_count_up()
+
+        task = asyncio.create_task(asyncio.to_thread(func, *args))
+        self._inflight_put_tasks.add(task)
+
+        def release_buffers(done: asyncio.Task[Any]) -> None:
+            self._inflight_put_tasks.discard(done)
+            for memory_obj in memory_objs:
+                memory_obj.ref_count_down()
+            if not done.cancelled():
+                done.exception()
+
+        task.add_done_callback(release_buffers)
+        try:
+            return await asyncio.wait_for(
+                asyncio.shield(task), timeout=self.config.transfer_timeout
+            )
+        except asyncio.TimeoutError as e:
+            raise TimeoutError(
+                f"Mooncake {operation} timed out after "
+                f"{self.config.transfer_timeout}s"
+            ) from e
+
+    @staticmethod
+    def _check_put_status(operation: str, status: Any) -> None:
+        if status is not None and status != 0:
+            raise RuntimeError(f"Mooncake {operation} failed with status {status}")
+
+    @staticmethod
+    def _check_batched_put_status(
+        keys: List[CacheEngineKey], statuses: Any
+    ) -> None:
+        if statuses is None:
+            return
+        if len(statuses) != len(keys):
+            raise RuntimeError(
+                "Mooncake batch_put_from returned "
+                f"{len(statuses)} statuses for {len(keys)} keys"
+            )
+        for key, status in zip(keys, statuses, strict=True):
+            if status != 0:
+                raise RuntimeError(
+                    f"Mooncake batch_put_from failed for {key}: status {status}"
+                )
+
     async def batched_put(
         self,
         keys: List[CacheEngineKey],
@@ -795,21 +871,13 @@ class MooncakestoreConnector(RemoteConnector):
             buffer_ptrs.append(obj.data_ptr)
             buffer_sizes.append(obj.get_size())
 
-        try:
-            await asyncio.wait_for(
-                asyncio.to_thread(
-                    self.store.batch_put_from,
-                    key_strs,
-                    buffer_ptrs,
-                    buffer_sizes,
-                    self.replica_config,
-                ),
-                timeout=self.config.transfer_timeout,
-            )
-        except asyncio.TimeoutError:
-            logger.warning(
-                "Timeout during batch_put_from; some decoders may redo prefill."
-            )
+        statuses = await self._run_blocking_put(
+            "batch_put_from",
+            self.store.batch_put_from,
+            (key_strs, buffer_ptrs, buffer_sizes, self.replica_config),
+            memory_objs,
+        )
+        self._check_batched_put_status(keys, statuses)
 
     async def _batched_put_with_metadata(
         self,
@@ -829,21 +897,13 @@ class MooncakestoreConnector(RemoteConnector):
             buffer_ptr = memory_obj.data_ptr
             buffer_size = memory_obj.get_size()
 
-            await asyncio.wait_for(
-                asyncio.to_thread(
-                    self.store.put_from,
-                    key_str,
-                    buffer_ptr,
-                    buffer_size,
-                    self.replica_config,
-                ),
-                timeout=self.config.transfer_timeout,
+            status = await self._run_blocking_put(
+                "put_from",
+                self.store.put_from,
+                (key_str, buffer_ptr, buffer_size, self.replica_config),
+                [memory_obj],
             )
-        except asyncio.TimeoutError:
-            logger.warning(
-                f"Timeout when putting key {key_str} using put_from. "
-                "Decode instance may redo prefill."
-            )
+            self._check_put_status("put_from", status)
         except Exception as e:
             logger.error(
                 f"Failed to put key {key_str} using put_from: "
@@ -868,17 +928,13 @@ class MooncakestoreConnector(RemoteConnector):
             ).serialize()
             assert len(metadata_bytes) == self.remote_metadata_bytes
 
-            await asyncio.wait_for(
-                asyncio.to_thread(
-                    self.store.put_parts, key_str, metadata_bytes, kv_bytes
-                ),
-                timeout=self.config.transfer_timeout,
+            status = await self._run_blocking_put(
+                "put_parts",
+                self.store.put_parts,
+                (key_str, metadata_bytes, kv_bytes),
+                [memory_obj],
             )
-        except asyncio.TimeoutError:
-            logger.warning(
-                f"Timeout when putting key {key_str} using put_parts. "
-                "Decode instance may redo prefill."
-            )
+            self._check_put_status("put_parts", status)
         except Exception as e:
             logger.error(
                 f"Failed to put key {key_str} using put_parts: "
@@ -891,6 +947,11 @@ class MooncakestoreConnector(RemoteConnector):
         pass
 
     async def close(self):
+        if self._inflight_put_tasks:
+            await asyncio.gather(
+                *tuple(self._inflight_put_tasks), return_exceptions=True
+            )
+
         # Unregister buffer before closing the store
         self._unregister_cpu_buffer()
 
