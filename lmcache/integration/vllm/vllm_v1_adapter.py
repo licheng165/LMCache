@@ -74,6 +74,12 @@ def _mtp_dw_diag_enabled() -> bool:
     return os.environ.get("VLLM_ASCEND_MTP_DW_DIAG", "0") == "1"
 
 
+def _mtp_dw_deep_diag_enabled() -> bool:
+    return _mtp_dw_diag_enabled() and (
+        os.environ.get("VLLM_ASCEND_MTP_DW_DEEP_DIAG", "0") == "1"
+    )
+
+
 def _mtp_dw_event(stage: str, **fields: Any) -> None:
     if not _mtp_dw_diag_enabled():
         return
@@ -3066,6 +3072,50 @@ class LMCacheConnectorV1Impl:
         if callable(is_passive) and is_passive():
             return
         if not self._decode_window_save_has_required_groups(request):
+            if _mtp_dw_deep_diag_enabled():
+                required_groups = self._decode_window_save_required_groups(request)
+                completed_state = getattr(
+                    self, "_decode_window_save_completed_groups", set()
+                )
+                completed_groups = sorted(
+                    kv_group
+                    for kv_group in required_groups
+                    if self._layerwise_save_storer_key(request, kv_group)
+                    in completed_state
+                )
+                metadata = getattr(engine, "metadata", None)
+                worker_rank = getattr(metadata, "worker_id", None)
+                if completed_groups:
+                    seen = getattr(self, "_mtp_dw_deep_window_group_wait_seen", None)
+                    if seen is None:
+                        seen = set()
+                        self._mtp_dw_deep_window_group_wait_seen = seen
+                    key = (
+                        request.req_id,
+                        request.decode_window_start,
+                        request.decode_window_end,
+                    )
+                    if key not in seen:
+                        if len(seen) >= 256:
+                            seen.pop()
+                        seen.add(key)
+                        _mtp_dw_event(
+                            "deep",
+                            event="window_group_wait",
+                            req=request.req_id,
+                            worker_rank=worker_rank,
+                            tp_rank=worker_rank,
+                            tp_world=getattr(metadata, "world_size", None),
+                            frontier=len(request.token_ids),
+                            window_start=request.decode_window_start,
+                            window_end=request.decode_window_end,
+                            kv_group=None,
+                            required_groups=sorted(required_groups),
+                            completed_groups=completed_groups,
+                            missing_groups=sorted(
+                                required_groups - set(completed_groups)
+                            ),
+                        )
             logger.debug(
                 "Decode-window save not marked complete before required "
                 "store groups are seen: req_id=%s required_groups=%s",
@@ -4004,6 +4054,277 @@ class LMCacheConnectorV1Impl:
         return False
 
     def _worker_retrieve_state_for_request(
+        self, request: ReqMeta
+    ) -> Optional[WorkerRetrieveState]:
+        state = self._worker_retrieve_state.get(request.req_id)
+        if state is None or not (state.metadata_warm or state.cached_keys):
+            return None
+        self._validate_shared_worker_retrieve_state(state, request)
+        return state
+
+    @staticmethod
+    def _bind_worker_retrieve_cache_to_request(
+        request: ReqMeta,
+        state: WorkerRetrieveState,
+    ) -> None:
+        """Expose legacy cache metadata only when bootstrap still needs it."""
+        request.cached_keys = state.cached_keys
+        request.cached_starts = state.cached_starts
+        request.cached_ends = state.cached_ends
+        request.cached_memory_objs = state.cached_memory_objs
+        request.cached_tensors = state.cached_tensors
+        request.cached_chunk_dev_ptrs = state.cached_chunk_dev_ptrs
+        request.cached_chunk_ptrs_npu = state.cached_chunk_ptrs_npu
+        request.cached_shared_handles = state.cached_shared_handles
+        request.cached_keys_indexer = state.cached_keys_indexer
+        request.cached_starts_indexer = state.cached_starts_indexer
+        request.cached_ends_indexer = state.cached_ends_indexer
+        request.cached_memory_objs_indexer = state.cached_memory_objs_indexer
+        request.cached_tensors_indexer = state.cached_tensors_indexer
+        request.cached_chunk_dev_ptrs_indexer = state.cached_chunk_dev_ptrs_indexer
+        request.cached_chunk_ptrs_npu_indexer = state.cached_chunk_ptrs_npu_indexer
+        request.cached_shared_handles_indexer = state.cached_shared_handles_indexer
+
+    def _worker_retrieve_state_invalidation_reason(
+        self,
+        request: ReqMeta,
+        token_count: int,
+        state: WorkerRetrieveState,
+    ) -> Optional[str]:
+        if request.resumed_from_preemption:
+            return "resumed_from_preemption"
+        if request.is_sparse_decode:
+            if state.shared_request_active:
+                engine = getattr(self, "lmcache_engine", None)
+                generation = int(
+                    getattr(engine, "shared_cpu_cache_generation", 0) or 0
+                )
+                expected_scope_token = self._shared_request_scope_token(
+                    request.req_id,
+                    generation,
+                    token_count,
+                )
+                if state.request_scope_token != expected_scope_token:
+                    return "request_scope_changed"
+            if state.cached_starts and state.cached_starts[0] != 0:
+                return "nonzero_cached_start"
+            if (
+                request.load_spec is not None
+                and request.load_spec.lmcache_cached_tokens > state.token_count
+            ):
+                return "load_frontier_advanced"
+            # Sparse decode metadata is keyed by the full LMCache-hit prefix.
+            # A shorter current prefix means the cached request state is stale.
+            if state.token_count and (
+                token_count < state.token_count
+                or len(request.token_ids) < state.token_count
+            ):
+                return "retrieve_prefix_shrunk"
+            return None
+        if state.cached_ends and token_count < state.cached_ends[-1]:
+            return "cached_end_past_retrieve"
+        if (
+            request.load_spec is not None
+            and request.load_spec.lmcache_cached_tokens > state.token_count
+        ):
+            return "load_frontier_advanced"
+        return None
+
+    @staticmethod
+    def _deep_retrieve_range_summary(
+        starts: list[int], ends: list[int]
+    ) -> dict[str, Optional[int]]:
+        ranges = list(zip(starts, ends, strict=False))
+        return {
+            "count": len(ranges),
+            "first_start": int(ranges[0][0]) if ranges else None,
+            "last_end": int(ranges[-1][1]) if ranges else None,
+        }
+
+    @staticmethod
+    def _deep_cache_values_present(values: Any) -> bool:
+        if values is None:
+            return False
+        if isinstance(values, torch.Tensor):
+            return values.numel() > 0
+        if isinstance(values, dict):
+            return any(
+                LMCacheConnectorV1Impl._deep_cache_values_present(value)
+                for value in values.values()
+            )
+        if isinstance(values, (list, tuple, set)):
+            return any(
+                LMCacheConnectorV1Impl._deep_cache_values_present(value)
+                for value in values
+            )
+        return True
+
+    @staticmethod
+    def _deep_retrieve_group_cache_present(
+        state: WorkerRetrieveState, kv_group: int
+    ) -> bool:
+        suffix = "_indexer" if kv_group == 1 else ""
+        fields = (
+            "cached_keys",
+            "cached_memory_objs",
+            "cached_tensors",
+            "cached_chunk_dev_ptrs",
+            "cached_chunk_ptrs_npu",
+            "cached_shared_handles",
+        )
+        if any(
+            LMCacheConnectorV1Impl._deep_cache_values_present(
+                getattr(state, field + suffix)
+            )
+            for field in fields
+        ):
+            return True
+        return any(
+            LMCacheConnectorV1Impl._deep_cache_values_present(cache.get(kv_group))
+            for cache in (
+                state.shared_handles_by_group,
+                state.shared_views_by_group,
+                state.shared_chunk_ptrs_npu_by_group,
+                state.rank0_backing_objs_by_group,
+            )
+        )
+
+    def _trace_deep_retrieve_state(
+        self,
+        request: ReqMeta,
+        prior_state: Optional[WorkerRetrieveState],
+        prior_snapshot: Optional[dict[str, Any]],
+        *,
+        invalidated: bool,
+        invalidation_reason: Optional[str],
+        post_state: Optional[WorkerRetrieveState],
+        prior_state_rebound: bool,
+        kv_group0_retriever_present: bool,
+        kv_group1_retriever_present: bool,
+    ) -> None:
+        if not _mtp_dw_deep_diag_enabled() or request.load_spec is None:
+            return
+        frontier = int(request.load_spec.lmcache_cached_tokens)
+        prior_frontier = (
+            int(prior_snapshot["frontier"])
+            if prior_snapshot is not None
+            else 0
+        )
+        if prior_state is not None and prior_snapshot is None:
+            return
+        if frontier <= prior_frontier:
+            return
+
+        transitions = getattr(self, "_mtp_dw_deep_retrieve_transitions", None)
+        if transitions is None:
+            transitions = {}
+            self._mtp_dw_deep_retrieve_transitions = transitions
+        if request.req_id in transitions:
+            return
+        if len(transitions) >= 256:
+            transitions.pop(next(iter(transitions)))
+        transitions[request.req_id] = frontier
+
+        stale_retained = (
+            prior_state is not None
+            and prior_state_rebound
+            and post_state is prior_state
+            and prior_frontier < frontier
+        )
+        metadata = getattr(getattr(self, "lmcache_engine", None), "metadata", None)
+        worker_rank = getattr(metadata, "worker_id", None)
+        if stale_retained:
+            _mtp_dw_event(
+                "fail",
+                req=request.req_id,
+                invariant="stale_retrieve_state",
+                frontier=frontier,
+                prior_frontier=prior_frontier,
+                window_start=prior_frontier,
+                window_end=frontier,
+            )
+        _mtp_dw_event(
+            "deep",
+            event="retrieve_state",
+            req=request.req_id,
+            worker_rank=worker_rank,
+            tp_rank=worker_rank,
+            tp_world=getattr(metadata, "world_size", None),
+            frontier=frontier,
+            prior_frontier=prior_frontier,
+            window_start=prior_frontier,
+            window_end=frontier,
+            kv_group=None,
+            prior_state_present=prior_state is not None,
+            post_state_present=post_state is not None,
+            invalidated=invalidated,
+            invalidation_reason=invalidation_reason,
+            prior_state_rebound=prior_state_rebound,
+            rebound_range_count=(
+                min(len(post_state.cached_starts), len(post_state.cached_ends))
+                if post_state is not None
+                else 0
+            ),
+            prior_kv_group0_cached_ranges=(
+                prior_snapshot["kv_group0_cached_ranges"]
+                if prior_snapshot is not None
+                else self._deep_retrieve_range_summary([], [])
+            ),
+            prior_kv_group1_cached_ranges=(
+                prior_snapshot["kv_group1_cached_ranges"]
+                if prior_snapshot is not None
+                else self._deep_retrieve_range_summary([], [])
+            ),
+            kv_group0_retriever_present=kv_group0_retriever_present,
+            kv_group1_retriever_present=kv_group1_retriever_present,
+            prior_kv_group0_cache_present=(
+                prior_snapshot["kv_group0_cache_present"]
+                if prior_snapshot is not None
+                else False
+            ),
+            prior_kv_group1_cache_present=(
+                prior_snapshot["kv_group1_cache_present"]
+                if prior_snapshot is not None
+                else False
+            ),
+            post_kv_group0_cache_present=(
+                self._deep_retrieve_group_cache_present(post_state, 0)
+                if post_state is not None
+                else False
+            ),
+            post_kv_group1_cache_present=(
+                self._deep_retrieve_group_cache_present(post_state, 1)
+                if post_state is not None
+                else False
+            ),
+            prior_scope_token=(
+                prior_snapshot["scope_token"] if prior_snapshot is not None else None
+            ),
+            prior_scope_token_present=(
+                prior_snapshot["scope_token_present"]
+                if prior_snapshot is not None
+                else False
+            ),
+            shared_request_active=(
+                prior_snapshot["shared_request_active"]
+                if prior_snapshot is not None
+                else False
+            ),
+            shared_generation=(
+                prior_snapshot["shared_generation"]
+                if prior_snapshot is not None
+                else 0
+            ),
+            pointer_cache_generation=(
+                prior_snapshot["pointer_cache_generation"]
+                if prior_snapshot is not None
+                else 0
+            ),
+            resumed_from_preemption=bool(request.resumed_from_preemption),
+            stale_state_retained=stale_retained,
+        )
+
+    def _bind_worker_retrieve_state_to_request(
         self, request: ReqMeta
     ) -> Optional[WorkerRetrieveState]:
         state = self._worker_retrieve_state.get(request.req_id)
@@ -4987,10 +5308,74 @@ class LMCacheConnectorV1Impl:
                         vllm_cached_tokens=request.load_spec.vllm_cached_tokens,
                     )
                 elif request.is_sparse_decode:
+                    prior_retrieve_state = None
+                    prior_retrieve_snapshot = None
+                    invalidation_reason = None
+                    retrieve_state_invalidated = False
                     if hasattr(self, "_worker_retrieve_state"):
-                        if self._should_invalidate_worker_retrieve_state(
-                            request, token_count
+                        prior_retrieve_state = self._worker_retrieve_state.get(
+                            request.req_id
+                        )
+                        if (
+                            _mtp_dw_deep_diag_enabled()
+                            and prior_retrieve_state is not None
                         ):
+                            prior_retrieve_snapshot = {
+                                "frontier": prior_retrieve_state.token_count,
+                                "kv_group0_cached_ranges": (
+                                    self._deep_retrieve_range_summary(
+                                        prior_retrieve_state.cached_starts,
+                                        prior_retrieve_state.cached_ends,
+                                    )
+                                ),
+                                "kv_group1_cached_ranges": (
+                                    self._deep_retrieve_range_summary(
+                                        prior_retrieve_state.cached_starts_indexer,
+                                        prior_retrieve_state.cached_ends_indexer,
+                                    )
+                                ),
+                                "kv_group0_cache_present": (
+                                    self._deep_retrieve_group_cache_present(
+                                        prior_retrieve_state, 0
+                                    )
+                                ),
+                                "kv_group1_cache_present": (
+                                    self._deep_retrieve_group_cache_present(
+                                        prior_retrieve_state, 1
+                                    )
+                                ),
+                                "scope_token_present": (
+                                    prior_retrieve_state.request_scope_token is not None
+                                ),
+                                "scope_token": (
+                                    prior_retrieve_state.request_scope_token
+                                ),
+                                "shared_request_active": (
+                                    prior_retrieve_state.shared_request_active
+                                ),
+                                "shared_generation": (
+                                    prior_retrieve_state.shared_generation
+                                ),
+                                "pointer_cache_generation": (
+                                    prior_retrieve_state.pointer_cache_generation
+                                ),
+                            }
+                        retrieve_state_invalidated = (
+                            self._should_invalidate_worker_retrieve_state(
+                                request, token_count
+                            )
+                        )
+                        if retrieve_state_invalidated:
+                            if _mtp_dw_deep_diag_enabled():
+                                invalidation_reason = "resumed_from_preemption"
+                                if prior_retrieve_state is not None:
+                                    invalidation_reason = (
+                                        self._worker_retrieve_state_invalidation_reason(
+                                            request,
+                                            token_count,
+                                            prior_retrieve_state,
+                                        )
+                                    )
                             self._drop_worker_retrieve_state(request.req_id)
                         bound_state = self._worker_retrieve_state_for_request(
                             request
@@ -5250,6 +5635,22 @@ class LMCacheConnectorV1Impl:
                             ),
                             token_count=token_count,
                         )
+                    post_retrieve_state = (
+                        self._worker_retrieve_state.get(request.req_id)
+                        if hasattr(self, "_worker_retrieve_state")
+                        else None
+                    )
+                    self._trace_deep_retrieve_state(
+                        request,
+                        prior_retrieve_state,
+                        prior_retrieve_snapshot,
+                        invalidated=retrieve_state_invalidated,
+                        invalidation_reason=invalidation_reason,
+                        post_state=post_retrieve_state,
+                        prior_state_rebound=bound_state is prior_retrieve_state,
+                        kv_group0_retriever_present=layerwise_retriever is not None,
+                        kv_group1_retriever_present=indexer_retriever is not None,
+                    )
                     self.layerwise_retrievers.append(
                         (layerwise_retriever, indexer_retriever)
                     )
@@ -6946,6 +7347,53 @@ class LMCacheConnectorV1Impl:
                 )
                 return
 
+            if _mtp_dw_deep_diag_enabled():
+                planned_reqs = getattr(
+                    self, "_mtp_dw_deep_window_group_planned_reqs", None
+                )
+                if planned_reqs is None:
+                    planned_reqs = set()
+                    self._mtp_dw_deep_window_group_planned_reqs = planned_reqs
+                if tracker.req_id not in planned_reqs:
+                    if len(planned_reqs) >= 256:
+                        planned_reqs.pop()
+                    planned_reqs.add(tracker.req_id)
+                    save_spec = req_meta.save_spec
+                    kv_group0_save = bool(
+                        save_spec is not None and save_spec.can_save_latent
+                    )
+                    kv_group1_save = bool(
+                        save_spec is not None and save_spec.can_save_indexer
+                    )
+                    dsa_two_groups = self._is_dsa_two_groups()
+                    _mtp_dw_event(
+                        "deep",
+                        event="window_group_plan",
+                        req=tracker.req_id,
+                        worker_rank=None,
+                        tp_rank=None,
+                        tp_world=None,
+                        frontier=len(tracker.token_ids),
+                        window_start=window_start,
+                        window_end=window_end,
+                        kv_group=None,
+                        dsa_two_groups=dsa_two_groups,
+                        shared_cpu_enabled=bool(
+                            self._shared_cpu_config_value(
+                                "enable_shared_cpu_cache", False
+                            )
+                        ),
+                        latent_only=(
+                            dsa_two_groups and kv_group0_save and not kv_group1_save
+                        ),
+                        indexer_disabled=dsa_two_groups and not kv_group1_save,
+                        kv_group0_save=kv_group0_save,
+                        kv_group1_save=kv_group1_save,
+                        required_groups=sorted(
+                            self._decode_window_save_required_groups(req_meta)
+                        ),
+                    )
+
             self._trace_decode_window_decision(
                 tracker, decision="emitted", reason="window_ready"
             )
@@ -6981,6 +7429,17 @@ class LMCacheConnectorV1Impl:
                 states = getattr(self, "_mtp_dw_window_decision_states", None)
                 if states is not None:
                     states.pop(finished_req_id, None)
+            planned_reqs = getattr(
+                self, "_mtp_dw_deep_window_group_planned_reqs", None
+            )
+            if planned_reqs is not None:
+                planned_reqs.discard(finished_req_id)
+            waits = getattr(self, "_mtp_dw_deep_window_group_wait_seen", None)
+            if waits is not None:
+                waits_copy = {
+                    key for key in waits if key[0] != finished_req_id
+                }
+                self._mtp_dw_deep_window_group_wait_seen = waits_copy
             self._unfinished_requests.pop(finished_req_id, None)
 
         # We should load KV for:
@@ -7282,6 +7741,18 @@ class LMCacheConnectorV1Impl:
         # This callback runs in the scheduler process. Worker-owned state is
         # released when the same request ID reaches worker-side get_finished().
         self._release_request_lookup_pins(request.request_id)
+        # Layerwise save uses request-scoped generators. If request finishes
+        # without entering wait_for_save (abort/error/evict path), make sure
+        # we release the generator entry to avoid leaking state.
+        if getattr(self, "use_layerwise", False) and hasattr(
+            self, "_layerwise_save_storers"
+        ):
+            self._drop_layerwise_save_storers(request.request_id)
+
+        self._drop_worker_retrieve_state(request.request_id)
+        transitions = getattr(self, "_mtp_dw_deep_retrieve_transitions", None)
+        if transitions is not None:
+            transitions.pop(request.request_id, None)
 
         # Cleanup if request was aborted
         if request.status == RequestStatus.FINISHED_ABORTED and self.async_loading:

@@ -79,6 +79,225 @@ def _make_request(*, resumed: bool = False) -> ReqMeta:
 
 
 class TestWorkerRetrieveState:
+    @staticmethod
+    def _deep_snapshot(state: WorkerRetrieveState) -> dict[str, object]:
+        return {
+            "frontier": state.token_count,
+            "kv_group0_cached_ranges": {
+                "count": 1,
+                "first_start": 0,
+                "last_end": 256,
+            },
+            "kv_group1_cached_ranges": {
+                "count": 0,
+                "first_start": None,
+                "last_end": None,
+            },
+            "kv_group0_cache_present": True,
+            "kv_group1_cache_present": False,
+            "scope_token": None,
+            "scope_token_present": False,
+            "shared_request_active": False,
+            "shared_generation": 0,
+            "pointer_cache_generation": 0,
+        }
+
+    def test_deep_retrieve_state_requires_both_gates_and_is_bounded_once(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        impl = _make_impl()
+        state = WorkerRetrieveState(
+            cached_keys=[["k0"]],
+            cached_starts=[0],
+            cached_ends=[256],
+            metadata_warm=True,
+            token_count=256,
+        )
+        request = _make_request()
+        request.token_ids = [0] * 512
+        request.load_spec.lmcache_cached_tokens = 512
+        events = []
+        monkeypatch.setenv("VLLM_ASCEND_MTP_DW_DIAG", "1")
+        monkeypatch.delenv("VLLM_ASCEND_MTP_DW_DEEP_DIAG", raising=False)
+        monkeypatch.setattr(
+            adapter_mod,
+            "_mtp_dw_event",
+            lambda stage, **fields: events.append({"stage": stage, **fields}),
+        )
+
+        impl._trace_deep_retrieve_state(
+            request,
+            state,
+            self._deep_snapshot(state),
+            invalidated=True,
+            invalidation_reason="load_frontier_advanced",
+            post_state=None,
+            prior_state_rebound=False,
+            kv_group0_retriever_present=True,
+            kv_group1_retriever_present=False,
+        )
+        assert events == []
+        assert not hasattr(impl, "_mtp_dw_deep_retrieve_transitions")
+
+        monkeypatch.setenv("VLLM_ASCEND_MTP_DW_DEEP_DIAG", "1")
+        for _ in range(2):
+            impl._trace_deep_retrieve_state(
+                request,
+                state,
+                self._deep_snapshot(state),
+                invalidated=True,
+                invalidation_reason="load_frontier_advanced",
+                post_state=None,
+                prior_state_rebound=False,
+                kv_group0_retriever_present=True,
+                kv_group1_retriever_present=False,
+            )
+
+        assert len(events) == 1
+        assert events[0]["stage"] == "deep"
+        assert events[0]["event"] == "retrieve_state"
+        assert events[0]["prior_frontier"] == 256
+        assert events[0]["frontier"] == 512
+        assert events[0]["prior_kv_group0_cached_ranges"]["last_end"] == 256
+        assert events[0]["invalidation_reason"] == "load_frontier_advanced"
+        assert events[0]["window_start"] == 256
+        assert events[0]["window_end"] == 512
+
+    def test_deep_retrieve_state_records_first_frontier_without_prior_state(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        impl = _make_impl()
+        request = _make_request()
+        request.load_spec.lmcache_cached_tokens = 256
+        post_state = WorkerRetrieveState(token_count=256)
+        events = []
+        monkeypatch.setenv("VLLM_ASCEND_MTP_DW_DIAG", "1")
+        monkeypatch.setenv("VLLM_ASCEND_MTP_DW_DEEP_DIAG", "1")
+        monkeypatch.setattr(
+            adapter_mod,
+            "_mtp_dw_event",
+            lambda stage, **fields: events.append({"stage": stage, **fields}),
+        )
+
+        impl._trace_deep_retrieve_state(
+            request,
+            None,
+            None,
+            invalidated=False,
+            invalidation_reason=None,
+            post_state=post_state,
+            prior_state_rebound=False,
+            kv_group0_retriever_present=True,
+            kv_group1_retriever_present=False,
+        )
+
+        assert len(events) == 1
+        assert events[0]["prior_frontier"] == 0
+        assert events[0]["prior_state_present"] is False
+        assert events[0]["post_state_present"] is True
+        assert events[0]["stale_state_retained"] is False
+
+    def test_deep_retrieve_state_reports_stale_state_without_blocking(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        impl = _make_impl()
+        state = WorkerRetrieveState(
+            cached_keys=[["k0"]],
+            cached_starts=[0],
+            cached_ends=[256],
+            metadata_warm=True,
+            token_count=256,
+        )
+        request = _make_request()
+        request.token_ids = [0] * 512
+        request.load_spec.lmcache_cached_tokens = 512
+        events = []
+        monkeypatch.setenv("VLLM_ASCEND_MTP_DW_DIAG", "1")
+        monkeypatch.setenv("VLLM_ASCEND_MTP_DW_DEEP_DIAG", "1")
+        monkeypatch.setattr(
+            adapter_mod,
+            "_mtp_dw_event",
+            lambda stage, **fields: events.append({"stage": stage, **fields}),
+        )
+
+        impl._trace_deep_retrieve_state(
+            request,
+            state,
+            self._deep_snapshot(state),
+            invalidated=False,
+            invalidation_reason=None,
+            post_state=state,
+            prior_state_rebound=True,
+            kv_group0_retriever_present=True,
+            kv_group1_retriever_present=False,
+        )
+
+        assert [event["stage"] for event in events] == ["fail", "deep"]
+        assert events[0]["invariant"] == "stale_retrieve_state"
+        assert events[1]["stale_state_retained"] is True
+
+    def test_deep_retrieve_state_does_not_flag_rebound_state_as_stale(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        impl = _make_impl()
+        prior_state = WorkerRetrieveState(token_count=256)
+        rebound_state = WorkerRetrieveState(token_count=512)
+        request = _make_request()
+        request.token_ids = [0] * 512
+        request.load_spec.lmcache_cached_tokens = 512
+        events = []
+        monkeypatch.setenv("VLLM_ASCEND_MTP_DW_DIAG", "1")
+        monkeypatch.setenv("VLLM_ASCEND_MTP_DW_DEEP_DIAG", "1")
+        monkeypatch.setattr(
+            adapter_mod,
+            "_mtp_dw_event",
+            lambda stage, **fields: events.append({"stage": stage, **fields}),
+        )
+
+        impl._trace_deep_retrieve_state(
+            request,
+            prior_state,
+            self._deep_snapshot(prior_state),
+            invalidated=False,
+            invalidation_reason=None,
+            post_state=rebound_state,
+            prior_state_rebound=False,
+            kv_group0_retriever_present=True,
+            kv_group1_retriever_present=False,
+        )
+
+        assert [event["stage"] for event in events] == ["deep"]
+        assert events[0]["stale_state_retained"] is False
+        assert events[0]["post_kv_group0_cache_present"] is False
+
+    def test_deep_group_presence_includes_pointer_only_cache(self) -> None:
+        state = WorkerRetrieveState(
+            cached_chunk_ptrs_npu=[torch.tensor([1], dtype=torch.long)],
+            cached_shared_handles_indexer=[["handle"]],
+        )
+
+        assert LMCacheConnectorV1Impl._deep_retrieve_group_cache_present(state, 0)
+        assert LMCacheConnectorV1Impl._deep_retrieve_group_cache_present(state, 1)
+
+        empty_state = WorkerRetrieveState(
+            cached_keys=[[]],
+            cached_chunk_ptrs_npu=[None],
+            cached_shared_handles_indexer=[[]],
+        )
+        assert not LMCacheConnectorV1Impl._deep_retrieve_group_cache_present(
+            empty_state, 0
+        )
+        assert not LMCacheConnectorV1Impl._deep_retrieve_group_cache_present(
+            empty_state, 1
+        )
+
+    def test_deep_range_summary_uses_only_complete_ranges(self) -> None:
+        assert LMCacheConnectorV1Impl._deep_retrieve_range_summary([0], []) == {
+            "count": 0,
+            "first_start": None,
+            "last_end": None,
+        }
+
     def test_sparse_decode_load_tokens_reuses_full_prefix_list(self):
         tokens = [1, 2, 3, 4]
 

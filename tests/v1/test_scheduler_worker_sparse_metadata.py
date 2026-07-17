@@ -875,18 +875,102 @@ class TestDecodeWindowSaveMetadata:
         assert req_meta.save_spec.can_save_indexer is False
         assert tracker.decode_window_save_next_start == 512
 
+    def test_deep_window_group_plan_explains_latent_only_commit_groups(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        impl, tracker, scheduler_output = self._build_decode_window_case(
+            shared_cpu=False,
+            indexer_blocks=False,
+        )
+        events: list[dict] = []
+        monkeypatch.setenv("VLLM_ASCEND_MTP_DW_DIAG", "1")
+        monkeypatch.setenv("VLLM_ASCEND_MTP_DW_DEEP_DIAG", "1")
+        monkeypatch.setattr(
+            adapter_module,
+            "_mtp_dw_event",
+            lambda stage, **fields: events.append({"stage": stage, **fields}),
+        )
+
+        impl.build_connector_meta(scheduler_output)
+
+        plans = [
+            event for event in events if event.get("event") == "window_group_plan"
+        ]
+        assert len(plans) == 1
+
+        finished = StubSchedulerOutput(
+            finished_req_ids={tracker.req_id},
+            scheduled_new_reqs=[],
+            scheduled_cached_reqs=StubCachedRequestData([], [], []),
+            num_scheduled_tokens={},
+        )
+        impl.build_connector_meta(finished)
+        assert tracker.req_id not in impl._mtp_dw_deep_window_group_planned_reqs
+        assert plans[0]["stage"] == "deep"
+        assert plans[0]["latent_only"] is True
+        assert plans[0]["indexer_disabled"] is True
+        assert plans[0]["kv_group0_save"] is True
+        assert plans[0]["kv_group1_save"] is False
+        assert plans[0]["required_groups"] == [0]
+
+    def test_deep_window_group_plan_requires_both_gates_and_dedupes_request(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        impl, tracker, scheduler_output = self._build_decode_window_case(
+            shared_cpu=False,
+            indexer_blocks=False,
+        )
+        events: list[dict] = []
+        monkeypatch.setenv("VLLM_ASCEND_MTP_DW_DIAG", "1")
+        monkeypatch.delenv("VLLM_ASCEND_MTP_DW_DEEP_DIAG", raising=False)
+        monkeypatch.setattr(
+            adapter_module,
+            "_mtp_dw_event",
+            lambda stage, **fields: events.append({"stage": stage, **fields}),
+        )
+
+        impl.build_connector_meta(scheduler_output)
+
+        assert not any(
+            event.get("event") == "window_group_plan" for event in events
+        )
+        assert not hasattr(impl, "_mtp_dw_deep_window_group_planned_reqs")
+
+        monkeypatch.setenv("VLLM_ASCEND_MTP_DW_DEEP_DIAG", "1")
+        tracker.token_ids.extend(range(512, 768))
+        impl._add_decode_window_save_metas(MagicMock(), tracker)
+        tracker.token_ids.extend(range(768, 1024))
+        impl._add_decode_window_save_metas(MagicMock(), tracker)
+
+        plans = [
+            event for event in events if event.get("event") == "window_group_plan"
+        ]
+        assert len(plans) == 1
+
     def test_shared_cpu_two_group_decode_window_save_requires_indexer_slots(
-        self,
+        self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         impl, tracker, scheduler_output = self._build_decode_window_case(
             shared_cpu=True,
             indexer_blocks=False,
+        )
+        events: list[dict] = []
+        monkeypatch.setenv("VLLM_ASCEND_MTP_DW_DIAG", "1")
+        monkeypatch.setenv("VLLM_ASCEND_MTP_DW_DEEP_DIAG", "1")
+        monkeypatch.setattr(
+            adapter_module,
+            "_mtp_dw_event",
+            lambda stage, **fields: events.append({"stage": stage, **fields}),
         )
 
         meta = impl.build_connector_meta(scheduler_output)
 
         assert meta.requests == []
         assert tracker.decode_window_save_next_start == 256
+        assert not any(
+            event.get("event") == "window_group_plan" for event in events
+        )
+        assert not hasattr(impl, "_mtp_dw_deep_window_group_planned_reqs")
 
     def test_shared_cpu_two_group_decode_window_save_allows_matching_indexer(
         self,
