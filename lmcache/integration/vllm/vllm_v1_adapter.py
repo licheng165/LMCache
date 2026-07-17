@@ -2570,39 +2570,42 @@ class LMCacheConnectorV1Impl:
 
     def _drain_layerwise_retrievers(self) -> None:
         """Finish suspended layerwise generators to avoid GC cost on reset."""
-        for idx, retriever_pair in enumerate(self.layerwise_retrievers):
-            is_sparse = (
-                idx < len(self._layerwise_retriever_is_sparse)
-                and self._layerwise_retriever_is_sparse[idx]
-            )
-            primary, secondary = retriever_pair
-            for retriever in (primary, secondary):
-                if retriever is None:
-                    continue
-                try:
+        try:
+            for idx, retriever_pair in enumerate(self.layerwise_retrievers):
+                is_sparse = (
+                    idx < len(self._layerwise_retriever_is_sparse)
+                    and self._layerwise_retriever_is_sparse[idx]
+                )
+                for retriever in retriever_pair:
+                    if retriever is None:
+                        continue
                     if is_sparse:
-                        self._drain_sparse_layerwise_retriever(retriever)
-                    else:
-                        while True:
-                            next(retriever)
-                except StopIteration:
-                    pass
-        self.layerwise_retrievers.clear()
-        if hasattr(self, "_layerwise_requests"):
-            self._layerwise_requests.clear()
-        self._layerwise_retriever_is_sparse.clear()
-        if hasattr(self, "_layerwise_sparse_req_ids"):
-            self._layerwise_sparse_req_ids.clear()
-        if hasattr(self, "_layerwise_waited_groups"):
-            self._layerwise_waited_groups.clear()
-        if hasattr(self, "_layerwise_sparse_indexer_sent_layers"):
-            self._layerwise_sparse_indexer_sent_layers.clear()
-        self._layerwise_required_wait_groups_cache = None
+                        self._close_layerwise_retriever(retriever)
+                        continue
+                    for _ in retriever:
+                        pass
+        finally:
+            for retriever_pair in self.layerwise_retrievers:
+                for retriever in retriever_pair:
+                    if retriever is not None:
+                        self._close_layerwise_retriever(retriever)
+            self.layerwise_retrievers.clear()
+            if hasattr(self, "_layerwise_requests"):
+                self._layerwise_requests.clear()
+            self._layerwise_retriever_is_sparse.clear()
+            if hasattr(self, "_layerwise_sparse_req_ids"):
+                self._layerwise_sparse_req_ids.clear()
+            if hasattr(self, "_layerwise_waited_groups"):
+                self._layerwise_waited_groups.clear()
+            if hasattr(self, "_layerwise_sparse_indexer_sent_layers"):
+                self._layerwise_sparse_indexer_sent_layers.clear()
+            self._layerwise_required_wait_groups_cache = None
 
-    def _drain_sparse_layerwise_retriever(
-        self, retriever: Generator[Any, Any, Any]
+    @staticmethod
+    def _close_layerwise_retriever(
+        retriever: Generator[Any, Any, Any],
     ) -> None:
-        """Close sparse head-token-wise retrievers waiting on send()."""
+        """Close a suspended layerwise retriever during step cleanup."""
         try:
             retriever.close()
         except (GeneratorExit, RuntimeError, ValueError):

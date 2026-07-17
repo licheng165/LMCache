@@ -1994,6 +1994,26 @@ class LMCacheEngine:
                 local_prefix.release()
             raise
 
+    @staticmethod
+    def _close_shared_retrieve_consumer(
+        consumer: Optional[Generator[Any, Any, Any]],
+    ) -> None:
+        if consumer is not None:
+            consumer.close()
+
+    @staticmethod
+    def _release_shared_retrieve_objs(
+        memory_objs: list[MemoryObj], *, unpin: bool
+    ) -> None:
+        if unpin:
+            for mem_obj in memory_objs:
+                if mem_obj.is_pinned:
+                    mem_obj.unpin()
+        while memory_objs:
+            mem_obj = memory_objs.pop()
+            if mem_obj.is_valid():
+                mem_obj.ref_count_down()
+
     def _retrieve_layer_shared_rank0(
         self,
         *,
@@ -2039,7 +2059,6 @@ class LMCacheEngine:
         next(mem_obj_consumer)
 
         to_release: list[MemoryObj] = []
-        to_unpin: list[MemoryObj] = []
         try:
             for layer_id in range(self.num_layers):
                 try:
@@ -2071,7 +2090,6 @@ class LMCacheEngine:
                         )
                     )
                     raise
-                to_unpin.extend(mem_objs_layer)
                 to_release.extend(mem_objs_layer)
 
                 handles = self._make_shared_handles_for_layer(
@@ -2103,6 +2121,8 @@ class LMCacheEngine:
                 mem_obj_consumer.send(mem_objs_layer)
 
             next(mem_obj_consumer)
+            self._close_shared_retrieve_consumer(mem_obj_consumer)
+            mem_obj_consumer = None
             retrieved_tokens = torch.sum(ret_mask)
             self.stats_monitor.on_retrieve_finished(
                 monitor_req_id,
@@ -2115,13 +2135,15 @@ class LMCacheEngine:
                 retrieved_tokens,
             )
             yield None
+            # Keep request-owned shared objects through the final layer wait,
+            # but release them before the result yield can remain suspended.
+            self._release_shared_retrieve_objs(to_release, unpin=True)
             yield ret_mask
         finally:
-            for mem_obj in to_unpin:
-                if getattr(mem_obj, "is_pinned", False):
-                    mem_obj.unpin()
-            for mem_obj in to_release:
-                mem_obj.ref_count_down()
+            try:
+                self._close_shared_retrieve_consumer(mem_obj_consumer)
+            finally:
+                self._release_shared_retrieve_objs(to_release, unpin=True)
 
     def _retrieve_layer_shared_passive(
         self,
@@ -2227,6 +2249,8 @@ class LMCacheEngine:
 
             if mem_obj_consumer is not None:
                 next(mem_obj_consumer)
+                self._close_shared_retrieve_consumer(mem_obj_consumer)
+                mem_obj_consumer = None
 
             retrieved_tokens = torch.sum(ret_mask)
             self.stats_monitor.on_retrieve_finished(monitor_req_id, retrieved_tokens)
@@ -2237,11 +2261,15 @@ class LMCacheEngine:
                 retrieved_tokens,
             )
             yield None
+            # Keep request-owned shared objects through the final layer wait,
+            # but release them before the result yield can remain suspended.
+            self._release_shared_retrieve_objs(to_release, unpin=False)
             yield ret_mask
         finally:
-            for mem_obj in to_release:
-                if mem_obj.is_valid():
-                    mem_obj.ref_count_down()
+            try:
+                self._close_shared_retrieve_consumer(mem_obj_consumer)
+            finally:
+                self._release_shared_retrieve_objs(to_release, unpin=False)
 
     def skip_shared_layerwise_retrieve(
         self,

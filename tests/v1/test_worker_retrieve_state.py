@@ -2071,6 +2071,43 @@ class TestWorkerRetrieveState:
         assert req.cached_tensors == []
         impl._drain_layerwise_retrievers()
 
+    def test_drain_layerwise_retrievers_closes_all_on_failure(self):
+        impl = _make_impl()
+        closed = []
+
+        def _retriever(name, *, fail):
+            try:
+                yield
+                if fail:
+                    raise RuntimeError("drain failed")
+                yield
+            finally:
+                closed.append(name)
+
+        primary = _retriever("primary", fail=True)
+        secondary = _retriever("secondary", fail=False)
+        next(primary)
+        next(secondary)
+        impl.layerwise_retrievers = [(primary, secondary)]
+        impl._layerwise_requests = [object()]
+        impl._layerwise_retriever_is_sparse = [False]
+        impl._layerwise_sparse_req_ids = ["req-1"]
+        impl._layerwise_waited_groups = {0}
+        impl._layerwise_sparse_indexer_sent_layers = {0}
+        impl._layerwise_required_wait_groups_cache = (0,)
+
+        with pytest.raises(RuntimeError, match="drain failed"):
+            impl._drain_layerwise_retrievers()
+
+        assert closed == ["primary", "secondary"]
+        assert impl.layerwise_retrievers == []
+        assert impl._layerwise_requests == []
+        assert impl._layerwise_retriever_is_sparse == []
+        assert impl._layerwise_sparse_req_ids == []
+        assert impl._layerwise_waited_groups == set()
+        assert impl._layerwise_sparse_indexer_sent_layers == set()
+        assert impl._layerwise_required_wait_groups_cache is None
+
     def test_store_seed_merges_chunked_prefill_hot_cache(self):
         impl = _make_impl()
         impl.config = SimpleNamespace(dsa_two_groups=False)

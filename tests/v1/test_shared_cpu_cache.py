@@ -897,6 +897,9 @@ class _FakeResolvableMemoryObj:
         self.is_pinned = False
         self.ref_count_down_count = 0
 
+    def is_valid(self):
+        return self.ref_count_down_count == 0
+
     def pin(self):
         self.is_pinned = True
 
@@ -909,13 +912,17 @@ class _FakeResolvableMemoryObj:
 
 class _FakeLayerwiseGPUConnector:
     def __init__(self):
+        self.close_count = 0
         self.sent = []
 
     def batched_to_gpu(self, starts, ends, **kwargs):
-        while True:
-            mem_objs = yield
-            if mem_objs is not None:
-                self.sent.append(mem_objs)
+        try:
+            while True:
+                mem_objs = yield
+                if mem_objs is not None:
+                    self.sent.append(mem_objs)
+        finally:
+            self.close_count += 1
 
 
 class _FakePassiveSharedView:
@@ -923,7 +930,7 @@ class _FakePassiveSharedView:
         self.ref_count_down_count = 0
 
     def is_valid(self):
-        return True
+        return self.ref_count_down_count == 0
 
     def ref_count_down(self):
         self.ref_count_down_count += 1
@@ -937,6 +944,71 @@ class _FakePassiveSharedAllocator:
         view = _FakePassiveSharedView()
         self.views.append(view)
         return view
+
+
+def _make_passive_shared_retrieve_engine(
+    *,
+    kv_group: int,
+    num_layers: int = 2,
+    requests: tuple[tuple[str, int], ...] = (("req-1", 0),),
+) -> LMCacheEngine:
+    engine = object.__new__(LMCacheEngine)
+    engine.gpu_connector = _FakeLayerwiseGPUConnector()
+    engine.num_layers = num_layers
+    engine.shared_cpu_cache_generation = 9
+    engine.shared_cpu_cache_passive_allocator = _FakePassiveSharedAllocator()
+    engine.metadata = SimpleNamespace(first_rank=0)
+    engine.stats_monitor = SimpleNamespace(
+        on_retrieve_finished=lambda monitor_req_id, tokens: None
+    )
+    engine._expected_shared_cpu_chunk_metadata = lambda **kwargs: (
+        torch.Size([4]),
+        torch.float16,
+        MemoryFormat.KV_MLA_LATENT_FMT,
+    )
+    envelopes = iter(
+        [
+            SharedHandleEnvelope(
+                request_id=req_id,
+                phase="dense_prefix",
+                request_ordinal=request_ordinal,
+                layer_id=layer_id,
+                kv_group=kv_group,
+                status="ok",
+                generation=9,
+                handles=[object()],
+            )
+            for req_id, request_ordinal in requests
+            for layer_id in range(num_layers)
+        ]
+    )
+    engine._receive_shared_envelope = lambda: next(envelopes)
+    return engine
+
+
+def _make_passive_shared_retriever(
+    engine: LMCacheEngine,
+    *,
+    req_id: str = "req-1",
+    request_ordinal: int = 0,
+    kv_group: int = 0,
+):
+    ret_mask = torch.zeros(4, dtype=torch.bool)
+    keys_by_layer = _make_key().split_layers(engine.num_layers)
+    retriever = engine._retrieve_layer_shared_passive(
+        starts_all=[0],
+        ends_all=[4],
+        keys_layer_major=[[key] for key in keys_by_layer],
+        ret_mask=ret_mask,
+        monitor_req_id=123,
+        req_id=req_id,
+        kv_group=kv_group,
+        kwargs={
+            "shared_cpu_phase": "dense_prefix",
+            "shared_cpu_request_ordinal": request_ordinal,
+        },
+    )
+    return retriever, ret_mask
 
 
 class _FakeGetBlockingLocalCPUBackend:
@@ -2347,7 +2419,10 @@ def test_dense_prefix_zero_hit_broadcasts_skipped_not_miss():
     assert broadcasts[-1] == {"stats": 0}
 
 
-def test_shared_dense_rank0_retriever_yields_legacy_drain_slot(monkeypatch):
+@pytest.mark.parametrize("kv_group", [0, 1])
+def test_shared_dense_rank0_retriever_releases_before_result_tail(
+    monkeypatch, kv_group
+):
     import lmcache.v1.cache_engine as cache_engine_module
 
     monkeypatch.setattr(
@@ -2383,24 +2458,33 @@ def test_shared_dense_rank0_retriever_yields_legacy_drain_slot(monkeypatch):
         ret_mask=ret_mask,
         monitor_req_id=123,
         req_id="req-1",
-        kv_group=0,
+        kv_group=kv_group,
         kwargs={"shared_cpu_phase": "dense_prefix"},
     )
 
-    yielded = [next(retriever) for _ in range(engine.num_layers + 2)]
+    yielded = [next(retriever) for _ in range(engine.num_layers + 1)]
 
     assert yielded[0].item() == 4
     assert yielded[1] is None
     assert yielded[2] is None
-    assert torch.equal(yielded[3], ret_mask)
     assert [item.layer_id for item in broadcasts] == [0, 1]
     assert engine.gpu_connector.sent == [[mem_objs[0]], [mem_objs[1]]]
+    assert [mem.ref_count_down_count for mem in mem_objs] == [0, 0]
+    assert all(mem.is_pinned for mem in mem_objs)
+    assert engine.gpu_connector.close_count == 1
+
+    assert torch.equal(next(retriever), ret_mask)
+    assert [mem.ref_count_down_count for mem in mem_objs] == [1, 1]
+    assert all(not mem.is_pinned for mem in mem_objs)
     with pytest.raises(StopIteration):
         next(retriever)
     assert [mem.ref_count_down_count for mem in mem_objs] == [1, 1]
 
 
-def test_shared_dense_passive_retriever_yields_legacy_drain_slot(monkeypatch):
+@pytest.mark.parametrize("kv_group", [0, 1])
+def test_shared_dense_passive_retriever_releases_before_result_tail(
+    monkeypatch, kv_group
+):
     import lmcache.v1.cache_engine as cache_engine_module
 
     monkeypatch.setattr(
@@ -2408,75 +2492,68 @@ def test_shared_dense_passive_retriever_yields_legacy_drain_slot(monkeypatch):
         "assert_layerwise_gpu_connector",
         lambda _connector: None,
     )
-    engine = object.__new__(LMCacheEngine)
-    engine.gpu_connector = _FakeLayerwiseGPUConnector()
-    engine.num_layers = 2
-    engine.shared_cpu_cache_generation = 9
-    engine.shared_cpu_cache_passive_allocator = _FakePassiveSharedAllocator()
-    engine.metadata = SimpleNamespace(first_rank=0)
-    engine.stats_monitor = SimpleNamespace(
-        on_retrieve_finished=lambda monitor_req_id, tokens: None
-    )
-    engine._expected_shared_cpu_chunk_metadata = lambda **kwargs: (
-        torch.Size([4]),
-        torch.float16,
-        MemoryFormat.KV_MLA_LATENT_FMT,
-    )
-    envelopes = iter(
-        [
-            SharedHandleEnvelope(
-                request_id="req-1",
-                phase="dense_prefix",
-                request_ordinal=0,
-                layer_id=0,
-                kv_group=0,
-                status="ok",
-                generation=9,
-                handles=[object()],
-            ),
-            SharedHandleEnvelope(
-                request_id="req-1",
-                phase="dense_prefix",
-                request_ordinal=0,
-                layer_id=1,
-                kv_group=0,
-                status="ok",
-                generation=9,
-                handles=[object()],
-            ),
-        ]
-    )
-    engine._receive_shared_envelope = lambda: next(envelopes)
-    ret_mask = torch.zeros(4, dtype=torch.bool)
-    keys_by_layer = _make_key().split_layers(engine.num_layers)
-
-    retriever = engine._retrieve_layer_shared_passive(
-        starts_all=[0],
-        ends_all=[4],
-        keys_layer_major=[[key] for key in keys_by_layer],
-        ret_mask=ret_mask,
-        monitor_req_id=123,
-        req_id="req-1",
-        kv_group=0,
-        kwargs={"shared_cpu_phase": "dense_prefix"},
+    engine = _make_passive_shared_retrieve_engine(kv_group=kv_group)
+    retriever, ret_mask = _make_passive_shared_retriever(
+        engine,
+        kv_group=kv_group,
     )
 
-    yielded = [next(retriever) for _ in range(engine.num_layers + 2)]
+    yielded = [next(retriever) for _ in range(engine.num_layers + 1)]
 
     assert yielded[0].item() == 4
     assert yielded[1] is None
     assert yielded[2] is None
-    assert torch.equal(yielded[3], ret_mask)
     assert engine.gpu_connector.sent == [
         [engine.shared_cpu_cache_passive_allocator.views[0]],
         [engine.shared_cpu_cache_passive_allocator.views[1]],
     ]
-    with pytest.raises(StopIteration):
-        next(retriever)
+    assert [
+        view.ref_count_down_count
+        for view in engine.shared_cpu_cache_passive_allocator.views
+    ] == [0, 0]
+    assert engine.gpu_connector.close_count == 1
+
+    assert torch.equal(next(retriever), ret_mask)
     assert [
         view.ref_count_down_count
         for view in engine.shared_cpu_cache_passive_allocator.views
     ] == [1, 1]
+    with pytest.raises(StopIteration):
+        next(retriever)
+
+
+def test_shared_dense_passive_views_remain_request_owned(monkeypatch):
+    import lmcache.v1.cache_engine as cache_engine_module
+
+    monkeypatch.setattr(
+        cache_engine_module,
+        "assert_layerwise_gpu_connector",
+        lambda _connector: None,
+    )
+    engine = _make_passive_shared_retrieve_engine(
+        kv_group=0,
+        requests=(("req-a", 0), ("req-b", 1)),
+    )
+    first, first_mask = _make_passive_shared_retriever(
+        engine, req_id="req-a", request_ordinal=0
+    )
+    second, _ = _make_passive_shared_retriever(
+        engine, req_id="req-b", request_ordinal=1
+    )
+    next(first)
+    next(first)
+    next(second)
+    assert next(first) is None
+
+    views = engine.shared_cpu_cache_passive_allocator.views
+    assert [view.ref_count_down_count for view in views] == [0, 0, 0]
+
+    assert torch.equal(next(first), first_mask)
+    assert [view.ref_count_down_count for view in views] == [1, 1, 0]
+
+    second.close()
+    assert [view.ref_count_down_count for view in views] == [1, 1, 1]
+    assert engine.gpu_connector.close_count == 2
 
 
 def test_strict_shared_envelope_rejects_miss_before_view_creation():
