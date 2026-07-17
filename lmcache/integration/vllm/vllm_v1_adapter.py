@@ -1,10 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
 # Standard
+import os
+import time
 from collections.abc import Iterable
 from dataclasses import dataclass, field
 from types import SimpleNamespace
 from typing import TYPE_CHECKING, Any, Generator, Optional, Union
-import os
 
 # Third Party
 from vllm.config import (
@@ -3093,6 +3094,11 @@ class LMCacheConnectorV1Impl:
         for req_id in req_ids:
             self._drop_layerwise_save_storers(req_id)
             self._drop_worker_retrieve_state(req_id)
+            indexer_reuse_logged = getattr(
+                self, "_indexer_resident_logged_req_ids", None
+            )
+            if indexer_reuse_logged is not None:
+                indexer_reuse_logged.discard(req_id)
 
     @staticmethod
     def _release_shared_worker_retrieve_state(
@@ -4717,6 +4723,32 @@ class LMCacheConnectorV1Impl:
 
         metadata = self._parent._get_connector_metadata()
         assert isinstance(metadata, LMCacheConnectorMetadata)
+        bootstrap_requests = [
+            request
+            for request in metadata.requests
+            if request.load_spec is not None
+            and request.load_spec.can_load
+            and request.load_spec.bootstrap_sample
+        ]
+        self._bootstrap_layerwise_req_ids = [
+            request.req_id for request in bootstrap_requests
+        ]
+        if bootstrap_requests:
+            logger.info(
+                "[BOOTSTRAP_LMCACHE_START] requests=%s metadata_requests=%d "
+                "dsa_two_groups=%s shared_cpu=%s use_layerwise=%s",
+                [request.req_id for request in bootstrap_requests],
+                len(metadata.requests),
+                self._is_dsa_two_groups(),
+                bool(
+                    getattr(
+                        self.lmcache_engine,
+                        "enable_shared_cpu_cache",
+                        False,
+                    )
+                ),
+                self.use_layerwise,
+            )
 
         active_req_ids = {
             req.req_id
@@ -4779,6 +4811,8 @@ class LMCacheConnectorV1Impl:
             if request.load_spec is None or not request.load_spec.can_load:
                 continue
 
+            is_bootstrap_sample = bool(request.load_spec.bootstrap_sample)
+
             tokens = request.token_ids
             lmcache_cached_tokens = request.load_spec.lmcache_cached_tokens
             assert request.slot_mapping
@@ -4819,6 +4853,22 @@ class LMCacheConnectorV1Impl:
             token_mask = self._load_token_mask_for_retrieve(
                 request, token_count, self._lmcache_chunk_size
             )
+            if is_bootstrap_sample:
+                logger.info(
+                    "[BOOTSTRAP_LMCACHE_REQUEST] req=%s token_ids=%d "
+                    "retrieve_tokens=%d vllm_cached=%d lmcache_cached=%d "
+                    "slot_mapping_shape=%s recalc_last=%s sync=%s",
+                    request.req_id,
+                    len(tokens),
+                    token_count,
+                    request.load_spec.vllm_cached_tokens,
+                    request.load_spec.lmcache_cached_tokens,
+                    tuple(slot_mapping.shape)
+                    if hasattr(slot_mapping, "shape")
+                    else None,
+                    recalc_last_applied,
+                    idx == last_idx,
+                )
             if (
                 not request.is_sparse_decode
                 and token_count > len(slot_mapping)
@@ -4965,13 +5015,22 @@ class LMCacheConnectorV1Impl:
                                 token_count,
                             )
                         ):
-                            logger.debug(
-                                "Skipping shared CPU DSA index retrieve for "
-                                "resident live sparse decode state: req_id=%s "
-                                "token_count=%d",
-                                request.req_id,
-                                token_count,
+                            logged_req_ids = getattr(
+                                self,
+                                "_indexer_resident_logged_req_ids",
+                                set(),
                             )
+                            if request.req_id not in logged_req_ids:
+                                logger.info(
+                                    "[DSA_INDEXER_REUSE] req=%s token_count=%d "
+                                    "source=npu_resident remote_index_load=false",
+                                    request.req_id,
+                                    token_count,
+                                )
+                                logged_req_ids.add(request.req_id)
+                                self._indexer_resident_logged_req_ids = (
+                                    logged_req_ids
+                                )
                         elif not materialize_index:
                             indexer_skipped = True
                         elif not indexer_kvcaches:
@@ -5091,6 +5150,19 @@ class LMCacheConnectorV1Impl:
                                 )
                             )
                             next(indexer_retriever)
+                            if is_bootstrap_sample:
+                                logger.info(
+                                    "[BOOTSTRAP_INDEXER_MATERIALIZE] req=%s "
+                                    "token_count=%d index_slot_shape=%s "
+                                    "shared_cpu=%s sync=%s retriever_started=true",
+                                    request.req_id,
+                                    token_count,
+                                    tuple(idx_slot.shape)
+                                    if hasattr(idx_slot, "shape")
+                                    else None,
+                                    shared_cpu_enabled,
+                                    sync,
+                                )
 
                     if indexer_skipped:
                         request.shared_index_skipped = True
@@ -5119,6 +5191,16 @@ class LMCacheConnectorV1Impl:
                     self._layerwise_requests.append(request)
                     self._layerwise_retriever_is_sparse.append(True)
                     self._layerwise_sparse_req_ids.append(request.req_id)
+                    if is_bootstrap_sample:
+                        logger.info(
+                            "[BOOTSTRAP_LMCACHE_RETRIEVERS_READY] req=%s "
+                            "latent=true indexer=%s layerwise_pairs=%d "
+                            "indexer_skipped=%s",
+                            request.req_id,
+                            indexer_retriever is not None,
+                            len(self.layerwise_retrievers),
+                            indexer_skipped,
+                        )
                 else:
                     retrieve_slot_mapping = slot_mapping
                     if lmcache_cached_tokens < len(slot_mapping):
@@ -5416,6 +5498,19 @@ class LMCacheConnectorV1Impl:
                 for request in metadata.requests
                 if request.load_spec is not None and request.load_spec.can_load
             ]
+        bootstrap_req_ids = getattr(
+            self, "_bootstrap_layerwise_req_ids", ()
+        )
+        if bootstrap_req_ids and request_ids is not None:
+            requested_req_ids = set(request_ids)
+            bootstrap_req_ids = [
+                req_id
+                for req_id in bootstrap_req_ids
+                if req_id in requested_req_ids
+            ]
+        wait_started = (
+            time.perf_counter() if bootstrap_req_ids else 0.0
+        )
 
         rows_of_req = None
         if request_ids is not None:
@@ -5464,6 +5559,19 @@ class LMCacheConnectorV1Impl:
             )
 
         wait_group = self._layerwise_wait_group(layer_name)
+        layer_before = self.current_layer
+        if bootstrap_req_ids:
+            logger.info(
+                "[BOOTSTRAP_LMCACHE_LAYER_WAIT_BEGIN] layer_index=%d "
+                "wait_group=%d layer=%s requests=%s selected_rows=%s "
+                "retrievers=%d",
+                layer_before,
+                wait_group,
+                layer_name,
+                bootstrap_req_ids,
+                selected_rows,
+                len(self.layerwise_retrievers),
+            )
         parsed_layer_id = None
         parsed_layer_id_loaded = False
         sparse_indexer_sent_layers = None
@@ -5471,6 +5579,12 @@ class LMCacheConnectorV1Impl:
         idx = 0
         decode_row = 0
         for request in layerwise_requests:
+            is_bootstrap_sample = bool(
+                bootstrap_req_ids and request.req_id in bootstrap_req_ids
+            )
+            request_wait_started = (
+                time.perf_counter() if is_bootstrap_sample else 0.0
+            )
             if idx >= len(self.layerwise_retrievers):
                 logger.warning(
                     "wait_for_layer_load: missing retriever for request %s "
@@ -5659,6 +5773,27 @@ class LMCacheConnectorV1Impl:
                 assert ret_token_mask is not None
                 num_retrieved_tokens = ret_token_mask.sum().item()
                 logger.info("Retrieved %d tokens", num_retrieved_tokens)
+            if is_bootstrap_sample:
+                indexer_sent = bool(
+                    request.is_sparse_decode
+                    and indexer_sent_key is not None
+                    and sparse_indexer_sent_layers is not None
+                    and indexer_sent_key in sparse_indexer_sent_layers
+                )
+                logger.info(
+                    "[BOOTSTRAP_LMCACHE_LAYER_REQUEST_READY] req=%s "
+                    "layer_index=%d wait_group=%d layer=%s sparse=%s "
+                    "rows=%d indexer_sent=%s ret_mask=%s wait_ms=%.3f",
+                    request.req_id,
+                    layer_before,
+                    wait_group,
+                    layer_name,
+                    request.is_sparse_decode,
+                    row_count if request.is_sparse_decode else 1,
+                    indexer_sent,
+                    ret_token_mask is not None,
+                    (time.perf_counter() - request_wait_started) * 1000,
+                )
             idx += 1
 
         if self.layerwise_retrievers and self._layerwise_wait_should_advance(
@@ -5671,6 +5806,17 @@ class LMCacheConnectorV1Impl:
                     assert isinstance(metadata, LMCacheConnectorMetadata)
                 self._finalize_worker_retrieve_state_from_metadata(metadata)
                 self._drain_layerwise_retrievers()
+
+        if bootstrap_req_ids:
+            logger.info(
+                "[BOOTSTRAP_LMCACHE_LAYER_WAIT_DONE] layer_index=%d "
+                "wait_group=%d layer=%s next_layer=%d total_ms=%.3f",
+                layer_before,
+                wait_group,
+                layer_name,
+                self.current_layer,
+                (time.perf_counter() - wait_started) * 1000,
+            )
 
         return
 
@@ -6436,6 +6582,14 @@ class LMCacheConnectorV1Impl:
                 request.num_tokens,
                 num_computed_tokens,
             )
+            if getattr(request, "bootstrap_sample_pending", False):
+                logger.warning(
+                    "[BOOTSTRAP_LMCACHE_LOOKUP] req=%s result=unknown "
+                    "prompt_tokens=%d vllm_cached=%d action=defer",
+                    req_id,
+                    request.num_tokens,
+                    num_computed_tokens,
+                )
             return None
 
         # When prompt length is divisible by the block size and all
@@ -6449,6 +6603,19 @@ class LMCacheConnectorV1Impl:
             and getattr(request, "bootstrap_sample_pending", False)
             and num_external_hit_tokens == request.num_tokens
         )
+        if getattr(request, "bootstrap_sample_pending", False):
+            logger.info(
+                "[BOOTSTRAP_LMCACHE_LOOKUP] req=%s prompt_tokens=%d "
+                "vllm_cached=%d lmcache_hit=%d full_hit=%s "
+                "sparse_attention=%s bootstrap_sample=%s",
+                req_id,
+                request.num_tokens,
+                num_computed_tokens,
+                num_external_hit_tokens,
+                num_external_hit_tokens == request.num_tokens,
+                self.enable_sparse_attention,
+                bootstrap_sample,
+            )
 
         # In the ordinary full-prompt-hit case, recompute the last token. A
         # validated final-hidden handoff makes all prompt tokens authoritative.
@@ -6490,6 +6657,16 @@ class LMCacheConnectorV1Impl:
             can_load=False,
             bootstrap_sample=bootstrap_sample,
         )
+        if getattr(request, "bootstrap_sample_pending", False):
+            logger.info(
+                "[BOOTSTRAP_LMCACHE_LOAD_SPEC] req=%s need_to_allocate=%d "
+                "below_min_retrieve=%s min_retrieve=%d bootstrap_sample=%s",
+                req_id,
+                max(need_to_allocate, 0),
+                below_min_retrieve,
+                min_retrieve,
+                bootstrap_sample,
+            )
 
         if below_min_retrieve or need_to_allocate <= 0:
             return 0
@@ -6717,12 +6894,25 @@ class LMCacheConnectorV1Impl:
                 load_spec is not None and load_spec.bootstrap_sample
             )
             if is_bootstrap_sample:
-                # The D node has no target-model prefill/attention call before
-                # sampling. Enter the sparse cold-load path immediately so the
-                # compact latent table is used only as retrieval scratch while
-                # the complete DSA index is materialized.
+                assert load_spec is not None
+                # There is no authoritative D-side prompt recomputation before
+                # sampling. A backend may run a discard-only target shadow for
+                # DP/EP alignment. Enter sparse cold load immediately so the
+                # compact latent table is retrieval scratch while the complete
+                # DSA index is materialized.
                 request_tracker.seed_sparse_decode_tokens(
                     list(request_tracker.token_ids)
+                )
+                logger.info(
+                    "[BOOTSTRAP_LMCACHE_METADATA] req=%s prompt_tokens=%d "
+                    "scheduled_tokens=%d vllm_cached=%d lmcache_cached=%d "
+                    "sparse_seed_tokens=%d",
+                    request.req_id,
+                    request_tracker.prompt_len,
+                    scheduler_output.num_scheduled_tokens[request.req_id],
+                    load_spec.vllm_cached_tokens,
+                    load_spec.lmcache_cached_tokens,
+                    len(request_tracker.sparse_token_ids),
                 )
 
             req_meta = ReqMeta.from_request_tracker(
@@ -7026,6 +7216,16 @@ class LMCacheConnectorV1Impl:
             else:
                 return_params = return_params or {}
                 return_params["bootstrap_final_hidden"] = final_hidden
+                logger.info(
+                    "[FINAL_HIDDEN_LMCACHE_RETURN] req=%s dtype=%s shape=%s "
+                    "prompt_tokens=%s base64_chars=%d checksum=%s",
+                    request.request_id,
+                    final_hidden.get("dtype"),
+                    final_hidden.get("shape"),
+                    final_hidden.get("prompt_length"),
+                    len(final_hidden.get("data", "")),
+                    str(final_hidden.get("data_sha256", ""))[:16],
+                )
 
         if self.config.get_extra_config_value(
             "enable_cache_usage_details_in_response", False
