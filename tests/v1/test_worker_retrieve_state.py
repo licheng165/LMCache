@@ -12,6 +12,7 @@ import torch
 # First Party
 from lmcache.integration.vllm import vllm_v1_adapter as adapter_mod
 from lmcache.integration.vllm.vllm_v1_adapter import (
+    LMCacheConnectorMetadata,
     LMCacheConnectorV1Impl,
     LoadSpec,
     ReqMeta,
@@ -19,6 +20,7 @@ from lmcache.integration.vllm.vllm_v1_adapter import (
     SaveSpec,
     WorkerRetrieveState,
 )
+from lmcache.v1.cache_engine import LayerwiseStoreResult
 from lmcache.v1.kv_layer_groups import KVLayerGroupsManager
 from tests.v1.connector_test_utils import (
     make_sparse_req_meta,
@@ -29,6 +31,7 @@ from tests.v1.connector_test_utils import (
 def _make_impl() -> LMCacheConnectorV1Impl:
     impl = object.__new__(LMCacheConnectorV1Impl)
     impl._worker_retrieve_state = {}
+    impl.kv_role = "kv_both"
     return impl
 
 
@@ -45,23 +48,37 @@ def _make_group_order_impl(
 
 
 def _make_store_request(
+    impl: LMCacheConnectorV1Impl,
     *,
     token_count: int,
     start: int,
     end: int,
     key: str,
     tensor: str,
-) -> ReqMeta:
-    return ReqMeta(
+    decode_window: tuple[int, int] | None = None,
+) -> tuple[ReqMeta, LayerwiseStoreResult]:
+    request = ReqMeta(
         req_id="req-1",
         token_ids=[0] * token_count,
         is_sparse_decode=False,
-        cached_keys=[[key]],
-        cached_starts=[start],
-        cached_ends=[end],
-        cached_memory_objs=[[f"mem-{key}"]],
-        cached_tensors=[[tensor]],
+        is_decode_window_save=decode_window is not None,
+        decode_window_start=decode_window[0] if decode_window else None,
+        decode_window_end=decode_window[1] if decode_window else None,
+        decode_window_size=(
+            decode_window[1] - decode_window[0]
+            if decode_window
+            else None
+        ),
     )
+    result = LayerwiseStoreResult(
+        request_id=request.req_id,
+        starts=[start],
+        ends=[end],
+        keys=[[key]],
+        memory_objs=[[f"mem-{key}"]],
+        tensors=[[tensor]],
+    )
+    return request, result
 
 
 def _make_request(*, resumed: bool = False) -> ReqMeta:
@@ -76,6 +93,10 @@ def _make_request(*, resumed: bool = False) -> ReqMeta:
         is_sparse_decode=True,
         resumed_from_preemption=resumed,
     )
+
+
+def _bind_worker_state(impl: LMCacheConnectorV1Impl, request: ReqMeta):
+    return impl._worker_retrieve_state_for_request(request)
 
 
 class TestWorkerRetrieveState:
@@ -265,7 +286,7 @@ class TestWorkerRetrieveState:
         )
 
         with pytest.raises(RuntimeError, match="invalid DSA index"):
-            impl._bind_worker_retrieve_state_to_request(request)
+            _bind_worker_state(impl, request)
 
     def test_record_shared_state_preserves_skipped_index_without_index_objs(self):
         impl = _make_impl()
@@ -276,9 +297,9 @@ class TestWorkerRetrieveState:
         )
         state = WorkerRetrieveState(shared_index_status="skipped")
         request = _make_request()
-        request.cached_memory_objs = [["latent-view"]]
-        request.cached_shared_handles = [["latent-handle"]]
-        request.cached_chunk_ptrs_npu = ["latent-ptrs"]
+        state.cached_memory_objs = [["latent-view"]]
+        state.cached_shared_handles = [["latent-handle"]]
+        state.cached_chunk_ptrs_npu = ["latent-ptrs"]
 
         impl._record_shared_worker_retrieve_state(state, request)
 
@@ -297,15 +318,15 @@ class TestWorkerRetrieveState:
         )
         state = WorkerRetrieveState()
         request = _make_request()
-        request.cached_memory_objs = [
+        state.cached_memory_objs = [
             ["latent-view-layer0"],
             ["latent-view-layer1"],
         ]
-        request.cached_shared_handles = [
+        state.cached_shared_handles = [
             ["latent-handle-layer0"],
             ["latent-handle-layer1"],
         ]
-        request.cached_chunk_ptrs_npu = [
+        state.cached_chunk_ptrs_npu = [
             "latent-ptrs-layer0",
             "latent-ptrs-layer1",
         ]
@@ -330,11 +351,11 @@ class TestWorkerRetrieveState:
         )
         state = WorkerRetrieveState()
         request = _make_request()
-        request.cached_memory_objs = [["latent-view"]]
-        request.cached_shared_handles = [["latent-handle"]]
-        request.cached_chunk_ptrs_npu = ["latent-ptrs"]
-        request.cached_memory_objs_indexer = [["stale-index-view"]]
-        request.cached_shared_handles_indexer = [["stale-index-handle"]]
+        state.cached_memory_objs = [["latent-view"]]
+        state.cached_shared_handles = [["latent-handle"]]
+        state.cached_chunk_ptrs_npu = ["latent-ptrs"]
+        state.cached_memory_objs_indexer = [["stale-index-view"]]
+        state.cached_shared_handles_indexer = [["stale-index-handle"]]
         request.shared_index_skipped = True
 
         with pytest.raises(RuntimeError, match="kv_group=1"):
@@ -353,15 +374,15 @@ class TestWorkerRetrieveState:
         )
         state = WorkerRetrieveState()
         request = _make_request()
-        request.cached_memory_objs = [
+        state.cached_memory_objs = [
             ["latent-view-layer0"],
             ["latent-view-layer1"],
         ]
-        request.cached_shared_handles = [
+        state.cached_shared_handles = [
             ["latent-handle-layer0"],
             ["latent-handle-layer1"],
         ]
-        request.cached_chunk_ptrs_npu = [
+        state.cached_chunk_ptrs_npu = [
             "latent-ptrs-layer0",
             "latent-ptrs-layer1",
         ]
@@ -382,9 +403,9 @@ class TestWorkerRetrieveState:
         )
         state = WorkerRetrieveState()
         request = _make_request()
-        request.cached_memory_objs = [["latent-view-layer0"], []]
-        request.cached_shared_handles = [["latent-handle-layer0"], []]
-        request.cached_chunk_ptrs_npu = ["latent-ptrs-layer0", None]
+        state.cached_memory_objs = [["latent-view-layer0"], []]
+        state.cached_shared_handles = [["latent-handle-layer0"], []]
+        state.cached_chunk_ptrs_npu = ["latent-ptrs-layer0", None]
 
         with pytest.raises(RuntimeError, match="incomplete MLA latent"):
             impl._record_shared_worker_retrieve_state(state, request)
@@ -407,11 +428,11 @@ class TestWorkerRetrieveState:
             lmcache_cached_tokens=512,
             can_load=True,
         )
-        request.cached_starts = [256]
-        request.cached_ends = [512]
-        request.cached_memory_objs = [["latent-view"]]
-        request.cached_shared_handles = [["latent-handle"]]
-        request.cached_chunk_ptrs_npu = [torch.tensor([111], dtype=torch.long)]
+        state.cached_starts = [256]
+        state.cached_ends = [512]
+        state.cached_memory_objs = [["latent-view"]]
+        state.cached_shared_handles = [["latent-handle"]]
+        state.cached_chunk_ptrs_npu = [torch.tensor([111], dtype=torch.long)]
 
         with pytest.raises(RuntimeError, match="non-contiguous prefix coverage"):
             impl._record_shared_worker_retrieve_state(state, request)
@@ -429,21 +450,21 @@ class TestWorkerRetrieveState:
         )
         state = WorkerRetrieveState()
         request = _make_request()
-        request.cached_memory_objs = [
+        state.cached_memory_objs = [
             ["latent-view-layer0"],
             ["latent-view-layer1"],
         ]
-        request.cached_shared_handles = [
+        state.cached_shared_handles = [
             ["latent-handle-layer0"],
             ["latent-handle-layer1"],
         ]
-        request.cached_chunk_ptrs_npu = [
+        state.cached_chunk_ptrs_npu = [
             "latent-ptrs-layer0",
             "latent-ptrs-layer1",
         ]
-        request.cached_memory_objs_indexer = [["index-view-layer0"], []]
-        request.cached_shared_handles_indexer = [["index-handle-layer0"], []]
-        request.cached_chunk_ptrs_npu_indexer = ["index-ptrs-layer0", None]
+        state.cached_memory_objs_indexer = [["index-view-layer0"], []]
+        state.cached_shared_handles_indexer = [["index-handle-layer0"], []]
+        state.cached_chunk_ptrs_npu_indexer = ["index-ptrs-layer0", None]
 
         with pytest.raises(RuntimeError, match="complete materialized DSA index"):
             impl._record_shared_worker_retrieve_state(state, request)
@@ -461,27 +482,27 @@ class TestWorkerRetrieveState:
         )
         state = WorkerRetrieveState()
         request = _make_request()
-        request.cached_memory_objs = [
+        state.cached_memory_objs = [
             ["latent-view-layer0"],
             ["latent-view-layer1"],
         ]
-        request.cached_shared_handles = [
+        state.cached_shared_handles = [
             ["latent-handle-layer0"],
             ["latent-handle-layer1"],
         ]
-        request.cached_chunk_ptrs_npu = [
+        state.cached_chunk_ptrs_npu = [
             "latent-ptrs-layer0",
             "latent-ptrs-layer1",
         ]
-        request.cached_memory_objs_indexer = [
+        state.cached_memory_objs_indexer = [
             ["index-view-layer0"],
             ["index-view-layer1"],
         ]
-        request.cached_shared_handles_indexer = [
+        state.cached_shared_handles_indexer = [
             ["index-handle-layer0"],
             ["index-handle-layer1"],
         ]
-        request.cached_chunk_ptrs_npu_indexer = [
+        state.cached_chunk_ptrs_npu_indexer = [
             "index-ptrs-layer0",
             "index-ptrs-layer1",
         ]
@@ -494,12 +515,12 @@ class TestWorkerRetrieveState:
         assert state.token_count == request.load_spec.lmcache_cached_tokens
         assert state.request_scope_token == "req-1:7:3"
         assert state.shared_views_by_group == {
-            0: request.cached_memory_objs,
-            1: request.cached_memory_objs_indexer,
+            0: state.cached_memory_objs,
+            1: state.cached_memory_objs_indexer,
         }
         assert state.shared_handles_by_group == {
-            0: request.cached_shared_handles,
-            1: request.cached_shared_handles_indexer,
+            0: state.cached_shared_handles,
+            1: state.cached_shared_handles_indexer,
         }
 
     def test_record_shared_state_rejects_short_latent_pointer_tensor(self):
@@ -514,11 +535,11 @@ class TestWorkerRetrieveState:
         )
         state = WorkerRetrieveState()
         request = _make_request()
-        request.cached_starts = [0, 256]
-        request.cached_ends = [256, 512]
-        request.cached_memory_objs = [["latent-view-0", "latent-view-1"]]
-        request.cached_shared_handles = [["latent-handle-0", "latent-handle-1"]]
-        request.cached_chunk_ptrs_npu = [torch.tensor([111], dtype=torch.long)]
+        state.cached_starts = [0, 256]
+        state.cached_ends = [256, 512]
+        state.cached_memory_objs = [["latent-view-0", "latent-view-1"]]
+        state.cached_shared_handles = [["latent-handle-0", "latent-handle-1"]]
+        state.cached_chunk_ptrs_npu = [torch.tensor([111], dtype=torch.long)]
 
         with pytest.raises(RuntimeError, match="pointer-cache install"):
             impl._record_shared_worker_retrieve_state(state, request)
@@ -536,16 +557,16 @@ class TestWorkerRetrieveState:
         )
         state = WorkerRetrieveState()
         request = _make_request()
-        request.cached_starts = [0, 256]
-        request.cached_ends = [256, 512]
-        request.cached_memory_objs = [["latent-view-0", "latent-view-1"]]
-        request.cached_shared_handles = [["latent-handle-0", "latent-handle-1"]]
-        request.cached_chunk_ptrs_npu = [torch.tensor([111, 222], dtype=torch.long)]
-        request.cached_starts_indexer = [0]
-        request.cached_ends_indexer = [256]
-        request.cached_memory_objs_indexer = [["index-view-0"]]
-        request.cached_shared_handles_indexer = [["index-handle-0"]]
-        request.cached_chunk_ptrs_npu_indexer = [
+        state.cached_starts = [0, 256]
+        state.cached_ends = [256, 512]
+        state.cached_memory_objs = [["latent-view-0", "latent-view-1"]]
+        state.cached_shared_handles = [["latent-handle-0", "latent-handle-1"]]
+        state.cached_chunk_ptrs_npu = [torch.tensor([111, 222], dtype=torch.long)]
+        state.cached_starts_indexer = [0]
+        state.cached_ends_indexer = [256]
+        state.cached_memory_objs_indexer = [["index-view-0"]]
+        state.cached_shared_handles_indexer = [["index-handle-0"]]
+        state.cached_chunk_ptrs_npu_indexer = [
             torch.tensor([333], dtype=torch.long)
         ]
 
@@ -695,6 +716,71 @@ class TestWorkerRetrieveState:
         assert backing_obj.released == 1
         engine.lookup_unpin.assert_called_once_with("req-1")
 
+    def test_get_finished_releases_worker_state_after_save(self):
+        impl = _make_impl()
+        impl._wait_for_save_done = True
+        impl._release_finished_worker_requests = MagicMock()
+
+        assert impl.get_finished(set()) == (None, None)
+        impl._release_finished_worker_requests.assert_not_called()
+
+        result = impl.get_finished({"req-1"})
+
+        assert result == (None, None)
+        impl._release_finished_worker_requests.assert_called_once_with({"req-1"})
+
+    def test_get_finished_defers_cleanup_until_wait_for_save(self):
+        request = SimpleNamespace(
+            req_id="req-1",
+            token_ids=[1, 2, 3],
+            save_spec=SaveSpec(skip_leading_tokens=0, can_save=True),
+        )
+        metadata = LMCacheConnectorMetadata(requests=[request])
+        impl = _make_impl()
+        impl._parent = SimpleNamespace(
+            _get_connector_metadata=lambda: metadata,
+        )
+        impl.kv_role = "kv_both"
+        impl._wait_for_save_done = False
+        impl._finished_req_ids_waiting_for_save = set()
+        impl._release_finished_worker_requests = MagicMock()
+        impl._wait_for_save_impl = MagicMock()
+
+        assert impl.get_finished({"req-1"}) == (None, None)
+        impl._release_finished_worker_requests.assert_not_called()
+        assert impl._finished_req_ids_waiting_for_save == {"req-1"}
+
+        impl.wait_for_save()
+
+        impl._wait_for_save_impl.assert_called_once_with()
+        impl._release_finished_worker_requests.assert_called_once_with({"req-1"})
+        assert impl._finished_req_ids_waiting_for_save == set()
+
+    def test_wait_for_save_failure_marks_step_complete(self):
+        impl = _make_impl()
+        impl._wait_for_save_done = False
+        impl._finished_req_ids_waiting_for_save = set()
+        impl._wait_for_save_impl = MagicMock(
+            side_effect=RuntimeError("save failed")
+        )
+        with pytest.raises(RuntimeError, match="save failed"):
+            impl.wait_for_save()
+
+        assert impl._wait_for_save_done is True
+
+    def test_get_finished_without_pending_save_releases_immediately(self):
+        metadata = LMCacheConnectorMetadata(requests=[])
+        impl = _make_impl()
+        impl._parent = SimpleNamespace(
+            _get_connector_metadata=lambda: metadata,
+        )
+        impl._wait_for_save_done = False
+        impl._finished_req_ids_waiting_for_save = set()
+        impl._release_finished_worker_requests = MagicMock()
+
+        assert impl.get_finished({"req-1"}) == (None, None)
+        impl._release_finished_worker_requests.assert_called_once_with({"req-1"})
+
     def test_save_transfers_active_shared_state_without_releasing(self):
         class FakeMemObj:
             def __init__(self):
@@ -718,11 +804,13 @@ class TestWorkerRetrieveState:
             request_scope_token="req-1:8:256",
         )
         request = _make_request()
-        request.cached_keys = [["new-k"]]
-        request.cached_starts = [0]
-        request.cached_ends = [256]
+        state = impl._worker_retrieve_state["req-1"]
+        state.cached_keys = [["new-k"]]
+        state.cached_starts = [0]
+        state.cached_ends = [256]
 
-        impl._save_worker_retrieve_state_from_request(
+        impl._publish_worker_retrieve_state(
+            state,
             request,
             location="LocalCPUBackend",
             metadata_warm=True,
@@ -737,7 +825,7 @@ class TestWorkerRetrieveState:
         assert state.request_scope_token == "req-1:8:256"
         assert state.shared_validation_signature is None
 
-    def test_save_replacement_does_not_reuse_old_validation_signature(self):
+    def test_publish_refreshes_existing_validation_signature(self):
         impl = _make_impl()
         impl.num_layers = 1
         impl.config = SimpleNamespace(dsa_two_groups=False)
@@ -764,28 +852,31 @@ class TestWorkerRetrieveState:
         request = _make_request()
         request.token_ids = [0] * 256
         request.load_spec.lmcache_cached_tokens = 256
-        old_state.shared_validation_signature = (
-            impl._shared_worker_validation_signature(
-                old_state,
-                request,
-                current_generation=7,
-                pointer_generation=7,
-                materialize_index=False,
-            )
+        old_signature = impl._shared_worker_validation_signature(
+            old_state,
+            request,
+            current_generation=7,
+            pointer_generation=7,
+            materialize_index=False,
         )
+        old_state.shared_validation_signature = old_signature
         impl._worker_retrieve_state["req-1"] = old_state
 
         fresh = _make_request()
         fresh.token_ids = [0] * 256
         fresh.load_spec.lmcache_cached_tokens = 256
-        fresh.cached_keys = [["k0"]]
-        fresh.cached_starts = [0]
-        fresh.cached_ends = [256]
-        fresh.cached_memory_objs = [["new-latent-view"]]
-        fresh.cached_chunk_ptrs_npu = [torch.tensor([222], dtype=torch.long)]
-        fresh.cached_shared_handles = [["new-handle"]]
+        fresh_state = old_state
+        fresh_state.cached_keys = [["k0"]]
+        fresh_state.cached_starts = [0]
+        fresh_state.cached_ends = [256]
+        fresh_state.cached_memory_objs = [["new-latent-view"]]
+        fresh_state.cached_chunk_ptrs_npu = [
+            torch.tensor([222], dtype=torch.long)
+        ]
+        fresh_state.cached_shared_handles = [["new-handle"]]
 
-        impl._save_worker_retrieve_state_from_request(
+        impl._publish_worker_retrieve_state(
+            fresh_state,
             fresh,
             location="local",
             metadata_warm=True,
@@ -793,11 +884,9 @@ class TestWorkerRetrieveState:
         )
 
         new_state = impl._worker_retrieve_state["req-1"]
-        assert new_state is not old_state
+        assert new_state is old_state
         assert new_state.shared_validation_signature is not None
-        assert new_state.shared_validation_signature != (
-            old_state.shared_validation_signature
-        )
+        assert new_state.shared_validation_signature != old_signature
         assert new_state.cached_memory_objs == [["new-latent-view"]]
 
     def test_save_records_rank0_shared_backing_objs_for_cleanup(self):
@@ -822,15 +911,18 @@ class TestWorkerRetrieveState:
         )
         backing_obj = FakeMemObj()
         request = _make_request()
-        request.cached_keys = [["k"]]
-        request.cached_starts = [0]
-        request.cached_ends = [256]
-        request.cached_memory_objs = [[backing_obj]]
-        request.cached_tensors = [["tensor"]]
-        request.cached_chunk_ptrs_npu = ["latent-ptrs"]
-        request.cached_shared_handles = [["handle"]]
+        state = WorkerRetrieveState(
+            cached_keys=[["k"]],
+            cached_starts=[0],
+            cached_ends=[256],
+            cached_memory_objs=[[backing_obj]],
+            cached_tensors=[["tensor"]],
+            cached_chunk_ptrs_npu=["latent-ptrs"],
+            cached_shared_handles=[["handle"]],
+        )
 
-        impl._save_worker_retrieve_state_from_request(
+        impl._publish_worker_retrieve_state(
+            state,
             request,
             location="mixed",
             metadata_warm=True,
@@ -897,17 +989,18 @@ class TestWorkerRetrieveState:
         )
         borrowed_obj = BorrowedLocalCPUObj()
         hot_cache = {"k": borrowed_obj}
-        request = _make_store_request(
+        request, store_result = _make_store_request(
+            impl,
             token_count=256,
             start=0,
             end=256,
             key="k",
             tensor="tensor",
         )
-        request.cached_memory_objs = [[borrowed_obj]]
-        request.cached_tensors = [[borrowed_obj.tensor]]
+        store_result.memory_objs = [[borrowed_obj]]
+        store_result.tensors = [[borrowed_obj.tensor]]
 
-        impl._maybe_seed_worker_retrieve_state_from_store(request)
+        impl._promote_layerwise_store_result(request, store_result)
 
         seeded_state = impl._worker_retrieve_state["req-1"]
         assert seeded_state.shared_request_active is False
@@ -925,8 +1018,9 @@ class TestWorkerRetrieveState:
             lmcache_cached_tokens=256,
             can_load=True,
         )
-        request.cached_chunk_ptrs_npu = ["latent-ptrs"]
-        impl._save_worker_retrieve_state_from_request(
+        seeded_state.cached_chunk_ptrs_npu = ["latent-ptrs"]
+        impl._publish_worker_retrieve_state(
+            seeded_state,
             request,
             location="LocalCPUBackend",
             metadata_warm=True,
@@ -954,7 +1048,60 @@ class TestWorkerRetrieveState:
         assert second_hit.ref_count == 1
         assert second_hit.valid is True
 
-    def test_save_releases_replaced_passive_shared_views(self):
+    def test_store_seed_prepare_failure_rolls_back_request_ownership(self):
+        class BorrowedObj:
+            def __init__(self):
+                self.ref_count = 1
+                self.pin_count = 0
+
+            @property
+            def is_pinned(self):
+                return self.pin_count > 0
+
+            def ref_count_up(self):
+                self.ref_count += 1
+
+            def ref_count_down(self):
+                self.ref_count -= 1
+
+            def pin(self):
+                self.pin_count += 1
+                return True
+
+            def unpin(self):
+                self.pin_count -= 1
+                return True
+
+        impl = _make_impl()
+        impl._latent_kvcaches = [object()]
+        impl.lmcache_engine = SimpleNamespace(
+            enable_shared_cpu_cache=True,
+            shared_cpu_cache_generation=9,
+            store_location="LocalCPUBackend",
+            metadata=SimpleNamespace(is_first_rank=lambda: True),
+        )
+        borrowed_obj = BorrowedObj()
+        request, store_result = _make_store_request(
+            impl,
+            token_count=256,
+            start=0,
+            end=256,
+            key="k",
+            tensor="tensor",
+        )
+        store_result.memory_objs = [[borrowed_obj]]
+        impl._refresh_prepared_sparse_sources = MagicMock(
+            side_effect=RuntimeError("prepare failed")
+        )
+
+        with pytest.raises(RuntimeError, match="prepare failed"):
+            impl._promote_layerwise_store_result(request, store_result)
+
+        assert impl._worker_retrieve_state == {}
+        assert borrowed_obj.ref_count == 1
+        assert borrowed_obj.pin_count == 0
+
+    def test_drop_then_publish_releases_passive_shared_views(self):
         class FakeMemObj:
             def __init__(self):
                 self.released = 0
@@ -982,14 +1129,18 @@ class TestWorkerRetrieveState:
         )
         new_view = FakeMemObj()
         request = _make_request()
-        request.cached_keys = [["new-k"]]
-        request.cached_starts = [0]
-        request.cached_ends = [256]
-        request.cached_memory_objs = [[new_view]]
-        request.cached_chunk_ptrs_npu = ["latent-ptrs"]
-        request.cached_shared_handles = [["new-handle"]]
+        state = WorkerRetrieveState(
+            cached_keys=[["new-k"]],
+            cached_starts=[0],
+            cached_ends=[256],
+            cached_memory_objs=[[new_view]],
+            cached_chunk_ptrs_npu=["latent-ptrs"],
+            cached_shared_handles=[["new-handle"]],
+        )
 
-        impl._save_worker_retrieve_state_from_request(
+        impl._drop_worker_retrieve_state("req-1")
+        impl._publish_worker_retrieve_state(
+            state,
             request,
             location="mixed",
             metadata_warm=True,
@@ -1022,14 +1173,17 @@ class TestWorkerRetrieveState:
         )
         request = _make_request()
         request.token_ids = [1] * 512
-        request.cached_keys = [["k"]]
-        request.cached_starts = [0]
-        request.cached_ends = [256]
-        request.cached_memory_objs = [[FakeMemObj()]]
-        request.cached_chunk_ptrs_npu = ["latent-ptrs"]
-        request.cached_shared_handles = [["handle"]]
+        state = WorkerRetrieveState(
+            cached_keys=[["k"]],
+            cached_starts=[0],
+            cached_ends=[256],
+            cached_memory_objs=[[FakeMemObj()]],
+            cached_chunk_ptrs_npu=["latent-ptrs"],
+            cached_shared_handles=[["handle"]],
+        )
 
-        impl._save_worker_retrieve_state_from_request(
+        impl._publish_worker_retrieve_state(
+            state,
             request,
             location="mixed",
             metadata_warm=True,
@@ -1068,15 +1222,18 @@ class TestWorkerRetrieveState:
         )
         backing_obj = FakeMemObj()
         request = _make_request()
-        request.cached_keys = [["k"]]
-        request.cached_starts = [0]
-        request.cached_ends = [256]
-        request.cached_memory_objs = [[backing_obj]]
-        request.cached_chunk_ptrs_npu = ["latent-ptrs"]
-        request.cached_shared_handles = [["handle"]]
+        state = WorkerRetrieveState(
+            cached_keys=[["k"]],
+            cached_starts=[0],
+            cached_ends=[256],
+            cached_memory_objs=[[backing_obj]],
+            cached_chunk_ptrs_npu=["latent-ptrs"],
+            cached_shared_handles=[["handle"]],
+        )
 
         with pytest.raises(RuntimeError, match="capacity registry failed"):
-            impl._save_worker_retrieve_state_from_request(
+            impl._publish_worker_retrieve_state(
+                state,
                 request,
                 location="mixed",
                 metadata_warm=True,
@@ -1103,11 +1260,14 @@ class TestWorkerRetrieveState:
         )
         passive_view = FakeMemObj()
         request = _make_request()
-        request.cached_memory_objs = [[passive_view]]
-        request.cached_shared_handles = [["handle"]]
+        state = WorkerRetrieveState(
+            cached_memory_objs=[[passive_view]],
+            cached_shared_handles=[["handle"]],
+        )
 
         with pytest.raises(RuntimeError, match="pointer-cache install"):
-            impl._save_worker_retrieve_state_from_request(
+            impl._publish_worker_retrieve_state(
+                state,
                 request,
                 location="mixed",
                 metadata_warm=True,
@@ -1138,14 +1298,17 @@ class TestWorkerRetrieveState:
         )
         backing_obj = FakeMemObj()
         request = _make_request()
-        request.cached_keys = [["k"]]
-        request.cached_starts = [0]
-        request.cached_ends = [256]
-        request.cached_memory_objs = [[backing_obj]]
-        request.cached_shared_handles = [["handle"]]
+        state = WorkerRetrieveState(
+            cached_keys=[["k"]],
+            cached_starts=[0],
+            cached_ends=[256],
+            cached_memory_objs=[[backing_obj]],
+            cached_shared_handles=[["handle"]],
+        )
 
         with pytest.raises(RuntimeError, match="pointer-cache install"):
-            impl._save_worker_retrieve_state_from_request(
+            impl._publish_worker_retrieve_state(
+                state,
                 request,
                 location="mixed",
                 metadata_warm=True,
@@ -1185,14 +1348,17 @@ class TestWorkerRetrieveState:
         impl._worker_retrieve_state["req-1"] = old_state
         new_view = FakeMemObj()
         request = _make_request()
-        request.cached_keys = [["new-k"]]
-        request.cached_starts = [0]
-        request.cached_ends = [256]
-        request.cached_memory_objs = [[new_view]]
-        request.cached_shared_handles = [["new-handle"]]
+        state = WorkerRetrieveState(
+            cached_keys=[["new-k"]],
+            cached_starts=[0],
+            cached_ends=[256],
+            cached_memory_objs=[[new_view]],
+            cached_shared_handles=[["new-handle"]],
+        )
 
         with pytest.raises(RuntimeError, match="pointer-cache install"):
-            impl._save_worker_retrieve_state_from_request(
+            impl._publish_worker_retrieve_state(
+                state,
                 request,
                 location="mixed",
                 metadata_warm=True,
@@ -1539,12 +1705,12 @@ class TestWorkerRetrieveState:
         assert captured == ["latent", "indexer"]
         assert impl.current_layer == 1
 
-    def test_bind_rehydrates_scheduler_empty_metadata(self):
+    def test_bind_keeps_scheduler_metadata_payload_free(self):
         impl = _make_impl()
         impl.config = SimpleNamespace(dsa_two_groups=False)
         impl.lmcache_engine = SimpleNamespace(enable_shared_cpu_cache=False)
         request = _make_request()
-        assert request.cached_keys == []
+        assert not hasattr(request, "cached_keys")
 
         impl._worker_retrieve_state["req-1"] = WorkerRetrieveState(
             cached_keys=[["layer0-key"]],
@@ -1555,11 +1721,12 @@ class TestWorkerRetrieveState:
             token_count=256,
         )
 
-        bound = impl._bind_worker_retrieve_state_to_request(request)
-        assert bound is not None
-        assert request.cached_keys == [["layer0-key"]]
-        assert request.cached_starts == [0]
-        assert request.cached_ends == [256]
+        bound = _bind_worker_state(impl, request)
+        assert bound is impl._worker_retrieve_state["req-1"]
+        assert bound.cached_keys == [["layer0-key"]]
+        assert bound.cached_starts == [0]
+        assert bound.cached_ends == [256]
+        assert not hasattr(request, "cached_keys")
 
     def test_bind_rejects_stale_shared_generation(self):
         impl = _make_impl()
@@ -1580,7 +1747,7 @@ class TestWorkerRetrieveState:
         )
 
         with pytest.raises(RuntimeError, match="generation mismatch"):
-            impl._bind_worker_retrieve_state_to_request(request)
+            _bind_worker_state(impl, request)
 
     def test_bind_rejects_stale_pointer_cache_generation(self):
         impl = _make_impl()
@@ -1602,7 +1769,7 @@ class TestWorkerRetrieveState:
         )
 
         with pytest.raises(RuntimeError, match="pointer-cache generation"):
-            impl._bind_worker_retrieve_state_to_request(request)
+            _bind_worker_state(impl, request)
 
     def test_bind_rejects_missing_shared_pointer_cache(self):
         impl = _make_impl()
@@ -1626,7 +1793,7 @@ class TestWorkerRetrieveState:
         )
 
         with pytest.raises(RuntimeError, match="missing MLA latent"):
-            impl._bind_worker_retrieve_state_to_request(request)
+            _bind_worker_state(impl, request)
 
     def test_shared_pointer_cache_entry_requires_actual_coverage(self):
         covers = LMCacheConnectorV1Impl._shared_pointer_cache_entry_covers
@@ -1662,7 +1829,7 @@ class TestWorkerRetrieveState:
         )
 
         with pytest.raises(RuntimeError, match="request scope mismatch"):
-            impl._bind_worker_retrieve_state_to_request(request)
+            _bind_worker_state(impl, request)
 
     def test_bind_shared_scope_uses_lmcache_hit_tokens(self):
         impl = _make_impl()
@@ -1688,7 +1855,7 @@ class TestWorkerRetrieveState:
             request_scope_token="req-1:2:3",
         )
 
-        assert impl._bind_worker_retrieve_state_to_request(request) is not None
+        assert _bind_worker_state(impl, request) is not None
 
     def test_bind_shared_hot_state_reuses_validation_signature(self, monkeypatch):
         impl = _make_impl()
@@ -1744,13 +1911,13 @@ class TestWorkerRetrieveState:
             )),
         )
 
-        assert impl._bind_worker_retrieve_state_to_request(request) is not None
+        assert _bind_worker_state(impl, request) is not None
         assert calls == [(2, 1)]
         assert prefix_checks == [([0], [3], 3)]
 
         calls.clear()
         prefix_checks.clear()
-        assert impl._bind_worker_retrieve_state_to_request(request) is not None
+        assert _bind_worker_state(impl, request) is not None
         assert calls == []
         assert prefix_checks == []
 
@@ -1758,7 +1925,7 @@ class TestWorkerRetrieveState:
         state.cached_memory_objs = [list(layer) for layer in state.cached_memory_objs]
         calls.clear()
         prefix_checks.clear()
-        assert impl._bind_worker_retrieve_state_to_request(request) is not None
+        assert _bind_worker_state(impl, request) is not None
         assert calls == [(2, 1)]
         assert prefix_checks == [([0], [3], 3)]
 
@@ -1786,7 +1953,7 @@ class TestWorkerRetrieveState:
         )
 
         with pytest.raises(RuntimeError, match="incomplete MLA latent"):
-            impl._bind_worker_retrieve_state_to_request(request)
+            _bind_worker_state(impl, request)
 
     def test_bind_rejects_missing_strict_shared_index(self):
         impl = _make_impl()
@@ -1810,7 +1977,7 @@ class TestWorkerRetrieveState:
         )
 
         with pytest.raises(RuntimeError, match="invalid DSA index"):
-            impl._bind_worker_retrieve_state_to_request(request)
+            _bind_worker_state(impl, request)
 
     def test_bind_warm_shared_state_does_not_walk_index_metadata(self):
         impl = _make_impl()
@@ -1846,19 +2013,22 @@ class TestWorkerRetrieveState:
             request_scope_token="req-1:3:3",
         )
 
-        assert impl._bind_worker_retrieve_state_to_request(request) is not None
+        assert _bind_worker_state(impl, request) is not None
 
     def test_save_then_bind_round_trip(self):
         impl = _make_impl()
         impl.config = SimpleNamespace(dsa_two_groups=False)
         impl.lmcache_engine = SimpleNamespace(enable_shared_cpu_cache=False)
         request = _make_request()
-        request.cached_keys = [["k"]]
-        request.cached_starts = [0]
-        request.cached_ends = [256]
-        request.cached_shared_handles = [["handle"]]
+        state = WorkerRetrieveState(
+            cached_keys=[["k"]],
+            cached_starts=[0],
+            cached_ends=[256],
+            cached_shared_handles=[["handle"]],
+        )
 
-        impl._save_worker_retrieve_state_from_request(
+        impl._publish_worker_retrieve_state(
+            state,
             request,
             location="local",
             metadata_warm=True,
@@ -1866,35 +2036,42 @@ class TestWorkerRetrieveState:
         )
 
         fresh = _make_request()
-        assert fresh.cached_keys == []
-        impl._bind_worker_retrieve_state_to_request(fresh)
-        assert fresh.cached_keys == [["k"]]
-        assert fresh.cached_shared_handles == [["handle"]]
+        assert not hasattr(fresh, "cached_keys")
+        bound = _bind_worker_state(impl, fresh)
+        assert bound is state
+        assert bound.cached_keys == [["k"]]
+        assert bound.cached_shared_handles == [["handle"]]
+        assert not hasattr(fresh, "cached_keys")
 
     def test_finalize_sparse_state_uses_lmcache_hit_token_count(self):
         impl = _make_impl()
         captured = {}
 
-        def capture_save(request, *, location, metadata_warm, token_count):
+        def capture_save(
+            state, request, *, location, metadata_warm, token_count
+        ):
+            captured["state"] = state
             captured["request"] = request
             captured["location"] = location
             captured["metadata_warm"] = metadata_warm
             captured["token_count"] = token_count
 
-        impl._save_worker_retrieve_state_from_request = capture_save
+        impl._publish_worker_retrieve_state = capture_save
         request = _make_request()
         request.token_ids = [1, 2, 3, 4]
         request.load_spec.lmcache_cached_tokens = 3
-        request.cached_keys = [["k"]]
+        state = WorkerRetrieveState(cached_keys=[["k"]], metadata_warm=True)
+        impl._worker_retrieve_state[request.req_id] = state
 
         impl._finalize_worker_retrieve_state_from_metadata(
             SimpleNamespace(requests=[request])
         )
 
+        assert captured["state"] is state
         assert captured["request"] is request
         assert captured["token_count"] == 3
 
-    def test_request_tracker_round_trip_preserves_shared_handles(self):
+    def test_scheduler_metadata_excludes_worker_cache_payload(self):
         tracker = RequestTracker(
             req_id="req-1",
             prompt_len=512,
@@ -1902,16 +2079,24 @@ class TestWorkerRetrieveState:
             allocated_block_ids=list(range(4)),
             allocated_block_ids_indexer=list(range(4)),
         )
-        tracker.cached_keys = [["latent-k"]]
-        tracker.cached_starts = [0]
-        tracker.cached_ends = [256]
-        tracker.cached_memory_objs = [["latent-mem"]]
-        tracker.cached_shared_handles = [["latent-handle"]]
-        tracker.cached_keys_indexer = [["index-k"]]
-        tracker.cached_starts_indexer = [0]
-        tracker.cached_ends_indexer = [256]
-        tracker.cached_memory_objs_indexer = [["index-mem"]]
-        tracker.cached_shared_handles_indexer = [["index-handle"]]
+        cache_fields = {
+            "cached_keys",
+            "cached_starts",
+            "cached_ends",
+            "cached_memory_objs",
+            "cached_tensors",
+            "cached_chunk_dev_ptrs",
+            "cached_chunk_ptrs_npu",
+            "cached_shared_handles",
+            "cached_keys_indexer",
+            "cached_starts_indexer",
+            "cached_ends_indexer",
+            "cached_memory_objs_indexer",
+            "cached_tensors_indexer",
+            "cached_chunk_dev_ptrs_indexer",
+            "cached_chunk_ptrs_npu_indexer",
+            "cached_shared_handles_indexer",
+        }
 
         req_meta = ReqMeta.from_request_tracker(
             tracker,
@@ -1926,8 +2111,8 @@ class TestWorkerRetrieveState:
         )
 
         assert req_meta is not None
-        assert req_meta.cached_shared_handles == [["latent-handle"]]
-        assert req_meta.cached_shared_handles_indexer == [["index-handle"]]
+        assert cache_fields.isdisjoint(vars(tracker))
+        assert cache_fields.isdisjoint(vars(req_meta))
 
     def test_sparse_reqmeta_does_not_allocate_full_true_decode_mask(self):
         tracker = RequestTracker(
@@ -2005,11 +2190,13 @@ class TestWorkerRetrieveState:
 
     def test_sparse_decode_start_uses_minimal_prepared_kwargs(self):
         req = make_sparse_req_meta("req-1", token_count=256)
-        req.cached_keys = [["layer-key"]]
-        req.cached_starts = [0]
-        req.cached_ends = [256]
-        req.cached_tensors = [[torch.zeros(256)]]
-        req.cached_chunk_ptrs_npu = [torch.tensor([123], dtype=torch.long)]
+        state = WorkerRetrieveState(
+            cached_keys=[["layer-key"]],
+            cached_starts=[0],
+            cached_ends=[256],
+            cached_tensors=[[torch.zeros(256)]],
+            cached_chunk_ptrs_npu=[torch.tensor([123], dtype=torch.long)],
+        )
         impl, _, _ = make_worker_connector([req], use_layerwise=True)
         impl.config.dsa_two_groups = False
         impl.num_layers = 1
@@ -2039,17 +2226,13 @@ class TestWorkerRetrieveState:
                 return _retriever()
 
         impl.lmcache_engine = _FakeEngine()
-        impl._save_worker_retrieve_state_from_request(
+        impl._publish_worker_retrieve_state(
+            state,
             req,
             location="LocalCPUBackend",
             metadata_warm=True,
             token_count=256,
         )
-        req.cached_keys = []
-        req.cached_starts = []
-        req.cached_ends = []
-        req.cached_tensors = []
-        req.cached_chunk_ptrs_npu = []
 
         impl.start_load_kv(SimpleNamespace(attn_metadata=SimpleNamespace()))
 
@@ -2067,8 +2250,8 @@ class TestWorkerRetrieveState:
         assert prepared_source.total_tokens == 256
         assert prepared_source.chunk_token_counts == (256,)
         assert prepared_source.pointer_device == torch.device("cpu")
-        assert req.cached_keys == []
-        assert req.cached_tensors == []
+        assert not hasattr(req, "cached_keys")
+        assert impl._worker_retrieve_state[req.req_id] is state
         impl._drain_layerwise_retrievers()
 
     def test_drain_layerwise_retrievers_closes_all_on_failure(self):
@@ -2108,6 +2291,66 @@ class TestWorkerRetrieveState:
         assert impl._layerwise_sparse_indexer_sent_layers == set()
         assert impl._layerwise_required_wait_groups_cache is None
 
+    def test_store_results_remain_local_to_their_operation(self):
+        impl = _make_impl()
+        normal, normal_result = _make_store_request(
+            impl,
+            token_count=512,
+            start=0,
+            end=512,
+            key="normal",
+            tensor="normal-tensor",
+        )
+        first_window, first_result = _make_store_request(
+            impl,
+            token_count=256,
+            start=0,
+            end=256,
+            key="window-0",
+            tensor="window-tensor-0",
+            decode_window=(0, 256),
+        )
+        second_window, second_result = _make_store_request(
+            impl,
+            token_count=512,
+            start=256,
+            end=512,
+            key="window-1",
+            tensor="window-tensor-1",
+            decode_window=(256, 512),
+        )
+
+        operation_keys = {
+            impl._layerwise_save_storer_key(request)
+            for request in (normal, first_window, second_window)
+        }
+        assert len(operation_keys) == 3
+        assert len({id(normal_result), id(first_result), id(second_result)}) == 3
+
+    def test_empty_store_result_still_validates_request_identity(self):
+        impl = _make_impl()
+        request = ReqMeta(req_id="req-1", token_ids=[])
+        result = LayerwiseStoreResult(request_id="req-other")
+
+        with pytest.raises(RuntimeError, match="store result request mismatch"):
+            impl._promote_layerwise_store_result(request, result)
+
+    def test_sparse_decode_store_result_is_not_promoted(self):
+        impl = _make_impl()
+        request, result = _make_store_request(
+            impl,
+            token_count=256,
+            start=0,
+            end=256,
+            key="decode",
+            tensor="decode-tensor",
+        )
+        request.is_sparse_decode = True
+
+        impl._promote_layerwise_store_result(request, result)
+
+        assert request.req_id not in impl._worker_retrieve_state
+
     def test_store_seed_merges_chunked_prefill_hot_cache(self):
         impl = _make_impl()
         impl.config = SimpleNamespace(dsa_two_groups=False)
@@ -2119,32 +2362,30 @@ class TestWorkerRetrieveState:
             ),
         )
 
-        first = _make_store_request(
+        first, first_result = _make_store_request(
+            impl,
             token_count=4096,
             start=0,
             end=4096,
             key="k0",
             tensor="t0",
         )
-        second = _make_store_request(
+        second, second_result = _make_store_request(
+            impl,
             token_count=8192,
             start=4096,
             end=8192,
             key="k1",
             tensor="t1",
         )
-        first.cached_shared_handles = [["h0"]]
-        second.cached_shared_handles = [["h1"]]
-
-        impl._maybe_seed_worker_retrieve_state_from_store(first)
-        impl._maybe_seed_worker_retrieve_state_from_store(second)
+        impl._promote_layerwise_store_result(first, first_result)
+        impl._promote_layerwise_store_result(second, second_result)
 
         state = impl._worker_retrieve_state["req-1"]
         assert state.cached_starts == [0, 4096]
         assert state.cached_ends == [4096, 8192]
         assert state.cached_keys == [["k0", "k1"]]
         assert state.cached_tensors == [["t0", "t1"]]
-        assert state.cached_shared_handles == [["h0", "h1"]]
         assert state.token_count == 8192
 
     def test_store_seed_full_chunk_replaces_partial_at_same_start(self):
@@ -2158,14 +2399,16 @@ class TestWorkerRetrieveState:
                 store_location="LocalCPUBackend",
             ),
         )
-        partial = _make_store_request(
+        partial, partial_result = _make_store_request(
+            impl,
             token_count=100,
             start=0,
             end=100,
             key="partial-key",
             tensor="partial-tensor",
         )
-        full = _make_store_request(
+        full, full_result = _make_store_request(
+            impl,
             token_count=256,
             start=0,
             end=256,
@@ -2173,8 +2416,8 @@ class TestWorkerRetrieveState:
             tensor="full-tensor",
         )
 
-        impl._maybe_seed_worker_retrieve_state_from_store(partial)
-        impl._maybe_seed_worker_retrieve_state_from_store(full)
+        impl._promote_layerwise_store_result(partial, partial_result)
+        impl._promote_layerwise_store_result(full, full_result)
 
         state = impl._worker_retrieve_state["req-1"]
         assert state.cached_starts == [0]
@@ -2194,14 +2437,16 @@ class TestWorkerRetrieveState:
                 store_location="LocalCPUBackend",
             ),
         )
-        full = _make_store_request(
+        full, full_result = _make_store_request(
+            impl,
             token_count=256,
             start=0,
             end=256,
             key="full-key",
             tensor="full-tensor",
         )
-        stale_partial = _make_store_request(
+        stale_partial, partial_result = _make_store_request(
+            impl,
             token_count=100,
             start=0,
             end=100,
@@ -2209,8 +2454,8 @@ class TestWorkerRetrieveState:
             tensor="partial-tensor",
         )
 
-        impl._maybe_seed_worker_retrieve_state_from_store(full)
-        impl._maybe_seed_worker_retrieve_state_from_store(stale_partial)
+        impl._promote_layerwise_store_result(full, full_result)
+        impl._promote_layerwise_store_result(stale_partial, partial_result)
 
         state = impl._worker_retrieve_state["req-1"]
         assert state.cached_starts == [0]
@@ -2246,17 +2491,18 @@ class TestWorkerRetrieveState:
             request_scope_token="req-1:5:256",
         )
 
-        saved = _make_store_request(
+        saved, store_result = _make_store_request(
+            impl,
             token_count=512,
             start=256,
             end=512,
             key="k1",
             tensor="t1",
         )
-        saved.cached_chunk_dev_ptrs = [[222]]
-        saved.cached_chunk_ptrs_npu = [torch.tensor([222], dtype=torch.long)]
+        store_result.chunk_dev_ptrs = [[222]]
+        store_result.chunk_ptrs = [torch.tensor([222], dtype=torch.long)]
 
-        impl._maybe_seed_worker_retrieve_state_from_store(saved)
+        impl._promote_layerwise_store_result(saved, store_result)
 
         state = impl._worker_retrieve_state["req-1"]
         assert state.cached_starts == [0, 256]
@@ -2280,19 +2526,17 @@ class TestWorkerRetrieveState:
             storage_manager=None,
             store_location="LocalCPUBackend",
         )
-        saved = _make_store_request(
+        saved, store_result = _make_store_request(
+            impl,
             token_count=512,
             start=256,
             end=512,
             key="k1",
             tensor="t1",
+            decode_window=(256, 512),
         )
-        saved.is_decode_window_save = True
-        saved.decode_window_start = 256
-        saved.decode_window_end = 512
-        saved.decode_window_size = 256
 
-        impl._maybe_seed_worker_retrieve_state_from_store(saved)
+        impl._promote_layerwise_store_result(saved, store_result)
 
         assert "req-1" not in impl._worker_retrieve_state
 
@@ -2329,28 +2573,26 @@ class TestWorkerRetrieveState:
             request_scope_token="req-1:5:256",
         )
 
-        saved = _make_store_request(
+        saved, store_result = _make_store_request(
+            impl,
             token_count=512,
             start=256,
             end=512,
             key="k1",
             tensor="t1",
+            decode_window=(256, 512),
         )
-        saved.is_decode_window_save = True
-        saved.decode_window_start = 256
-        saved.decode_window_end = 512
-        saved.decode_window_size = 256
         saved.save_spec = SaveSpec(
             256,
             True,
             can_save_latent=True,
             can_save_indexer=False,
         )
-        saved.cached_chunk_dev_ptrs = [[222]]
-        saved.cached_chunk_ptrs_npu = [torch.tensor([222], dtype=torch.long)]
+        store_result.chunk_dev_ptrs = [[222]]
+        store_result.chunk_ptrs = [torch.tensor([222], dtype=torch.long)]
 
-        impl._record_decode_window_save_group_completed(saved, 0)
-        impl._maybe_seed_worker_retrieve_state_from_store(saved)
+        impl._record_decode_window_save_group_completed(saved, 0, store_result)
+        impl._promote_layerwise_store_result(saved, store_result)
         impl._mark_decode_window_save_completed(saved)
 
         state = impl._worker_retrieve_state["req-1"]
@@ -2418,38 +2660,39 @@ class TestWorkerRetrieveState:
             request_scope_token="req-1:5:256",
         )
 
-        saved = _make_store_request(
+        saved, latent_result = _make_store_request(
+            impl,
             token_count=512,
             start=256,
             end=512,
             key="k1",
             tensor="t1",
+            decode_window=(256, 512),
         )
-        saved.is_decode_window_save = True
-        saved.decode_window_start = 256
-        saved.decode_window_end = 512
-        saved.decode_window_size = 256
         saved.save_spec = SaveSpec(
             256,
             True,
             can_save_latent=True,
             can_save_indexer=True,
         )
-        saved.cached_chunk_dev_ptrs = [[222]]
-        saved.cached_chunk_ptrs_npu = [torch.tensor([222], dtype=torch.long)]
-        saved.cached_keys_indexer = [["ik1"]]
-        saved.cached_starts_indexer = [256]
-        saved.cached_ends_indexer = [512]
-        saved.cached_memory_objs_indexer = [["im1"]]
-        saved.cached_tensors_indexer = [["it1"]]
-        saved.cached_chunk_dev_ptrs_indexer = [[444]]
-        saved.cached_chunk_ptrs_npu_indexer = [
-            torch.tensor([444], dtype=torch.long)
-        ]
+        latent_result.chunk_dev_ptrs = [[222]]
+        latent_result.chunk_ptrs = [torch.tensor([222], dtype=torch.long)]
+        index_result = LayerwiseStoreResult(
+            request_id=saved.req_id,
+            kv_group=1,
+            starts=[256],
+            ends=[512],
+            keys=[["ik1"]],
+            memory_objs=[["im1"]],
+            tensors=[["it1"]],
+            chunk_dev_ptrs=[[444]],
+            chunk_ptrs=[torch.tensor([444], dtype=torch.long)],
+        )
 
-        impl._record_decode_window_save_group_completed(saved, 0)
-        impl._record_decode_window_save_group_completed(saved, 1)
-        impl._maybe_seed_worker_retrieve_state_from_store(saved)
+        impl._record_decode_window_save_group_completed(saved, 0, latent_result)
+        impl._record_decode_window_save_group_completed(saved, 1, index_result)
+        impl._promote_layerwise_store_result(saved, latent_result)
+        impl._promote_layerwise_store_result(saved, index_result)
         impl._mark_decode_window_save_completed(saved)
 
         state = impl._worker_retrieve_state["req-1"]
@@ -2498,21 +2741,22 @@ class TestWorkerRetrieveState:
             request_scope_token="req-1:5:256",
         )
 
-        saved = _make_store_request(
+        saved, store_result = _make_store_request(
+            impl,
             token_count=512,
             start=256,
             end=512,
             key="k1",
             tensor="t1",
         )
-        saved.cached_chunk_dev_ptrs = [[222]]
+        store_result.chunk_dev_ptrs = [[222]]
         # Missing per-layer NPU pointer tensor must not be hidden by a fresh
         # scope token; the next decode would otherwise look warm but be unable
         # to launch the shared sparse direct path.
-        saved.cached_chunk_ptrs_npu = [None]
+        store_result.chunk_ptrs = [None]
 
         with pytest.raises(RuntimeError, match="incomplete shared CPU MLA"):
-            impl._maybe_seed_worker_retrieve_state_from_store(saved)
+            impl._promote_layerwise_store_result(saved, store_result)
 
         state = impl._worker_retrieve_state["req-1"]
         assert state.request_scope_token == "req-1:5:256"
@@ -2553,28 +2797,26 @@ class TestWorkerRetrieveState:
             request_scope_token="req-1:5:256",
         )
 
-        saved = _make_store_request(
+        saved, store_result = _make_store_request(
+            impl,
             token_count=512,
             start=256,
             end=512,
             key="k1",
             tensor="t1",
+            decode_window=(256, 512),
         )
-        saved.is_decode_window_save = True
-        saved.decode_window_start = 256
-        saved.decode_window_end = 512
-        saved.decode_window_size = 256
         saved.save_spec = SaveSpec(
             256,
             True,
             can_save_latent=True,
             can_save_indexer=False,
         )
-        saved.cached_chunk_dev_ptrs = [[222]]
-        saved.cached_chunk_ptrs_npu = [None]
+        store_result.chunk_dev_ptrs = [[222]]
+        store_result.chunk_ptrs = [None]
 
-        impl._record_decode_window_save_group_completed(saved, 0)
-        impl._maybe_seed_worker_retrieve_state_from_store(saved)
+        impl._record_decode_window_save_group_completed(saved, 0, store_result)
+        impl._promote_layerwise_store_result(saved, store_result)
         impl._mark_decode_window_save_completed(saved)
 
         state = impl._worker_retrieve_state["req-1"]
@@ -2622,28 +2864,26 @@ class TestWorkerRetrieveState:
             request_scope_token=f"req-1:5:{old_end}",
         )
 
-        saved = _make_store_request(
+        saved, store_result = _make_store_request(
+            impl,
             token_count=old_end + 256,
             start=old_end,
             end=old_end + 256,
             key="k-new",
             tensor="t-new",
+            decode_window=(old_end, old_end + 256),
         )
-        saved.is_decode_window_save = True
-        saved.decode_window_start = old_end
-        saved.decode_window_end = old_end + 256
-        saved.decode_window_size = 256
         saved.save_spec = SaveSpec(
             old_end,
             True,
             can_save_latent=True,
             can_save_indexer=False,
         )
-        saved.cached_chunk_dev_ptrs = [[999]]
-        saved.cached_chunk_ptrs_npu = [None]
+        store_result.chunk_dev_ptrs = [[999]]
+        store_result.chunk_ptrs = [None]
 
-        impl._record_decode_window_save_group_completed(saved, 0)
-        impl._maybe_seed_worker_retrieve_state_from_store(saved)
+        impl._record_decode_window_save_group_completed(saved, 0, store_result)
+        impl._promote_layerwise_store_result(saved, store_result)
         impl._mark_decode_window_save_completed(saved)
 
         state = impl._worker_retrieve_state["req-1"]
@@ -2666,27 +2906,25 @@ class TestWorkerRetrieveState:
             store_location="LocalCPUBackend",
         )
 
-        saved = _make_store_request(
+        saved, store_result = _make_store_request(
+            impl,
             token_count=512,
             start=0,
             end=256,
             key="wrong-window",
             tensor="wrong-tensor",
+            decode_window=(256, 512),
         )
-        saved.is_decode_window_save = True
-        saved.decode_window_start = 256
-        saved.decode_window_end = 512
-        saved.decode_window_size = 256
         saved.save_spec = SaveSpec(
             256,
             True,
             can_save_latent=True,
             can_save_indexer=False,
         )
-        saved.cached_chunk_dev_ptrs = [[111]]
-        saved.cached_chunk_ptrs_npu = [torch.tensor([111], dtype=torch.long)]
+        store_result.chunk_dev_ptrs = [[111]]
+        store_result.chunk_ptrs = [torch.tensor([111], dtype=torch.long)]
 
-        impl._record_decode_window_save_group_completed(saved, 0)
+        impl._record_decode_window_save_group_completed(saved, 0, store_result)
         impl._mark_decode_window_save_completed(saved)
 
         assert impl.get_completed_decode_window_saves() == {}
@@ -2722,28 +2960,26 @@ class TestWorkerRetrieveState:
             request_scope_token="req-1:5:256",
         )
 
-        saved = _make_store_request(
+        saved, store_result = _make_store_request(
+            impl,
             token_count=768,
             start=512,
             end=768,
             key="future",
             tensor="future-tensor",
+            decode_window=(512, 768),
         )
-        saved.is_decode_window_save = True
-        saved.decode_window_start = 512
-        saved.decode_window_end = 768
-        saved.decode_window_size = 256
         saved.save_spec = SaveSpec(
             512,
             True,
             can_save_latent=True,
             can_save_indexer=False,
         )
-        saved.cached_chunk_dev_ptrs = [[333]]
-        saved.cached_chunk_ptrs_npu = [torch.tensor([333], dtype=torch.long)]
+        store_result.chunk_dev_ptrs = [[333]]
+        store_result.chunk_ptrs = [torch.tensor([333], dtype=torch.long)]
 
-        impl._record_decode_window_save_group_completed(saved, 0)
-        impl._maybe_seed_worker_retrieve_state_from_store(saved)
+        impl._record_decode_window_save_group_completed(saved, 0, store_result)
+        impl._promote_layerwise_store_result(saved, store_result)
         impl._mark_decode_window_save_completed(saved)
 
         state = impl._worker_retrieve_state["req-1"]
@@ -2794,18 +3030,19 @@ class TestWorkerRetrieveState:
             request_scope_token="req-1:5:256",
         )
 
-        saved = _make_store_request(
+        saved, store_result = _make_store_request(
+            impl,
             token_count=512,
             start=256,
             end=512,
             key="k1",
             tensor="t1",
         )
-        saved.cached_chunk_dev_ptrs = [[222]]
-        saved.cached_chunk_ptrs_npu = [torch.tensor([222], dtype=torch.long)]
+        store_result.chunk_dev_ptrs = [[222]]
+        store_result.chunk_ptrs = [torch.tensor([222], dtype=torch.long)]
 
         with pytest.raises(RuntimeError, match="incomplete shared CPU DSA index"):
-            impl._maybe_seed_worker_retrieve_state_from_store(saved)
+            impl._promote_layerwise_store_result(saved, store_result)
 
         state = impl._worker_retrieve_state["req-1"]
         assert state.request_scope_token == "req-1:5:256"
@@ -2924,7 +3161,7 @@ class TestWorkerRetrieveState:
         )
 
         with pytest.raises(RuntimeError, match="pointer-cache tensors"):
-            impl._bind_worker_retrieve_state_to_request(request)
+            _bind_worker_state(impl, request)
 
     def test_bind_shared_hot_state_rejects_gapped_prefix_coverage(self):
         impl = _make_impl()
@@ -2953,7 +3190,7 @@ class TestWorkerRetrieveState:
         )
 
         with pytest.raises(RuntimeError, match="non-contiguous MLA"):
-            impl._bind_worker_retrieve_state_to_request(request)
+            _bind_worker_state(impl, request)
 
     def test_warm_kwargs_only_when_prefix_unchanged(self):
         impl = _make_impl()
@@ -3127,6 +3364,7 @@ class TestWorkerRetrieveState:
         )
 
         location, metadata_warm = impl._warm_request_retrieve_metadata(
+            WorkerRetrieveState(),
             _make_request(),
             torch.tensor([1, 2, 3]),
             torch.ones(3, dtype=torch.bool),

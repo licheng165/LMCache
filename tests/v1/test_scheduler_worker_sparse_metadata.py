@@ -116,7 +116,7 @@ class TestBuildConnectorMetaSparseSyntheticLoadSpec:
         assert req_meta.token_ids == list(range(prompt_len))
         assert req_meta.save_spec is not None
         assert req_meta.save_spec.can_save is False
-        assert req_meta.cached_keys == []
+        assert not hasattr(req_meta, "cached_keys")
 
     def test_sparse_decode_does_not_load_partial_only_prompt(self) -> None:
         impl = _make_scheduler_impl()

@@ -74,19 +74,6 @@ def _make_req(
         save_spec=SaveSpec(skip_leading_tokens=0, can_save=can_save),
         is_sparse_decode=False,
         load_spec=None,
-        cached_keys=[],
-        cached_starts=[],
-        cached_ends=[],
-        cached_memory_objs=[],
-        cached_tensors=[],
-        cached_keys_indexer=[],
-        cached_starts_indexer=[],
-        cached_ends_indexer=[],
-        cached_memory_objs_indexer=[],
-        cached_tensors_indexer=[],
-        cached_chunk_dev_ptrs_indexer=[],
-        cached_chunk_ptrs_npu_indexer=[],
-        cached_shared_handles_indexer=[],
         request_configs=request_configs,
     )
 
@@ -122,17 +109,6 @@ def _make_connector(requests):
     connector._decode_window_save_completed_groups = set()
     connector._decode_window_save_expected_start = {}
     return connector, metadata, engine
-
-
-def _init_indexer_cache_fields(request) -> None:
-    request.cached_keys_indexer = []
-    request.cached_starts_indexer = []
-    request.cached_ends_indexer = []
-    request.cached_memory_objs_indexer = []
-    request.cached_tensors_indexer = []
-    request.cached_chunk_dev_ptrs_indexer = []
-    request.cached_chunk_ptrs_npu_indexer = []
-    request.cached_shared_handles_indexer = []
 
 
 def test_layerwise_storer_is_request_scoped_across_interleaved_finalize() -> None:
@@ -688,7 +664,6 @@ def test_indexer_save_uses_layer_metadata_slots_not_request_slots() -> None:
         can_save_indexer=True,
     )
     request.indexer_slot_mapping = [torch.arange(100, 104, dtype=torch.long)]
-    _init_indexer_cache_fields(request)
 
     connector, _, engine = _make_connector([request])
     connector.config = SimpleNamespace(dsa_two_groups=True)
@@ -724,7 +699,6 @@ def test_chunked_indexer_save_pads_layer_metadata_slots() -> None:
         can_save_indexer=True,
     )
     request.indexer_slot_mapping = [torch.arange(100, 116, dtype=torch.long)]
-    _init_indexer_cache_fields(request)
 
     connector, _, engine = _make_connector([request])
     connector.kv_role = "kv_both"
@@ -773,7 +747,6 @@ def test_sparse_layerwise_indexer_save_uses_request_local_window() -> None:
     request.save_indexer_slot_mapping = [
         torch.arange(600, 608, dtype=torch.long)
     ]
-    _init_indexer_cache_fields(request)
 
     connector, _, engine = _make_connector([request])
     connector.kv_role = "kv_both"
@@ -815,7 +788,6 @@ def test_sparse_layerwise_producer_indexer_uses_request_full_mapping() -> None:
         can_save_indexer=True,
     )
     request.windowed_sparse_save = True
-    _init_indexer_cache_fields(request)
 
     connector, _, engine = _make_connector([request])
     connector.enable_sparse_attention = True

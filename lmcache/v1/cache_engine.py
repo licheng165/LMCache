@@ -2,6 +2,7 @@
 # Standard
 from collections import defaultdict
 from collections.abc import Iterable
+from dataclasses import dataclass, field
 from typing import (
     TYPE_CHECKING,
     Any,
@@ -89,6 +90,30 @@ LayerwiseRetrieveSegment = Tuple[
     List[int],
     List[List[CacheEngineKey]],
 ]
+
+
+@dataclass
+class LayerwiseStoreResult:
+    """Cache objects produced by one completed layerwise store generator.
+
+    Storage backends own the memory objects after a successful put. A consumer
+    that needs lifetime independent of backend residency must acquire its own
+    reference.
+    """
+
+    request_id: str
+    kv_group: int = 0
+    starts: List[int] = field(default_factory=list)
+    ends: List[int] = field(default_factory=list)
+    keys: List[List[CacheEngineKey]] = field(default_factory=list)
+    memory_objs: List[List[MemoryObj]] = field(default_factory=list)
+    tensors: List[List[torch.Tensor]] = field(default_factory=list)
+    chunk_dev_ptrs: List[List[int]] = field(default_factory=list)
+    chunk_ptrs: List[Optional[torch.Tensor]] = field(default_factory=list)
+
+    def has_cache(self) -> bool:
+        """Return whether the completed store produced reusable cache data."""
+        return bool(self.starts and self.ends and self.keys and self.memory_objs)
 
 
 class CacheEngineEndSignal:
@@ -2705,7 +2730,7 @@ class LMCacheEngine:
         tokens: Union[torch.Tensor, list[int]],
         mask: Optional[torch.Tensor] = None,
         **kwargs,
-    ) -> Generator[None, None, None]:
+    ) -> Generator[Optional[LayerwiseStoreResult], None, None]:
         """
         Store the KV cache in a layerwise manner.
 
@@ -2718,14 +2743,21 @@ class LMCacheEngine:
         :param **kwargs: The additional arguments for the storage backend which
             will be passed into the gpu_connector.
 
-        return: A generator that yields None. In the first iteration, the
-            generator allocates the memory objects for all layers and moves
+        return: A generator that yields None for each layer and a
+            LayerwiseStoreResult after the final layer. In the first iteration,
+            the generator allocates the memory objects for all layers and moves
             the KV cache of the first layer from GPU to CPU. In the next
             iterations, it moves the KV cache of layer i from GPU to the memory
             objects (on CPU) and puts the memory objects of layer i-1 to the
             storage backends. In the last iteration, it puts the memory objects
-            of the last layer to the storage backends.
+            of the last layer to the storage backends and yields the completed
+            store output.
         """
+        store_result = LayerwiseStoreResult(
+            request_id=str(kwargs.get("req_id", "unspecified")),
+            kv_group=int(kwargs.get("kv_group", 0) or 0),
+        )
+
         # Health check: block operation if LMCache is unhealthy
         if not self.is_healthy():
             logger.warning("LMCache is unhealthy, skipping store_layer operation")
@@ -2742,7 +2774,7 @@ class LMCacheEngine:
             for layer_id in range(self.num_layers):
                 yield
             # Extra yield consumed by wait_for_save() after the last layer.
-            yield
+            yield store_result
             return
 
         assert self.storage_manager is not None
@@ -2752,6 +2784,7 @@ class LMCacheEngine:
 
         # Get req_id for logging
         req_id = self._get_req_id(kwargs)
+        store_result.request_id = req_id
 
         if mask is not None:
             num_to_store_tokens = torch.sum(mask).item()
@@ -2777,12 +2810,8 @@ class LMCacheEngine:
             # Still need to yield to avoid StopIteration
             for layer_id in range(self.num_layers):
                 yield
-            yield
+            yield store_result
             return
-
-        cached_keys = kwargs.get("cached_keys")
-        assert cached_keys is not None
-        assert isinstance(cached_keys, list)
 
         starts = []
         ends = []
@@ -2879,6 +2908,10 @@ class LMCacheEngine:
             # Transpose the keys and memory objects into layer major format
             memory_objs = [list(row) for row in zip(*memory_objs, strict=False)]
             keys = [list(row) for row in zip(*keys, strict=False)]
+            store_result.starts = starts
+            store_result.ends = ends
+            store_result.keys = keys
+            store_result.memory_objs = memory_objs
             pending_store_release: dict[int, MemoryObj] = {
                 id(mem_obj): mem_obj
                 for layer_objs in memory_objs
@@ -2943,7 +2976,7 @@ class LMCacheEngine:
                 yield
 
         self.stats_monitor.on_store_finished(monitor_req_id, tot_token_num)
-        yield
+        yield store_result
 
     @_lmcache_nvtx_annotate
     @torch.inference_mode()
