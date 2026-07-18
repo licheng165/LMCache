@@ -20,7 +20,7 @@ from lmcache.integration.vllm.vllm_v1_adapter import (
     SaveSpec,
     WorkerRetrieveState,
 )
-from lmcache.v1.cache_engine import LayerwiseStoreResult
+from lmcache.v1.cache_engine import LayerwiseStoreResult, LMCacheEngine
 from lmcache.v1.kv_layer_groups import KVLayerGroupsManager
 from tests.v1.connector_test_utils import (
     make_sparse_req_meta,
@@ -32,7 +32,27 @@ def _make_impl() -> LMCacheConnectorV1Impl:
     impl = object.__new__(LMCacheConnectorV1Impl)
     impl._worker_retrieve_state = {}
     impl.kv_role = "kv_both"
+    impl._late_finished_sending = set()
     return impl
+
+
+def _make_shared_engine(
+    *,
+    rank0: bool,
+    generation: int = 9,
+) -> LMCacheEngine:
+    engine = object.__new__(LMCacheEngine)
+    engine.enable_shared_cpu_cache = True
+    engine.shared_cpu_cache_generation = generation
+    engine._shared_cpu_request_leases = {}
+    engine.metadata = SimpleNamespace(
+        is_first_rank=lambda: rank0,
+        world_size=1,
+    )
+    engine.store_location = "LocalCPUBackend"
+    engine.config = SimpleNamespace(extra_config={})
+    engine.lookup_unpin = MagicMock()
+    return engine
 
 
 def _make_group_order_impl(
@@ -100,6 +120,7 @@ def _bind_worker_state(impl: LMCacheConnectorV1Impl, request: ReqMeta):
 
 
 class TestWorkerRetrieveState:
+
     def test_sparse_decode_load_tokens_reuses_full_prefix_list(self):
         tokens = [1, 2, 3, 4]
 
@@ -167,16 +188,14 @@ class TestWorkerRetrieveState:
         ]
 
     def test_shared_cpu_cache_state_tracks_skipped_index(self):
-        state = WorkerRetrieveState()
-        state.shared_handles_by_group[0] = [["latent-handle"]]
-        state.shared_views_by_group[0] = [["latent-view"]]
-        state.shared_chunk_ptrs_npu_by_group[0] = [None]
-        state.shared_latent_status = "present"
-        state.shared_index_status = "skipped"
-        state.shared_generation = 3
-        state.pointer_cache_generation = 3
-        state.shared_request_active = True
-        state.request_scope_token = "req-1:3"
+        state = WorkerRetrieveState(
+            shared_latent_status="present",
+            shared_index_status="skipped",
+            shared_generation=3,
+            pointer_cache_generation=3,
+            shared_request_active=True,
+            request_scope_token="req-1:3",
+        )
 
         assert state.shared_latent_status == "present"
         assert state.shared_index_status == "skipped"
@@ -290,10 +309,11 @@ class TestWorkerRetrieveState:
 
     def test_record_shared_state_preserves_skipped_index_without_index_objs(self):
         impl = _make_impl()
+        register = MagicMock()
         impl.lmcache_engine = SimpleNamespace(
             enable_shared_cpu_cache=True,
             shared_cpu_cache_generation=7,
-            metadata=SimpleNamespace(is_first_rank=lambda: False),
+            register_shared_cpu_sparse_request=register,
         )
         state = WorkerRetrieveState(shared_index_status="skipped")
         request = _make_request()
@@ -306,15 +326,18 @@ class TestWorkerRetrieveState:
         assert state.shared_latent_status == "present"
         assert state.shared_index_status == "skipped"
         assert state.pointer_cache_generation == 7
-        assert state.shared_views_by_group == {0: [["latent-view"]]}
-        assert state.shared_handles_by_group == {0: [["latent-handle"]]}
+        register.assert_called_once_with(
+            "req-1",
+            owned_groups={0: state.cached_memory_objs},
+        )
 
     def test_record_shared_state_uses_request_skipped_index_marker(self):
         impl = _make_impl()
+        register = MagicMock()
         impl.lmcache_engine = SimpleNamespace(
             enable_shared_cpu_cache=True,
             shared_cpu_cache_generation=7,
-            metadata=SimpleNamespace(is_first_rank=lambda: False),
+            register_shared_cpu_sparse_request=register,
         )
         state = WorkerRetrieveState()
         request = _make_request()
@@ -338,6 +361,7 @@ class TestWorkerRetrieveState:
         assert state.shared_index_status == "skipped"
         assert state.shared_request_active is True
         assert state.pointer_cache_generation == 7
+        register.assert_called_once()
 
     def test_record_shared_state_rejects_skipped_index_with_index_objs(self):
         impl = _make_impl()
@@ -474,11 +498,12 @@ class TestWorkerRetrieveState:
         impl.num_layers = 2
         impl.config = SimpleNamespace(dsa_two_groups=True)
         impl.kv_role = "kv_both"
+        register = MagicMock()
         impl.lmcache_engine = SimpleNamespace(
             enable_shared_cpu_cache=True,
             shared_cpu_cache_generation=7,
             shared_cpu_materialize_index_on_decode_cold=True,
-            metadata=SimpleNamespace(is_first_rank=lambda: False),
+            register_shared_cpu_sparse_request=register,
         )
         state = WorkerRetrieveState()
         request = _make_request()
@@ -514,14 +539,13 @@ class TestWorkerRetrieveState:
         assert state.shared_request_active is True
         assert state.token_count == request.load_spec.lmcache_cached_tokens
         assert state.request_scope_token == "req-1:7:3"
-        assert state.shared_views_by_group == {
-            0: state.cached_memory_objs,
-            1: state.cached_memory_objs_indexer,
-        }
-        assert state.shared_handles_by_group == {
-            0: state.cached_shared_handles,
-            1: state.cached_shared_handles_indexer,
-        }
+        register.assert_called_once_with(
+            "req-1",
+            owned_groups={
+                0: state.cached_memory_objs,
+                1: state.cached_memory_objs_indexer,
+            },
+        )
 
     def test_record_shared_state_rejects_short_latent_pointer_tensor(self):
         impl = _make_impl()
@@ -610,39 +634,27 @@ class TestWorkerRetrieveState:
         assert config.extra_config["vllm_max_num_batched_tokens"] == 4096
 
     def test_release_shared_cpu_cache_state_invalidates_request_scope(self):
-        class FakeMemObj:
-            def __init__(self, pinned: bool = False):
-                self.released = 0
-                self.unpinned = 0
-                self.is_pinned = pinned
-
-            def ref_count_down(self):
-                self.released += 1
-
-            def unpin(self):
-                self.unpinned += 1
-                self.is_pinned = False
-
-        passive_view = FakeMemObj()
-        backing_obj = FakeMemObj(pinned=True)
         state = WorkerRetrieveState(
-            shared_views_by_group={0: [[passive_view]]},
+            req_id="req-1",
+            cached_memory_objs=[["view"]],
+            cached_tensors=[["tensor"]],
             cached_shared_handles=[["handle"]],
-            rank0_backing_objs_by_group={0: [[backing_obj]]},
-            shared_chunk_ptrs_npu_by_group={0: [None]},
             shared_latent_status="present",
             shared_index_status="skipped",
             shared_request_active=True,
             request_scope_token="req-1:4",
         )
+        engine = SimpleNamespace(
+            release_shared_cpu_sparse_request=MagicMock(),
+        )
 
-        LMCacheConnectorV1Impl._release_shared_worker_retrieve_state(state)
+        LMCacheConnectorV1Impl._release_shared_worker_retrieve_state(
+            state,
+            engine,
+        )
 
-        assert passive_view.released == 1
-        assert backing_obj.unpinned == 1
-        assert state.shared_views_by_group == {}
+        engine.release_shared_cpu_sparse_request.assert_called_once_with("req-1")
         assert state.cached_shared_handles == []
-        assert state.rank0_backing_objs_by_group == {}
         assert state.shared_index_status == "missing"
         assert state.shared_generation == 0
         assert state.pointer_cache_generation == 0
@@ -670,19 +682,6 @@ class TestWorkerRetrieveState:
         assert state.shared_request_active is False
 
     def test_finished_worker_request_releases_request_owned_cache_state(self):
-        class FakeMemObj:
-            def __init__(self, pinned: bool = False):
-                self.released = 0
-                self.unpinned = 0
-                self.is_pinned = pinned
-
-            def ref_count_down(self):
-                self.released += 1
-
-            def unpin(self):
-                self.unpinned += 1
-                self.is_pinned = False
-
         storer_closed: list[bool] = []
 
         def storer():
@@ -693,16 +692,15 @@ class TestWorkerRetrieveState:
 
         layerwise_storer = storer()
         next(layerwise_storer)
-        passive_view = FakeMemObj()
-        backing_obj = FakeMemObj(pinned=True)
         engine = MagicMock()
         impl = _make_impl()
         impl._manager = SimpleNamespace(lmcache_engine=engine)
         impl._layerwise_save_storers = {("req-1", 0): layerwise_storer}
         impl._worker_retrieve_state = {
             "req-1": WorkerRetrieveState(
-                shared_views_by_group={0: [[passive_view]]},
-                rank0_backing_objs_by_group={0: [[backing_obj]]},
+                req_id="req-1",
+                cached_memory_objs=[["view"]],
+                shared_request_active=True,
             )
         }
 
@@ -711,10 +709,17 @@ class TestWorkerRetrieveState:
         assert impl._layerwise_save_storers == {}
         assert impl._worker_retrieve_state == {}
         assert storer_closed == [True]
-        assert passive_view.released == 1
-        assert backing_obj.unpinned == 1
-        assert backing_obj.released == 1
+        engine.release_shared_cpu_sparse_request.assert_called_once_with("req-1")
         engine.lookup_unpin.assert_called_once_with("req-1")
+
+    def test_finished_worker_request_releases_engine_lease_without_state(self):
+        engine = MagicMock()
+        impl = _make_impl()
+        impl._manager = SimpleNamespace(lmcache_engine=engine)
+
+        impl._release_finished_worker_requests({"req-1"})
+
+        engine.release_shared_cpu_sparse_request.assert_called_once_with("req-1")
 
     def test_get_finished_releases_worker_state_after_save(self):
         impl = _make_impl()
@@ -752,7 +757,9 @@ class TestWorkerRetrieveState:
 
         impl.wait_for_save()
 
-        impl._wait_for_save_impl.assert_called_once_with()
+        impl._wait_for_save_impl.assert_called_once()
+        (save_context,) = impl._wait_for_save_impl.call_args.args
+        assert save_context == {}
         impl._release_finished_worker_requests.assert_called_once_with({"req-1"})
         assert impl._finished_req_ids_waiting_for_save == set()
 
@@ -782,21 +789,12 @@ class TestWorkerRetrieveState:
         impl._release_finished_worker_requests.assert_called_once_with({"req-1"})
 
     def test_save_transfers_active_shared_state_without_releasing(self):
-        class FakeMemObj:
-            def __init__(self):
-                self.released = 0
-
-            def ref_count_down(self):
-                self.released += 1
-
         impl = _make_impl()
         impl.lmcache_engine = SimpleNamespace(enable_shared_cpu_cache=False)
-        view = FakeMemObj()
         impl._worker_retrieve_state["req-1"] = WorkerRetrieveState(
             cached_keys=[["old-k"]],
             cached_starts=[0],
             cached_ends=[256],
-            shared_views_by_group={0: [[view]]},
             shared_latent_status="present",
             shared_generation=8,
             pointer_cache_generation=8,
@@ -806,8 +804,6 @@ class TestWorkerRetrieveState:
         request = _make_request()
         state = impl._worker_retrieve_state["req-1"]
         state.cached_keys = [["new-k"]]
-        state.cached_starts = [0]
-        state.cached_ends = [256]
 
         impl._publish_worker_retrieve_state(
             state,
@@ -818,8 +814,6 @@ class TestWorkerRetrieveState:
         )
 
         state = impl._worker_retrieve_state["req-1"]
-        assert view.released == 0
-        assert state.shared_views_by_group == {0: [[view]]}
         assert state.shared_request_active is True
         assert state.pointer_cache_generation == 8
         assert state.request_scope_token == "req-1:8:256"
@@ -829,11 +823,7 @@ class TestWorkerRetrieveState:
         impl = _make_impl()
         impl.num_layers = 1
         impl.config = SimpleNamespace(dsa_two_groups=False)
-        impl.lmcache_engine = SimpleNamespace(
-            enable_shared_cpu_cache=True,
-            shared_cpu_cache_generation=7,
-            metadata=SimpleNamespace(is_first_rank=lambda: False),
-        )
+        impl.lmcache_engine = _make_shared_engine(rank0=False, generation=7)
         old_state = WorkerRetrieveState(
             cached_keys=[["k0"]],
             cached_starts=[0],
@@ -889,12 +879,15 @@ class TestWorkerRetrieveState:
         assert new_state.shared_validation_signature != old_signature
         assert new_state.cached_memory_objs == [["new-latent-view"]]
 
-    def test_save_records_rank0_shared_backing_objs_for_cleanup(self):
+    def test_save_registers_rank0_shared_backing_for_cleanup(self):
         class FakeMemObj:
             def __init__(self):
                 self.released = 0
                 self.unpinned = 0
                 self.is_pinned = True
+
+            def is_valid(self):
+                return True
 
             def ref_count_down(self):
                 self.released += 1
@@ -904,11 +897,8 @@ class TestWorkerRetrieveState:
                 self.is_pinned = False
 
         impl = _make_impl()
-        impl.lmcache_engine = SimpleNamespace(
-            enable_shared_cpu_cache=True,
-            shared_cpu_cache_generation=9,
-            metadata=SimpleNamespace(is_first_rank=lambda: True),
-        )
+        engine = _make_shared_engine(rank0=True, generation=9)
+        impl.lmcache_engine = engine
         backing_obj = FakeMemObj()
         request = _make_request()
         state = WorkerRetrieveState(
@@ -930,15 +920,19 @@ class TestWorkerRetrieveState:
         )
 
         state = impl._worker_retrieve_state["req-1"]
-        assert state.shared_handles_by_group == {0: [["handle"]]}
+        assert engine.shared_cpu_rank0_request_object_ids("req-1", 0) == {
+            id(backing_obj)
+        }
         assert state.cached_shared_handles == [["handle"]]
-        assert state.rank0_backing_objs_by_group == {0: [[backing_obj]]}
         assert state.shared_latent_status == "present"
         assert state.shared_generation == 9
         assert state.pointer_cache_generation == 9
         assert state.shared_request_active is True
 
-        LMCacheConnectorV1Impl._release_shared_worker_retrieve_state(state)
+        LMCacheConnectorV1Impl._release_shared_worker_retrieve_state(
+            state,
+            engine,
+        )
         assert backing_obj.unpinned == 1
         assert backing_obj.released == 1
         assert state.cached_memory_objs == []
@@ -953,6 +947,9 @@ class TestWorkerRetrieveState:
             @property
             def is_pinned(self):
                 return self.pin_count > 0
+
+            def is_valid(self):
+                return self.valid
 
             def ref_count_up(self):
                 self.ref_count += 1
@@ -977,16 +974,8 @@ class TestWorkerRetrieveState:
                 return object() if self.valid else None
 
         impl = _make_impl()
-        impl.lmcache_engine = SimpleNamespace(
-            enable_shared_cpu_cache=True,
-            shared_cpu_cache_generation=9,
-            store_location="LocalCPUBackend",
-            lookup_unpin=lambda _req_id: None,
-            metadata=SimpleNamespace(
-                world_size=1,
-                is_first_rank=lambda: True,
-            ),
-        )
+        engine = _make_shared_engine(rank0=True, generation=9)
+        impl.lmcache_engine = engine
         borrowed_obj = BorrowedLocalCPUObj()
         hot_cache = {"k": borrowed_obj}
         request, store_result = _make_store_request(
@@ -1004,11 +993,13 @@ class TestWorkerRetrieveState:
 
         seeded_state = impl._worker_retrieve_state["req-1"]
         assert seeded_state.shared_request_active is False
-        assert seeded_state.rank0_backing_objs_by_group == {0: [[borrowed_obj]]}
+        assert engine.shared_cpu_rank0_request_object_ids("req-1", 0) == {
+            id(borrowed_obj)
+        }
         assert borrowed_obj.ref_count == 2
         assert borrowed_obj.pin_count == 1
 
-        impl._retain_rank0_store_seed_state(seeded_state)
+        impl._retain_shared_store_seed_state(seeded_state)
         assert borrowed_obj.ref_count == 2
         assert borrowed_obj.pin_count == 1
 
@@ -1029,7 +1020,9 @@ class TestWorkerRetrieveState:
 
         state = impl._worker_retrieve_state["req-1"]
         assert state.shared_request_active is True
-        assert state.rank0_backing_objs_by_group == {0: [[borrowed_obj]]}
+        assert engine.shared_cpu_rank0_request_object_ids("req-1", 0) == {
+            id(borrowed_obj)
+        }
         assert borrowed_obj.ref_count == 2
         assert borrowed_obj.pin_count == 1
 
@@ -1110,22 +1103,24 @@ class TestWorkerRetrieveState:
                 self.released += 1
 
         impl = _make_impl()
-        impl.lmcache_engine = SimpleNamespace(
-            enable_shared_cpu_cache=True,
-            shared_cpu_cache_generation=10,
-            metadata=SimpleNamespace(is_first_rank=lambda: False),
-        )
+        engine = _make_shared_engine(rank0=False, generation=10)
+        impl.lmcache_engine = engine
         old_view = FakeMemObj()
+        engine.register_shared_cpu_sparse_request(
+            "req-1",
+            owned_groups={0: [[old_view]]},
+        )
         impl._worker_retrieve_state["req-1"] = WorkerRetrieveState(
+            req_id="req-1",
             cached_keys=[["old-k"]],
             cached_starts=[0],
             cached_ends=[256],
-            shared_views_by_group={0: [[old_view]]},
+            cached_memory_objs=[[old_view]],
             shared_latent_status="present",
-            shared_generation=9,
-            pointer_cache_generation=9,
+            shared_generation=10,
+            pointer_cache_generation=10,
             shared_request_active=True,
-            request_scope_token="req-1:9:256",
+            request_scope_token="req-1:10:256",
         )
         new_view = FakeMemObj()
         request = _make_request()
@@ -1150,51 +1145,11 @@ class TestWorkerRetrieveState:
         state = impl._worker_retrieve_state["req-1"]
         assert old_view.released == 1
         assert new_view.released == 0
-        assert state.shared_views_by_group == {0: [[new_view]]}
+        assert engine._shared_cpu_request_leases["req-1"].object_ids(0) == {
+            id(new_view)
+        }
         assert state.shared_generation == 10
-
-    def test_save_records_rank0_shared_request_in_engine_registry(self):
-        class FakeMemObj:
-            is_pinned = True
-
-            def ref_count_down(self):
-                pass
-
-            def unpin(self):
-                pass
-
-        register = MagicMock()
-        impl = _make_impl()
-        impl.lmcache_engine = SimpleNamespace(
-            enable_shared_cpu_cache=True,
-            shared_cpu_cache_generation=9,
-            metadata=SimpleNamespace(is_first_rank=lambda: True),
-            register_shared_cpu_sparse_request=register,
-        )
-        request = _make_request()
-        request.token_ids = [1] * 512
-        state = WorkerRetrieveState(
-            cached_keys=[["k"]],
-            cached_starts=[0],
-            cached_ends=[256],
-            cached_memory_objs=[[FakeMemObj()]],
-            cached_chunk_ptrs_npu=["latent-ptrs"],
-            cached_shared_handles=[["handle"]],
-        )
-
-        impl._publish_worker_retrieve_state(
-            state,
-            request,
-            location="mixed",
-            metadata_warm=True,
-            token_count=256,
-        )
-
-        register.assert_called_once_with(
-            "req-1",
-            token_count=256,
-            phase="sparse_decode_bootstrap",
-        )
+        impl._drop_worker_retrieve_state("req-1")
 
     def test_register_failure_releases_unstored_rank0_shared_objects(self):
         class FakeMemObj:
@@ -1202,6 +1157,9 @@ class TestWorkerRetrieveState:
                 self.released = 0
                 self.unpinned = 0
                 self.is_pinned = True
+
+            def is_valid(self):
+                return True
 
             def ref_count_down(self):
                 self.released += 1
@@ -1214,12 +1172,9 @@ class TestWorkerRetrieveState:
             raise RuntimeError("capacity registry failed")
 
         impl = _make_impl()
-        impl.lmcache_engine = SimpleNamespace(
-            enable_shared_cpu_cache=True,
-            shared_cpu_cache_generation=9,
-            metadata=SimpleNamespace(is_first_rank=lambda: True),
-            register_shared_cpu_sparse_request=fail_register,
-        )
+        engine = _make_shared_engine(rank0=True)
+        engine.register_shared_cpu_sparse_request = fail_register
+        impl.lmcache_engine = engine
         backing_obj = FakeMemObj()
         request = _make_request()
         state = WorkerRetrieveState(
@@ -1253,11 +1208,7 @@ class TestWorkerRetrieveState:
                 self.released += 1
 
         impl = _make_impl()
-        impl.lmcache_engine = SimpleNamespace(
-            enable_shared_cpu_cache=True,
-            shared_cpu_cache_generation=9,
-            metadata=SimpleNamespace(is_first_rank=lambda: False),
-        )
+        impl.lmcache_engine = _make_shared_engine(rank0=False)
         passive_view = FakeMemObj()
         request = _make_request()
         state = WorkerRetrieveState(
@@ -1283,6 +1234,9 @@ class TestWorkerRetrieveState:
                 self.unpinned = 0
                 self.is_pinned = True
 
+            def is_valid(self):
+                return True
+
             def ref_count_down(self):
                 self.released += 1
 
@@ -1291,11 +1245,7 @@ class TestWorkerRetrieveState:
                 self.is_pinned = False
 
         impl = _make_impl()
-        impl.lmcache_engine = SimpleNamespace(
-            enable_shared_cpu_cache=True,
-            shared_cpu_cache_generation=9,
-            metadata=SimpleNamespace(is_first_rank=lambda: True),
-        )
+        impl.lmcache_engine = _make_shared_engine(rank0=True)
         backing_obj = FakeMemObj()
         request = _make_request()
         state = WorkerRetrieveState(
@@ -1328,22 +1278,24 @@ class TestWorkerRetrieveState:
                 self.released += 1
 
         impl = _make_impl()
-        impl.lmcache_engine = SimpleNamespace(
-            enable_shared_cpu_cache=True,
-            shared_cpu_cache_generation=9,
-            metadata=SimpleNamespace(is_first_rank=lambda: False),
-        )
+        engine = _make_shared_engine(rank0=False)
+        impl.lmcache_engine = engine
         old_view = FakeMemObj()
+        engine.register_shared_cpu_sparse_request(
+            "req-1",
+            owned_groups={0: [[old_view]]},
+        )
         old_state = WorkerRetrieveState(
+            req_id="req-1",
             cached_keys=[["old-k"]],
             cached_starts=[0],
             cached_ends=[256],
-            shared_views_by_group={0: [[old_view]]},
+            cached_memory_objs=[[old_view]],
             shared_latent_status="present",
-            shared_generation=8,
-            pointer_cache_generation=8,
+            shared_generation=9,
+            pointer_cache_generation=9,
             shared_request_active=True,
-            request_scope_token="req-1:8:256",
+            request_scope_token="req-1:9:256",
         )
         impl._worker_retrieve_state["req-1"] = old_state
         new_view = FakeMemObj()
@@ -1366,9 +1318,63 @@ class TestWorkerRetrieveState:
             )
 
         assert impl._worker_retrieve_state["req-1"] is old_state
-        assert old_state.shared_views_by_group == {0: [[old_view]]}
-        assert old_state.pointer_cache_generation == 8
+        assert engine._shared_cpu_request_leases["req-1"].object_ids(0) == {
+            id(old_view)
+        }
+        assert old_state.pointer_cache_generation == 9
         assert old_view.released == 0
+        assert new_view.released == 1
+        engine.release_shared_cpu_sparse_request("req-1")
+
+    def test_failed_in_place_refresh_drops_old_shared_state(self):
+        class FakeMemObj:
+            def __init__(self):
+                self.released = 0
+
+            def ref_count_down(self):
+                self.released += 1
+
+        impl = _make_impl()
+        engine = _make_shared_engine(rank0=False)
+        impl.lmcache_engine = engine
+        old_view = FakeMemObj()
+        new_view = FakeMemObj()
+        engine.register_shared_cpu_sparse_request(
+            "req-1",
+            owned_groups={0: [[old_view]]},
+        )
+        state = WorkerRetrieveState(
+            req_id="req-1",
+            cached_keys=[["old-k"]],
+            cached_starts=[0],
+            cached_ends=[256],
+            cached_memory_objs=[[old_view]],
+            cached_chunk_ptrs_npu=["old-ptrs"],
+            shared_latent_status="present",
+            shared_generation=9,
+            pointer_cache_generation=9,
+            shared_request_active=True,
+            request_scope_token="req-1:9:256",
+        )
+        impl._worker_retrieve_state["req-1"] = state
+
+        # Retrieval updates the bound state in place before publication.
+        state.cached_keys = [["new-k"]]
+        state.cached_memory_objs = [[new_view]]
+        state.cached_chunk_ptrs_npu = []
+
+        with pytest.raises(RuntimeError, match="pointer-cache install"):
+            impl._publish_worker_retrieve_state(
+                state,
+                _make_request(),
+                location="mixed",
+                metadata_warm=True,
+                token_count=256,
+            )
+
+        assert "req-1" not in impl._worker_retrieve_state
+        assert "req-1" not in engine._shared_cpu_request_leases
+        assert old_view.released == 1
         assert new_view.released == 1
 
     def test_dense_prefix_prime_interleaves_latent_and_indexer(self):
@@ -2470,6 +2476,7 @@ class TestWorkerRetrieveState:
             shared_cpu_cache_generation=5,
             storage_manager=None,
             store_location="LocalCPUBackend",
+            retain_shared_cpu_store_seed=MagicMock(),
         )
         old_ptrs = torch.tensor([111], dtype=torch.long)
         impl._worker_retrieve_state["req-1"] = WorkerRetrieveState(
@@ -2481,7 +2488,6 @@ class TestWorkerRetrieveState:
             cached_chunk_dev_ptrs=[[111]],
             cached_chunk_ptrs_npu=[old_ptrs],
             cached_shared_handles=[["h0"]],
-            rank0_backing_objs_by_group={0: [["m0"]]},
             metadata_warm=True,
             token_count=256,
             shared_latent_status="present",
@@ -2552,6 +2558,7 @@ class TestWorkerRetrieveState:
             shared_cpu_cache_generation=5,
             storage_manager=None,
             store_location="LocalCPUBackend",
+            retain_shared_cpu_store_seed=MagicMock(),
         )
         old_ptrs = torch.tensor([111], dtype=torch.long)
         impl._worker_retrieve_state["req-1"] = WorkerRetrieveState(
@@ -2563,7 +2570,6 @@ class TestWorkerRetrieveState:
             cached_chunk_dev_ptrs=[[111]],
             cached_chunk_ptrs_npu=[old_ptrs],
             cached_shared_handles=[["h0"]],
-            rank0_backing_objs_by_group={0: [["m0"]]},
             metadata_warm=True,
             token_count=256,
             shared_latent_status="present",
@@ -2626,6 +2632,7 @@ class TestWorkerRetrieveState:
             shared_cpu_cache_generation=5,
             storage_manager=None,
             store_location="LocalCPUBackend",
+            retain_shared_cpu_store_seed=MagicMock(),
             config=SimpleNamespace(
                 extra_config={"shared_cpu_materialize_index_on_decode_cold": True}
             ),
@@ -2649,7 +2656,6 @@ class TestWorkerRetrieveState:
                 torch.tensor([333], dtype=torch.long)
             ],
             cached_shared_handles_indexer=[["ih0"]],
-            rank0_backing_objs_by_group={0: [["m0"]], 1: [["im0"]]},
             metadata_warm=True,
             token_count=256,
             shared_latent_status="present",
@@ -2722,6 +2728,7 @@ class TestWorkerRetrieveState:
             shared_cpu_cache_generation=5,
             storage_manager=None,
             store_location="LocalCPUBackend",
+            retain_shared_cpu_store_seed=MagicMock(),
         )
         impl._worker_retrieve_state["req-1"] = WorkerRetrieveState(
             cached_keys=[["k0"]],
@@ -2731,7 +2738,6 @@ class TestWorkerRetrieveState:
             cached_tensors=[["t0"]],
             cached_chunk_dev_ptrs=[[111]],
             cached_chunk_ptrs_npu=[torch.tensor([111], dtype=torch.long)],
-            rank0_backing_objs_by_group={0: [["m0"]]},
             metadata_warm=True,
             token_count=256,
             shared_latent_status="present",
@@ -2778,6 +2784,7 @@ class TestWorkerRetrieveState:
             shared_cpu_cache_generation=5,
             storage_manager=None,
             store_location="LocalCPUBackend",
+            retain_shared_cpu_store_seed=MagicMock(),
         )
         impl._worker_retrieve_state["req-1"] = WorkerRetrieveState(
             cached_keys=[["k0"]],
@@ -2787,7 +2794,6 @@ class TestWorkerRetrieveState:
             cached_tensors=[["t0"]],
             cached_chunk_dev_ptrs=[[111]],
             cached_chunk_ptrs_npu=[torch.tensor([111], dtype=torch.long)],
-            rank0_backing_objs_by_group={0: [["m0"]]},
             metadata_warm=True,
             token_count=256,
             shared_latent_status="present",
@@ -2839,6 +2845,7 @@ class TestWorkerRetrieveState:
             shared_cpu_cache_generation=5,
             storage_manager=None,
             store_location="LocalCPUBackend",
+            retain_shared_cpu_store_seed=MagicMock(),
         )
         old_chunk_count = 73
         old_end = old_chunk_count * 256
@@ -2852,9 +2859,6 @@ class TestWorkerRetrieveState:
             cached_chunk_ptrs_npu=[
                 torch.arange(old_chunk_count, dtype=torch.long)
             ],
-            rank0_backing_objs_by_group={
-                0: [[f"m{i}" for i in range(old_chunk_count)]]
-            },
             metadata_warm=True,
             token_count=old_end,
             shared_latent_status="present",
@@ -2941,6 +2945,7 @@ class TestWorkerRetrieveState:
             shared_cpu_cache_generation=5,
             storage_manager=None,
             store_location="LocalCPUBackend",
+            retain_shared_cpu_store_seed=MagicMock(),
         )
         impl._worker_retrieve_state["req-1"] = WorkerRetrieveState(
             cached_keys=[["k0"]],
@@ -2950,7 +2955,6 @@ class TestWorkerRetrieveState:
             cached_tensors=[["t0"]],
             cached_chunk_dev_ptrs=[[111]],
             cached_chunk_ptrs_npu=[torch.tensor([111], dtype=torch.long)],
-            rank0_backing_objs_by_group={0: [["m0"]]},
             metadata_warm=True,
             token_count=256,
             shared_latent_status="present",
@@ -2998,6 +3002,7 @@ class TestWorkerRetrieveState:
             shared_cpu_cache_generation=5,
             storage_manager=None,
             store_location="LocalCPUBackend",
+            retain_shared_cpu_store_seed=MagicMock(),
             config=SimpleNamespace(
                 extra_config={"shared_cpu_materialize_index_on_decode_cold": True}
             ),
@@ -3019,7 +3024,6 @@ class TestWorkerRetrieveState:
             cached_chunk_ptrs_npu_indexer=[
                 torch.tensor([333], dtype=torch.long)
             ],
-            rank0_backing_objs_by_group={0: [["m0"]], 1: [["im0"]]},
             metadata_warm=True,
             token_count=256,
             shared_latent_status="present",
@@ -3396,6 +3400,9 @@ class TestWorkerRetrieveState:
                 self.unpinned = 0
                 self.is_pinned = True
 
+            def is_valid(self):
+                return True
+
             def ref_count_down(self):
                 self.released += 1
 
@@ -3403,12 +3410,14 @@ class TestWorkerRetrieveState:
                 self.unpinned += 1
                 self.is_pinned = False
 
-        engine = SimpleNamespace(
-            release_shared_cpu_sparse_request=MagicMock(),
-        )
+        engine = _make_shared_engine(rank0=True)
         impl = _make_impl()
         impl.lmcache_engine = engine
         backing = FakeMemObj()
+        engine.register_shared_cpu_sparse_request(
+            "req-2",
+            owned_groups={0: [[backing]]},
+        )
         impl._worker_retrieve_state = {
             "req-1": WorkerRetrieveState(metadata_warm=True, cached_keys=[["k"]]),
             "req-2": WorkerRetrieveState(
@@ -3418,7 +3427,6 @@ class TestWorkerRetrieveState:
                 cached_ends=[256],
                 cached_memory_objs=[[backing]],
                 cached_chunk_ptrs_npu=[torch.tensor([123], dtype=torch.long)],
-                rank0_backing_objs_by_group={0: [[backing]]},
                 metadata_warm=True,
                 shared_latent_status="present",
                 shared_generation=9,
@@ -3433,7 +3441,7 @@ class TestWorkerRetrieveState:
         state = impl._worker_retrieve_state["req-2"]
         assert backing.unpinned == 1
         assert backing.released == 1
-        engine.release_shared_cpu_sparse_request.assert_called_once_with("req-2")
+        assert "req-2" not in engine._shared_cpu_request_leases
         assert state.cached_keys == [["k2"]]
         assert state.cached_starts == [0]
         assert state.cached_ends == [256]

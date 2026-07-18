@@ -63,6 +63,7 @@ from lmcache.v1.sampled_lookup import (
     first_last_layer_keys,
 )
 from lmcache.v1.shared_cpu_cache import (
+    SharedCPURequestLease,
     SharedChunkHandle,
     SharedHandleEnvelope,
     SharedSlabMapping,
@@ -179,7 +180,7 @@ class LMCacheEngine:
         self.shared_cpu_cache_generation = 0
         self.shared_cpu_cache_mapping: Optional[SharedSlabMapping] = None
         self.shared_cpu_cache_passive_allocator = None
-        self._shared_cpu_active_sparse_requests: dict[str, dict[str, Any]] = {}
+        self._shared_cpu_request_leases: dict[str, SharedCPURequestLease] = {}
         self._sampled_lookup_local_fallback_logged = False
         self._validate_shared_cpu_cache_contract()
         self._prepare_shared_cpu_cache_name()
@@ -1429,33 +1430,130 @@ class LMCacheEngine:
                     evictable_bytes += physical_size
             snapshot["pinned_bytes"] = pinned_bytes
             snapshot["evictable_bytes"] = evictable_bytes
-            snapshot["active_sparse_requests"] = len(
-                self._shared_cpu_active_sparse_requests
+            snapshot["active_sparse_requests"] = sum(
+                lease.active
+                for lease in self._shared_cpu_request_leases.values()
             )
             return snapshot
         except Exception as exc:
             return {"capacity_snapshot_error": str(exc)}
 
+    def _get_shared_cpu_request_lease(
+        self,
+        req_id: str,
+    ) -> tuple[SharedCPURequestLease, bool]:
+        lease = self._shared_cpu_request_leases.get(req_id)
+        if (
+            lease is not None
+            and lease.generation != self.shared_cpu_cache_generation
+        ):
+            self._shared_cpu_request_leases.pop(req_id, None)
+            lease.close()
+            lease = None
+        if lease is not None:
+            return lease, False
+        return (
+            SharedCPURequestLease(
+                request_id=req_id,
+                generation=self.shared_cpu_cache_generation,
+                is_rank0=self.metadata.is_first_rank(),
+            ),
+            True,
+        )
+
     def register_shared_cpu_sparse_request(
         self,
         req_id: str,
         *,
-        token_count: int = 0,
-        phase: str = "sparse_decode_bootstrap",
+        owned_groups: Optional[dict[int, list[list[MemoryObj]]]] = None,
     ) -> None:
         if not req_id:
             return
-        self._shared_cpu_active_sparse_requests[req_id] = {
-            "token_count": int(token_count or 0),
-            "phase": phase,
-            "generation": self.shared_cpu_cache_generation,
-            "registered_at": time.time(),
-        }
+        lease, created = self._get_shared_cpu_request_lease(req_id)
+        try:
+            if owned_groups:
+                lease.replace_groups(owned_groups, retain=False)
+            lease.active = True
+            self._shared_cpu_request_leases[req_id] = lease
+        except Exception:
+            if created:
+                lease.close()
+            raise
+
+    def retain_shared_cpu_store_seed(
+        self,
+        req_id: str,
+        groups: dict[int, list[list[MemoryObj]]],
+    ) -> None:
+        if not req_id or not groups or not self.metadata.is_first_rank():
+            return
+        lease, created = self._get_shared_cpu_request_lease(req_id)
+        try:
+            lease.replace_groups(groups, retain=True)
+            self._shared_cpu_request_leases[req_id] = lease
+        except Exception:
+            if created:
+                lease.close()
+            raise
+
+    def shared_cpu_rank0_request_object_ids(
+        self,
+        req_id: Optional[str],
+        kv_group: int,
+    ) -> set[int]:
+        if not req_id:
+            return set()
+        lease = self._shared_cpu_request_leases.get(req_id)
+        if (
+            lease is None
+            or lease.generation != self.shared_cpu_cache_generation
+            or not lease.is_rank0
+        ):
+            return set()
+        return lease.object_ids(kv_group)
+
+    def release_shared_cpu_unowned_objects(
+        self,
+        req_id: Optional[str],
+        groups: dict[int, list[list[MemoryObj]]],
+    ) -> None:
+        """Release retrieved objects not adopted by the request lease."""
+
+        lease = self._shared_cpu_request_leases.get(req_id or "")
+        owned_ids = (
+            lease.object_ids()
+            if lease is not None
+            and lease.generation == self.shared_cpu_cache_generation
+            else set()
+        )
+        unowned_objects = [
+            memory_obj
+            for layers in groups.values()
+            for layer in layers
+            for memory_obj in layer
+            if id(memory_obj) not in owned_ids
+        ]
+        if not unowned_objects:
+            return
+        SharedCPURequestLease(
+            request_id=req_id or "unowned",
+            generation=self.shared_cpu_cache_generation,
+            is_rank0=self.metadata.is_first_rank(),
+            groups={0: [unowned_objects]},
+        ).close()
 
     def release_shared_cpu_sparse_request(self, req_id: Optional[str]) -> None:
         if not req_id:
             return
-        self._shared_cpu_active_sparse_requests.pop(req_id, None)
+        lease = self._shared_cpu_request_leases.pop(req_id, None)
+        if lease is not None:
+            lease.close()
+
+    def _release_all_shared_cpu_request_leases(self) -> None:
+        leases = list(self._shared_cpu_request_leases.values())
+        self._shared_cpu_request_leases.clear()
+        for lease in leases:
+            lease.close()
 
     def _shared_cpu_estimated_physical_chunk_bytes(
         self,
@@ -1591,7 +1689,11 @@ class LMCacheEngine:
                 evictable_bytes += physical_size
 
         available_after_eviction = free_bytes + evictable_bytes
-        active_sparse_requests = set(self._shared_cpu_active_sparse_requests)
+        active_sparse_requests = {
+            req_id
+            for req_id, lease in self._shared_cpu_request_leases.items()
+            if lease.active
+        }
         if req_id:
             active_sparse_requests.add(req_id)
         details = {
@@ -4049,6 +4151,7 @@ class LMCacheEngine:
             except Exception as e:
                 logger.error(f"Error closing lmcache_worker: {e}")
 
+        self._release_all_shared_cpu_request_leases()
         try:
             logger.info("Closing storage_manager...")
             if self.storage_manager is not None:

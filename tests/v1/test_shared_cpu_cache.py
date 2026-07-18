@@ -24,10 +24,144 @@ from lmcache.v1.shared_cpu_cache import (
     SharedCPUCacheError,
     SharedCPUCacheValidationError,
     SharedHandleEnvelope,
+    SharedCPURequestLease,
     SharedSlabMapping,
 )
 from lmcache.v1.storage_backend.connector.base_connector import RemoteConnector
 from lmcache.v1.storage_backend.local_cpu_backend import LocalCPUPrefixGetResult
+
+
+class _LeaseMemoryObj:
+    def __init__(self, *, pinned: bool = False) -> None:
+        self.ref_count = 1
+        self.pin_count = int(pinned)
+        self.valid = True
+
+    @property
+    def is_pinned(self) -> bool:
+        return self.pin_count > 0
+
+    def is_valid(self) -> bool:
+        return self.valid
+
+    def ref_count_up(self) -> None:
+        self.ref_count += 1
+
+    def ref_count_down(self) -> None:
+        self.ref_count -= 1
+        if self.ref_count == 0 and self.pin_count == 0:
+            self.valid = False
+
+    def pin(self) -> bool:
+        self.pin_count += 1
+        return True
+
+    def unpin(self) -> bool:
+        self.pin_count -= 1
+        return True
+
+
+def test_shared_cpu_request_lease_retains_store_seed_once() -> None:
+    memory_obj = _LeaseMemoryObj()
+    lease = SharedCPURequestLease(
+        request_id="req",
+        generation=1,
+        is_rank0=True,
+    )
+
+    lease.replace_groups({0: [[memory_obj]]}, retain=True)
+    lease.replace_groups({0: [[memory_obj]]}, retain=True)
+
+    assert memory_obj.ref_count == 2
+    assert memory_obj.pin_count == 1
+    lease.close()
+    assert memory_obj.ref_count == 1
+    assert memory_obj.pin_count == 0
+
+
+def test_shared_cpu_request_lease_retain_failure_is_transactional() -> None:
+    class FailingPinMemoryObj(_LeaseMemoryObj):
+        def pin(self) -> bool:
+            return False
+
+    old_obj = _LeaseMemoryObj()
+    new_obj = _LeaseMemoryObj()
+    failing_obj = FailingPinMemoryObj()
+    lease = SharedCPURequestLease(
+        request_id="req",
+        generation=1,
+        is_rank0=True,
+    )
+    lease.replace_groups({0: [[old_obj]]}, retain=True)
+
+    with pytest.raises(RuntimeError, match="pin"):
+        lease.replace_groups(
+            {0: [[old_obj, new_obj, failing_obj]]},
+            retain=True,
+        )
+
+    assert lease.object_ids(0) == {id(old_obj)}
+    assert (old_obj.ref_count, old_obj.pin_count) == (2, 1)
+    assert (new_obj.ref_count, new_obj.pin_count) == (1, 0)
+    assert (failing_obj.ref_count, failing_obj.pin_count) == (1, 0)
+
+    lease.close()
+    assert (old_obj.ref_count, old_obj.pin_count) == (1, 0)
+
+
+def test_shared_cpu_request_lease_replaces_adopted_views() -> None:
+    old_view = _LeaseMemoryObj()
+    new_view = _LeaseMemoryObj()
+    layers = [[old_view]]
+    lease = SharedCPURequestLease(
+        request_id="req",
+        generation=1,
+        is_rank0=False,
+    )
+
+    lease.replace_groups({0: layers}, retain=False)
+    layers[0].append(new_view)
+    assert lease.object_ids(0) == {id(old_view)}
+
+    lease.replace_groups({0: [[new_view]]}, retain=False)
+    assert old_view.ref_count == 0
+    assert not old_view.valid
+    assert new_view.ref_count == 1
+
+    lease.close()
+    lease.close()
+    assert new_view.ref_count == 0
+    assert not new_view.valid
+
+
+def test_stale_request_lease_does_not_claim_new_generation_objects() -> None:
+    memory_obj = _LeaseMemoryObj()
+    stale_lease = SharedCPURequestLease(
+        request_id="req",
+        generation=1,
+        is_rank0=True,
+    )
+    stale_lease.replace_groups({0: [[memory_obj]]}, retain=True)
+
+    # Simulate the independent pin/ref acquired for a generation-2 publication.
+    memory_obj.ref_count_up()
+    memory_obj.pin()
+    engine = object.__new__(LMCacheEngine)
+    engine.shared_cpu_cache_generation = 2
+    engine.metadata = SimpleNamespace(is_first_rank=lambda: True)
+    engine._shared_cpu_request_leases = {"req": stale_lease}
+
+    assert engine.shared_cpu_rank0_request_object_ids("req", 0) == set()
+    engine.release_shared_cpu_unowned_objects(
+        "req",
+        {0: [[memory_obj]]},
+    )
+    assert memory_obj.ref_count == 2
+    assert memory_obj.pin_count == 1
+
+    engine.release_shared_cpu_sparse_request("req")
+    assert memory_obj.ref_count == 1
+    assert memory_obj.pin_count == 0
 
 
 class _FakeRemoteConnector(RemoteConnector):
@@ -741,7 +875,7 @@ def _make_engine_for_sparse_capacity(*, max_local_cpu_size: float):
     engine.dsa_two_groups = True
     engine.shared_cpu_cache_strict = True
     engine.gpu_connector = _FakeSharedShapeConnector()
-    engine._shared_cpu_active_sparse_requests = {}
+    engine._shared_cpu_request_leases = {}
     return engine
 
 
@@ -1205,7 +1339,12 @@ def test_runtime_capacity_details_exclude_required_hot_chunks_from_evictable():
         other_obj,
     )
     engine.config.chunk_size = 4
-    engine._shared_cpu_active_sparse_requests = {"req-old": {}}
+    engine._shared_cpu_request_leases["req-old"] = SharedCPURequestLease(
+        request_id="req-old",
+        generation=0,
+        is_rank0=True,
+        active=True,
+    )
 
     details = engine._shared_cpu_runtime_capacity_details(
         req_id="req-1",

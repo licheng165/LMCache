@@ -99,8 +99,8 @@ def _make_connector(requests):
     connector._indexer_kvcaches = []
     connector._layerwise_save_storers = {}
     connector._deferred_latent_pending = set()
-    # lmcache_ascend patches LMCacheConnectorV1Impl at import time; __new__ skips
-    # LMCacheAscendConnectorV1Impl.__init__ which normally sets these.
+    # lmcache_ascend patches LMCacheConnectorV1Impl; __new__ skips generic and
+    # Ascend worker initialization.
     connector.store_async = False
     connector._wait_for_save_done = True
     connector._finished_req_ids_waiting_for_save = set()
