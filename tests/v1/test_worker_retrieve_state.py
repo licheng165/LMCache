@@ -1296,19 +1296,27 @@ class TestWorkerRetrieveState:
         impl.layerwise_retrievers = [(retriever, None)]
 
         selected_tokens = torch.tensor(
-            [[10, 11, 12, 13], [18831, 18814, 18810, 18651]],
+            [
+                [10, 11, 12, 13],
+                [100, 101, 102, 103],
+                [18831, 18814, 18810, 18651],
+            ],
             dtype=torch.int32,
         )
         target_slot_mapping = torch.tensor(
-            [[100, 101, 102, 103], [900, 901, 902, 903]],
+            [
+                [500, 501, 502, 503],
+                [700, 701, 702, 703],
+                [900, 901, 902, 903],
+            ],
             dtype=torch.long,
         )
 
         impl.wait_for_layer_load(
             "model.layers.0.self_attn.attn",
             selected_tokens=selected_tokens,
-            token_start_index=[0, 0],
-            request_ids=["other-req", "req-1"],
+            token_start_index=[0, 0, 0],
+            request_ids=["req-1", "other-req", "req-1"],
             target_slot_mapping=target_slot_mapping,
         )
 
@@ -1316,8 +1324,71 @@ class TestWorkerRetrieveState:
         assert len(captured) == 1
         payload = captured[0]
         assert payload["payload_event"] is sentinel_event
-        assert torch.equal(payload["selected_token_ids"], selected_tokens[1])
-        assert torch.equal(payload["target_slot_mapping"], target_slot_mapping[1])
+        assert torch.equal(
+            payload["selected_token_ids"], selected_tokens[[0, 2]]
+        )
+        assert torch.equal(
+            payload["target_slot_mapping"], target_slot_mapping[[0, 2]]
+        )
+
+    def test_wait_for_layer_load_contiguous_mtp_rows_use_view_payload(
+        self, monkeypatch
+    ):
+        req = make_sparse_req_meta("req-1", token_count=4)
+        impl, _, _ = make_worker_connector([req], use_layerwise=True)
+        impl.current_layer = 0
+        impl.num_layers = 2
+        impl._layerwise_retriever_is_sparse = [True]
+        monkeypatch.setattr(
+            adapter_mod,
+            "_dsa_record_payload_event_if_needed",
+            lambda *values: (_ for _ in ()).throw(
+                AssertionError("contiguous MTP rows must not record an event")
+            ),
+        )
+
+        captured = []
+
+        def _retriever():
+            payload = yield None
+            captured.append(payload)
+            yield torch.ones(4, dtype=torch.bool)
+
+        retriever = _retriever()
+        next(retriever)
+        impl.layerwise_retrievers = [(retriever, None)]
+
+        selected_tokens = torch.tensor(
+            [
+                [1, 2, 3, 4],
+                [10, 11, 12, 13],
+                [20, 21, 22, 23],
+            ],
+            dtype=torch.int32,
+        )
+        target_slot_mapping = torch.tensor(
+            [
+                [100, 101, 102, 103],
+                [900, 901, 902, 903],
+                [904, 905, 906, 907],
+            ],
+            dtype=torch.long,
+        )
+
+        impl.wait_for_layer_load(
+            "model.layers.0.self_attn.attn",
+            selected_tokens=selected_tokens,
+            token_start_index=[0, 0, 0],
+            request_ids=["other-req", "req-1", "req-1"],
+            target_slot_mapping=target_slot_mapping,
+        )
+
+        selected_payload, token_start, target_payload = captured[0]
+        assert token_start is None
+        assert torch.equal(selected_payload, selected_tokens[1:3])
+        assert torch.equal(target_payload, target_slot_mapping[1:3])
+        assert selected_payload.data_ptr() == selected_tokens[1].data_ptr()
+        assert target_payload.data_ptr() == target_slot_mapping[1].data_ptr()
 
     def test_wait_for_layer_load_ordered_sparse_rows_use_view_payload(
         self, monkeypatch
