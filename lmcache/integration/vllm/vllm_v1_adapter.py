@@ -384,13 +384,28 @@ def _dsa_record_payload_event_if_needed(*values: Any) -> Optional[Any]:
     )
 
 
+def _contiguous_row_slice(rows: list[int]) -> Optional[slice]:
+    if not rows:
+        return None
+    start = rows[0]
+    if all(row == start + offset for offset, row in enumerate(rows)):
+        return slice(start, start + len(rows))
+    return None
+
+
 def _row_select(value: Any, rows: list[int]):
     if hasattr(value, "__getitem__"):
         if isinstance(value, torch.Tensor):
             if len(rows) == 1:
                 row = rows[0]
                 return value[row]
+            row_slice = _contiguous_row_slice(rows)
+            if row_slice is not None:
+                return value[row_slice]
             return value[rows]
+        row_slice = _contiguous_row_slice(rows)
+        if row_slice is not None:
+            return value[row_slice]
         return [value[row] for row in rows]
     raise TypeError(f"Unsupported row-indexed value type: {type(value)!r}")
 
@@ -3066,6 +3081,8 @@ class LMCacheConnectorV1Impl:
             self._layerwise_retriever_is_sparse.clear()
             if hasattr(self, "_layerwise_sparse_req_ids"):
                 self._layerwise_sparse_req_ids.clear()
+            self._layerwise_sparse_row_groups_key = None
+            self._layerwise_sparse_row_groups = None
             if hasattr(self, "_layerwise_waited_groups"):
                 self._layerwise_waited_groups.clear()
             if hasattr(self, "_layerwise_sparse_indexer_sent_layers"):
@@ -5188,6 +5205,8 @@ class LMCacheConnectorV1Impl:
         self._drain_layerwise_retrievers()
         self._layerwise_requests = []
         self._layerwise_sparse_req_ids = []
+        self._layerwise_sparse_row_groups_key = None
+        self._layerwise_sparse_row_groups = None
         self._layerwise_waited_groups = set()
         self._layerwise_sparse_indexer_sent_layers = set()
         self._layerwise_required_wait_groups_cache = None
@@ -5886,14 +5905,25 @@ class LMCacheConnectorV1Impl:
                     and request.load_spec.can_load
                     and request.is_sparse_decode
                 ]
-            ordered_sparse_rows = (
-                len(request_ids) == len(sparse_req_ids)
-                and request_ids == sparse_req_ids
-            )
-            if not ordered_sparse_rows:
-                rows_of_req = {}
-                for row, rid in enumerate(request_ids):
-                    rows_of_req.setdefault(rid, []).append(row)
+            row_groups_key = (tuple(request_ids), tuple(sparse_req_ids))
+            if (
+                getattr(self, "_layerwise_sparse_row_groups_key", None)
+                == row_groups_key
+            ):
+                rows_of_req = getattr(
+                    self, "_layerwise_sparse_row_groups", None
+                )
+            else:
+                ordered_sparse_rows = (
+                    len(request_ids) == len(sparse_req_ids)
+                    and request_ids == sparse_req_ids
+                )
+                if not ordered_sparse_rows:
+                    rows_of_req = {}
+                    for row, rid in enumerate(request_ids):
+                        rows_of_req.setdefault(rid, []).append(row)
+                self._layerwise_sparse_row_groups_key = row_groups_key
+                self._layerwise_sparse_row_groups = rows_of_req
         _record_pd_stage_trace_detail(
             pd_stage_trace,
             "request_mapping",
@@ -5946,6 +5976,7 @@ class LMCacheConnectorV1Impl:
                 payload = None
                 rows = None
                 row_count = 1
+                row_selection_requires_event = False
                 if selected_tokens is None:
                     selected_tokens_per_req = None
                     token_start_index_per_req = 0
@@ -5982,6 +6013,9 @@ class LMCacheConnectorV1Impl:
                             )
                         rows = rows_of_req[request.req_id]
                         row_count = len(rows)
+                        row_selection_requires_event = (
+                            _contiguous_row_slice(rows) is None
+                        )
                         if max(rows) >= selected_rows:
                             raise RuntimeError(
                                 "Sparse decode row out of bounds for "
@@ -6056,7 +6090,7 @@ class LMCacheConnectorV1Impl:
                                 selected_tokens_payload,
                                 target_slot_mapping_payload,
                             )
-                            if rows_of_req is not None
+                            if row_selection_requires_event
                             else None
                         )
                         _record_pd_stage_trace_detail(
@@ -6149,7 +6183,7 @@ class LMCacheConnectorV1Impl:
                                 selected_tokens_payload,
                                 token_start_payload,
                             )
-                            if rows_of_req is not None
+                            if row_selection_requires_event
                             else None
                         )
                         _record_pd_stage_trace_detail(
