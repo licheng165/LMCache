@@ -2055,13 +2055,20 @@ class LMCacheEngine:
             return
 
         assert_layerwise_gpu_connector(self.gpu_connector)
+        consumer_setup_started = time.perf_counter()
         mem_obj_consumer = self.gpu_connector.batched_to_gpu(starts, ends, **kwargs)
         next(mem_obj_consumer)
 
         to_release: list[MemoryObj] = []
+        materialize_ms = 0.0
+        publish_ms = 0.0
+        npu_consumer_ms = (
+            time.perf_counter() - consumer_setup_started
+        ) * 1000
         try:
             for layer_id in range(self.num_layers):
                 try:
+                    materialize_started = time.perf_counter()
                     mem_objs_layer = self._resolve_shared_rank0_layer_mem_objs(
                         req_id=req_id,
                         phase=phase,
@@ -2070,6 +2077,9 @@ class LMCacheEngine:
                         keys_layer=keys_layer_major[layer_id],
                         chunk_locations=chunk_locations_layer_major[layer_id],
                     )
+                    materialize_ms += (
+                        time.perf_counter() - materialize_started
+                    ) * 1000
                 except Exception as exc:
                     message = (
                         "Shared CPU cache rank0 materialization failed before "
@@ -2092,6 +2102,7 @@ class LMCacheEngine:
                     raise
                 to_release.extend(mem_objs_layer)
 
+                publish_started = time.perf_counter()
                 handles = self._make_shared_handles_for_layer(
                     req_id=req_id,
                     phase=phase,
@@ -2112,13 +2123,18 @@ class LMCacheEngine:
                         handles=handles,
                     )
                 )
+                publish_ms += (time.perf_counter() - publish_started) * 1000
 
                 if layer_id == 0:
                     yield torch.sum(ret_mask)
                 else:
                     yield None
 
+                npu_consumer_started = time.perf_counter()
                 mem_obj_consumer.send(mem_objs_layer)
+                npu_consumer_ms += (
+                    time.perf_counter() - npu_consumer_started
+                ) * 1000
 
             next(mem_obj_consumer)
             self._close_shared_retrieve_consumer(mem_obj_consumer)
@@ -2129,10 +2145,19 @@ class LMCacheEngine:
                 retrieved_tokens,
             )
             logger.info(
-                "[req_id=%s kv_group=%s] Shared CPU rank0 retrieved %d tokens",
+                "[req_id=%s kv_group=%s] Shared CPU rank0 retrieved %d tokens "
+                "[P2D_SHARED_CPU_RETRIEVE] role=rank0 layers=%d "
+                "materialize_ms=%.3f publish_ms=%.3f "
+                "npu_consumer_ms=%.3f active_total_ms=%.3f "
+                "excludes_generator_suspension=true",
                 req_id,
                 kv_group,
                 retrieved_tokens,
+                self.num_layers,
+                materialize_ms,
+                publish_ms,
+                npu_consumer_ms,
+                materialize_ms + publish_ms + npu_consumer_ms,
             )
             yield None
             # Keep request-owned shared objects through the final layer wait,
@@ -2170,10 +2195,17 @@ class LMCacheEngine:
         mem_obj_consumer = None
         to_release: list[MemoryObj] = []
         expected_handle_count: Optional[int] = None
+        envelope_wait_ms = 0.0
+        view_build_ms = 0.0
+        npu_consumer_ms = 0.0
 
         try:
             for layer_id in range(self.num_layers):
+                envelope_started = time.perf_counter()
                 envelope = self._receive_shared_envelope()
+                envelope_wait_ms += (
+                    time.perf_counter() - envelope_started
+                ) * 1000
                 self._validate_shared_layerwise_envelope(
                     envelope,
                     req_id=req_id,
@@ -2196,12 +2228,16 @@ class LMCacheEngine:
                     ends = ends_all[:expected_handle_count]
                     for start, end in zip(starts, ends, strict=False):
                         ret_mask[start:end] = True
+                    npu_consumer_started = time.perf_counter()
                     mem_obj_consumer = self.gpu_connector.batched_to_gpu(
                         starts,
                         ends,
                         **kwargs,
                     )
                     next(mem_obj_consumer)
+                    npu_consumer_ms += (
+                        time.perf_counter() - npu_consumer_started
+                    ) * 1000
                 elif len(envelope.handles) != expected_handle_count:
                     raise ValueError(
                         "Shared CPU cache passive received inconsistent handle "
@@ -2209,6 +2245,7 @@ class LMCacheEngine:
                         f"{expected_handle_count}"
                     )
 
+                view_started = time.perf_counter()
                 mem_objs_layer: list[MemoryObj] = []
                 for chunk_index, handle in enumerate(envelope.handles):
                     expected_shape, expected_dtype, expected_fmt = (
@@ -2238,6 +2275,7 @@ class LMCacheEngine:
                     )
                     mem_objs_layer.append(mem_obj)
                     to_release.append(mem_obj)
+                view_build_ms += (time.perf_counter() - view_started) * 1000
 
                 if layer_id == 0:
                     yield torch.sum(ret_mask)
@@ -2245,7 +2283,11 @@ class LMCacheEngine:
                     yield None
 
                 assert mem_obj_consumer is not None
+                npu_consumer_started = time.perf_counter()
                 mem_obj_consumer.send(mem_objs_layer)
+                npu_consumer_ms += (
+                    time.perf_counter() - npu_consumer_started
+                ) * 1000
 
             if mem_obj_consumer is not None:
                 next(mem_obj_consumer)
@@ -2255,10 +2297,19 @@ class LMCacheEngine:
             retrieved_tokens = torch.sum(ret_mask)
             self.stats_monitor.on_retrieve_finished(monitor_req_id, retrieved_tokens)
             logger.info(
-                "[req_id=%s kv_group=%s] Shared CPU passive retrieved %d tokens",
+                "[req_id=%s kv_group=%s] Shared CPU passive retrieved %d tokens "
+                "[P2D_SHARED_CPU_RETRIEVE] role=passive layers=%d "
+                "envelope_wait_ms=%.3f view_build_ms=%.3f "
+                "npu_consumer_ms=%.3f active_total_ms=%.3f "
+                "excludes_generator_suspension=true",
                 req_id,
                 kv_group,
                 retrieved_tokens,
+                self.num_layers,
+                envelope_wait_ms,
+                view_build_ms,
+                npu_consumer_ms,
+                envelope_wait_ms + view_build_ms + npu_consumer_ms,
             )
             yield None
             # Keep request-owned shared objects through the final layer wait,

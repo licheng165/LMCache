@@ -5,6 +5,7 @@ from typing import Any, Callable, List, Optional, no_type_check
 import asyncio
 import json
 import os
+import time
 
 # Third Party
 import torch
@@ -617,6 +618,7 @@ class MooncakestoreConnector(RemoteConnector):
             )
             return [None] * len(keys)
 
+        total_started = time.perf_counter()
         logger.debug(f"Using batch_get_into for {len(keys)} keys (zero-copy mode)")
 
         # Reserve a buffer for every requested chunk
@@ -627,6 +629,7 @@ class MooncakestoreConnector(RemoteConnector):
         buffer_ptrs: list[int] = []
         buffer_sizes: list[int] = []
 
+        allocation_started = time.perf_counter()
         single_token_sizes: dict[int, int] = {}
         for i, key in enumerate(keys):
             meta_shapes, meta_dtypes, meta_fmt, single_token_size = (
@@ -644,6 +647,7 @@ class MooncakestoreConnector(RemoteConnector):
                 key_strs.append(key.to_string())
                 buffer_ptrs.append(obj.data_ptr)
                 buffer_sizes.append(obj.get_size())
+        allocation_ms = (time.perf_counter() - allocation_started) * 1000
 
         if not valid_idx:
             logger.warning("Batch-get aborted: unable to allocate any buffers.")
@@ -652,9 +656,11 @@ class MooncakestoreConnector(RemoteConnector):
         try:
             # Single RPC call for multiple chunks
             logger.debug(f"Calling batch_get_into with {len(key_strs)} keys")
+            transfer_started = time.perf_counter()
             bytes_read_list = await asyncio.to_thread(
                 self.store.batch_get_into, key_strs, buffer_ptrs, buffer_sizes
             )
+            transfer_ms = (time.perf_counter() - transfer_started) * 1000
             logger.debug(f"batch_get_into returned: {bytes_read_list}")
 
             # Assemble the final result list
@@ -678,6 +684,37 @@ class MooncakestoreConnector(RemoteConnector):
                     logger.error(f"Reshape failed for key {keys[i]}: {exc}")
                     memory_objs[i].ref_count_down()  # type: ignore
 
+            transferred_bytes = sum(
+                n_read for n_read in bytes_read_list if n_read > 0
+            )
+            keys_hit = sum(n_read > 0 for n_read in bytes_read_list)
+            gib_s = (
+                transferred_bytes / (1024**3) / (transfer_ms / 1000)
+                if transfer_ms > 0
+                else 0.0
+            )
+            first_key = keys[0]
+            logger.info(
+                "[P2D_MOONCAKE_GET] mode=batch_get_into "
+                "worker_id=%s kv_group=%s layer_id=%s keys_requested=%d "
+                "keys_submitted=%d keys_hit=%d requested_bytes=%d "
+                "transferred_bytes=%d allocation_ms=%.3f transfer_ms=%.3f "
+                "postprocess_ms=%.3f total_ms=%.3f effective_gib_s=%.3f "
+                "semantics=native_batch_get_call",
+                first_key.worker_id,
+                first_key.kv_group,
+                getattr(first_key, "layer_id", None),
+                len(keys),
+                len(key_strs),
+                keys_hit,
+                sum(buffer_sizes),
+                transferred_bytes,
+                allocation_ms,
+                transfer_ms,
+                (time.perf_counter() - transfer_started) * 1000 - transfer_ms,
+                (time.perf_counter() - total_started) * 1000,
+                gib_s,
+            )
             return results
 
         except Exception as exc:
@@ -696,8 +733,11 @@ class MooncakestoreConnector(RemoteConnector):
         """
         key_strs = [key.to_string() for key in keys]
 
+        total_started = time.perf_counter()
         try:
+            transfer_started = time.perf_counter()
             buffers = await asyncio.to_thread(self.store.batch_get_buffer, key_strs)
+            transfer_ms = (time.perf_counter() - transfer_started) * 1000
         except Exception as e:
             logger.error(f"batch_get_buffer failed: {str(e)}")
             return [None] * len(keys)
@@ -716,6 +756,32 @@ class MooncakestoreConnector(RemoteConnector):
                     f"Failed to process buffer {i} for key {key_strs[i]}: {str(e)}"
                 )
                 results.append(None)
+        transferred_bytes = sum(
+            len(buffer) for buffer in buffers if buffer is not None
+        )
+        gib_s = (
+            transferred_bytes / (1024**3) / (transfer_ms / 1000)
+            if transfer_ms > 0
+            else 0.0
+        )
+        first_key = keys[0]
+        logger.info(
+            "[P2D_MOONCAKE_GET] mode=batch_get_buffer worker_id=%s "
+            "kv_group=%s layer_id=%s keys_requested=%d keys_hit=%d "
+            "transferred_bytes=%d transfer_ms=%.3f postprocess_ms=%.3f "
+            "total_ms=%.3f effective_gib_s=%.3f "
+            "semantics=native_batch_get_call",
+            first_key.worker_id,
+            first_key.kv_group,
+            getattr(first_key, "layer_id", None),
+            len(keys),
+            sum(buffer is not None for buffer in buffers),
+            transferred_bytes,
+            transfer_ms,
+            (time.perf_counter() - transfer_started) * 1000 - transfer_ms,
+            (time.perf_counter() - total_started) * 1000,
+            gib_s,
+        )
         return results
 
     async def get(self, key: CacheEngineKey) -> Optional[MemoryObj]:
