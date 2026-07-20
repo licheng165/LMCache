@@ -6339,7 +6339,7 @@ class LMCacheConnectorV1Impl:
 
             self._add_decode_window_save_metas(meta, request_tracker)
             is_sparse_decode = self.enable_sparse_attention and (
-                request.num_computed_tokens > request_tracker.prompt_len
+                request.num_computed_tokens >= request_tracker.prompt_len
             )
             if is_sparse_decode:
                 if (

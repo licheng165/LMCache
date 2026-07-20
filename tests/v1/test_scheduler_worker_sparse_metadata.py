@@ -131,6 +131,44 @@ class TestDisaggSpecOwnership:
 
 
 class TestBuildConnectorMetaSparseSyntheticLoadSpec:
+    def test_first_decode_step_includes_prompt_boundary(self) -> None:
+        impl = _make_scheduler_impl()
+        impl._decode_window_save_window_size = 256
+        req_id = "first-decode"
+        prompt_len = 300
+        decode_token = 999
+        vllm_req = _make_vllm_request(
+            req_id, prompt_len, prompt_len, decode_token
+        )
+
+        impl._unfinished_requests[req_id] = vllm_req
+        impl._request_trackers[req_id] = RequestTracker(
+            req_id=req_id,
+            prompt_len=prompt_len,
+            token_ids=list(range(prompt_len)),
+            allocated_block_ids=list(range(19)),
+            num_saved_tokens=prompt_len,
+        )
+        scheduler_output = StubSchedulerOutput(
+            finished_req_ids=set(),
+            scheduled_new_reqs=[],
+            scheduled_cached_reqs=StubCachedRequestData(
+                req_ids=[req_id],
+                new_token_ids=[[decode_token]],
+                new_block_ids=[[]],
+            ),
+            num_scheduled_tokens={req_id: 1},
+        )
+
+        meta = impl.build_connector_meta(scheduler_output)
+
+        assert len(meta.requests) == 1
+        req_meta = meta.requests[0]
+        assert req_meta.is_sparse_decode
+        assert req_meta.load_spec is not None
+        assert req_meta.load_spec.can_load is True
+        assert req_meta.load_spec.lmcache_cached_tokens == 256
+
     def test_sparse_decode_steps_synthesize_load_spec_and_sparse_tokens(self) -> None:
         impl = _make_scheduler_impl()
         req_id = "sparse-req"
