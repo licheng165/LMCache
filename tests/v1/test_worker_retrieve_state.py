@@ -31,6 +31,8 @@ from tests.v1.connector_test_utils import (
 def _make_impl() -> LMCacheConnectorV1Impl:
     impl = object.__new__(LMCacheConnectorV1Impl)
     impl._worker_retrieve_state = {}
+    impl._layerwise_save_storers = {}
+    impl._deferred_latent_pending = set()
     impl.kv_role = "kv_both"
     impl._late_finished_sending = set()
     return impl
@@ -120,6 +122,19 @@ def _bind_worker_state(impl: LMCacheConnectorV1Impl, request: ReqMeta):
 
 
 class TestWorkerRetrieveState:
+
+    def test_failed_block_reporting_ignores_unmapped_tokens(self):
+        impl = _make_impl()
+        impl._block_size = 16
+
+        missing_blocks = impl.record_failed_blocks(
+            "req-1",
+            torch.tensor([True, True, True, True]),
+            torch.tensor([True, False, True, False]),
+            torch.tensor([0, 16, 32]),
+        )
+
+        assert missing_blocks == {1}
 
     def test_sparse_decode_load_tokens_reuses_full_prefix_list(self):
         tokens = [1, 2, 3, 4]
@@ -695,7 +710,8 @@ class TestWorkerRetrieveState:
         engine = MagicMock()
         impl = _make_impl()
         impl._manager = SimpleNamespace(lmcache_engine=engine)
-        impl._layerwise_save_storers = {("req-1", 0): layerwise_storer}
+        storer_key = ("req-1", "normal_save", 0, 0, 0)
+        impl._layerwise_save_storers = {storer_key: layerwise_storer}
         impl._worker_retrieve_state = {
             "req-1": WorkerRetrieveState(
                 req_id="req-1",

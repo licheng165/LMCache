@@ -75,6 +75,61 @@ def _make_vllm_request(
     )
 
 
+class TestRequestTrackerPhase:
+    def test_one_token_prefill_boundary_remains_prefill(self) -> None:
+        tracker = RequestTracker(
+            req_id="phase-boundary",
+            prompt_len=4,
+            token_ids=[0, 1, 2],
+            allocated_block_ids=[0],
+        )
+
+        tracker.update([3], [])
+        assert not tracker.is_decode_phase
+
+        tracker.update([4], [])
+        assert tracker.is_decode_phase
+
+
+class TestDisaggSpecOwnership:
+    def test_build_meta_copies_spec_from_scheduler_owned_request(self) -> None:
+        impl = _make_scheduler_impl()
+        req_id = "vllm-req"
+        impl._unfinished_requests[req_id] = SimpleNamespace(
+            kv_transfer_params={
+                "disagg_spec": {
+                    "req_id": "transfer-req",
+                    "receiver_host": "decode-host",
+                    "receiver_init_port": 9000,
+                    "receiver_alloc_port": 9001,
+                }
+            }
+        )
+        new_request = SimpleNamespace(
+            req_id=req_id,
+            prompt_token_ids=[1],
+            block_ids=[0],
+            num_computed_tokens=0,
+            sampling_params=SimpleNamespace(extra_args=None),
+        )
+        scheduler_output = StubSchedulerOutput(
+            finished_req_ids=set(),
+            scheduled_new_reqs=[new_request],
+            scheduled_cached_reqs=StubCachedRequestData(
+                req_ids=[],
+                new_token_ids=[],
+                new_block_ids=[],
+            ),
+            num_scheduled_tokens={req_id: 1},
+        )
+
+        impl.build_connector_meta(scheduler_output)
+
+        tracker = impl._request_trackers[req_id]
+        assert tracker.disagg_spec is not None
+        assert tracker.disagg_spec.receiver_id == "decode-host9000"
+
+
 class TestBuildConnectorMetaSparseSyntheticLoadSpec:
     def test_sparse_decode_steps_synthesize_load_spec_and_sparse_tokens(self) -> None:
         impl = _make_scheduler_impl()

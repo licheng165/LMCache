@@ -603,7 +603,8 @@ def test_layerwise_save_passes_request_configs() -> None:
 
 
 def test_finished_worker_request_closes_abandoned_layerwise_storer() -> None:
-    connector, _, engine = _make_connector([_make_req("req-1")])
+    request = _make_req("req-1")
+    connector, _, engine = _make_connector([request])
     closed = []
 
     def _abandoned_storer():
@@ -615,7 +616,8 @@ def test_finished_worker_request_closes_abandoned_layerwise_storer() -> None:
 
     storer = _abandoned_storer()
     next(storer)
-    connector._layerwise_save_storers["req-1"] = storer
+    storer_key = connector._layerwise_save_storer_key(request, 0)
+    connector._layerwise_save_storers[storer_key] = storer
 
     connector._release_finished_worker_requests({"req-1"})
 
@@ -629,7 +631,9 @@ def test_deferred_latent_flush_drains_full_store_layer() -> None:
     request.save_spec.can_save_latent = True
     connector, _, engine = _make_connector([request])
     connector.kv_role = "kv_both"
-    connector._deferred_latent_pending.add("req-1")
+    connector._deferred_latent_pending.add(
+        connector._layerwise_save_storer_key(request, 0)
+    )
     connector._latent_kvcaches = [torch.zeros(1)]
     connector._kvcaches_for_group = lambda _kv_group: [torch.zeros(1)]
     connector._refresh_kvcaches_list = lambda: None
@@ -652,7 +656,7 @@ def test_deferred_latent_flush_drains_full_store_layer() -> None:
 
     assert engine.store_calls == ["req-1"]
     assert engine.store_steps["req-1"] == engine.num_layers + 1
-    assert "req-1" not in connector._deferred_latent_pending
+    assert not connector._deferred_latent_pending
 
 
 def test_indexer_save_uses_layer_metadata_slots_not_request_slots() -> None:
