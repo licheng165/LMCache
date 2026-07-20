@@ -5920,6 +5920,7 @@ class LMCacheConnectorV1Impl:
         request_ids: list = None,
         target_slot_mapping=None,
         payload_event=None,
+        selected_token_counts=None,
     ) -> None:
         """Blocking until the KV for a specific layer is loaded into vLLM's
         paged buffer.
@@ -5933,9 +5934,12 @@ class LMCacheConnectorV1Impl:
             request_ids: req_id for each selected_tokens row (duplicates allowed).
             target_slot_mapping: optional batched physical destination slots,
                 row-aligned with selected_tokens.
+            selected_token_counts: number of real selected tokens per row in
+                an explicit sparse payload. Padding beyond each count is not
+                transferred to the NPU KV cache.
             payload_event: optional producer event recorded by vLLM after
-                selected_tokens/target_slot_mapping were built. LMCache waits on
-                this before row-selecting from those tensors.
+                selected_tokens/target_slot_mapping/selected_token_counts were
+                built. LMCache waits on this before row-selecting those tensors.
         """
         if self.layerwise_retrievers and logger.isEnabledFor(10):
             logger.debug("Waiting for layer %d to be loaded", self.current_layer)
@@ -6028,8 +6032,10 @@ class LMCacheConnectorV1Impl:
                     selected_tokens_per_req = None
                     token_start_index_per_req = 0
                     target_slot_mapping_per_req = None
+                    selected_token_counts_per_req = None
                 else:
                     assert selected_rows is not None
+                    selected_token_counts_per_req = None
                     if rows_of_req is None:
                         row = decode_row
                         if row >= selected_rows:
@@ -6069,26 +6075,41 @@ class LMCacheConnectorV1Impl:
                             target_slot_mapping_per_req = _row_select(
                                 target_slot_mapping, rows
                             )
+                        if selected_token_counts is not None:
+                            selected_token_counts_per_req = (
+                                _single_row_select(selected_token_counts, row)
+                                if rows_of_req is None
+                                else _row_select(selected_token_counts, rows)
+                            )
                         selected_tokens_payload = _sparse_payload_value(
                             selected_tokens_per_req
                         )
                         target_slot_mapping_payload = _sparse_payload_value(
                             target_slot_mapping_per_req
                         )
+                        selected_token_counts_payload = _sparse_payload_value(
+                            selected_token_counts_per_req
+                        )
                         local_payload_event = (
                             _dsa_record_payload_event_if_needed(
                                 selected_tokens_payload,
                                 target_slot_mapping_payload,
+                                selected_token_counts_payload,
                             )
                             if row_selection_requires_event
                             else None
                         )
-                        if local_payload_event is not None:
+                        if (
+                            local_payload_event is not None
+                            or selected_token_counts_payload is not None
+                        ):
                             payload = {
                                 "selected_token_ids": selected_tokens_payload,
                                 "target_slot_mapping": target_slot_mapping_payload,
-                                "payload_event": local_payload_event,
+                                "selected_token_counts": selected_token_counts_payload,
                             }
+                            if local_payload_event is not None:
+                                payload["payload_event"] = local_payload_event
                         else:
                             payload = (
                                 selected_tokens_payload,
