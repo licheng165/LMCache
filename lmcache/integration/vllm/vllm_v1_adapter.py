@@ -1650,6 +1650,29 @@ class LMCacheConnectorV1Impl:
         )
         return window_size
 
+    def _mtp_dw_unsafe_scratch_guard_frontier(self) -> int:
+        """Return the first committed frontier safe for MTP scratch probing.
+
+        This opt-in diagnostic guard prevents sparse retrieve while the fixed
+        MTP scratch rows can still address non-committed sequence slots. It is
+        intentionally conservative and is not the final scratch-layout fix.
+        """
+        if (
+            os.environ.get("LMCACHE_MTP_DW_UNSAFE_SCRATCH_GUARD", "0") != "1"
+            or self._decode_window_save_window_size <= 0
+        ):
+            return 0
+        vllm_config = getattr(self, "_vllm_config", None)
+        model_config = getattr(vllm_config, "model_config", None)
+        hf_config = getattr(model_config, "hf_config", None)
+        index_topk = int(getattr(hf_config, "index_topk", 0) or 0)
+        num_speculative_tokens = int(
+            getattr(vllm_config, "num_speculative_tokens", 0) or 0
+        )
+        if index_topk <= 0 or num_speculative_tokens <= 0:
+            return 0
+        return index_topk * (num_speculative_tokens + 1)
+
     def _check_legacy_register_kv_caches(self) -> None:
         """Check for legacy connector without register_kv_caches implementation."""
         if self.lmcache_engine is None:
@@ -7724,11 +7747,41 @@ class LMCacheConnectorV1Impl:
                         save_frontier,
                         token_len,
                     )
+                unsafe_scratch_frontier = (
+                    self._mtp_dw_unsafe_scratch_guard_frontier()
+                )
+                num_scratch_rows = (
+                    int(
+                        getattr(
+                            getattr(self, "_vllm_config", None),
+                            "num_speculative_tokens",
+                            0,
+                        )
+                        or 0
+                    )
+                    + 1
+                )
+                sparse_load_is_safe = (
+                    unsafe_scratch_frontier == 0
+                    or lmcache_cached_for_sparse >= unsafe_scratch_frontier
+                )
                 load_spec = LoadSpec(
                     vllm_cached_tokens=0,
                     lmcache_cached_tokens=lmcache_cached_for_sparse,
-                    can_load=lmcache_cached_for_sparse > 0,
+                    can_load=(
+                        lmcache_cached_for_sparse > 0 and sparse_load_is_safe
+                    ),
                 )
+                if not sparse_load_is_safe:
+                    _mtp_dw_event(
+                        "probe",
+                        event="unsafe_scratch_guard",
+                        req=request_tracker.req_id,
+                        frontier=lmcache_cached_for_sparse,
+                        required_frontier=unsafe_scratch_frontier,
+                        index_topk=unsafe_scratch_frontier // num_scratch_rows,
+                        sparse_load_disabled=True,
+                    )
 
             req_meta = ReqMeta.from_request_tracker(
                 request_tracker,
