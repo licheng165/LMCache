@@ -82,6 +82,7 @@ class LMCacheConnectorV1Dynamic(KVConnectorBase_V1):
         request_ids=None,
         target_slot_mapping=None,
         payload_event=None,
+        selected_token_counts=None,
     ) -> None:
         """
         Block until the KV for a specific layer is loaded into vLLM's
@@ -108,6 +109,7 @@ class LMCacheConnectorV1Dynamic(KVConnectorBase_V1):
             request_ids,
             target_slot_mapping=target_slot_mapping,
             payload_event=payload_event,
+            selected_token_counts=selected_token_counts,
         )
 
     def save_kv_layer(
