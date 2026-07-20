@@ -5402,6 +5402,10 @@ class LMCacheConnectorV1Impl:
                             "slot_mapping": slot_mapping,
                             "sync": sync,
                             "kv_group": 0,
+                            "req_id": request.req_id,
+                            "lmcache_cached_tokens": (
+                                request.load_spec.lmcache_cached_tokens
+                            ),
                             "prepared_sparse_source": latent_prepared,
                         }
                     else:
@@ -5547,6 +5551,10 @@ class LMCacheConnectorV1Impl:
                                     "slot_mapping": idx_slot,
                                     "sync": sync,
                                     "kv_group": 1,
+                                    "req_id": request.req_id,
+                                    "lmcache_cached_tokens": (
+                                        request.load_spec.lmcache_cached_tokens
+                                    ),
                                     "prepared_sparse_source": indexer_prepared,
                                 }
                             else:
