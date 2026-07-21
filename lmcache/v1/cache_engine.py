@@ -1063,6 +1063,7 @@ class LMCacheEngine:
         mem_objs_layer: list[MemoryObj],
         layer_id: int,
         kv_group: int,
+        chunk_index_base: int = 0,
     ) -> list[SharedChunkHandle]:
         if self.shared_cpu_cache_name is None:
             raise ValueError("Shared CPU cache name is not initialized")
@@ -1074,9 +1075,10 @@ class LMCacheEngine:
                 f"memory_objs={len(mem_objs_layer)}"
             )
         handles: list[SharedChunkHandle] = []
-        for chunk_index, (key, mem_obj) in enumerate(
+        for chunk_offset, (key, mem_obj) in enumerate(
             zip(keys_layer, mem_objs_layer, strict=True)
         ):
+            chunk_index = chunk_index_base + chunk_offset
             self._validate_rank0_shared_mem_obj(
                 mem_obj,
                 req_id=req_id,
@@ -1466,12 +1468,25 @@ class LMCacheEngine:
         req_id: str,
         *,
         owned_groups: Optional[dict[int, list[list[MemoryObj]]]] = None,
+        append_from: Optional[dict[int, int]] = None,
     ) -> None:
+        """Adopt complete groups or append-only suffixes for a live request.
+
+        Args:
+            req_id: Request whose shared objects remain live.
+            owned_groups: Complete per-layer object lists to adopt.
+            append_from: Existing chunk count per group for suffix adoption.
+
+        Raises:
+            ValueError: If suffix adoption is not append-aligned.
+        """
         if not req_id:
             return
         lease, created = self._get_shared_cpu_request_lease(req_id)
         try:
-            if owned_groups:
+            if append_from is not None and not created and owned_groups:
+                lease.append_groups(owned_groups, append_from)
+            elif owned_groups:
                 lease.replace_groups(owned_groups, retain=False)
             lease.active = True
             self._shared_cpu_request_leases[req_id] = lease

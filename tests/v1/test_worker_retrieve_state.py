@@ -381,6 +381,40 @@ class TestWorkerRetrieveState:
         assert state.pointer_cache_generation == 7
         register.assert_called_once()
 
+    def test_record_shared_state_adopts_only_appended_chunks(self):
+        impl = _make_impl()
+        impl.config = SimpleNamespace(dsa_two_groups=False)
+        impl.num_layers = 1
+        register = MagicMock()
+        impl.lmcache_engine = SimpleNamespace(
+            enable_shared_cpu_cache=True,
+            shared_cpu_cache_generation=7,
+            register_shared_cpu_sparse_request=register,
+        )
+        state = WorkerRetrieveState(
+            cached_starts=[0, 256],
+            cached_ends=[256, 512],
+            cached_memory_objs=[["old", "new"]],
+            cached_chunk_ptrs_npu=[torch.tensor([1, 2])],
+            token_count=512,
+            shared_index_status="skipped",
+        )
+        request = _make_request()
+        request.token_ids = [0] * 512
+        request.load_spec = LoadSpec(0, 512, True)
+
+        impl._record_shared_worker_retrieve_state(
+            state,
+            request,
+            previous_token_count=256,
+        )
+
+        register.assert_called_once_with(
+            "req-1",
+            owned_groups={0: state.cached_memory_objs},
+            append_from={0: 1},
+        )
+
     def test_record_shared_state_rejects_skipped_index_with_index_objs(self):
         impl = _make_impl()
         impl.config = SimpleNamespace(dsa_two_groups=True)
@@ -2459,6 +2493,34 @@ class TestWorkerRetrieveState:
         assert impl._layerwise_sparse_indexer_sent_layers == set()
         assert impl._layerwise_required_wait_groups_cache is None
 
+    def test_sparse_retrieve_failure_drops_partially_extended_state(self):
+        impl = _make_impl()
+        impl._release_request_lookup_pins = MagicMock()
+        release_unowned = MagicMock()
+        release_request = MagicMock()
+        impl.lmcache_engine = SimpleNamespace(
+            enable_shared_cpu_cache=True,
+            release_shared_cpu_unowned_objects=release_unowned,
+            release_shared_cpu_sparse_request=release_request,
+        )
+        impl._drain_layerwise_retrievers = MagicMock()
+        state = WorkerRetrieveState(
+            req_id="req-1",
+            cached_memory_objs=[["old", "new"]],
+            shared_request_active=True,
+        )
+        impl._worker_retrieve_state["req-1"] = state
+        request = _make_request()
+
+        with pytest.raises(RuntimeError, match="index group failed"):
+            with impl._sparse_retrieve_state_guard([request]):
+                raise RuntimeError("index group failed")
+
+        release_unowned.assert_called_once()
+        release_request.assert_called_once_with("req-1")
+        impl._drain_layerwise_retrievers.assert_called_once()
+        assert "req-1" not in impl._worker_retrieve_state
+
     def test_store_results_remain_local_to_their_operation(self):
         impl = _make_impl()
         normal, normal_result = _make_store_request(
@@ -2708,7 +2770,7 @@ class TestWorkerRetrieveState:
 
         assert "req-1" not in impl._worker_retrieve_state
 
-    def test_decode_window_save_shared_cpu_keeps_state_stale_for_next_refresh(self):
+    def test_decode_window_save_shared_cpu_preserves_state_for_suffix_refresh(self):
         impl = _make_impl()
         impl.config = SimpleNamespace(dsa_two_groups=False)
         impl.num_layers = 1
@@ -2779,9 +2841,9 @@ class TestWorkerRetrieveState:
             lmcache_cached_tokens=512,
             can_load=True,
         )
-        assert impl._should_invalidate_worker_retrieve_state(next_sparse, 512)
+        assert not impl._should_invalidate_worker_retrieve_state(next_sparse, 512)
 
-    def test_decode_window_save_shared_cpu_two_groups_refreshes_together(self):
+    def test_decode_window_save_shared_cpu_two_groups_preserve_state(self):
         impl = _make_impl()
         impl.config = SimpleNamespace(dsa_two_groups=True)
         impl.num_layers = 1
@@ -2881,7 +2943,7 @@ class TestWorkerRetrieveState:
             lmcache_cached_tokens=512,
             can_load=True,
         )
-        assert impl._should_invalidate_worker_retrieve_state(next_sparse, 512)
+        assert not impl._should_invalidate_worker_retrieve_state(next_sparse, 512)
 
     def test_decode_save_merge_rejects_missing_pointer_cache(self):
         impl = _make_impl()
@@ -3450,6 +3512,45 @@ class TestWorkerRetrieveState:
         )
 
         assert impl._should_invalidate_worker_retrieve_state(req, 2048)
+
+    def test_sparse_decode_aligned_lmcache_hit_growth_extends(self):
+        impl = _make_impl()
+        impl._worker_retrieve_state["req-1"] = WorkerRetrieveState(
+            cached_keys=[["k"]],
+            cached_starts=[0],
+            cached_ends=[256],
+            metadata_warm=True,
+            token_count=256,
+        )
+        req = _make_request()
+        req.token_ids = [0] * 512
+        req.load_spec = LoadSpec(
+            vllm_cached_tokens=0,
+            lmcache_cached_tokens=512,
+            can_load=True,
+        )
+
+        assert not impl._should_invalidate_worker_retrieve_state(req, 512)
+
+    def test_sparse_decode_unaligned_lmcache_hit_growth_invalidates(self):
+        impl = _make_impl()
+        impl._lmcache_chunk_size = 256
+        impl._worker_retrieve_state["req-1"] = WorkerRetrieveState(
+            cached_keys=[["k"]],
+            cached_starts=[0],
+            cached_ends=[256],
+            metadata_warm=True,
+            token_count=256,
+        )
+        req = _make_request()
+        req.token_ids = [0] * 300
+        req.load_spec = LoadSpec(
+            vllm_cached_tokens=0,
+            lmcache_cached_tokens=300,
+            can_load=True,
+        )
+
+        assert impl._should_invalidate_worker_retrieve_state(req, 300)
 
     def test_sparse_decode_prompt_shrink_invalidates(self):
         impl = _make_impl()

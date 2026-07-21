@@ -134,6 +134,87 @@ def test_shared_cpu_request_lease_replaces_adopted_views() -> None:
     assert not new_view.valid
 
 
+def test_shared_cpu_request_lease_appends_adopted_suffix() -> None:
+    old_views = [_LeaseMemoryObj(), _LeaseMemoryObj()]
+    new_views = [_LeaseMemoryObj(), _LeaseMemoryObj()]
+    lease = SharedCPURequestLease(
+        request_id="req",
+        generation=1,
+        is_rank0=False,
+    )
+    lease.replace_groups({0: [[old_views[0]], [old_views[1]]]}, retain=False)
+
+    lease.append_groups(
+        {
+            0: [
+                [old_views[0], new_views[0]],
+                [old_views[1], new_views[1]],
+            ]
+        },
+        {0: 1},
+    )
+
+    assert lease.object_ids(0) == {id(obj) for obj in old_views + new_views}
+    lease.close()
+    assert all(not obj.valid for obj in old_views + new_views)
+
+
+def test_shared_cpu_request_lease_append_alignment_failure_is_atomic() -> None:
+    old_views = [_LeaseMemoryObj(), _LeaseMemoryObj()]
+    new_views = [_LeaseMemoryObj(), _LeaseMemoryObj()]
+    lease = SharedCPURequestLease(
+        request_id="req",
+        generation=1,
+        is_rank0=False,
+    )
+    lease.replace_groups(
+        {0: [[old_views[0]], [old_views[1], new_views[1]]]},
+        retain=False,
+    )
+
+    with pytest.raises(ValueError, match="append-aligned"):
+        lease.append_groups(
+            {
+                0: [
+                    [old_views[0], new_views[0]],
+                    [old_views[1], new_views[1]],
+                ]
+            },
+            {0: 1},
+        )
+
+    assert lease.groups[0] == [
+        [old_views[0]],
+        [old_views[1], new_views[1]],
+    ]
+
+
+def test_shared_cpu_engine_registers_request_suffix_without_replacement() -> None:
+    old_view = _LeaseMemoryObj()
+    new_view = _LeaseMemoryObj()
+    engine = object.__new__(LMCacheEngine)
+    engine.shared_cpu_cache_generation = 1
+    engine.metadata = SimpleNamespace(is_first_rank=lambda: False)
+    engine._shared_cpu_request_leases = {}
+    engine.register_shared_cpu_sparse_request(
+        "req",
+        owned_groups={0: [[old_view]]},
+    )
+
+    engine.register_shared_cpu_sparse_request(
+        "req",
+        owned_groups={0: [[old_view, new_view]]},
+        append_from={0: 1},
+    )
+
+    assert engine._shared_cpu_request_leases["req"].groups == {
+        0: [[old_view, new_view]]
+    }
+    assert old_view.ref_count == 1
+    engine.release_shared_cpu_sparse_request("req")
+    assert not old_view.valid and not new_view.valid
+
+
 def test_stale_request_lease_does_not_claim_new_generation_objects() -> None:
     memory_obj = _LeaseMemoryObj()
     stale_lease = SharedCPURequestLease(

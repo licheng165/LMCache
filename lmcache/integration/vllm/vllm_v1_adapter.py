@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # Standard
 from collections.abc import Iterable
-from contextlib import nullcontext
+from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass, field
 from types import SimpleNamespace
 from typing import TYPE_CHECKING, Any, Generator, Optional, Union
@@ -1927,10 +1927,14 @@ class LMCacheConnectorV1Impl:
         retrieve_token_count = self._shared_retrieve_token_count_for_request(
             request
         )
+        validated_token_count = min(
+            retrieve_token_count,
+            int(state.token_count or retrieve_token_count),
+        )
         prepared_latent = state.prepared_sparse_sources.get(0)
         if (
             prepared_latent is not None
-            and prepared_latent.total_tokens == retrieve_token_count
+            and prepared_latent.total_tokens == validated_token_count
         ):
             if state.req_id != request.req_id:
                 raise RuntimeError(
@@ -1943,9 +1947,10 @@ class LMCacheConnectorV1Impl:
             # process generation and request identity can invalidate it here.
             return
 
-        expected_scope_token = self._shared_request_scope_token_for_request(
-            request,
+        expected_scope_token = self._shared_request_scope_token(
+            request.req_id,
             current_generation,
+            validated_token_count,
         )
         if state.request_scope_token != expected_scope_token:
             raise RuntimeError(
@@ -1990,7 +1995,7 @@ class LMCacheConnectorV1Impl:
         if not self._cached_ranges_cover_prefix(
             state.cached_starts,
             state.cached_ends,
-            retrieve_token_count,
+            validated_token_count,
         ):
             cached_ranges = list(
                 zip(state.cached_starts, state.cached_ends, strict=False)
@@ -1999,7 +2004,7 @@ class LMCacheConnectorV1Impl:
                 "Shared CPU sparse decode hot path has non-contiguous MLA "
                 "latent prefix coverage before transfer: "
                 f"req_id={request.req_id}, kv_group=0, "
-                f"token_count={retrieve_token_count}, "
+                f"token_count={validated_token_count}, "
                 f"cached_ranges={cached_ranges}"
             )
         expected_layers = int(getattr(self, "num_layers", 0) or 0)
@@ -3250,6 +3255,7 @@ class LMCacheConnectorV1Impl:
         self,
         state: WorkerRetrieveState,
         request: ReqMeta,
+        previous_token_count: int = 0,
     ) -> None:
         engine = self.lmcache_engine
         if (
@@ -3391,12 +3397,57 @@ class LMCacheConnectorV1Impl:
             pointer_generation=generation,
             materialize_index=materialize_index,
         )
-        engine.register_shared_cpu_sparse_request(
-            request.req_id,
-            owned_groups=owned_groups,
-        )
+        append_from = None
+        if 0 < previous_token_count < state.token_count:
+            cache = state.cache_kwargs(0, dsa_two_groups=self._is_dsa_two_groups())
+            previous_chunks = sum(
+                int(end) <= previous_token_count for end in cache["cached_ends"]
+            )
+            if (
+                previous_chunks
+                and int(cache["cached_ends"][previous_chunks - 1])
+                == previous_token_count
+            ):
+                append_from = dict.fromkeys(owned_groups, previous_chunks)
+        if append_from is None:
+            engine.register_shared_cpu_sparse_request(
+                request.req_id,
+                owned_groups=owned_groups,
+            )
+        else:
+            engine.register_shared_cpu_sparse_request(
+                request.req_id,
+                owned_groups=owned_groups,
+                append_from=append_from,
+            )
         state.shared_request_active = True
         state.shared_validation_signature = validation_signature
+
+    def _worker_retrieve_state_can_extend(
+        self,
+        state: WorkerRetrieveState,
+        request: ReqMeta,
+        token_count: int,
+    ) -> bool:
+        committed = int(state.token_count or 0)
+        chunk_size = int(getattr(self, "_lmcache_chunk_size", 1) or 1)
+        load_spec = request.load_spec
+        return bool(
+            committed > 0
+            and token_count > committed
+            and token_count <= len(request.token_ids)
+            and load_spec is not None
+            and int(load_spec.lmcache_cached_tokens) == token_count
+            and committed % chunk_size == 0
+            and token_count % chunk_size == 0
+            and state.cached_ends
+            and int(state.cached_ends[-1]) == committed
+            and self._cached_ranges_cover_prefix(
+                state.cached_starts,
+                state.cached_ends,
+                committed,
+            )
+        )
 
     def _should_invalidate_worker_retrieve_state(
         self, request: ReqMeta, token_count: int
@@ -3406,6 +3457,11 @@ class LMCacheConnectorV1Impl:
         state = self._worker_retrieve_state.get(request.req_id)
         if state is None:
             return False
+        extending = self._worker_retrieve_state_can_extend(
+            state,
+            request,
+            token_count,
+        )
         if request.is_sparse_decode:
             if state.shared_request_active:
                 engine = getattr(self, "lmcache_engine", None)
@@ -3417,23 +3473,18 @@ class LMCacheConnectorV1Impl:
                     if (
                         state.req_id != request.req_id
                         or state.shared_generation != generation
-                        or prepared_latent.total_tokens != token_count
+                        or prepared_latent.total_tokens != state.token_count
                     ):
                         return True
                 else:
                     expected_scope_token = self._shared_request_scope_token(
                         request.req_id,
                         generation,
-                        token_count,
+                        state.token_count,
                     )
                     if state.request_scope_token != expected_scope_token:
                         return True
             if state.cached_starts and state.cached_starts[0] != 0:
-                return True
-            if (
-                request.load_spec is not None
-                and request.load_spec.lmcache_cached_tokens > state.token_count
-            ):
                 return True
             # Sparse decode metadata is keyed by the full LMCache-hit prefix.
             # A shorter current prefix means the cached request state is stale.
@@ -3442,6 +3493,8 @@ class LMCacheConnectorV1Impl:
                 or len(request.token_ids) < state.token_count
             ):
                 return True
+            if token_count > state.token_count:
+                return not extending
             return False
         if state.cached_ends and token_count < state.cached_ends[-1]:
             return True
@@ -4041,13 +4094,20 @@ class LMCacheConnectorV1Impl:
 
         states = self._worker_retrieve_state
         previous_state = states.get(request.req_id)
+        previous_token_count = (
+            int(state.token_count) if previous_state is state else 0
+        )
         state.req_id = request.req_id
         state.location = location or state.location
         state.metadata_warm = metadata_warm or state.metadata_warm
         state.token_count = token_count
         try:
             self._refresh_prepared_sparse_sources(state, token_count)
-            self._record_shared_worker_retrieve_state(state, request)
+            self._record_shared_worker_retrieve_state(
+                state,
+                request,
+                previous_token_count,
+            )
         except Exception:
             self._release_unadopted_shared_request_objects(state, request)
             preserve_previous_lease = (
@@ -4529,7 +4589,6 @@ class LMCacheConnectorV1Impl:
                         retrieve_state.metadata_warm = (
                             metadata_warm or retrieve_state.metadata_warm
                         )
-                        retrieve_state.token_count = token_count
                         logger.debug(
                             "Deferring shared CPU sparse retrieve state save "
                             "until pointer-cache install completes: req_id=%s",
@@ -4805,6 +4864,24 @@ class LMCacheConnectorV1Impl:
         )
         return missing_blocks
 
+    @contextmanager
+    def _sparse_retrieve_state_guard(
+        self,
+        requests: Iterable[ReqMeta],
+    ) -> Generator[None, None, None]:
+        try:
+            yield
+        except Exception:
+            for request in requests:
+                if not request.is_sparse_decode:
+                    continue
+                state = self._worker_retrieve_state.get(request.req_id)
+                if state is not None:
+                    self._release_unadopted_shared_request_objects(state, request)
+                self._drop_worker_retrieve_state(request.req_id)
+            self._drain_layerwise_retrievers()
+            raise
+
     @_lmcache_nvtx_annotate
     def wait_for_layer_load(
         self,
@@ -4909,7 +4986,7 @@ class LMCacheConnectorV1Impl:
             if callable(defer_consumer_wait):
                 join_context = defer_consumer_wait()
 
-        with join_context:
+        with self._sparse_retrieve_state_guard(layerwise_requests), join_context:
             idx = 0
             decode_row = 0
             for request in layerwise_requests:
@@ -5104,11 +5181,14 @@ class LMCacheConnectorV1Impl:
         ):
             self.current_layer += 1
             if self.current_layer >= self.num_layers:
-                if metadata is None:
-                    metadata = self._parent._get_connector_metadata()
-                    assert isinstance(metadata, LMCacheConnectorMetadata)
-                self._finalize_worker_retrieve_state_from_metadata(metadata)
-                self._drain_layerwise_retrievers()
+                with self._sparse_retrieve_state_guard(
+                    tuple(layerwise_requests)
+                ):
+                    if metadata is None:
+                        metadata = self._parent._get_connector_metadata()
+                        assert isinstance(metadata, LMCacheConnectorMetadata)
+                    self._finalize_worker_retrieve_state_from_metadata(metadata)
+                    self._drain_layerwise_retrievers()
 
         return
 

@@ -139,6 +139,50 @@ class SharedCPURequestLease:
             memory_obj for memory_obj in old_objects if id(memory_obj) not in new_ids
         )
 
+    def append_groups(
+        self,
+        groups: dict[int, list[list[MemoryObj]]],
+        chunk_index_base: dict[int, int],
+    ) -> None:
+        """Adopt suffixes without rescanning or retaining the live prefix.
+
+        Args:
+            groups: Complete per-layer object lists after the append.
+            chunk_index_base: Existing chunk count for each owned group.
+
+        Raises:
+            ValueError: If a live group is not aligned with its append point.
+        """
+
+        updates: list[tuple[list[list[MemoryObj]], list[list[MemoryObj]]]] = []
+        additions: list[tuple[int, list[list[MemoryObj]]]] = []
+        for kv_group, layers in groups.items():
+            current = self.groups.get(kv_group)
+            if current is None:
+                additions.append((kv_group, [list(layer) for layer in layers]))
+                continue
+            if len(current) != len(layers):
+                raise ValueError(
+                    "Shared CPU request lease suffix has an incompatible "
+                    f"layer count: kv_group={kv_group}, "
+                    f"current={len(current)}, new={len(layers)}"
+                )
+            append_at = chunk_index_base[kv_group]
+            if any(len(layer) != append_at for layer in current):
+                raise ValueError(
+                    "Shared CPU request lease is not append-aligned: "
+                    f"kv_group={kv_group}, append_at={append_at}"
+                )
+            updates.append(
+                (current, [list(layer[append_at:]) for layer in layers])
+            )
+
+        for current, suffix in updates:
+            for layer, layer_suffix in zip(current, suffix, strict=True):
+                layer.extend(layer_suffix)
+        for kv_group, suffix in additions:
+            self.groups[kv_group] = suffix
+
     def object_ids(self, kv_group: Optional[int] = None) -> set[int]:
         groups = (
             self.groups.values()
