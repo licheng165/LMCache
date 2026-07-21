@@ -5356,7 +5356,7 @@ class LMCacheConnectorV1Impl:
             # A PD decoder did not execute prefill locally. Materialize the
             # prompt's final partial LMCache chunk into the request's ordinary paged
             # NPU cache once, before sparse selected-token loads start using
-            # the independent scratch blocks.
+            # the request's retained front-prefix scratch blocks.
             if request.is_sparse_decode and self.kv_role == "kv_consumer":
                 restored = getattr(self, "_pd_partial_restored_req_ids", None)
                 if restored is None:

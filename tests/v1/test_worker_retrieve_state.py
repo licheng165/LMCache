@@ -1654,6 +1654,38 @@ class TestWorkerRetrieveState:
         assert selected_payload.data_ptr() == selected_tokens.data_ptr()
         assert target_payload.data_ptr() == target_slot_mapping.data_ptr()
 
+    def test_request_union_payload_is_forwarded_as_one_sparse_row(self):
+        req = make_sparse_req_meta("req-1", token_count=4)
+        impl, _, _ = make_worker_connector([req], use_layerwise=True)
+        impl.current_layer = 0
+        impl.num_layers = 2
+        impl._layerwise_retriever_is_sparse = [True]
+        captured = []
+
+        def _retriever():
+            payload = yield None
+            captured.append(payload)
+            yield torch.ones(3, dtype=torch.bool)
+
+        retriever = _retriever()
+        next(retriever)
+        impl.layerwise_retrievers = [(retriever, None)]
+        selected = torch.tensor([[5, 7, 9, 0]], dtype=torch.int32)
+        targets = torch.tensor([[100, 101, 102, 0]], dtype=torch.long)
+        counts = torch.tensor([3], dtype=torch.int32)
+
+        impl.wait_for_layer_load(
+            "model.layers.0.self_attn.attn",
+            selected_tokens=selected,
+            request_ids=["req-1"],
+            target_slot_mapping=targets,
+            selected_token_counts=counts,
+        )
+
+        assert len(captured) == 1
+        assert captured[0]["selected_token_counts"].item() == 3
+        assert captured[0]["selected_token_ids"].shape == (4,)
+
     def test_sparse_decode_attn_wait_drives_latent_and_indexer(self):
         req = make_sparse_req_meta("req-1", token_count=4)
         impl, _, _ = make_worker_connector([req], use_layerwise=True)
