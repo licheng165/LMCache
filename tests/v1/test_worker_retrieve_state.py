@@ -2244,7 +2244,9 @@ class TestWorkerRetrieveState:
         }
         impl._refresh_kvcaches_list()
         impl.layerwise_retrievers = []
+        impl._layerwise_requests = []
         impl._layerwise_retriever_is_sparse = []
+        impl._layerwise_sparse_req_ids = []
         impl._stats_monitor = SimpleNamespace(
             update_interval_vllm_hit_tokens=lambda *_args: None,
             update_interval_prompt_tokens=lambda *_args: None,
@@ -2295,7 +2297,9 @@ class TestWorkerRetrieveState:
         }
         impl._refresh_kvcaches_list()
         impl.layerwise_retrievers = []
+        impl._layerwise_requests = []
         impl._layerwise_retriever_is_sparse = []
+        impl._layerwise_sparse_req_ids = []
         impl._stats_monitor = SimpleNamespace(
             update_interval_vllm_hit_tokens=lambda *_args: None,
             update_interval_prompt_tokens=lambda *_args: None,
@@ -2343,6 +2347,78 @@ class TestWorkerRetrieveState:
         assert not hasattr(req, "cached_keys")
         assert impl._worker_retrieve_state[req.req_id] is state
         impl._drain_layerwise_retrievers()
+
+    def test_start_load_kv_aggregates_step_setup(self):
+        sparse = make_sparse_req_meta("sparse", token_count=4)
+        skipped = make_sparse_req_meta("skipped", can_load=False, token_count=4)
+        dense = make_sparse_req_meta("dense", token_count=4)
+        dense.is_sparse_decode = False
+        sparse.load_spec.vllm_cached_tokens = 1
+        skipped.load_spec.vllm_cached_tokens = 2
+        dense.load_spec.vllm_cached_tokens = 3
+
+        impl, _, _ = make_worker_connector(
+            [sparse, skipped, dense], use_layerwise=True
+        )
+        impl.config.dsa_two_groups = False
+        impl.num_layers = 1
+        impl._refresh_kvcaches_list()
+        impl.layerwise_retrievers = []
+        impl._layerwise_requests = []
+        impl._layerwise_retriever_is_sparse = []
+        impl._layerwise_sparse_req_ids = []
+        stats = SimpleNamespace(
+            update_interval_vllm_hit_tokens=MagicMock(),
+            update_interval_prompt_tokens=MagicMock(),
+        )
+        staging = MagicMock()
+        calls = []
+
+        class _FakeEngine:
+            enable_shared_cpu_cache = False
+            gpu_connector = SimpleNamespace(
+                set_layerwise_staging_concurrency=staging
+            )
+
+            def retrieve_layer_head_token_wise(self, tokens, mask, **kwargs):
+                calls.append(("sparse", kwargs["sync"]))
+
+                def _retriever():
+                    yield None
+                    yield torch.ones(len(tokens), dtype=torch.bool)
+
+                return _retriever()
+
+            def retrieve_layer(self, tokens, mask, **kwargs):
+                calls.append(("dense", kwargs["sync"]))
+
+                def _retriever():
+                    yield None
+                    yield None
+                    yield torch.ones(len(tokens), dtype=torch.bool)
+
+                return _retriever()
+
+        impl._stats_monitor = stats
+        impl.lmcache_engine = _FakeEngine()
+
+        impl.start_load_kv(SimpleNamespace(attn_metadata=SimpleNamespace()))
+
+        stats.update_interval_vllm_hit_tokens.assert_called_once_with(6)
+        stats.update_interval_prompt_tokens.assert_called_once_with(12)
+        staging.assert_called_once_with(2)
+        assert calls == [("sparse", False), ("dense", True)]
+        impl._drain_layerwise_retrievers()
+
+    def test_start_load_kv_without_attention_skips_step_setup(self):
+        impl = _make_impl()
+        impl._parent = SimpleNamespace(_get_connector_metadata=MagicMock())
+
+        impl.start_load_kv(SimpleNamespace(attn_metadata=None))
+
+        impl._parent._get_connector_metadata.assert_not_called()
+        assert impl.current_layer == 0
+        assert impl._wait_for_save_done is False
 
     def test_drain_layerwise_retrievers_closes_all_on_failure(self):
         impl = _make_impl()

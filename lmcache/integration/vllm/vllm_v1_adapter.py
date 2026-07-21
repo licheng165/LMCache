@@ -1266,6 +1266,8 @@ class LMCacheConnectorV1Impl:
         self._layerwise_retriever_is_sparse: list[bool] = []
         self._layerwise_sparse_req_ids: list[str] = []
         self._layerwise_waited_groups: set[int] = set()
+        self._layerwise_sparse_indexer_sent_layers: set[tuple[str, int]] = set()
+        self._layerwise_required_wait_groups_cache: Optional[set[int]] = None
         self._layerwise_save_storers: dict[
             LayerwiseSaveKey, Generator[Optional[LayerwiseStoreResult], None, None]
         ] = {}
@@ -4190,6 +4192,11 @@ class LMCacheConnectorV1Impl:
         self.current_layer = 0
         self._wait_for_save_done = False
 
+        attn_metadata = forward_context.attn_metadata
+        if attn_metadata is None:
+            logger.debug("In connector.start_load_kv, but the attn_metadata is None")
+            return
+
         if len(self.kv_caches) == 0:
             logger.warning(
                 "Please update LMCacheConnector, "
@@ -4200,11 +4207,27 @@ class LMCacheConnectorV1Impl:
         metadata = self._parent._get_connector_metadata()
         assert isinstance(metadata, LMCacheConnectorMetadata)
 
-        active_req_ids = {
-            req.req_id
-            for req in metadata.requests
-            if not self._is_decode_window_save_request(req)
-        }
+        active_req_ids: set[str] = set()
+        loadable_requests: list[tuple[int, ReqMeta]] = []
+        vllm_hit_tokens = 0
+        prompt_tokens = 0
+        staged_load_count = 0
+        has_load_spec = False
+        for idx, request in enumerate(metadata.requests):
+            if not self._is_decode_window_save_request(request):
+                active_req_ids.add(request.req_id)
+            load_spec = request.load_spec
+            if load_spec is None:
+                continue
+            has_load_spec = True
+            vllm_hit_tokens += load_spec.vllm_cached_tokens
+            prompt_tokens += len(request.token_ids)
+            if not load_spec.can_load:
+                continue
+            loadable_requests.append((idx, request))
+            if self.use_layerwise and not request.is_sparse_decode:
+                staged_load_count += 1
+
         self._prune_worker_retrieve_state(active_req_ids)
 
         assert len(self.kv_caches) > 0
@@ -4212,54 +4235,25 @@ class LMCacheConnectorV1Impl:
             self._refresh_kvcaches_list()
         kvcaches = self._kvcaches_list
 
-        attn_metadata = forward_context.attn_metadata
-        if attn_metadata is None:
-            logger.debug("In connector.start_load_kv, but the attn_metadata is None")
-            return
-
         assert self.lmcache_engine is not None
 
         self._drain_layerwise_retrievers()
-        self._layerwise_requests = []
-        self._layerwise_sparse_req_ids = []
-        self._layerwise_waited_groups = set()
-        self._layerwise_sparse_indexer_sent_layers = set()
-        self._layerwise_required_wait_groups_cache = None
-
-        load_count = sum(
-            1
-            for req in metadata.requests
-            if req.load_spec is not None and req.load_spec.can_load
-        )
         gpu_connector = getattr(self.lmcache_engine, "gpu_connector", None)
-        if gpu_connector is not None and hasattr(
+        if staged_load_count and gpu_connector is not None and hasattr(
             gpu_connector, "set_layerwise_staging_concurrency"
         ):
-            # Each loading request holds a staging buffer for the full layer
-            # loop; add one slot for an overlapping layerwise store.
+            # Each staged load holds a buffer for the full layer loop; add one
+            # slot for an overlapping layerwise store.
             gpu_connector.set_layerwise_staging_concurrency(
-                max(2, load_count + 1)
+                max(2, staged_load_count + 1)
             )
+        if has_load_spec:
+            self._stats_monitor.update_interval_vllm_hit_tokens(vllm_hit_tokens)
+            self._stats_monitor.update_interval_prompt_tokens(prompt_tokens)
 
-        last_idx = -1
-        for idx, request in enumerate(metadata.requests):
-            if request.load_spec is not None and request.load_spec.can_load:
-                last_idx = idx
-
-        for idx, request in enumerate(metadata.requests):
-            # Update metrics for all requests that have a load_spec
-            if request.load_spec is not None:
-                self._stats_monitor.update_interval_vllm_hit_tokens(
-                    request.load_spec.vllm_cached_tokens
-                )
-                self._stats_monitor.update_interval_prompt_tokens(
-                    len(request.token_ids)
-                )
-
-            if request.load_spec is None or not request.load_spec.can_load:
-                continue
-
+        for load_idx, (idx, request) in enumerate(loadable_requests):
             tokens = request.token_ids
+            assert request.load_spec is not None
             lmcache_cached_tokens = request.load_spec.lmcache_cached_tokens
             assert request.slot_mapping
 
@@ -4313,10 +4307,7 @@ class LMCacheConnectorV1Impl:
                 )
 
             if self.use_layerwise or request.is_sparse_decode:
-                if idx == last_idx:
-                    sync = True
-                else:
-                    sync = False
+                sync = load_idx == len(loadable_requests) - 1
                 # NOTE(Jiayi): Perform blending before layerwise prefix caching
                 if self.enable_blending:
                     # TODO(Jiayi): Need to make prefix caching and blending compatible
