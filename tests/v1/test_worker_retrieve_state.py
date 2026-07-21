@@ -2,6 +2,7 @@
 """Tests for worker-local sparse decode retrieve state cache."""
 
 # Standard
+from contextlib import contextmanager
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
@@ -1559,12 +1560,27 @@ class TestWorkerRetrieveState:
         impl, _, _ = make_worker_connector(requests, use_layerwise=True)
         impl.current_layer = 0
         impl.num_layers = 2
+        impl._layerwise_retriever_is_sparse = [True, True]
         impl._layerwise_sparse_req_ids = [request.req_id for request in requests]
         captured = []
+        events = []
+
+        @contextmanager
+        def _defer_consumer_wait():
+            events.append(("enter", impl.current_layer))
+            try:
+                yield
+            finally:
+                events.append(("exit", impl.current_layer))
+
+        impl.lmcache_engine.gpu_connector = SimpleNamespace(
+            defer_sparse_load_consumer_wait=_defer_consumer_wait
+        )
 
         def _retriever():
             payload = yield None
             captured.append(payload)
+            events.append(("submit", impl._layerwise_sparse_req_ids[len(captured) - 1]))
             yield torch.ones(4, dtype=torch.bool)
 
         retrievers = [_retriever(), _retriever()]
@@ -1597,6 +1613,12 @@ class TestWorkerRetrieveState:
             assert torch.equal(selected_payload, selected_tokens[row])
             assert torch.equal(target_payload, target_slot_mapping[row])
         assert impl.current_layer == 1
+        assert events == [
+            ("enter", 0),
+            ("submit", "req-0"),
+            ("submit", "req-1"),
+            ("exit", 0),
+        ]
 
     def test_sparse_decode_attn_wait_drives_latent_and_indexer(self):
         req = make_sparse_req_meta("req-1", token_count=4)

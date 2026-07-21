@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # Standard
 from collections.abc import Iterable
+from contextlib import nullcontext
 from dataclasses import dataclass, field
 from types import SimpleNamespace
 from typing import TYPE_CHECKING, Any, Generator, Optional, Union
@@ -4862,194 +4863,215 @@ class LMCacheConnectorV1Impl:
         parsed_layer_id_loaded = False
         sparse_indexer_sent_layers = None
 
-        idx = 0
-        decode_row = 0
-        for request in layerwise_requests:
-            if idx >= len(self.layerwise_retrievers):
-                logger.warning(
-                    "wait_for_layer_load: missing retriever for request %s "
-                    "(idx=%d, retrievers=%d)",
-                    request.req_id,
-                    idx,
-                    len(self.layerwise_retrievers),
-                )
-                break
-            layerwise_retriever, indexer_retriever = self.layerwise_retrievers[idx]
-            if request.is_sparse_decode:
-                payload = None
-                rows = None
-                row_count = 1
-                if selected_tokens is None:
-                    selected_tokens_per_req = None
-                    token_start_index_per_req = 0
-                    target_slot_mapping_per_req = None
-                else:
-                    assert selected_rows is not None
-                    if rows_of_req is None:
-                        row = decode_row
-                        if row >= selected_rows:
-                            raise RuntimeError(
-                                "Sparse decode row out of bounds for "
-                                f"layer={layer_name} req={request.req_id} "
-                                f"rows={[row]} selected_rows={selected_rows}"
-                            )
-                        selected_tokens_per_req = _single_row_select(
-                            selected_tokens, row
-                        )
-                    else:
-                        if request.req_id not in rows_of_req:
-                            raise RuntimeError(
-                                "Missing sparse decode row for "
-                                f"layer={layer_name} req={request.req_id} "
-                                f"sparse_decode_row={decode_row}"
-                            )
-                        rows = rows_of_req[request.req_id]
-                        row_count = len(rows)
-                        if max(rows) >= selected_rows:
-                            raise RuntimeError(
-                                "Sparse decode row out of bounds for "
-                                f"layer={layer_name} req={request.req_id} "
-                                f"rows={rows} selected_rows={selected_rows}"
-                            )
-                        selected_tokens_per_req = _row_select(selected_tokens, rows)
-                    if target_slot_mapping is not None:
-                        if rows_of_req is None:
-                            target_slot_mapping_per_req = _single_row_select(
-                                target_slot_mapping, row
-                            )
-                        else:
-                            target_slot_mapping_per_req = _row_select(
-                                target_slot_mapping, rows
-                            )
-                        selected_tokens_payload = _sparse_payload_value(
-                            selected_tokens_per_req
-                        )
-                        target_slot_mapping_payload = _sparse_payload_value(
-                            target_slot_mapping_per_req
-                        )
-                        local_payload_event = (
-                            _dsa_record_payload_event_if_needed(
-                                selected_tokens_payload,
-                                target_slot_mapping_payload,
-                            )
-                            if rows_of_req is not None
-                            else None
-                        )
-                        if local_payload_event is not None:
-                            payload = {
-                                "selected_token_ids": selected_tokens_payload,
-                                "target_slot_mapping": target_slot_mapping_payload,
-                                "payload_event": local_payload_event,
-                            }
-                        else:
-                            payload = (
-                                selected_tokens_payload,
-                                None,
-                                target_slot_mapping_payload,
-                            )
-                        token_start_index_per_req = None
-                    else:
-                        token_start_index_per_req = (
-                            0
-                            if token_start_index is None
-                            else (
-                                _single_row_select(token_start_index, row)
-                                if rows_of_req is None
-                                else _row_select(token_start_index, rows)
-                            )
-                        )
-                        selected_tokens_payload = _sparse_payload_value(
-                            selected_tokens_per_req
-                        )
-                        token_start_payload = _sparse_payload_value(
-                            token_start_index_per_req
-                        )
-                        local_payload_event = (
-                            _dsa_record_payload_event_if_needed(
-                                selected_tokens_payload,
-                                token_start_payload,
-                            )
-                            if rows_of_req is not None
-                            else None
-                        )
-                        if local_payload_event is not None:
-                            payload = {
-                                "selected_token_ids": selected_tokens_payload,
-                                "token_start_index": token_start_payload,
-                                "payload_event": local_payload_event,
-                            }
-                        else:
-                            selected_tokens_per_req = selected_tokens_payload
-                            token_start_index_per_req = token_start_payload
-                sparse_payload = (
-                    payload
-                    if payload is not None
-                    else (selected_tokens_per_req, token_start_index_per_req)
-                )
-                indexer_sent_key = (
-                    (request.req_id, self.current_layer)
-                    if indexer_retriever is not None
-                    else None
-                )
-                if indexer_retriever is not None:
-                    if not parsed_layer_id_loaded:
-                        parsed_layer_id = self._layerwise_layer_id_from_name(
-                            layer_name
-                        )
-                        parsed_layer_id_loaded = True
-                    if sparse_indexer_sent_layers is None:
-                        sparse_indexer_sent_layers = getattr(
-                            self,
-                            "_layerwise_sparse_indexer_sent_layers",
-                            None,
-                        )
-                        if sparse_indexer_sent_layers is None:
-                            sparse_indexer_sent_layers = set()
-                            self._layerwise_sparse_indexer_sent_layers = (
-                                sparse_indexer_sent_layers
-                            )
-                if wait_group == 1:
-                    ret_token_mask = None
-                    if (
-                        indexer_retriever is not None
-                        and sparse_indexer_sent_layers is not None
-                        and (
-                            parsed_layer_id is None
-                            or parsed_layer_id == self.current_layer
-                        )
-                        and indexer_sent_key not in sparse_indexer_sent_layers
-                    ):
-                        indexer_retriever.send((None, 0))
-                        sparse_indexer_sent_layers.add(indexer_sent_key)
-                else:
-                    ret_token_mask = layerwise_retriever.send(sparse_payload)
-                    if (
-                        indexer_retriever is not None
-                        and sparse_indexer_sent_layers is not None
-                        and indexer_sent_key not in sparse_indexer_sent_layers
-                    ):
-                        indexer_ret_mask = indexer_retriever.send((None, 0))
-                        sparse_indexer_sent_layers.add(indexer_sent_key)
-                        if ret_token_mask is None:
-                            ret_token_mask = indexer_ret_mask
-                decode_row += row_count
-            else:
-                if wait_group == 1:
-                    if indexer_retriever is not None:
-                        next(indexer_retriever)
-                    ret_token_mask = None
-                else:
-                    ret_token_mask = next(layerwise_retriever)
+        join_context = nullcontext()
+        sparse_retrievers = getattr(self, "_layerwise_retriever_is_sparse", ())
+        if (
+            len(self.layerwise_retrievers) > 1
+            and len(sparse_retrievers) == len(self.layerwise_retrievers)
+            and all(sparse_retrievers)
+        ):
+            gpu_connector = getattr(
+                getattr(self, "lmcache_engine", None),
+                "gpu_connector",
+                None,
+            )
+            defer_consumer_wait = getattr(
+                gpu_connector,
+                "defer_sparse_load_consumer_wait",
+                None,
+            )
+            if callable(defer_consumer_wait):
+                join_context = defer_consumer_wait()
 
-            if (
-                wait_group == 0
-                and self.current_layer == self.num_layers - 1
-                and not request.is_sparse_decode
-            ):
-                assert ret_token_mask is not None
-                num_retrieved_tokens = ret_token_mask.sum().item()
-                logger.info("Retrieved %d tokens", num_retrieved_tokens)
-            idx += 1
+        with join_context:
+            idx = 0
+            decode_row = 0
+            for request in layerwise_requests:
+                if idx >= len(self.layerwise_retrievers):
+                    logger.warning(
+                        "wait_for_layer_load: missing retriever for request %s "
+                        "(idx=%d, retrievers=%d)",
+                        request.req_id,
+                        idx,
+                        len(self.layerwise_retrievers),
+                    )
+                    break
+                layerwise_retriever, indexer_retriever = self.layerwise_retrievers[idx]
+                if request.is_sparse_decode:
+                    payload = None
+                    rows = None
+                    row_count = 1
+                    if selected_tokens is None:
+                        selected_tokens_per_req = None
+                        token_start_index_per_req = 0
+                        target_slot_mapping_per_req = None
+                    else:
+                        assert selected_rows is not None
+                        if rows_of_req is None:
+                            row = decode_row
+                            if row >= selected_rows:
+                                raise RuntimeError(
+                                    "Sparse decode row out of bounds for "
+                                    f"layer={layer_name} req={request.req_id} "
+                                    f"rows={[row]} selected_rows={selected_rows}"
+                                )
+                            selected_tokens_per_req = _single_row_select(
+                                selected_tokens, row
+                            )
+                        else:
+                            if request.req_id not in rows_of_req:
+                                raise RuntimeError(
+                                    "Missing sparse decode row for "
+                                    f"layer={layer_name} req={request.req_id} "
+                                    f"sparse_decode_row={decode_row}"
+                                )
+                            rows = rows_of_req[request.req_id]
+                            row_count = len(rows)
+                            if max(rows) >= selected_rows:
+                                raise RuntimeError(
+                                    "Sparse decode row out of bounds for "
+                                    f"layer={layer_name} req={request.req_id} "
+                                    f"rows={rows} selected_rows={selected_rows}"
+                                )
+                            selected_tokens_per_req = _row_select(selected_tokens, rows)
+                        if target_slot_mapping is not None:
+                            if rows_of_req is None:
+                                target_slot_mapping_per_req = _single_row_select(
+                                    target_slot_mapping, row
+                                )
+                            else:
+                                target_slot_mapping_per_req = _row_select(
+                                    target_slot_mapping, rows
+                                )
+                            selected_tokens_payload = _sparse_payload_value(
+                                selected_tokens_per_req
+                            )
+                            target_slot_mapping_payload = _sparse_payload_value(
+                                target_slot_mapping_per_req
+                            )
+                            local_payload_event = (
+                                _dsa_record_payload_event_if_needed(
+                                    selected_tokens_payload,
+                                    target_slot_mapping_payload,
+                                )
+                                if rows_of_req is not None
+                                else None
+                            )
+                            if local_payload_event is not None:
+                                payload = {
+                                    "selected_token_ids": selected_tokens_payload,
+                                    "target_slot_mapping": target_slot_mapping_payload,
+                                    "payload_event": local_payload_event,
+                                }
+                            else:
+                                payload = (
+                                    selected_tokens_payload,
+                                    None,
+                                    target_slot_mapping_payload,
+                                )
+                            token_start_index_per_req = None
+                        else:
+                            token_start_index_per_req = (
+                                0
+                                if token_start_index is None
+                                else (
+                                    _single_row_select(token_start_index, row)
+                                    if rows_of_req is None
+                                    else _row_select(token_start_index, rows)
+                                )
+                            )
+                            selected_tokens_payload = _sparse_payload_value(
+                                selected_tokens_per_req
+                            )
+                            token_start_payload = _sparse_payload_value(
+                                token_start_index_per_req
+                            )
+                            local_payload_event = (
+                                _dsa_record_payload_event_if_needed(
+                                    selected_tokens_payload,
+                                    token_start_payload,
+                                )
+                                if rows_of_req is not None
+                                else None
+                            )
+                            if local_payload_event is not None:
+                                payload = {
+                                    "selected_token_ids": selected_tokens_payload,
+                                    "token_start_index": token_start_payload,
+                                    "payload_event": local_payload_event,
+                                }
+                            else:
+                                selected_tokens_per_req = selected_tokens_payload
+                                token_start_index_per_req = token_start_payload
+                    sparse_payload = (
+                        payload
+                        if payload is not None
+                        else (selected_tokens_per_req, token_start_index_per_req)
+                    )
+                    indexer_sent_key = (
+                        (request.req_id, self.current_layer)
+                        if indexer_retriever is not None
+                        else None
+                    )
+                    if indexer_retriever is not None:
+                        if not parsed_layer_id_loaded:
+                            parsed_layer_id = self._layerwise_layer_id_from_name(
+                                layer_name
+                            )
+                            parsed_layer_id_loaded = True
+                        if sparse_indexer_sent_layers is None:
+                            sparse_indexer_sent_layers = getattr(
+                                self,
+                                "_layerwise_sparse_indexer_sent_layers",
+                                None,
+                            )
+                            if sparse_indexer_sent_layers is None:
+                                sparse_indexer_sent_layers = set()
+                                self._layerwise_sparse_indexer_sent_layers = (
+                                    sparse_indexer_sent_layers
+                                )
+                    if wait_group == 1:
+                        ret_token_mask = None
+                        if (
+                            indexer_retriever is not None
+                            and sparse_indexer_sent_layers is not None
+                            and (
+                                parsed_layer_id is None
+                                or parsed_layer_id == self.current_layer
+                            )
+                            and indexer_sent_key not in sparse_indexer_sent_layers
+                        ):
+                            indexer_retriever.send((None, 0))
+                            sparse_indexer_sent_layers.add(indexer_sent_key)
+                    else:
+                        ret_token_mask = layerwise_retriever.send(sparse_payload)
+                        if (
+                            indexer_retriever is not None
+                            and sparse_indexer_sent_layers is not None
+                            and indexer_sent_key not in sparse_indexer_sent_layers
+                        ):
+                            indexer_ret_mask = indexer_retriever.send((None, 0))
+                            sparse_indexer_sent_layers.add(indexer_sent_key)
+                            if ret_token_mask is None:
+                                ret_token_mask = indexer_ret_mask
+                    decode_row += row_count
+                else:
+                    if wait_group == 1:
+                        if indexer_retriever is not None:
+                            next(indexer_retriever)
+                        ret_token_mask = None
+                    else:
+                        ret_token_mask = next(layerwise_retriever)
+
+                if (
+                    wait_group == 0
+                    and self.current_layer == self.num_layers - 1
+                    and not request.is_sparse_decode
+                ):
+                    assert ret_token_mask is not None
+                    num_retrieved_tokens = ret_token_mask.sum().item()
+                    logger.info("Retrieved %d tokens", num_retrieved_tokens)
+                idx += 1
 
         if self.layerwise_retrievers and self._layerwise_wait_should_advance(
             wait_group
