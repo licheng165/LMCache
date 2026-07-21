@@ -3231,7 +3231,17 @@ class TestWorkerRetrieveState:
         assert impl._should_invalidate_worker_retrieve_state(
             _make_request(resumed=True), 256
         )
+        assert (
+            impl._worker_retrieve_state_invalidation_reason(
+                _make_request(resumed=True), 256
+            )
+            == "resumed_from_preemption"
+        )
         assert impl._should_invalidate_worker_retrieve_state(_make_request(), 128)
+        assert (
+            impl._worker_retrieve_state_invalidation_reason(_make_request(), 128)
+            == "retrieve_token_count_shrank"
+        )
 
     def test_sparse_decode_selected_transfer_does_not_invalidate_full_prompt_cache(
         self,
@@ -3266,6 +3276,10 @@ class TestWorkerRetrieveState:
         )
 
         assert impl._should_invalidate_worker_retrieve_state(req, 2048)
+        assert (
+            impl._worker_retrieve_state_invalidation_reason(req, 2048)
+            == "lmcache_cached_prefix_grew"
+        )
 
     def test_sparse_decode_prompt_shrink_invalidates(self):
         impl = _make_impl()
@@ -3296,6 +3310,34 @@ class TestWorkerRetrieveState:
         req.token_ids = [0] * 18880
 
         assert impl._should_invalidate_worker_retrieve_state(req, 18880)
+        assert (
+            impl._worker_retrieve_state_invalidation_reason(req, 18880)
+            == "shared_request_scope_changed"
+        )
+
+    def test_sparse_decode_prepared_token_growth_reports_exact_reason(self):
+        impl = _make_impl()
+        impl.lmcache_engine = SimpleNamespace(shared_cpu_cache_generation=5)
+        impl._worker_retrieve_state["req-1"] = WorkerRetrieveState(
+            req_id="req-1",
+            cached_keys=[["k"]],
+            cached_starts=[0],
+            cached_ends=[256],
+            metadata_warm=True,
+            token_count=256,
+            shared_request_active=True,
+            shared_generation=5,
+            request_scope_token="req-1:5:256",
+            prepared_sparse_sources={0: SimpleNamespace(total_tokens=256)},
+        )
+        req = _make_request()
+        req.token_ids = [0] * 512
+        req.load_spec.lmcache_cached_tokens = 512
+
+        assert (
+            impl._worker_retrieve_state_invalidation_reason(req, 512)
+            == "prepared_token_count_changed"
+        )
 
     def test_sparse_decode_shared_scope_invalidation_uses_retrieve_tokens(self):
         impl = _make_impl()
@@ -3422,6 +3464,20 @@ class TestWorkerRetrieveState:
         assert state.cached_chunk_ptrs_npu == []
         assert state.shared_request_active is False
         assert state.metadata_warm is True
+        assert (
+            state.last_shared_scope_release_reason
+            == "absent_from_current_connector_metadata"
+        )
+        assert state.last_shared_scope_release_token_count == 256
+        assert (
+            impl._prepared_sparse_source_miss_reason(
+                state,
+                0,
+                256,
+                shared_cpu_enabled=True,
+            )
+            == "shared_scope_inactive_after:absent_from_current_connector_metadata"
+        )
 
     def test_prune_drops_non_warm_finished_requests(self):
         impl = _make_impl()

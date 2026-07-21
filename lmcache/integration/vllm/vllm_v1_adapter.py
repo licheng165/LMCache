@@ -671,6 +671,11 @@ class WorkerRetrieveState:
     shared_request_active: bool = False
     request_scope_token: Optional[str] = None
     shared_validation_signature: Optional[tuple[Any, ...]] = None
+    # Diagnostics only: records why an otherwise warm request lost its shared
+    # backing/views. This survives the release so a later cold preflight can
+    # name the lifecycle event that forced it to rebuild.
+    last_shared_scope_release_reason: Optional[str] = None
+    last_shared_scope_release_token_count: int = 0
     location: Optional[str] = None
     metadata_warm: bool = False
     token_count: int = 0
@@ -3121,9 +3126,28 @@ class LMCacheConnectorV1Impl:
         for req_id in dropped_req_ids:
             state = self._worker_retrieve_state.get(req_id)
             if state is not None and state.shared_request_active:
+                logger.info(
+                    "[P2D_WORKER_STATE_PRUNE] req=%s "
+                    "reason=absent_from_current_connector_metadata "
+                    "active_req_ids=%s state_token_count=%d "
+                    "prepared_groups=%s prepared_tokens=%s "
+                    "shared_generation=%d request_scope=%s "
+                    "action=release_shared_scope_keep_warm_metadata",
+                    req_id,
+                    sorted(active_req_ids),
+                    state.token_count,
+                    sorted(state.prepared_sparse_sources),
+                    {
+                        group: source.total_tokens
+                        for group, source in state.prepared_sparse_sources.items()
+                    },
+                    state.shared_generation,
+                    state.request_scope_token,
+                )
                 self._release_shared_worker_retrieve_state(
                     state,
                     getattr(self, "lmcache_engine", None),
+                    reason="absent_from_current_connector_metadata",
                 )
             if state is not None and (state.metadata_warm or state.cached_keys):
                 kept_warm_req_ids.append(req_id)
@@ -3140,13 +3164,19 @@ class LMCacheConnectorV1Impl:
             if req_id in active_req_ids or (state.metadata_warm or state.cached_keys)
         }
 
-    def _drop_worker_retrieve_state(self, req_id: str) -> None:
+    def _drop_worker_retrieve_state(
+        self,
+        req_id: str,
+        *,
+        reason: str = "worker_state_drop",
+    ) -> None:
         if hasattr(self, "_worker_retrieve_state"):
             state = self._worker_retrieve_state.pop(req_id, None)
             if state is not None:
                 self._release_shared_worker_retrieve_state(
                     state,
                     getattr(self, "lmcache_engine", None),
+                    reason=reason,
                 )
         self._release_request_lookup_pins(req_id)
 
@@ -3154,7 +3184,7 @@ class LMCacheConnectorV1Impl:
         """Release request-owned cache state in the worker process."""
         for req_id in req_ids:
             self._drop_layerwise_save_storers(req_id)
-            self._drop_worker_retrieve_state(req_id)
+            self._drop_worker_retrieve_state(req_id, reason="request_finished")
             indexer_reuse_logged = getattr(
                 self, "_indexer_resident_logged_req_ids", None
             )
@@ -3165,7 +3195,11 @@ class LMCacheConnectorV1Impl:
     def _release_shared_worker_retrieve_state(
         state: WorkerRetrieveState,
         engine: Optional[Any] = None,
+        *,
+        reason: str = "shared_scope_release",
     ) -> None:
+        state.last_shared_scope_release_reason = reason
+        state.last_shared_scope_release_token_count = state.token_count
         # Drop bindings before releasing the MemoryObjs that back their tensors.
         state.prepared_sparse_sources.clear()
         if engine is not None and state.shared_request_active:
@@ -3518,6 +3552,12 @@ class LMCacheConnectorV1Impl:
             "pointer_cache_generation": state.pointer_cache_generation,
             "request_scope_token": state.request_scope_token,
             "shared_validation_signature": state.shared_validation_signature,
+            "last_shared_scope_release_reason": (
+                state.last_shared_scope_release_reason
+            ),
+            "last_shared_scope_release_token_count": (
+                state.last_shared_scope_release_token_count
+            ),
             "prepared_sparse_sources": dict(state.prepared_sparse_sources),
         }
 
@@ -3847,6 +3887,8 @@ class LMCacheConnectorV1Impl:
                 else "missing"
             )
             state.shared_request_active = True
+            state.last_shared_scope_release_reason = None
+            state.last_shared_scope_release_token_count = 0
             state.shared_validation_signature = (
                 self._shared_worker_validation_signature(
                     state,
@@ -3879,14 +3921,16 @@ class LMCacheConnectorV1Impl:
                 rank0_backing=True,
             )
 
-    def _should_invalidate_worker_retrieve_state(
-        self, request: ReqMeta, token_count: int
-    ) -> bool:
+    def _worker_retrieve_state_invalidation_reason(
+        self,
+        request: ReqMeta,
+        token_count: int,
+    ) -> Optional[str]:
         if request.resumed_from_preemption:
-            return True
+            return "resumed_from_preemption"
         state = self._worker_retrieve_state.get(request.req_id)
         if state is None:
-            return False
+            return None
         if request.is_sparse_decode:
             if state.shared_request_active:
                 engine = getattr(self, "lmcache_engine", None)
@@ -3895,12 +3939,12 @@ class LMCacheConnectorV1Impl:
                 )
                 prepared_latent = state.prepared_sparse_sources.get(0)
                 if prepared_latent is not None:
-                    if (
-                        state.req_id != request.req_id
-                        or state.shared_generation != generation
-                        or prepared_latent.total_tokens != token_count
-                    ):
-                        return True
+                    if state.req_id != request.req_id:
+                        return "shared_request_identity_changed"
+                    if state.shared_generation != generation:
+                        return "shared_generation_changed"
+                    if prepared_latent.total_tokens != token_count:
+                        return "prepared_token_count_changed"
                 else:
                     expected_scope_token = self._shared_request_scope_token(
                         request.req_id,
@@ -3908,30 +3952,62 @@ class LMCacheConnectorV1Impl:
                         token_count,
                     )
                     if state.request_scope_token != expected_scope_token:
-                        return True
+                        return "shared_request_scope_changed"
             if state.cached_starts and state.cached_starts[0] != 0:
-                return True
+                return "cached_prefix_does_not_start_at_zero"
             if (
                 request.load_spec is not None
                 and request.load_spec.lmcache_cached_tokens > state.token_count
             ):
-                return True
+                return "lmcache_cached_prefix_grew"
             # Sparse decode metadata is keyed by the full LMCache-hit prefix.
             # A shorter current prefix means the cached request state is stale.
-            if state.token_count and (
-                token_count < state.token_count
-                or len(request.token_ids) < state.token_count
-            ):
-                return True
-            return False
+            if state.token_count and token_count < state.token_count:
+                return "retrieve_token_count_shrank"
+            if state.token_count and len(request.token_ids) < state.token_count:
+                return "request_token_count_shrank"
+            return None
         if state.cached_ends and token_count < state.cached_ends[-1]:
-            return True
+            return "dense_retrieve_token_count_shrank"
         if (
             request.load_spec is not None
             and request.load_spec.lmcache_cached_tokens > state.token_count
         ):
-            return True
-        return False
+            return "dense_lmcache_cached_prefix_grew"
+        return None
+
+    def _should_invalidate_worker_retrieve_state(
+        self, request: ReqMeta, token_count: int
+    ) -> bool:
+        return (
+            self._worker_retrieve_state_invalidation_reason(request, token_count)
+            is not None
+        )
+
+    @staticmethod
+    def _prepared_sparse_source_miss_reason(
+        state: Optional[WorkerRetrieveState],
+        kv_group: int,
+        token_count: int,
+        *,
+        shared_cpu_enabled: bool,
+        invalidation_reason: Optional[str] = None,
+    ) -> str:
+        if invalidation_reason is not None:
+            return f"state_invalidated:{invalidation_reason}"
+        if state is None:
+            return "worker_state_missing"
+        if not (state.metadata_warm or state.cached_keys):
+            return "worker_state_not_warm"
+        if shared_cpu_enabled and not state.shared_request_active:
+            previous = state.last_shared_scope_release_reason or "unknown"
+            return f"shared_scope_inactive_after:{previous}"
+        source = state.prepared_sparse_sources.get(kv_group)
+        if source is None:
+            return "prepared_source_missing"
+        if source.total_tokens != token_count:
+            return "prepared_source_token_count_mismatch"
+        return "prepared_source_rejected_unknown"
 
     def _worker_retrieve_state_for_request(
         self, request: ReqMeta
@@ -4382,13 +4458,40 @@ class LMCacheConnectorV1Impl:
             # broadcast. Leave all ranks on the old scope; the next sparse load
             # invalidates it and refreshes shared handles once, in ordered TP
             # collective flow.
-            logger.debug(
-                "Skipping shared CPU decode-window worker-state merge so the "
-                "next sparse load refreshes handles on every TP rank: req_id=%s "
-                "window=[%s,%s)",
+            existing_state = self._worker_retrieve_state.get(request.req_id)
+            logger.info(
+                "[P2D_DECODE_WINDOW_STATE_REFRESH_DEFERRED] req=%s "
+                "reason=shared_cpu_rank0_only_store_requires_tp_refresh "
+                "window_start=%s window_end=%s request_tokens=%d "
+                "saved_chunks_g0=%d saved_chunks_g1=%d "
+                "state_token_count=%s shared_active=%s prepared_tokens=%s "
+                "action=skip_local_merge_next_sparse_load_will_refresh",
                 request.req_id,
                 getattr(request, "decode_window_start", None),
                 getattr(request, "decode_window_end", None),
+                len(request.token_ids),
+                len(request.cached_starts),
+                len(request.cached_starts_indexer),
+                (
+                    existing_state.token_count
+                    if existing_state is not None
+                    else None
+                ),
+                (
+                    existing_state.shared_request_active
+                    if existing_state is not None
+                    else None
+                ),
+                (
+                    {
+                        group: source.total_tokens
+                        for group, source in (
+                            existing_state.prepared_sparse_sources.items()
+                        )
+                    }
+                    if existing_state is not None
+                    else {}
+                ),
             )
             return
 
@@ -4533,6 +4636,15 @@ class LMCacheConnectorV1Impl:
                     cached_ends,
                     token_count,
                 ):
+                    logger.info(
+                        "[P2D_PREPARED_SOURCE_BUILD] req=%s kv_group=%d "
+                        "status=skipped reason=non_contiguous_prefix "
+                        "token_count=%d ranges=%s",
+                        state.req_id,
+                        kv_group,
+                        token_count,
+                        list(zip(cached_starts, cached_ends, strict=False)),
+                    )
                     continue
                 chunk_token_counts = tuple(
                     int(end) - int(start)
@@ -4555,6 +4667,28 @@ class LMCacheConnectorV1Impl:
             )
             if source is not None:
                 prepared[kv_group] = source
+            else:
+                first_layer_chunks = (
+                    len(cache["cached_tensors"][0])
+                    if cache["cached_tensors"]
+                    and isinstance(cache["cached_tensors"][0], (list, tuple))
+                    else 0
+                )
+                logger.info(
+                    "[P2D_PREPARED_SOURCE_BUILD] req=%s kv_group=%d "
+                    "status=skipped "
+                    "reason=incomplete_tensor_pointer_or_token_coverage "
+                    "token_count=%d expected_layers=%d tensor_layers=%d "
+                    "pointer_layers=%d first_layer_chunks=%d range_chunks=%d",
+                    state.req_id,
+                    kv_group,
+                    token_count,
+                    self._num_layers_for_group(kv_group),
+                    len(cache["cached_tensors"]),
+                    len(cache["cached_chunk_ptrs_npu"]),
+                    first_layer_chunks,
+                    len(cached_starts),
+                )
         state.prepared_sparse_sources = prepared
 
     def _prepared_sparse_source(
@@ -4670,6 +4804,37 @@ class LMCacheConnectorV1Impl:
             raise
         self._worker_retrieve_state[request.req_id] = new_state
 
+    @staticmethod
+    def _log_worker_retrieve_state_finalized(
+        request: ReqMeta,
+        state: WorkerRetrieveState,
+        token_count: int,
+        *,
+        action: str,
+        previous_release_reason: Optional[str],
+    ) -> None:
+        logger.info(
+            "[P2D_WORKER_STATE_FINALIZED] req=%s action=%s "
+            "token_count=%d chunks_g0=%d chunks_g1=%d "
+            "shared_active=%s shared_generation=%d request_scope=%s "
+            "prepared_groups=%s prepared_tokens=%s "
+            "previous_release_reason=%s",
+            request.req_id,
+            action,
+            token_count,
+            len(state.cached_starts),
+            len(state.cached_starts_indexer),
+            state.shared_request_active,
+            state.shared_generation,
+            state.request_scope_token,
+            sorted(state.prepared_sparse_sources),
+            {
+                group: source.total_tokens
+                for group, source in state.prepared_sparse_sources.items()
+            },
+            previous_release_reason,
+        )
+
     def _finalize_worker_retrieve_state_from_metadata(
         self, metadata: LMCacheConnectorMetadata
     ) -> None:
@@ -4708,13 +4873,36 @@ class LMCacheConnectorV1Impl:
                     existing,
                     token_count,
                 )
+                self._log_worker_retrieve_state_finalized(
+                    request,
+                    existing,
+                    token_count,
+                    action="refresh_prepared_sources_only",
+                    previous_release_reason=(
+                        existing.last_shared_scope_release_reason
+                    ),
+                )
                 continue
+            previous_release_reason = (
+                existing.last_shared_scope_release_reason
+                if existing is not None
+                else None
+            )
             self._save_worker_retrieve_state_from_request(
                 request,
                 location=location,
                 metadata_warm=metadata_warm or bool(request.cached_keys),
                 token_count=token_count,
             )
+            installed = self._worker_retrieve_state.get(request.req_id)
+            if installed is not None:
+                self._log_worker_retrieve_state_finalized(
+                    request,
+                    installed,
+                    token_count,
+                    action="install_full_retrieve_state",
+                    previous_release_reason=previous_release_reason,
+                )
 
     def _sparse_decode_bootstrap_reuse_kwargs(
         self,
@@ -4827,6 +5015,32 @@ class LMCacheConnectorV1Impl:
             for req in metadata.requests
             if not self._is_decode_window_save_request(req)
         }
+        shared_scope_prune_candidates = sorted(
+            req_id
+            for req_id, state in getattr(
+                self, "_worker_retrieve_state", {}
+            ).items()
+            if req_id not in active_req_ids and state.shared_request_active
+        )
+        if shared_scope_prune_candidates:
+            request_kinds = [
+                (
+                    f"{req.req_id}:decode_window_save"
+                    if self._is_decode_window_save_request(req)
+                    else f"{req.req_id}:sparse_load"
+                    if req.is_sparse_decode
+                    else f"{req.req_id}:other"
+                )
+                for req in metadata.requests
+            ]
+            logger.info(
+                "[P2D_CONNECTOR_METADATA_STATE_GAP] "
+                "prune_candidates=%s active_req_ids=%s metadata_requests=%s "
+                "reason=request_absent_from_non_save_metadata",
+                shared_scope_prune_candidates,
+                sorted(active_req_ids),
+                request_kinds,
+            )
         self._prune_worker_retrieve_state(active_req_ids)
 
         assert len(self.kv_caches) > 0
@@ -4990,11 +5204,89 @@ class LMCacheConnectorV1Impl:
                         vllm_cached_tokens=request.load_spec.vllm_cached_tokens,
                     )
                 elif request.is_sparse_decode:
+                    invalidation_reason: Optional[str] = None
+                    state_before = None
                     if hasattr(self, "_worker_retrieve_state"):
-                        if self._should_invalidate_worker_retrieve_state(
-                            request, token_count
-                        ):
-                            self._drop_worker_retrieve_state(request.req_id)
+                        state_before = self._worker_retrieve_state.get(
+                            request.req_id
+                        )
+                        invalidation_reason = (
+                            self._worker_retrieve_state_invalidation_reason(
+                                request,
+                                token_count,
+                            )
+                        )
+                        if invalidation_reason is not None:
+                            engine_generation = int(
+                                getattr(
+                                    self.lmcache_engine,
+                                    "shared_cpu_cache_generation",
+                                    0,
+                                )
+                                or 0
+                            )
+                            logger.info(
+                                "[P2D_WORKER_STATE_INVALIDATED] req=%s "
+                                "reason=%s incoming_token_count=%d "
+                                "request_tokens=%d lmcache_cached=%d "
+                                "state_token_count=%s shared_active=%s "
+                                "state_generation=%s engine_generation=%d "
+                                "request_scope=%s prepared_groups=%s "
+                                "prepared_tokens=%s last_release_reason=%s "
+                                "action=drop_state_then_full_preflight",
+                                request.req_id,
+                                invalidation_reason,
+                                token_count,
+                                len(request.token_ids),
+                                request.load_spec.lmcache_cached_tokens,
+                                (
+                                    state_before.token_count
+                                    if state_before is not None
+                                    else None
+                                ),
+                                (
+                                    state_before.shared_request_active
+                                    if state_before is not None
+                                    else None
+                                ),
+                                (
+                                    state_before.shared_generation
+                                    if state_before is not None
+                                    else None
+                                ),
+                                engine_generation,
+                                (
+                                    state_before.request_scope_token
+                                    if state_before is not None
+                                    else None
+                                ),
+                                (
+                                    sorted(state_before.prepared_sparse_sources)
+                                    if state_before is not None
+                                    else []
+                                ),
+                                (
+                                    {
+                                        group: source.total_tokens
+                                        for group, source in (
+                                            state_before.prepared_sparse_sources.items()
+                                        )
+                                    }
+                                    if state_before is not None
+                                    else {}
+                                ),
+                                (
+                                    state_before.last_shared_scope_release_reason
+                                    if state_before is not None
+                                    else None
+                                ),
+                            )
+                            self._drop_worker_retrieve_state(
+                                request.req_id,
+                                reason=(
+                                    f"state_invalidation:{invalidation_reason}"
+                                ),
+                            )
                         bound_state = self._worker_retrieve_state_for_request(
                             request
                         )
@@ -5023,6 +5315,62 @@ class LMCacheConnectorV1Impl:
                             "prepared_sparse_source": latent_prepared,
                         }
                     else:
+                        latent_rebuild_reason = (
+                            self._prepared_sparse_source_miss_reason(
+                                (
+                                    bound_state
+                                    if bound_state is not None
+                                    else state_before
+                                ),
+                                0,
+                                token_count,
+                                shared_cpu_enabled=shared_cpu_enabled,
+                                invalidation_reason=invalidation_reason,
+                            )
+                        )
+                        if shared_cpu_enabled:
+                            logger.info(
+                                "[P2D_SHARED_CPU_FULL_PREFLIGHT_TRIGGER] "
+                                "req=%s kv_group=0 reason=%s "
+                                "incoming_token_count=%d state_token_count=%s "
+                                "shared_active=%s prepared_tokens=%s "
+                                "last_release_reason=%s "
+                                "last_release_token_count=%s "
+                                "action=rebuild_all_shared_chunks",
+                                request.req_id,
+                                latent_rebuild_reason,
+                                token_count,
+                                (
+                                    bound_state.token_count
+                                    if bound_state is not None
+                                    else None
+                                ),
+                                (
+                                    bound_state.shared_request_active
+                                    if bound_state is not None
+                                    else None
+                                ),
+                                (
+                                    {
+                                        group: source.total_tokens
+                                        for group, source in (
+                                            bound_state.prepared_sparse_sources.items()
+                                        )
+                                    }
+                                    if bound_state is not None
+                                    else {}
+                                ),
+                                (
+                                    bound_state.last_shared_scope_release_reason
+                                    if bound_state is not None
+                                    else None
+                                ),
+                                (
+                                    bound_state.last_shared_scope_release_token_count
+                                    if bound_state is not None
+                                    else None
+                                ),
+                            )
                         if bound_state is not None:
                             self._bind_worker_retrieve_cache_to_request(
                                 request,
@@ -5051,6 +5399,10 @@ class LMCacheConnectorV1Impl:
                             "shared_cpu_request_ordinal": idx,
                             **latent_cache,
                         }
+                        if shared_cpu_enabled:
+                            retrieve_kwargs["shared_cpu_rebuild_reason"] = (
+                                latent_rebuild_reason
+                            )
                         if shared_cpu_enabled and bound_state is not None:
                             existing_layers = (
                                 bound_state.rank0_backing_objs_by_group.get(0)
@@ -5177,6 +5529,66 @@ class LMCacheConnectorV1Impl:
                                     "prepared_sparse_source": indexer_prepared,
                                 }
                             else:
+                                indexer_rebuild_reason = (
+                                    self._prepared_sparse_source_miss_reason(
+                                        (
+                                            bound_state
+                                            if bound_state is not None
+                                            else state_before
+                                        ),
+                                        1,
+                                        token_count,
+                                        shared_cpu_enabled=shared_cpu_enabled,
+                                        invalidation_reason=invalidation_reason,
+                                    )
+                                )
+                                if shared_cpu_enabled:
+                                    logger.info(
+                                        "[P2D_SHARED_CPU_FULL_PREFLIGHT_TRIGGER] "
+                                        "req=%s kv_group=1 reason=%s "
+                                        "incoming_token_count=%d "
+                                        "state_token_count=%s shared_active=%s "
+                                        "prepared_tokens=%s "
+                                        "last_release_reason=%s "
+                                        "last_release_token_count=%s "
+                                        "action=rebuild_all_shared_chunks",
+                                        request.req_id,
+                                        indexer_rebuild_reason,
+                                        token_count,
+                                        (
+                                            bound_state.token_count
+                                            if bound_state is not None
+                                            else None
+                                        ),
+                                        (
+                                            bound_state.shared_request_active
+                                            if bound_state is not None
+                                            else None
+                                        ),
+                                        (
+                                            {
+                                                group: source.total_tokens
+                                                for group, source in (
+                                                    bound_state
+                                                    .prepared_sparse_sources
+                                                    .items()
+                                                )
+                                            }
+                                            if bound_state is not None
+                                            else {}
+                                        ),
+                                        (
+                                            bound_state.last_shared_scope_release_reason
+                                            if bound_state is not None
+                                            else None
+                                        ),
+                                        (
+                                            bound_state
+                                            .last_shared_scope_release_token_count
+                                            if bound_state is not None
+                                            else None
+                                        ),
+                                    )
                                 if bound_state is not None and not legacy_cache_bound:
                                     self._bind_worker_retrieve_cache_to_request(
                                         request,
@@ -5213,6 +5625,10 @@ class LMCacheConnectorV1Impl:
                                     "shared_cpu_request_ordinal": idx,
                                     **indexer_cache,
                                 }
+                                if shared_cpu_enabled:
+                                    indexer_kwargs[
+                                        "shared_cpu_rebuild_reason"
+                                    ] = indexer_rebuild_reason
                                 if shared_cpu_enabled and bound_state is not None:
                                     existing_layers = (
                                         bound_state.rank0_backing_objs_by_group.get(1)
