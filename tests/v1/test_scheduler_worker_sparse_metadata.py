@@ -76,6 +76,17 @@ def _make_vllm_request(
     )
 
 
+def test_chunk_size_must_be_integer_multiple_of_block_size() -> None:
+    impl = _make_scheduler_impl()
+    impl._lmcache_chunk_size = 250
+
+    with pytest.raises(
+        AssertionError,
+        match=r"chunk_size=250, block_size=16.*N \* block_size",
+    ):
+        impl._get_decode_window_save_window_size(impl.config)
+
+
 def test_decode_window_decisions_cover_second_window_and_finish(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -183,7 +194,7 @@ def test_decode_window_call_site_allocates_no_state_when_diag_disabled(
     meta.add_request.assert_not_called()
 
 
-def test_decode_window_anchor_is_partial_block_start_not_window_multiple() -> None:
+def test_decode_window_anchor_is_partial_lmcache_chunk_start() -> None:
     impl = _make_scheduler_impl()
     impl._decode_window_save_window_size = 512
     tracker = RequestTracker(
@@ -196,9 +207,9 @@ def test_decode_window_anchor_is_partial_block_start_not_window_multiple() -> No
     tracker.is_decode_phase = True
     tracker.decode_window_save_committed_end = 300
 
-    assert impl._init_decode_window_save_start(tracker) == 288
-    assert tracker.decode_window_save_anchor == 288
-    assert tracker.decode_window_save_committed_end == 288
+    assert impl._init_decode_window_save_start(tracker) == 256
+    assert tracker.decode_window_save_anchor == 256
+    assert tracker.decode_window_save_committed_end == 256
 
 
 def test_decode_window_merges_all_complete_windows_that_are_ready() -> None:
@@ -218,30 +229,30 @@ def test_decode_window_merges_all_complete_windows_that_are_ready() -> None:
 
     meta.add_request.assert_called_once()
     emitted = meta.add_request.call_args.args[0]
-    assert emitted.decode_window_start == 288
-    assert emitted.decode_window_end == 1312
-    assert tracker.decode_window_save_inflight_end == 1312
-    assert tracker.decode_window_save_next_start == 1312
+    assert emitted.decode_window_start == 256
+    assert emitted.decode_window_end == 1280
+    assert tracker.decode_window_save_inflight_end == 1280
+    assert tracker.decode_window_save_next_start == 1280
 
     impl._add_decode_window_save_metas(meta, tracker)
     meta.add_request.assert_called_once()
 
     impl._request_trackers[tracker.req_id] = tracker
     impl.update_connector_output(
-        SimpleNamespace(completed_decode_window_saves={tracker.req_id: 1312})
+        SimpleNamespace(completed_decode_window_saves={tracker.req_id: 1280})
     )
-    assert tracker.decode_window_save_committed_end == 1312
+    assert tracker.decode_window_save_committed_end == 1280
     assert tracker.decode_window_save_inflight_end is None
 
     tracker.token_ids.extend(range(1400, 1824))
     impl._add_decode_window_save_metas(meta, tracker)
     assert meta.add_request.call_count == 2
     next_emitted = meta.add_request.call_args.args[0]
-    assert next_emitted.decode_window_start == 1312
-    assert next_emitted.decode_window_end == 1824
+    assert next_emitted.decode_window_start == 1280
+    assert next_emitted.decode_window_end == 1792
 
 
-def test_prefill_completion_publishes_only_block_aligned_frontier() -> None:
+def test_prefill_completion_publishes_only_chunk_aligned_frontier() -> None:
     impl = _make_scheduler_impl()
     impl._completed_decode_window_saves = {}
     request = SimpleNamespace(
@@ -254,7 +265,7 @@ def test_prefill_completion_publishes_only_block_aligned_frontier() -> None:
 
     impl._mark_prefill_committed(request)
 
-    assert impl._completed_decode_window_saves == {"prefill-partial": 288}
+    assert impl._completed_decode_window_saves == {"prefill-partial": 256}
 
 
 class TestBuildConnectorMetaSparseSyntheticLoadSpec:
@@ -457,7 +468,7 @@ class TestBuildConnectorMetaSparseSyntheticLoadSpec:
             num_saved_tokens=256,
         )
         tracker.is_decode_phase = True
-        tracker.decode_window_save_committed_end = 352
+        tracker.decode_window_save_committed_end = 256
         tracker.sparse_token_ids = all_tokens[:352]
         tracker.sparse_slot_mapping = [torch.arange(352)]
         impl._request_trackers[req_id] = tracker
@@ -478,14 +489,14 @@ class TestBuildConnectorMetaSparseSyntheticLoadSpec:
 
         assert req_meta.load_spec is not None
         assert req_meta.load_spec.can_load is True
-        assert req_meta.load_spec.lmcache_cached_tokens == 352
-        assert req_meta.token_ids == all_tokens[:352]
-        assert tracker.sparse_token_ids == all_tokens[:352]
-        assert req_meta.slot_mapping[0].numel() == 352
-        assert tracker.sparse_slot_mapping[0].numel() == 352
+        assert req_meta.load_spec.lmcache_cached_tokens == 256
+        assert req_meta.token_ids == all_tokens[:256]
+        assert tracker.sparse_token_ids == all_tokens[:256]
+        assert req_meta.slot_mapping[0].numel() == 256
+        assert tracker.sparse_slot_mapping[0].numel() == 256
 
         impl.update_connector_output(
-            SimpleNamespace(completed_decode_window_saves={req_id: 608})
+            SimpleNamespace(completed_decode_window_saves={req_id: 512})
         )
         vllm_req.num_computed_tokens = 609
         scheduler_output = StubSchedulerOutput(
@@ -504,11 +515,11 @@ class TestBuildConnectorMetaSparseSyntheticLoadSpec:
 
         assert req_meta.load_spec is not None
         assert req_meta.load_spec.can_load is True
-        assert req_meta.load_spec.lmcache_cached_tokens == 608
-        assert req_meta.token_ids == all_tokens[:608]
-        assert tracker.sparse_token_ids == all_tokens[:608]
-        assert req_meta.slot_mapping[0].numel() == 608
-        assert tracker.sparse_slot_mapping[0].numel() == 608
+        assert req_meta.load_spec.lmcache_cached_tokens == 512
+        assert req_meta.token_ids == all_tokens[:512]
+        assert tracker.sparse_token_ids == all_tokens[:512]
+        assert req_meta.slot_mapping[0].numel() == 512
+        assert tracker.sparse_slot_mapping[0].numel() == 512
 
     def test_decode_window_completion_rejects_unemitted_frontier(self) -> None:
         impl = _make_scheduler_impl()
@@ -570,7 +581,31 @@ class TestBuildConnectorMetaSparseSyntheticLoadSpec:
                 SimpleNamespace(completed_decode_window_saves={req_id: 512})
             )
 
-    def test_decode_window_completion_uses_partial_block_anchor(self) -> None:
+    def test_decode_window_completion_rejects_block_only_aligned_frontier(
+        self,
+    ) -> None:
+        impl = _make_scheduler_impl()
+        impl._decode_window_save_window_size = 256
+        req_id = "sparse-window"
+        tracker = RequestTracker(
+            req_id=req_id,
+            prompt_len=256,
+            token_ids=list(range(400)),
+            allocated_block_ids=list(range(40)),
+            num_saved_tokens=256,
+        )
+        # 272 is block aligned (16) but not LMCache-chunk aligned (256).
+        tracker.decode_window_save_anchor = 256
+        tracker.decode_window_save_next_start = 272
+        tracker.decode_window_save_committed_end = 256
+        impl._request_trackers[req_id] = tracker
+
+        with pytest.raises(RuntimeError, match="lmcache_chunk_size=256"):
+            impl.update_connector_output(
+                SimpleNamespace(completed_decode_window_saves={req_id: 272})
+            )
+
+    def test_decode_window_completion_uses_partial_chunk_anchor(self) -> None:
         impl = _make_scheduler_impl()
         impl._decode_window_save_window_size = 512
         req_id = "sparse-window"
@@ -581,17 +616,17 @@ class TestBuildConnectorMetaSparseSyntheticLoadSpec:
             allocated_block_ids=list(range(60)),
             num_saved_tokens=300,
         )
-        tracker.decode_window_save_anchor = 288
-        tracker.decode_window_save_next_start = 800
-        tracker.decode_window_save_inflight_end = 800
-        tracker.decode_window_save_committed_end = 288
+        tracker.decode_window_save_anchor = 256
+        tracker.decode_window_save_next_start = 768
+        tracker.decode_window_save_inflight_end = 768
+        tracker.decode_window_save_committed_end = 256
         impl._request_trackers[req_id] = tracker
 
         impl.update_connector_output(
-            SimpleNamespace(completed_decode_window_saves={req_id: 800})
+            SimpleNamespace(completed_decode_window_saves={req_id: 768})
         )
 
-        assert tracker.decode_window_save_committed_end == 800
+        assert tracker.decode_window_save_committed_end == 768
         assert tracker.decode_window_save_inflight_end is None
 
     def test_decode_window_completion_rejects_partial_value(self) -> None:
@@ -606,8 +641,8 @@ class TestBuildConnectorMetaSparseSyntheticLoadSpec:
             num_saved_tokens=300,
         )
         tracker.decode_window_save_next_start = 768
-        tracker.decode_window_save_anchor = 288
-        tracker.decode_window_save_committed_end = 288
+        tracker.decode_window_save_anchor = 256
+        tracker.decode_window_save_committed_end = 256
         impl._request_trackers[req_id] = tracker
 
         with pytest.raises(RuntimeError, match="unexpected frontier"):
@@ -756,7 +791,7 @@ class TestDecodeWindowSaveMetadata:
             num_saved_tokens=256,
         )
         tracker.is_decode_phase = True
-        tracker.decode_window_save_committed_end = 352
+        tracker.decode_window_save_committed_end = 256
         impl._request_trackers[req_id] = tracker
 
         scheduler_output = StubSchedulerOutput(
@@ -796,7 +831,7 @@ class TestDecodeWindowSaveMetadata:
             num_saved_tokens=256,
         )
         tracker.is_decode_phase = True
-        tracker.decode_window_save_committed_end = 352
+        tracker.decode_window_save_committed_end = 256
         impl._request_trackers[req_id] = tracker
 
         scheduler_output = StubSchedulerOutput(
@@ -815,16 +850,16 @@ class TestDecodeWindowSaveMetadata:
         assert len(meta.requests) == 1
         req_meta = meta.requests[0]
         assert req_meta.is_decode_window_save is True
-        assert req_meta.decode_window_start == 352
-        assert req_meta.decode_window_end == 608
+        assert req_meta.decode_window_start == 256
+        assert req_meta.decode_window_end == 512
         assert req_meta.decode_window_size == 256
         assert req_meta.save_spec is not None
-        assert req_meta.save_spec.skip_leading_tokens == 352
+        assert req_meta.save_spec.skip_leading_tokens == 256
         assert req_meta.token_ids == prompt + decode_tokens
         assert len(req_meta.slot_mapping[0]) == 608
         assert tracker.num_saved_tokens == 256
-        assert tracker.decode_window_save_next_start == 608
-        assert tracker.decode_window_save_committed_end == 352
+        assert tracker.decode_window_save_next_start == 512
+        assert tracker.decode_window_save_committed_end == 256
 
     def test_decode_window_save_waits_until_boundary(self) -> None:
         impl = _make_scheduler_impl()
@@ -851,7 +886,7 @@ class TestDecodeWindowSaveMetadata:
             num_saved_tokens=256,
         )
         tracker.is_decode_phase = True
-        tracker.decode_window_save_committed_end = 352
+        tracker.decode_window_save_committed_end = 256
         impl._request_trackers[req_id] = tracker
 
         scheduler_output = StubSchedulerOutput(
@@ -869,7 +904,7 @@ class TestDecodeWindowSaveMetadata:
 
         assert meta.requests == []
         assert tracker.num_saved_tokens == 256
-        assert tracker.decode_window_save_next_start == 352
+        assert tracker.decode_window_save_next_start == 256
 
     def test_decode_window_frontier_resets_after_preemption(self) -> None:
         tracker = RequestTracker(
@@ -934,8 +969,8 @@ class TestDecodeWindowSaveMetadata:
 
         impl.build_connector_meta(scheduler_output)
 
-        assert tracker.decode_window_save_next_start == 352
-        assert tracker.decode_window_save_committed_end == 352
+        assert tracker.decode_window_save_next_start == 256
+        assert tracker.decode_window_save_committed_end == 256
 
     def test_two_group_decode_window_save_without_shared_cpu_allows_latent_only(
         self,
@@ -952,7 +987,7 @@ class TestDecodeWindowSaveMetadata:
         assert req_meta.is_decode_window_save is True
         assert req_meta.save_spec is not None
         assert req_meta.save_spec.can_save_indexer is False
-        assert tracker.decode_window_save_next_start == 608
+        assert tracker.decode_window_save_next_start == 512
 
     def test_deep_window_group_plan_explains_latent_only_commit_groups(
         self, monkeypatch: pytest.MonkeyPatch
@@ -1045,7 +1080,7 @@ class TestDecodeWindowSaveMetadata:
         meta = impl.build_connector_meta(scheduler_output)
 
         assert meta.requests == []
-        assert tracker.decode_window_save_next_start == 352
+        assert tracker.decode_window_save_next_start == 256
         assert not any(
             event.get("event") == "window_group_plan" for event in events
         )
@@ -1067,4 +1102,4 @@ class TestDecodeWindowSaveMetadata:
         assert req_meta.save_spec is not None
         assert req_meta.save_spec.can_save_indexer is True
         assert req_meta.indexer_slot_mapping
-        assert tracker.decode_window_save_next_start == 608
+        assert tracker.decode_window_save_next_start == 512

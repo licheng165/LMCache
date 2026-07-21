@@ -1622,6 +1622,12 @@ class LMCacheConnectorV1Impl:
     def _get_decode_window_save_window_size(
         self, config: LMCacheEngineConfig
     ) -> int:
+        assert self._lmcache_chunk_size % self._block_size == 0, (
+            "LMCache chunk_size must be an integer multiple of vLLM "
+            f"block_size: chunk_size={self._lmcache_chunk_size}, "
+            f"block_size={self._block_size}. Configure LMCache chunk_size "
+            "to N * block_size."
+        )
         raw_window_size = os.environ.get("LMCACHE_DECODE_WINDOW_SAVE_WINDOW_SIZE")
         if raw_window_size is None:
             raw_window_size = config.get_extra_config_value(
@@ -1648,16 +1654,10 @@ class LMCacheConnectorV1Impl:
                 "decode_window_save_window_size must be a multiple of "
                 f"lmcache chunk_size ({self._lmcache_chunk_size}), got {window_size}"
             )
-        if window_size % self._block_size != 0:
-            raise ValueError(
-                "decode_window_save_window_size must be a multiple of vLLM "
-                f"block_size ({self._block_size}), got {window_size}. Configure "
-                "an external window size of N * block_size."
-            )
         if not config.save_unfull_chunk:
             raise ValueError(
                 "decode window save requires save_unfull_chunk=true so the "
-                "prefill partial block is available to a PD decoder."
+                "prefill partial LMCache chunk is available to a PD decoder."
             )
 
         logger.info(
@@ -3187,14 +3187,18 @@ class LMCacheConnectorV1Impl:
         self._clear_decode_window_save_groups_for_window(request)
 
     def _mark_prefill_committed(self, request: ReqMeta) -> None:
-        """Publish the full-block prefill frontier after its save completes."""
+        """Publish the full-chunk prefill frontier after its save completes."""
         if (
             not request.is_last_prefill
             or request.is_sparse_decode
             or self._is_decode_window_save_request(request)
         ):
             return
-        committed_end = len(request.token_ids) // self._block_size * self._block_size
+        committed_end = (
+            len(request.token_ids)
+            // self._lmcache_chunk_size
+            * self._lmcache_chunk_size
+        )
         completed = getattr(self, "_completed_decode_window_saves", None)
         if completed is not None and committed_end > 0:
             completed[request.req_id] = max(
@@ -3221,7 +3225,9 @@ class LMCacheConnectorV1Impl:
             window_size = int(getattr(self, "_decode_window_save_window_size", 0) or 0)
             if window_size > 0 and tracker.decode_window_save_next_start is None:
                 prefill_end = (
-                    tracker.prompt_len // self._block_size * self._block_size
+                    tracker.prompt_len
+                    // self._lmcache_chunk_size
+                    * self._lmcache_chunk_size
                 )
                 if committed_end != prefill_end:
                     logger.debug(
@@ -3249,14 +3255,19 @@ class LMCacheConnectorV1Impl:
                     f"for request {req_id}; expected emitted frontier "
                     f"{tracker.decode_window_save_next_start}."
                 )
-            if committed_end % self._block_size:
+            if committed_end % self._lmcache_chunk_size:
                 raise RuntimeError(
                     f"LMCache reported unaligned committed_end={committed_end} "
-                    f"for request {req_id}; block_size={self._block_size}."
+                    f"for request {req_id}; "
+                    f"lmcache_chunk_size={self._lmcache_chunk_size}."
                 )
             anchor = tracker.decode_window_save_anchor
             if anchor is None:
-                anchor = tracker.prompt_len // self._block_size * self._block_size
+                anchor = (
+                    tracker.prompt_len
+                    // self._lmcache_chunk_size
+                    * self._lmcache_chunk_size
+                )
                 tracker.decode_window_save_anchor = anchor
             if (
                 window_size > 0
@@ -5343,7 +5354,7 @@ class LMCacheConnectorV1Impl:
                 request, token_count, self._lmcache_chunk_size
             )
             # A PD decoder did not execute prefill locally. Materialize the
-            # prompt's final partial block into the request's ordinary paged
+            # prompt's final partial LMCache chunk into the request's ordinary paged
             # NPU cache once, before sparse selected-token loads start using
             # the independent scratch blocks.
             if request.is_sparse_decode and self.kv_role == "kv_consumer":
@@ -5355,8 +5366,8 @@ class LMCacheConnectorV1Impl:
                     request.load_spec.dsa_committed_end
                     if request.load_spec.dsa_committed_end is not None
                     else len(request.token_ids)
-                    // self._block_size
-                    * self._block_size
+                    // self._lmcache_chunk_size
+                    * self._lmcache_chunk_size
                 )
                 partial_end = min(
                     request.load_spec.lmcache_cached_tokens,
@@ -5379,7 +5390,8 @@ class LMCacheConnectorV1Impl:
                         partial_end - partial_start
                     ):
                         raise RuntimeError(
-                            f"PD decoder failed to restore prompt partial block "
+                            "PD decoder failed to restore prompt partial "
+                            "LMCache chunk "
                             f"for request {request.req_id}: range="
                             f"[{partial_start}, {partial_end}). Ensure "
                             "save_unfull_chunk=true on the prefill worker."
@@ -7368,13 +7380,17 @@ class LMCacheConnectorV1Impl:
     def _init_decode_window_save_start(self, tracker: RequestTracker) -> int:
         if tracker.decode_window_save_next_start is not None:
             return tracker.decode_window_save_next_start
-        start = tracker.prompt_len // self._block_size * self._block_size
+        start = (
+            tracker.prompt_len
+            // self._lmcache_chunk_size
+            * self._lmcache_chunk_size
+        )
         tracker.decode_window_save_anchor = start
         tracker.decode_window_save_next_start = start
         tracker.decode_window_save_committed_end = (
             min(tracker.decode_window_save_committed_end, start)
-            // self._block_size
-            * self._block_size
+            // self._lmcache_chunk_size
+            * self._lmcache_chunk_size
         )
         return start
 
@@ -7850,12 +7866,12 @@ class LMCacheConnectorV1Impl:
                     )
                 dsa_committed_end = (
                     lmcache_cached_for_sparse
-                    // self._block_size
-                    * self._block_size
+                    // self._lmcache_chunk_size
+                    * self._lmcache_chunk_size
                 )
                 if self.kv_role == "kv_consumer":
-                    # Include the final partial prompt block in worker metadata;
-                    # the release/remap frontier remains block aligned below.
+                    # Include the final partial prompt chunk in worker metadata;
+                    # the release/remap frontier remains LMCache-chunk aligned below.
                     lmcache_cached_for_sparse = max(
                         lmcache_cached_for_sparse, request_tracker.prompt_len
                     )
