@@ -771,12 +771,14 @@ class TestDecodeWindowSaveMetadata:
         req_id = "decode-window"
         prompt_len = 356
         prompt = list(range(prompt_len))
-        decode_tokens = list(range(10_000, 10_252))
+        # partial chunk [256, 356) plus 156 decode tokens reaches the
+        # first complete decode-save frontier at 512 exactly.
+        decode_tokens = list(range(10_000, 10_156))
         vllm_req = SimpleNamespace(
             request_id=req_id,
             num_prompt_tokens=prompt_len,
             prompt_token_ids=prompt,
-            num_computed_tokens=prompt_len + 251,
+            num_computed_tokens=prompt_len + 155,
             all_token_ids=prompt + decode_tokens,
         )
         impl._unfinished_requests[req_id] = vllm_req
@@ -814,12 +816,14 @@ class TestDecodeWindowSaveMetadata:
         req_id = "decode-window"
         prompt_len = 356
         prompt = list(range(prompt_len))
-        decode_tokens = list(range(10_000, 10_252))
+        # partial chunk [256, 356) plus 156 decode tokens reaches the
+        # first complete decode-save frontier at 512 exactly.
+        decode_tokens = list(range(10_000, 10_156))
         vllm_req = SimpleNamespace(
             request_id=req_id,
             num_prompt_tokens=prompt_len,
             prompt_token_ids=prompt,
-            num_computed_tokens=prompt_len + 251,
+            num_computed_tokens=prompt_len + 155,
             all_token_ids=prompt + decode_tokens,
         )
         impl._unfinished_requests[req_id] = vllm_req
@@ -856,7 +860,7 @@ class TestDecodeWindowSaveMetadata:
         assert req_meta.save_spec is not None
         assert req_meta.save_spec.skip_leading_tokens == 256
         assert req_meta.token_ids == prompt + decode_tokens
-        assert len(req_meta.slot_mapping[0]) == 608
+        assert len(req_meta.slot_mapping[0]) == 512
         assert tracker.num_saved_tokens == 256
         assert tracker.decode_window_save_next_start == 512
         assert tracker.decode_window_save_committed_end == 256
@@ -869,12 +873,13 @@ class TestDecodeWindowSaveMetadata:
         req_id = "decode-window"
         prompt_len = 356
         prompt = list(range(prompt_len))
-        decode_tokens = list(range(10_000, 10_251))
+        # One token short of the first chunk-anchored frontier at 512.
+        decode_tokens = list(range(10_000, 10_155))
         vllm_req = SimpleNamespace(
             request_id=req_id,
             num_prompt_tokens=prompt_len,
             prompt_token_ids=prompt,
-            num_computed_tokens=prompt_len + 250,
+            num_computed_tokens=prompt_len + 154,
             all_token_ids=prompt + decode_tokens,
         )
         impl._unfinished_requests[req_id] = vllm_req
