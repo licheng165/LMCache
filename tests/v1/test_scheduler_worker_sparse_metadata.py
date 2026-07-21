@@ -183,6 +183,80 @@ def test_decode_window_call_site_allocates_no_state_when_diag_disabled(
     meta.add_request.assert_not_called()
 
 
+def test_decode_window_anchor_is_partial_block_start_not_window_multiple() -> None:
+    impl = _make_scheduler_impl()
+    impl._decode_window_save_window_size = 512
+    tracker = RequestTracker(
+        req_id="anchored-window",
+        prompt_len=300,
+        token_ids=list(range(1400)),
+        allocated_block_ids=list(range(100)),
+        num_saved_tokens=300,
+    )
+    tracker.is_decode_phase = True
+    tracker.decode_window_save_committed_end = 300
+
+    assert impl._init_decode_window_save_start(tracker) == 288
+    assert tracker.decode_window_save_anchor == 288
+    assert tracker.decode_window_save_committed_end == 288
+
+
+def test_decode_window_merges_all_complete_windows_that_are_ready() -> None:
+    impl = _make_scheduler_impl()
+    impl._decode_window_save_window_size = 512
+    tracker = RequestTracker(
+        req_id="one-window-at-a-time",
+        prompt_len=300,
+        token_ids=list(range(1400)),
+        allocated_block_ids=list(range(100)),
+        num_saved_tokens=300,
+    )
+    tracker.is_decode_phase = True
+    meta = MagicMock()
+
+    impl._add_decode_window_save_metas(meta, tracker)
+
+    meta.add_request.assert_called_once()
+    emitted = meta.add_request.call_args.args[0]
+    assert emitted.decode_window_start == 288
+    assert emitted.decode_window_end == 1312
+    assert tracker.decode_window_save_inflight_end == 1312
+    assert tracker.decode_window_save_next_start == 1312
+
+    impl._add_decode_window_save_metas(meta, tracker)
+    meta.add_request.assert_called_once()
+
+    impl._request_trackers[tracker.req_id] = tracker
+    impl.update_connector_output(
+        SimpleNamespace(completed_decode_window_saves={tracker.req_id: 1312})
+    )
+    assert tracker.decode_window_save_committed_end == 1312
+    assert tracker.decode_window_save_inflight_end is None
+
+    tracker.token_ids.extend(range(1400, 1824))
+    impl._add_decode_window_save_metas(meta, tracker)
+    assert meta.add_request.call_count == 2
+    next_emitted = meta.add_request.call_args.args[0]
+    assert next_emitted.decode_window_start == 1312
+    assert next_emitted.decode_window_end == 1824
+
+
+def test_prefill_completion_publishes_only_block_aligned_frontier() -> None:
+    impl = _make_scheduler_impl()
+    impl._completed_decode_window_saves = {}
+    request = SimpleNamespace(
+        req_id="prefill-partial",
+        token_ids=list(range(300)),
+        is_last_prefill=True,
+        is_sparse_decode=False,
+        is_decode_window_save=False,
+    )
+
+    impl._mark_prefill_committed(request)
+
+    assert impl._completed_decode_window_saves == {"prefill-partial": 288}
+
+
 class TestBuildConnectorMetaSparseSyntheticLoadSpec:
     def test_sparse_decode_steps_synthesize_load_spec_and_sparse_tokens(self) -> None:
         impl = _make_scheduler_impl()
@@ -435,7 +509,7 @@ class TestBuildConnectorMetaSparseSyntheticLoadSpec:
         assert req_meta.slot_mapping[0].numel() == 512
         assert tracker.sparse_slot_mapping[0].numel() == 512
 
-    def test_decode_window_completion_is_clamped_to_emitted_save_frontier(self) -> None:
+    def test_decode_window_completion_rejects_unemitted_frontier(self) -> None:
         impl = _make_scheduler_impl()
         impl._decode_window_save_window_size = 256
         req_id = "sparse-window"
@@ -450,11 +524,10 @@ class TestBuildConnectorMetaSparseSyntheticLoadSpec:
         tracker.decode_window_save_committed_end = 256
         impl._request_trackers[req_id] = tracker
 
-        impl.update_connector_output(
-            SimpleNamespace(completed_decode_window_saves={req_id: 999})
-        )
-
-        assert tracker.decode_window_save_committed_end == 512
+        with pytest.raises(RuntimeError, match="exceeds request frontier"):
+            impl.update_connector_output(
+                SimpleNamespace(completed_decode_window_saves={req_id: 999})
+            )
 
     def test_decode_window_completion_ignored_before_save_frontier_exists(self) -> None:
         impl = _make_scheduler_impl()
@@ -476,7 +549,7 @@ class TestBuildConnectorMetaSparseSyntheticLoadSpec:
 
         assert tracker.decode_window_save_committed_end == 256
 
-    def test_decode_window_completion_is_clamped_to_known_token_length(self) -> None:
+    def test_decode_window_completion_rejects_unknown_token_frontier(self) -> None:
         impl = _make_scheduler_impl()
         impl._decode_window_save_window_size = 256
         req_id = "sparse-window"
@@ -491,34 +564,36 @@ class TestBuildConnectorMetaSparseSyntheticLoadSpec:
         tracker.decode_window_save_committed_end = 256
         impl._request_trackers[req_id] = tracker
 
-        impl.update_connector_output(
-            SimpleNamespace(completed_decode_window_saves={req_id: 512})
-        )
+        with pytest.raises(RuntimeError, match="exceeds request frontier"):
+            impl.update_connector_output(
+                SimpleNamespace(completed_decode_window_saves={req_id: 512})
+            )
 
-        assert tracker.decode_window_save_committed_end == 256
-
-    def test_decode_window_completion_clamp_preserves_nonzero_window_start(self) -> None:
+    def test_decode_window_completion_uses_partial_block_anchor(self) -> None:
         impl = _make_scheduler_impl()
         impl._decode_window_save_window_size = 512
         req_id = "sparse-window"
         tracker = RequestTracker(
             req_id=req_id,
             prompt_len=300,
-            token_ids=list(range(768)),
+            token_ids=list(range(800)),
             allocated_block_ids=list(range(60)),
             num_saved_tokens=300,
         )
-        tracker.decode_window_save_next_start = 768
-        tracker.decode_window_save_committed_end = 300
+        tracker.decode_window_save_anchor = 288
+        tracker.decode_window_save_next_start = 800
+        tracker.decode_window_save_inflight_end = 800
+        tracker.decode_window_save_committed_end = 288
         impl._request_trackers[req_id] = tracker
 
         impl.update_connector_output(
-            SimpleNamespace(completed_decode_window_saves={req_id: 768})
+            SimpleNamespace(completed_decode_window_saves={req_id: 800})
         )
 
-        assert tracker.decode_window_save_committed_end == 768
+        assert tracker.decode_window_save_committed_end == 800
+        assert tracker.decode_window_save_inflight_end is None
 
-    def test_decode_window_completion_partial_value_clamps_to_previous_boundary(self) -> None:
+    def test_decode_window_completion_rejects_partial_value(self) -> None:
         impl = _make_scheduler_impl()
         impl._decode_window_save_window_size = 512
         req_id = "sparse-window"
@@ -530,14 +605,14 @@ class TestBuildConnectorMetaSparseSyntheticLoadSpec:
             num_saved_tokens=300,
         )
         tracker.decode_window_save_next_start = 768
-        tracker.decode_window_save_committed_end = 300
+        tracker.decode_window_save_anchor = 288
+        tracker.decode_window_save_committed_end = 288
         impl._request_trackers[req_id] = tracker
 
-        impl.update_connector_output(
-            SimpleNamespace(completed_decode_window_saves={req_id: 700})
-        )
-
-        assert tracker.decode_window_save_committed_end == 300
+        with pytest.raises(RuntimeError, match="unexpected frontier"):
+            impl.update_connector_output(
+                SimpleNamespace(completed_decode_window_saves={req_id: 700})
+            )
 
     def test_decode_window_sparse_load_uses_nonzero_save_frontier(self) -> None:
         impl = _make_scheduler_impl()

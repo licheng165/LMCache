@@ -442,6 +442,8 @@ class LoadSpec:
     lmcache_cached_tokens: int
     # Whether the scheduler allow us to load the tokens
     can_load: bool
+    # Block-aligned frontier that sparse decode may remap from LMCache.
+    dsa_committed_end: Optional[int] = None
 
 
 @dataclass
@@ -556,6 +558,8 @@ class RequestTracker:
     sparse_decode_ret_mask: Optional[torch.Tensor] = field(default=None, repr=False)
     # Decode window save only: independent progress for decode-window chunks.
     decode_window_save_next_start: Optional[int] = field(default=None, repr=False)
+    decode_window_save_anchor: Optional[int] = field(default=None, repr=False)
+    decode_window_save_inflight_end: Optional[int] = field(default=None, repr=False)
     # Decode window save only: highest token boundary confirmed readable from
     # LMCache by worker-side completion output.
     decode_window_save_committed_end: int = field(default=0, repr=False)
@@ -676,6 +680,8 @@ class RequestTracker:
             self.num_saved_tokens = lmcache_cached_tokens
             self.decode_window_save_committed_end = lmcache_cached_tokens
             self.decode_window_save_next_start = None
+            self.decode_window_save_anchor = None
+            self.decode_window_save_inflight_end = None
             num_computed_tokens = max(lmcache_cached_tokens, vllm_cached_tokens)
 
             # FIX: For preempted requests, restore token_ids from the full
@@ -1641,6 +1647,17 @@ class LMCacheConnectorV1Impl:
             raise ValueError(
                 "decode_window_save_window_size must be a multiple of "
                 f"lmcache chunk_size ({self._lmcache_chunk_size}), got {window_size}"
+            )
+        if window_size % self._block_size != 0:
+            raise ValueError(
+                "decode_window_save_window_size must be a multiple of vLLM "
+                f"block_size ({self._block_size}), got {window_size}. Configure "
+                "an external window size of N * block_size."
+            )
+        if not config.save_unfull_chunk:
+            raise ValueError(
+                "decode window save requires save_unfull_chunk=true so the "
+                "prefill partial block is available to a PD decoder."
             )
 
         logger.info(
@@ -3169,6 +3186,21 @@ class LMCacheConnectorV1Impl:
             )
         self._clear_decode_window_save_groups_for_window(request)
 
+    def _mark_prefill_committed(self, request: ReqMeta) -> None:
+        """Publish the full-block prefill frontier after its save completes."""
+        if (
+            not request.is_last_prefill
+            or request.is_sparse_decode
+            or self._is_decode_window_save_request(request)
+        ):
+            return
+        committed_end = len(request.token_ids) // self._block_size * self._block_size
+        completed = getattr(self, "_completed_decode_window_saves", None)
+        if completed is not None and committed_end > 0:
+            completed[request.req_id] = max(
+                completed.get(request.req_id, 0), committed_end
+            )
+
     def get_completed_decode_window_saves(self) -> dict[str, int]:
         completed = getattr(self, "_completed_decode_window_saves", None)
         if not completed:
@@ -3188,32 +3220,63 @@ class LMCacheConnectorV1Impl:
             committed_end = int(window_end)
             window_size = int(getattr(self, "_decode_window_save_window_size", 0) or 0)
             if window_size > 0 and tracker.decode_window_save_next_start is None:
-                logger.debug(
-                    "Ignoring decode-window completion before scheduler "
-                    "emitted any save window: req_id=%s window_end=%s",
-                    req_id,
-                    window_end,
+                prefill_end = (
+                    tracker.prompt_len // self._block_size * self._block_size
                 )
-                continue
-            if tracker.decode_window_save_next_start is not None:
-                next_start = int(tracker.decode_window_save_next_start)
-                committed_end = min(
-                    committed_end,
-                    next_start,
+                if committed_end != prefill_end:
+                    logger.debug(
+                        "Ignoring completion before the initial prefill "
+                        "frontier: req_id=%s completed_end=%s expected=%s",
+                        req_id,
+                        window_end,
+                        prefill_end,
+                    )
+                    continue
+                tracker.decode_window_save_anchor = prefill_end
+                tracker.decode_window_save_next_start = prefill_end
+            if committed_end > len(tracker.token_ids):
+                raise RuntimeError(
+                    f"LMCache committed_end={committed_end} exceeds request "
+                    f"frontier={len(tracker.token_ids)} for request {req_id}."
                 )
-                committed_end = min(committed_end, len(tracker.token_ids))
-                if window_size > 0 and committed_end < next_start:
-                    delta = next_start - committed_end
-                    windows_back = (delta + window_size - 1) // window_size
-                    committed_end = max(0, next_start - windows_back * window_size)
-            else:
-                committed_end = min(committed_end, len(tracker.token_ids))
-                if window_size > 0:
-                    committed_end = committed_end // window_size * window_size
+            if (
+                tracker.decode_window_save_next_start is not None
+                and committed_end
+                != int(tracker.decode_window_save_next_start)
+            ):
+                raise RuntimeError(
+                    f"LMCache completed unexpected frontier {committed_end} "
+                    f"for request {req_id}; expected emitted frontier "
+                    f"{tracker.decode_window_save_next_start}."
+                )
+            if committed_end % self._block_size:
+                raise RuntimeError(
+                    f"LMCache reported unaligned committed_end={committed_end} "
+                    f"for request {req_id}; block_size={self._block_size}."
+                )
+            anchor = tracker.decode_window_save_anchor
+            if anchor is None:
+                anchor = tracker.prompt_len // self._block_size * self._block_size
+                tracker.decode_window_save_anchor = anchor
+            if (
+                window_size > 0
+                and anchor is not None
+                and (committed_end - anchor) % window_size
+            ):
+                raise RuntimeError(
+                    f"LMCache committed_end={committed_end} is not on the "
+                    f"decode-window lattice anchor={anchor}, window_size={window_size} "
+                    f"for request {req_id}."
+                )
             committed_before = tracker.decode_window_save_committed_end
             tracker.decode_window_save_committed_end = max(
                 committed_before, committed_end
             )
+            if (
+                tracker.decode_window_save_inflight_end is not None
+                and committed_end >= tracker.decode_window_save_inflight_end
+            ):
+                tracker.decode_window_save_inflight_end = None
             _mtp_dw_event(
                 "commit",
                 req=req_id,
@@ -3239,6 +3302,8 @@ class LMCacheConnectorV1Impl:
                 )
 
     def _prune_worker_retrieve_state(self, active_req_ids: set[str]) -> None:
+        if hasattr(self, "_pd_partial_restored_req_ids"):
+            self._pd_partial_restored_req_ids.intersection_update(active_req_ids)
         if not hasattr(self, "_worker_retrieve_state"):
             return
         dropped_req_ids = set(self._worker_retrieve_state) - active_req_ids
@@ -5277,6 +5342,49 @@ class LMCacheConnectorV1Impl:
             token_mask = self._load_token_mask_for_retrieve(
                 request, token_count, self._lmcache_chunk_size
             )
+            # A PD decoder did not execute prefill locally. Materialize the
+            # prompt's final partial block into the request's ordinary paged
+            # NPU cache once, before sparse selected-token loads start using
+            # the independent scratch blocks.
+            if request.is_sparse_decode and self.kv_role == "kv_consumer":
+                restored = getattr(self, "_pd_partial_restored_req_ids", None)
+                if restored is None:
+                    restored = set()
+                    self._pd_partial_restored_req_ids = restored
+                partial_start = int(
+                    request.load_spec.dsa_committed_end
+                    if request.load_spec.dsa_committed_end is not None
+                    else len(request.token_ids)
+                    // self._block_size
+                    * self._block_size
+                )
+                partial_end = min(
+                    request.load_spec.lmcache_cached_tokens,
+                    len(request.token_ids),
+                )
+                if partial_start < partial_end and request.req_id not in restored:
+                    partial_mask = torch.zeros(token_count, dtype=torch.bool)
+                    partial_mask[partial_start:partial_end] = True
+                    partial_slots = slot_mapping[:token_count]
+                    restored_mask = self.lmcache_engine.retrieve(
+                        retrieve_tokens,
+                        partial_mask,
+                        kvcaches=kvcaches,
+                        slot_mapping=partial_slots,
+                        vllm_cached_tokens=partial_start,
+                        request_configs=request.request_configs,
+                        req_id=request.req_id,
+                    )
+                    if int(restored_mask[partial_start:partial_end].sum()) != (
+                        partial_end - partial_start
+                    ):
+                        raise RuntimeError(
+                            f"PD decoder failed to restore prompt partial block "
+                            f"for request {request.req_id}: range="
+                            f"[{partial_start}, {partial_end}). Ensure "
+                            "save_unfull_chunk=true on the prefill worker."
+                        )
+                    restored.add(request.req_id)
             if (
                 not request.is_sparse_decode
                 and token_count > len(slot_mapping)
@@ -6801,6 +6909,7 @@ class LMCacheConnectorV1Impl:
                             )
                 self._maybe_seed_worker_retrieve_state_from_store(request)
                 self._mark_decode_window_save_completed(request)
+                self._mark_prefill_committed(request)
                 self._maybe_lookup_unpin_for_request(request)
             return
 
@@ -6889,6 +6998,7 @@ class LMCacheConnectorV1Impl:
             )
             self._record_decode_window_save_group_completed(request, 0)
             self._mark_decode_window_save_completed(request)
+            self._mark_prefill_committed(request)
 
             # Update skip_leading_tokens only on last rank to ensure
             # each PP stage stores its own KV cache
@@ -7258,19 +7368,13 @@ class LMCacheConnectorV1Impl:
     def _init_decode_window_save_start(self, tracker: RequestTracker) -> int:
         if tracker.decode_window_save_next_start is not None:
             return tracker.decode_window_save_next_start
-        prompt_chunk_start = (
-            tracker.prompt_len // self._lmcache_chunk_size * self._lmcache_chunk_size
-        )
-        saved_chunk_start = (
-            tracker.num_saved_tokens
-            // self._lmcache_chunk_size
-            * self._lmcache_chunk_size
-        )
-        start = max(prompt_chunk_start, saved_chunk_start)
+        start = tracker.prompt_len // self._block_size * self._block_size
+        tracker.decode_window_save_anchor = start
         tracker.decode_window_save_next_start = start
-        tracker.decode_window_save_committed_end = max(
-            tracker.decode_window_save_committed_end,
-            min(start, len(tracker.token_ids)),
+        tracker.decode_window_save_committed_end = (
+            tracker.decode_window_save_committed_end
+            // self._block_size
+            * self._block_size
         )
         return start
 
@@ -7287,9 +7391,18 @@ class LMCacheConnectorV1Impl:
         next_start = self._init_decode_window_save_start(tracker)
         self._trace_decode_window_decision(tracker)
 
-        while len(tracker.token_ids) >= next_start + window_size:
+        if tracker.decode_window_save_inflight_end is not None:
+            return
+
+        available_end = next_start + (
+            (len(tracker.token_ids) - next_start) // window_size * window_size
+        )
+        while available_end > next_start:
             window_start = next_start
-            window_end = window_start + window_size
+            # Catch up in one store when decode has crossed multiple complete
+            # windows. committed_end advances only after this whole range is
+            # reported complete by the worker.
+            window_end = available_end
             req_meta = ReqMeta.from_decode_window_save(
                 tracker,
                 self._block_size,
@@ -7341,7 +7454,7 @@ class LMCacheConnectorV1Impl:
                 )
                 if (
                     window_end > len(tracker.token_ids)
-                    or window_end - window_start != window_size
+                    or (window_end - tracker.decode_window_save_anchor) % window_size
                 ):
                     _mtp_dw_event(
                         "fail",
@@ -7428,7 +7541,8 @@ class LMCacheConnectorV1Impl:
             )
             meta.add_request(req_meta)
             tracker.decode_window_save_next_start = window_end
-            next_start = window_end
+            tracker.decode_window_save_inflight_end = window_end
+            break
 
     @_lmcache_nvtx_annotate
     def build_connector_meta(
@@ -7683,6 +7797,8 @@ class LMCacheConnectorV1Impl:
                     tokens_to_keep,
                 )
                 request_tracker.decode_window_save_next_start = None
+                request_tracker.decode_window_save_anchor = None
+                request_tracker.decode_window_save_inflight_end = None
 
             # Pass all_token_ids for preempted requests to restore
             # token_ids correctly for chunk key computation
@@ -7732,10 +7848,22 @@ class LMCacheConnectorV1Impl:
                         save_frontier,
                         token_len,
                     )
+                dsa_committed_end = (
+                    lmcache_cached_for_sparse
+                    // self._block_size
+                    * self._block_size
+                )
+                if self.kv_role == "kv_consumer":
+                    # Include the final partial prompt block in worker metadata;
+                    # the release/remap frontier remains block aligned below.
+                    lmcache_cached_for_sparse = max(
+                        lmcache_cached_for_sparse, request_tracker.prompt_len
+                    )
                 load_spec = LoadSpec(
                     vllm_cached_tokens=0,
                     lmcache_cached_tokens=lmcache_cached_for_sparse,
                     can_load=lmcache_cached_for_sparse > 0,
+                    dsa_committed_end=dsa_committed_end,
                 )
 
             req_meta = ReqMeta.from_request_tracker(
