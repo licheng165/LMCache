@@ -46,6 +46,7 @@ from lmcache.v1.config import LMCacheEngineConfig
 from lmcache.v1.config_base import validate_and_set_config_value
 from lmcache.v1.gpu_connector.sparse import (
     PreparedSparseSource,
+    PreparedSparseSourceLayer,
     build_prepared_sparse_source,
 )
 from lmcache.v1.manager import LMCacheManager
@@ -683,6 +684,9 @@ class WorkerRetrieveState:
         default_factory=dict,
         repr=False,
     )
+    prepared_sparse_prefix_sources: dict[
+        tuple[int, int], PreparedSparseSource
+    ] = field(default_factory=dict, repr=False)
 
 
 @dataclass
@@ -2135,11 +2139,12 @@ class LMCacheConnectorV1Impl:
         retrieve_token_count = self._shared_retrieve_token_count_for_request(
             request
         )
-        prepared_latent = state.prepared_sparse_sources.get(0)
-        if (
-            prepared_latent is not None
-            and prepared_latent.total_tokens == retrieve_token_count
-        ):
+        prepared_latent = self._prepared_sparse_source(
+            state,
+            0,
+            retrieve_token_count,
+        )
+        if prepared_latent is not None:
             if state.req_id != request.req_id:
                 raise RuntimeError(
                     "Shared CPU sparse decode request identity changed before "
@@ -2151,10 +2156,24 @@ class LMCacheConnectorV1Impl:
             # process generation and request identity can invalidate it here.
             return
 
-        expected_scope_token = self._shared_request_scope_token_for_request(
-            request,
-            current_generation,
+        tail_refresh_prefix = self._shared_tail_refresh_prefix_chunks(
+            state,
+            0,
+            retrieve_token_count,
         )
+        if tail_refresh_prefix is not None:
+            expected_scope_token = self._shared_request_scope_token(
+                request.req_id,
+                current_generation,
+                state.token_count,
+            )
+            validation_token_count = int(state.token_count)
+        else:
+            expected_scope_token = self._shared_request_scope_token_for_request(
+                request,
+                current_generation,
+            )
+            validation_token_count = retrieve_token_count
         if state.request_scope_token != expected_scope_token:
             raise RuntimeError(
                 "Shared CPU sparse decode request scope mismatch before "
@@ -2198,7 +2217,7 @@ class LMCacheConnectorV1Impl:
         if not self._cached_ranges_cover_prefix(
             state.cached_starts,
             state.cached_ends,
-            retrieve_token_count,
+            validation_token_count,
         ):
             cached_ranges = list(
                 zip(state.cached_starts, state.cached_ends, strict=False)
@@ -2207,7 +2226,7 @@ class LMCacheConnectorV1Impl:
                 "Shared CPU sparse decode hot path has non-contiguous MLA "
                 "latent prefix coverage before transfer: "
                 f"req_id={request.req_id}, kv_group=0, "
-                f"token_count={retrieve_token_count}, "
+                f"token_count={validation_token_count}, "
                 f"cached_ranges={cached_ranges}"
             )
         expected_layers = int(getattr(self, "num_layers", 0) or 0)
@@ -3202,6 +3221,7 @@ class LMCacheConnectorV1Impl:
         state.last_shared_scope_release_token_count = state.token_count
         # Drop bindings before releasing the MemoryObjs that back their tensors.
         state.prepared_sparse_sources.clear()
+        state.prepared_sparse_prefix_sources.clear()
         if engine is not None and state.shared_request_active:
             release_fn = getattr(engine, "release_shared_cpu_sparse_request", None)
             if callable(release_fn):
@@ -3559,6 +3579,9 @@ class LMCacheConnectorV1Impl:
                 state.last_shared_scope_release_token_count
             ),
             "prepared_sparse_sources": dict(state.prepared_sparse_sources),
+            "prepared_sparse_prefix_sources": dict(
+                state.prepared_sparse_prefix_sources
+            ),
         }
 
     @staticmethod
@@ -3943,6 +3966,33 @@ class LMCacheConnectorV1Impl:
                         return "shared_request_identity_changed"
                     if state.shared_generation != generation:
                         return "shared_generation_changed"
+                    if (
+                        self._prepared_sparse_source(state, 0, token_count)
+                        is not None
+                    ):
+                        return None
+                    latent_tail_prefix = self._shared_tail_refresh_prefix_chunks(
+                        state,
+                        0,
+                        token_count,
+                    )
+                    if latent_tail_prefix is not None:
+                        if (
+                            self._is_dsa_two_groups()
+                            and self._sparse_decode_requires_index_materialization(
+                                request,
+                                True,
+                            )
+                            and state.cached_tensors_indexer
+                            and self._shared_tail_refresh_prefix_chunks(
+                                state,
+                                1,
+                                token_count,
+                            )
+                            is None
+                        ):
+                            return "shared_index_tail_refresh_unavailable"
+                        return None
                     if prepared_latent.total_tokens != token_count:
                         return "prepared_token_count_changed"
                 else:
@@ -3976,6 +4026,68 @@ class LMCacheConnectorV1Impl:
             return "dense_lmcache_cached_prefix_grew"
         return None
 
+    def _shared_tail_refresh_prefix_chunks(
+        self,
+        state: Optional[WorkerRetrieveState],
+        kv_group: int,
+        token_count: int,
+    ) -> Optional[int]:
+        """Return the stable chunk prefix for a shared-CPU tail-only refresh."""
+        if state is None or not state.shared_request_active:
+            return None
+        engine = getattr(self, "lmcache_engine", None)
+        if engine is None or not getattr(engine, "enable_shared_cpu_cache", False):
+            return None
+        generation = int(getattr(engine, "shared_cpu_cache_generation", 0) or 0)
+        if int(state.shared_generation or 0) != generation:
+            return None
+        token_count = int(token_count)
+        if token_count <= int(state.token_count or 0):
+            return None
+
+        cache = _retrieve_cache_kwargs(
+            state,
+            kv_group=kv_group,
+            dsa_two_groups=self._is_dsa_two_groups(),
+        )
+        starts = cache["cached_starts"]
+        ends = cache["cached_ends"]
+        if not starts or len(starts) != len(ends) or int(starts[0]) != 0:
+            return None
+
+        chunk_size = int(getattr(self, "_lmcache_chunk_size", 0) or 0)
+        if chunk_size <= 0:
+            return None
+        stable_tokens = int(state.token_count) // chunk_size * chunk_size
+        if stable_tokens <= 0:
+            return None
+
+        covered = 0
+        prefix_chunks = 0
+        for start, end in zip(starts, ends, strict=False):
+            start = int(start)
+            end = int(end)
+            if start != covered or end <= start or end > stable_tokens:
+                break
+            covered = end
+            prefix_chunks += 1
+        if covered != stable_tokens or prefix_chunks <= 0:
+            return None
+
+        num_layers = self._num_layers_for_group(kv_group)
+        data_cache = cache["cached_tensors"] or cache["cached_memory_objs"]
+        if len(data_cache) != num_layers or any(
+            layer is None or len(layer) < prefix_chunks for layer in data_cache
+        ):
+            return None
+        pointer_cache = cache["cached_chunk_ptrs_npu"]
+        if len(pointer_cache) != num_layers or any(
+            ptrs is None or int(ptrs.numel()) < prefix_chunks
+            for ptrs in pointer_cache
+        ):
+            return None
+        return prefix_chunks
+
     def _should_invalidate_worker_retrieve_state(
         self, request: ReqMeta, token_count: int
     ) -> bool:
@@ -3984,8 +4096,8 @@ class LMCacheConnectorV1Impl:
             is not None
         )
 
-    @staticmethod
     def _prepared_sparse_source_miss_reason(
+        self,
         state: Optional[WorkerRetrieveState],
         kv_group: int,
         token_count: int,
@@ -4005,6 +4117,15 @@ class LMCacheConnectorV1Impl:
         source = state.prepared_sparse_sources.get(kv_group)
         if source is None:
             return "prepared_source_missing"
+        if (
+            self._shared_tail_refresh_prefix_chunks(
+                state,
+                kv_group,
+                token_count,
+            )
+            is not None
+        ):
+            return "shared_tail_refresh"
         if source.total_tokens != token_count:
             return "prepared_source_token_count_mismatch"
         return "prepared_source_rejected_unknown"
@@ -4040,6 +4161,62 @@ class LMCacheConnectorV1Impl:
         request.cached_chunk_dev_ptrs_indexer = state.cached_chunk_dev_ptrs_indexer
         request.cached_chunk_ptrs_npu_indexer = state.cached_chunk_ptrs_npu_indexer
         request.cached_shared_handles_indexer = state.cached_shared_handles_indexer
+
+    def _bind_worker_retrieve_prefix_to_request(
+        self,
+        request: ReqMeta,
+        state: WorkerRetrieveState,
+        prefix_chunks_by_group: dict[int, int],
+    ) -> None:
+        """Bind shallow prefix views so a failed tail refresh leaves state intact."""
+
+        def sliced_layers(values: list, count: int) -> list:
+            return [
+                list(layer[:count]) if isinstance(layer, (list, tuple)) else layer
+                for layer in (values or [])
+            ]
+
+        def sliced_ptrs(values: list, count: int) -> list:
+            return [
+                value[:count] if isinstance(value, torch.Tensor) else value
+                for value in (values or [])
+            ]
+
+        dsa_two_groups = self._is_dsa_two_groups()
+        for kv_group, prefix_chunks in prefix_chunks_by_group.items():
+            source = _retrieve_cache_kwargs(
+                state,
+                kv_group=kv_group,
+                dsa_two_groups=dsa_two_groups,
+            )
+            suffix = "_indexer" if dsa_two_groups and kv_group == 1 else ""
+            setattr(
+                request,
+                f"cached_starts{suffix}",
+                list(source["cached_starts"][:prefix_chunks]),
+            )
+            setattr(
+                request,
+                f"cached_ends{suffix}",
+                list(source["cached_ends"][:prefix_chunks]),
+            )
+            for cache_name in (
+                "cached_keys",
+                "cached_memory_objs",
+                "cached_tensors",
+                "cached_chunk_dev_ptrs",
+                "cached_shared_handles",
+            ):
+                setattr(
+                    request,
+                    f"{cache_name}{suffix}",
+                    sliced_layers(source[cache_name], prefix_chunks),
+                )
+            setattr(
+                request,
+                f"cached_chunk_ptrs_npu{suffix}",
+                sliced_ptrs(source["cached_chunk_ptrs_npu"], prefix_chunks),
+            )
 
     def _bind_worker_retrieve_state_to_request(
         self,
@@ -4455,9 +4632,9 @@ class LMCacheConnectorV1Impl:
             # objects during decode-window save. If it privately merges those
             # chunks into its hot sparse state, the next decode step can diverge:
             # rank0 takes the cached path while passive ranks wait for a fresh
-            # broadcast. Leave all ranks on the old scope; the next sparse load
-            # invalidates it and refreshes shared handles once, in ordered TP
-            # collective flow.
+            # broadcast. Leave all ranks on the common old scope; the next
+            # sparse load preserves its stable prefix and publishes only the
+            # replaced/appended tail in ordered TP collective flow.
             existing_state = self._worker_retrieve_state.get(request.req_id)
             logger.info(
                 "[P2D_DECODE_WINDOW_STATE_REFRESH_DEFERRED] req=%s "
@@ -4465,7 +4642,7 @@ class LMCacheConnectorV1Impl:
                 "window_start=%s window_end=%s request_tokens=%d "
                 "saved_chunks_g0=%d saved_chunks_g1=%d "
                 "state_token_count=%s shared_active=%s prepared_tokens=%s "
-                "action=skip_local_merge_next_sparse_load_will_refresh",
+                "action=skip_local_merge_next_sparse_load_will_refresh_tail",
                 request.req_id,
                 getattr(request, "decode_window_start", None),
                 getattr(request, "decode_window_end", None),
@@ -4618,6 +4795,7 @@ class LMCacheConnectorV1Impl:
         token_count: int,
     ) -> None:
         """Seal complete per-group source caches after bootstrap or store."""
+        state.prepared_sparse_prefix_sources.clear()
         prepared: dict[int, PreparedSparseSource] = {}
         dsa_two_groups = self._is_dsa_two_groups()
         group_ids = (0, 1) if dsa_two_groups else (0,)
@@ -4691,6 +4869,44 @@ class LMCacheConnectorV1Impl:
                 )
         state.prepared_sparse_sources = prepared
 
+    @staticmethod
+    def _prepared_sparse_prefix_source(
+        source: PreparedSparseSource,
+        token_count: int,
+    ) -> Optional[PreparedSparseSource]:
+        """Return a zero-copy chunk-aligned prefix view of a prepared source."""
+        if not isinstance(source, PreparedSparseSource):
+            return None
+        token_count = int(token_count)
+        if token_count <= 0 or token_count >= source.total_tokens:
+            return None
+        if not source.chunk_token_counts:
+            return None
+
+        covered = 0
+        prefix_chunks = 0
+        for chunk_tokens in source.chunk_token_counts:
+            covered += int(chunk_tokens)
+            prefix_chunks += 1
+            if covered >= token_count:
+                break
+        if covered != token_count or prefix_chunks <= 0:
+            return None
+
+        layers = tuple(
+            PreparedSparseSourceLayer(
+                tensors=layer.tensors[:prefix_chunks],
+                chunk_ptrs_npu=layer.chunk_ptrs_npu[:prefix_chunks],
+            )
+            for layer in source.layers
+        )
+        return PreparedSparseSource(
+            layers=layers,
+            total_tokens=token_count,
+            chunk_token_counts=source.chunk_token_counts[:prefix_chunks],
+            pointer_device=source.pointer_device,
+        )
+
     def _prepared_sparse_source(
         self,
         state: Optional[WorkerRetrieveState],
@@ -4707,9 +4923,18 @@ class LMCacheConnectorV1Impl:
         ):
             return None
         source = state.prepared_sparse_sources.get(kv_group)
-        if source is None or source.total_tokens != token_count:
+        if source is None:
             return None
-        return source
+        if source.total_tokens == token_count:
+            return source
+        cache_key = (int(kv_group), int(token_count))
+        prefix_source = state.prepared_sparse_prefix_sources.get(cache_key)
+        if prefix_source is not None:
+            return prefix_source
+        prefix_source = self._prepared_sparse_prefix_source(source, token_count)
+        if prefix_source is not None:
+            state.prepared_sparse_prefix_sources[cache_key] = prefix_source
+        return prefix_source
 
     def _prepared_sparse_sources_current(
         self,
@@ -5010,39 +5235,6 @@ class LMCacheConnectorV1Impl:
                 self.use_layerwise,
             )
 
-        active_req_ids = {
-            req.req_id
-            for req in metadata.requests
-            if not self._is_decode_window_save_request(req)
-        }
-        shared_scope_prune_candidates = sorted(
-            req_id
-            for req_id, state in getattr(
-                self, "_worker_retrieve_state", {}
-            ).items()
-            if req_id not in active_req_ids and state.shared_request_active
-        )
-        if shared_scope_prune_candidates:
-            request_kinds = [
-                (
-                    f"{req.req_id}:decode_window_save"
-                    if self._is_decode_window_save_request(req)
-                    else f"{req.req_id}:sparse_load"
-                    if req.is_sparse_decode
-                    else f"{req.req_id}:other"
-                )
-                for req in metadata.requests
-            ]
-            logger.info(
-                "[P2D_CONNECTOR_METADATA_STATE_GAP] "
-                "prune_candidates=%s active_req_ids=%s metadata_requests=%s "
-                "reason=request_absent_from_non_save_metadata",
-                shared_scope_prune_candidates,
-                sorted(active_req_ids),
-                request_kinds,
-            )
-        self._prune_worker_retrieve_state(active_req_ids)
-
         assert len(self.kv_caches) > 0
         if not self._kvcaches_list:
             self._refresh_kvcaches_list()
@@ -5301,10 +5493,44 @@ class LMCacheConnectorV1Impl:
                             False,
                         )
                     )
+                    tail_refresh_prefixes: dict[int, int] = {}
+                    if shared_cpu_enabled and bound_state is not None:
+                        latent_prefix = self._shared_tail_refresh_prefix_chunks(
+                            bound_state,
+                            0,
+                            token_count,
+                        )
+                        if latent_prefix is not None:
+                            tail_refresh_prefixes[0] = latent_prefix
+                            if (
+                                dsa_two_groups
+                                and self._sparse_decode_requires_index_materialization(
+                                    request,
+                                    True,
+                                )
+                                and bound_state.cached_tensors_indexer
+                            ):
+                                index_prefix = (
+                                    self._shared_tail_refresh_prefix_chunks(
+                                        bound_state,
+                                        1,
+                                        token_count,
+                                    )
+                                )
+                                if index_prefix is None:
+                                    tail_refresh_prefixes.clear()
+                                else:
+                                    tail_refresh_prefixes[1] = index_prefix
+                    if tail_refresh_prefixes:
+                        self._bind_worker_retrieve_prefix_to_request(
+                            request,
+                            bound_state,
+                            tail_refresh_prefixes,
+                        )
                     latent_prepared = self._prepared_sparse_source(
                         bound_state, 0, token_count
                     )
-                    legacy_cache_bound = False
+                    legacy_cache_bound = bool(tail_refresh_prefixes)
                     shared_cpu_preflight_state: Optional[dict[str, Any]] = None
                     if latent_prepared is not None:
                         retrieve_kwargs: dict[str, Any] = {
@@ -5328,7 +5554,20 @@ class LMCacheConnectorV1Impl:
                                 invalidation_reason=invalidation_reason,
                             )
                         )
-                        if shared_cpu_enabled:
+                        latent_tail_prefix = tail_refresh_prefixes.get(0)
+                        if shared_cpu_enabled and latent_tail_prefix is not None:
+                            logger.info(
+                                "[P2D_SHARED_CPU_TAIL_PREFLIGHT_TRIGGER] "
+                                "req=%s kv_group=0 reason=%s "
+                                "incoming_token_count=%d state_token_count=%d "
+                                "prefix_chunks=%d action=refresh_tail_chunks",
+                                request.req_id,
+                                latent_rebuild_reason,
+                                token_count,
+                                bound_state.token_count,
+                                latent_tail_prefix,
+                            )
+                        elif shared_cpu_enabled:
                             logger.info(
                                 "[P2D_SHARED_CPU_FULL_PREFLIGHT_TRIGGER] "
                                 "req=%s kv_group=0 reason=%s "
@@ -5371,7 +5610,7 @@ class LMCacheConnectorV1Impl:
                                     else None
                                 ),
                             )
-                        if bound_state is not None:
+                        if bound_state is not None and not legacy_cache_bound:
                             self._bind_worker_retrieve_cache_to_request(
                                 request,
                                 bound_state,
@@ -5403,6 +5642,10 @@ class LMCacheConnectorV1Impl:
                             retrieve_kwargs["shared_cpu_rebuild_reason"] = (
                                 latent_rebuild_reason
                             )
+                        if latent_tail_prefix is not None:
+                            retrieve_kwargs[
+                                "shared_cpu_refresh_prefix_chunks"
+                            ] = latent_tail_prefix
                         if shared_cpu_enabled and bound_state is not None:
                             existing_layers = (
                                 bound_state.rank0_backing_objs_by_group.get(0)
@@ -5542,7 +5785,24 @@ class LMCacheConnectorV1Impl:
                                         invalidation_reason=invalidation_reason,
                                     )
                                 )
-                                if shared_cpu_enabled:
+                                index_tail_prefix = tail_refresh_prefixes.get(1)
+                                if (
+                                    shared_cpu_enabled
+                                    and index_tail_prefix is not None
+                                ):
+                                    logger.info(
+                                        "[P2D_SHARED_CPU_TAIL_PREFLIGHT_TRIGGER] "
+                                        "req=%s kv_group=1 reason=%s "
+                                        "incoming_token_count=%d "
+                                        "state_token_count=%d prefix_chunks=%d "
+                                        "action=refresh_tail_chunks",
+                                        request.req_id,
+                                        indexer_rebuild_reason,
+                                        token_count,
+                                        bound_state.token_count,
+                                        index_tail_prefix,
+                                    )
+                                elif shared_cpu_enabled:
                                     logger.info(
                                         "[P2D_SHARED_CPU_FULL_PREFLIGHT_TRIGGER] "
                                         "req=%s kv_group=1 reason=%s "
@@ -5629,6 +5889,10 @@ class LMCacheConnectorV1Impl:
                                     indexer_kwargs[
                                         "shared_cpu_rebuild_reason"
                                     ] = indexer_rebuild_reason
+                                if index_tail_prefix is not None:
+                                    indexer_kwargs[
+                                        "shared_cpu_refresh_prefix_chunks"
+                                    ] = index_tail_prefix
                                 if shared_cpu_enabled and bound_state is not None:
                                     existing_layers = (
                                         bound_state.rank0_backing_objs_by_group.get(1)
@@ -7209,6 +7473,7 @@ class LMCacheConnectorV1Impl:
     def get_finished(
         self, finished_req_ids: set[str]
     ) -> tuple[Optional[set[str]], Optional[set[str]]]:
+        self._release_finished_worker_requests(finished_req_ids)
         return None, None
 
     def get_block_ids_with_load_errors(self) -> set[int]:

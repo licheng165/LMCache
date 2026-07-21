@@ -1037,6 +1037,7 @@ class LMCacheEngine:
         mem_objs_layer: list[MemoryObj],
         layer_id: int,
         kv_group: int,
+        chunk_index_offset: int = 0,
     ) -> list[SharedChunkHandle]:
         if self.shared_cpu_cache_name is None:
             raise ValueError("Shared CPU cache name is not initialized")
@@ -1048,9 +1049,10 @@ class LMCacheEngine:
                 f"memory_objs={len(mem_objs_layer)}"
             )
         handles: list[SharedChunkHandle] = []
-        for chunk_index, (key, mem_obj) in enumerate(
+        for local_chunk_index, (key, mem_obj) in enumerate(
             zip(keys_layer, mem_objs_layer, strict=True)
         ):
+            chunk_index = int(chunk_index_offset) + local_chunk_index
             self._validate_rank0_shared_mem_obj(
                 mem_obj,
                 req_id=req_id,

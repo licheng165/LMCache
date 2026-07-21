@@ -19,6 +19,10 @@ from lmcache.integration.vllm.vllm_v1_adapter import (
     SaveSpec,
     WorkerRetrieveState,
 )
+from lmcache.v1.gpu_connector.sparse import (
+    PreparedSparseSource,
+    PreparedSparseSourceLayer,
+)
 from lmcache.v1.kv_layer_groups import KVLayerGroupsManager
 from tests.v1.connector_test_utils import (
     make_sparse_req_meta,
@@ -2515,10 +2519,11 @@ class TestWorkerRetrieveState:
 
         assert "req-1" not in impl._worker_retrieve_state
 
-    def test_decode_window_save_shared_cpu_keeps_state_stale_for_next_refresh(self):
+    def test_decode_window_save_shared_cpu_defers_to_tail_refresh(self):
         impl = _make_impl()
         impl.config = SimpleNamespace(dsa_two_groups=False)
         impl.num_layers = 1
+        impl._lmcache_chunk_size = 256
         impl._completed_decode_window_saves = {}
         impl._decode_window_save_completed_groups = set()
         impl._decode_window_save_expected_start = {}
@@ -2588,12 +2593,16 @@ class TestWorkerRetrieveState:
             lmcache_cached_tokens=512,
             can_load=True,
         )
-        assert impl._should_invalidate_worker_retrieve_state(next_sparse, 512)
+        assert not impl._should_invalidate_worker_retrieve_state(next_sparse, 512)
+        assert (
+            impl._shared_tail_refresh_prefix_chunks(state, 0, 512) == 1
+        )
 
     def test_decode_window_save_shared_cpu_two_groups_refreshes_together(self):
         impl = _make_impl()
         impl.config = SimpleNamespace(dsa_two_groups=True)
         impl.num_layers = 1
+        impl._lmcache_chunk_size = 256
         impl.kv_role = "kv_both"
         impl._completed_decode_window_saves = {}
         impl._decode_window_save_completed_groups = set()
@@ -2689,7 +2698,13 @@ class TestWorkerRetrieveState:
             lmcache_cached_tokens=512,
             can_load=True,
         )
-        assert impl._should_invalidate_worker_retrieve_state(next_sparse, 512)
+        assert not impl._should_invalidate_worker_retrieve_state(next_sparse, 512)
+        assert (
+            impl._shared_tail_refresh_prefix_chunks(state, 0, 512) == 1
+        )
+        assert (
+            impl._shared_tail_refresh_prefix_chunks(state, 1, 512) == 1
+        )
 
     def test_decode_save_merge_rejects_missing_pointer_cache(self):
         impl = _make_impl()
@@ -3258,6 +3273,37 @@ class TestWorkerRetrieveState:
         req.token_ids = [0] * 18879
         assert not impl._should_invalidate_worker_retrieve_state(req, 18879)
 
+    def test_prepared_sparse_source_reuses_chunk_aligned_prefix(self):
+        impl = _make_impl()
+        impl.lmcache_engine = SimpleNamespace(enable_shared_cpu_cache=True)
+        first = torch.zeros(1)
+        partial_tail = torch.ones(1)
+        ptrs = torch.tensor([111, 222], dtype=torch.long)
+        source = PreparedSparseSource(
+            layers=(
+                PreparedSparseSourceLayer(
+                    tensors=(first, partial_tail),
+                    chunk_ptrs_npu=ptrs,
+                ),
+            ),
+            total_tokens=286,
+            chunk_token_counts=(256, 30),
+            pointer_device=torch.device("cpu"),
+        )
+        state = WorkerRetrieveState(
+            shared_request_active=True,
+            prepared_sparse_sources={0: source},
+        )
+
+        prefix = impl._prepared_sparse_source(state, 0, 256)
+
+        assert prefix is not None
+        assert prefix.total_tokens == 256
+        assert prefix.chunk_token_counts == (256,)
+        assert prefix.layers[0].tensors == (first,)
+        assert prefix.layers[0].chunk_ptrs_npu.tolist() == [111]
+        assert impl._prepared_sparse_source(state, 0, 256) is prefix
+
     def test_sparse_decode_lmcache_hit_growth_invalidates(self):
         impl = _make_impl()
         impl._worker_retrieve_state["req-1"] = WorkerRetrieveState(
@@ -3411,6 +3457,33 @@ class TestWorkerRetrieveState:
         }
         impl._prune_worker_retrieve_state({"req-1"})
         assert set(impl._worker_retrieve_state) == {"req-1", "req-2"}
+
+    def test_get_finished_releases_worker_request_state(self):
+        impl = _make_impl()
+        impl._release_finished_worker_requests = MagicMock()
+
+        assert impl.get_finished({"req-1"}) == (None, None)
+
+        impl._release_finished_worker_requests.assert_called_once_with({"req-1"})
+
+    def test_empty_connector_metadata_keeps_live_worker_state(self):
+        impl, _, _ = make_worker_connector([], use_layerwise=True)
+        impl._kvcaches_list = [torch.zeros(1)]
+        impl.layerwise_retrievers = []
+        impl._layerwise_retriever_is_sparse = []
+        state = WorkerRetrieveState(
+            req_id="req-1",
+            shared_request_active=True,
+            shared_generation=9,
+            request_scope_token="req-1:9:256",
+            token_count=256,
+        )
+        impl._worker_retrieve_state["req-1"] = state
+
+        impl.start_load_kv(SimpleNamespace(attn_metadata=SimpleNamespace()))
+
+        assert impl._worker_retrieve_state["req-1"] is state
+        assert state.shared_request_active
 
     def test_prune_releases_shared_scope_but_keeps_warm_metadata(self):
         class FakeMemObj:
