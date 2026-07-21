@@ -1552,6 +1552,52 @@ class TestWorkerRetrieveState:
         assert selected_payload.data_ptr() == selected_tokens.data_ptr()
         assert target_payload.data_ptr() == target_slot_mapping.data_ptr()
 
+    def test_wait_for_layer_load_routes_exact_batch_rows_per_request(self):
+        requests = [
+            make_sparse_req_meta(req_id, token_count=4) for req_id in ("req-0", "req-1")
+        ]
+        impl, _, _ = make_worker_connector(requests, use_layerwise=True)
+        impl.current_layer = 0
+        impl.num_layers = 2
+        impl._layerwise_sparse_req_ids = [request.req_id for request in requests]
+        captured = []
+
+        def _retriever():
+            payload = yield None
+            captured.append(payload)
+            yield torch.ones(4, dtype=torch.bool)
+
+        retrievers = [_retriever(), _retriever()]
+        for retriever in retrievers:
+            next(retriever)
+        impl.layerwise_retrievers = [(retriever, None) for retriever in retrievers]
+
+        selected_tokens = torch.tensor(
+            [[10, 11, 12, 13], [20, 21, 22, 23]],
+            dtype=torch.int32,
+        )
+        target_slot_mapping = torch.tensor(
+            [[100, 101, 102, 103], [200, 201, 202, 203]],
+            dtype=torch.long,
+        )
+        impl.wait_for_layer_load(
+            "model.layers.0.self_attn.attn",
+            selected_tokens=selected_tokens,
+            request_ids=["req-1", "req-0"],
+            target_slot_mapping=target_slot_mapping,
+        )
+
+        assert len(captured) == 2
+        for row, (
+            selected_payload,
+            token_start,
+            target_payload,
+        ) in zip((1, 0), captured, strict=True):
+            assert token_start is None
+            assert torch.equal(selected_payload, selected_tokens[row])
+            assert torch.equal(target_payload, target_slot_mapping[row])
+        assert impl.current_layer == 1
+
     def test_sparse_decode_attn_wait_drives_latent_and_indexer(self):
         req = make_sparse_req_meta("req-1", token_count=4)
         impl, _, _ = make_worker_connector([req], use_layerwise=True)
