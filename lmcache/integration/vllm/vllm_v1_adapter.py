@@ -7372,7 +7372,7 @@ class LMCacheConnectorV1Impl:
         tracker.decode_window_save_anchor = start
         tracker.decode_window_save_next_start = start
         tracker.decode_window_save_committed_end = (
-            tracker.decode_window_save_committed_end
+            min(tracker.decode_window_save_committed_end, start)
             // self._block_size
             * self._block_size
         )
