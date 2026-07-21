@@ -2443,7 +2443,7 @@ class LMCacheConnectorV1Impl:
         """
         return retrieve_tokens, slot_mapping
 
-    def _drain_layerwise_retrievers(self) -> None:
+    def _drain_layerwise_retrievers(self, *, finish_dense: bool = True) -> None:
         """Finish suspended layerwise generators to avoid GC cost on reset."""
         try:
             for idx, retriever_pair in enumerate(self.layerwise_retrievers):
@@ -2454,7 +2454,7 @@ class LMCacheConnectorV1Impl:
                 for retriever in retriever_pair:
                     if retriever is None:
                         continue
-                    if is_sparse:
+                    if is_sparse or not finish_dense:
                         self._close_layerwise_retriever(retriever)
                         continue
                     for _ in retriever:
@@ -2485,6 +2485,18 @@ class LMCacheConnectorV1Impl:
             retriever.close()
         except (GeneratorExit, RuntimeError, ValueError):
             pass
+
+    def _abort_layerwise_retrieve_step(
+        self,
+        requests: Iterable[ReqMeta],
+    ) -> None:
+        """Release a partially constructed layerwise retrieve step."""
+        for request in requests:
+            state = self._worker_retrieve_state.get(request.req_id)
+            if state is not None:
+                self._release_unadopted_shared_request_objects(state, request)
+            self._drop_worker_retrieve_state(request.req_id)
+        self._drain_layerwise_retrievers(finish_dense=False)
 
     def _should_defer_lookup_unpin_for_sparse_decode(self, request: ReqMeta) -> bool:
         """Keep lookup pins across decode steps while sparse retrieve is active."""
@@ -2750,6 +2762,15 @@ class LMCacheConnectorV1Impl:
         for pending_key in list(self._deferred_latent_pending):
             if pending_key[0] == req_id:
                 self._deferred_latent_pending.discard(pending_key)
+
+    def _abort_save_step(self, requests: Iterable[ReqMeta]) -> None:
+        """Discard partial stores without advancing decode-window progress."""
+        expected = getattr(self, "_decode_window_save_expected_start", None)
+        saved_expected = dict(expected or {})
+        for request in requests:
+            self._drop_layerwise_save_storers(request.req_id)
+        if expected is not None:
+            expected.update(saved_expected)
 
     def _release_request_lookup_pins(self, req_id: str) -> None:
         manager = getattr(self, "_manager", None)
@@ -4271,6 +4292,20 @@ class LMCacheConnectorV1Impl:
 
     @_lmcache_nvtx_annotate
     def start_load_kv(self, forward_context: "ForwardContext", **kwargs) -> None:
+        """Start this step's KV loads and atomically discard partial setup."""
+        try:
+            self._start_load_kv(forward_context, **kwargs)
+        except BaseException:
+            metadata = self._parent._get_connector_metadata()
+            assert isinstance(metadata, LMCacheConnectorMetadata)
+            self._abort_layerwise_retrieve_step(
+                request
+                for request in metadata.requests
+                if request.load_spec is not None and request.load_spec.can_load
+            )
+            raise
+
+    def _start_load_kv(self, forward_context: "ForwardContext", **kwargs) -> None:
         """Start loading the KV cache from the connector buffer to vLLM's
         paged KV buffer.
 
@@ -4464,6 +4499,12 @@ class LMCacheConnectorV1Impl:
                             **retrieve_kwargs,
                         )
                     )
+                    self.layerwise_retrievers.append(
+                        (layerwise_retriever, None)
+                    )
+                    self._layerwise_requests.append(request)
+                    self._layerwise_retriever_is_sparse.append(True)
+                    self._layerwise_sparse_req_ids.append(request.req_id)
                     # NOTE: retrieve layers one by one with cpu prefetch
                     next(layerwise_retriever)
 
@@ -4567,6 +4608,10 @@ class LMCacheConnectorV1Impl:
                                     **indexer_kwargs,
                                 )
                             )
+                            self.layerwise_retrievers[-1] = (
+                                layerwise_retriever,
+                                indexer_retriever,
+                            )
                             next(indexer_retriever)
 
                     if indexer_skipped:
@@ -4602,12 +4647,6 @@ class LMCacheConnectorV1Impl:
                             metadata_warm=metadata_warm,
                             token_count=token_count,
                         )
-                    self.layerwise_retrievers.append(
-                        (layerwise_retriever, indexer_retriever)
-                    )
-                    self._layerwise_requests.append(request)
-                    self._layerwise_retriever_is_sparse.append(True)
-                    self._layerwise_sparse_req_ids.append(request.req_id)
                 else:
                     retrieve_slot_mapping = slot_mapping
                     if lmcache_cached_tokens < len(slot_mapping):
@@ -4624,6 +4663,11 @@ class LMCacheConnectorV1Impl:
                         request_configs=request.request_configs,
                         shared_cpu_request_ordinal=idx,
                     )
+                    self.layerwise_retrievers.append(
+                        (layerwise_retriever, None)
+                    )
+                    self._layerwise_requests.append(request)
+                    self._layerwise_retriever_is_sparse.append(False)
 
                     # Two-group DSA: also retrieve the indexer group (kv_group=1)
                     # for the same latent hit token count, scattering into vLLM's
@@ -4694,6 +4738,10 @@ class LMCacheConnectorV1Impl:
                                 request_configs=request.request_configs,
                                 shared_cpu_request_ordinal=idx,
                             )
+                            self.layerwise_retrievers[-1] = (
+                                layerwise_retriever,
+                                indexer_retriever,
+                            )
 
                     # Prime the same two-step window as the legacy dense path,
                     # but interleave groups so shared-cache collectives remain
@@ -4746,11 +4794,6 @@ class LMCacheConnectorV1Impl:
                         metadata_warm=metadata_warm,
                         token_count=lmcache_cached_tokens,
                     )
-                    self.layerwise_retrievers.append(
-                        (layerwise_retriever, indexer_retriever)
-                    )
-                    self._layerwise_requests.append(request)
-                    self._layerwise_retriever_is_sparse.append(False)
             else:
                 retrieve_slot_mapping = slot_mapping
                 if lmcache_cached_tokens < len(slot_mapping):
@@ -4871,15 +4914,8 @@ class LMCacheConnectorV1Impl:
     ) -> Generator[None, None, None]:
         try:
             yield
-        except Exception:
-            for request in requests:
-                if not request.is_sparse_decode:
-                    continue
-                state = self._worker_retrieve_state.get(request.req_id)
-                if state is not None:
-                    self._release_unadopted_shared_request_objects(state, request)
-                self._drop_worker_retrieve_state(request.req_id)
-            self._drain_layerwise_retrievers()
+        except BaseException:
+            self._abort_layerwise_retrieve_step(requests)
             raise
 
     @_lmcache_nvtx_annotate
@@ -5677,6 +5713,22 @@ class LMCacheConnectorV1Impl:
 
             try:
                 next(layerwise_storer)
+                if indexer_group_last:
+                    indexer_completed, store_result = (
+                        self._finalize_layerwise_storer(
+                            layerwise_storer,
+                        )
+                    )
+                    self._layerwise_save_storers.pop(storer_key, None)
+                    layerwise_storer = None
+                    self._consume_completed_layerwise_store(
+                        request,
+                        kv_group,
+                        indexer_completed,
+                        store_result,
+                    )
+                    if self._should_defer_latent_save_under_tp():
+                        self._flush_deferred_latent_store(request, save_spec)
             except StopIteration:
                 logger.error(
                     "Layerwise save storer exhausted early: req_id=%s key=%s "
@@ -5692,28 +5744,11 @@ class LMCacheConnectorV1Impl:
                     list(self._layerwise_save_storers.keys()),
                     list(getattr(self, "_deferred_latent_pending", set())),
                 )
+                self._abort_save_step((request,))
                 raise
-
-            if indexer_group_last:
-                indexer_completed, store_result = (
-                    self._finalize_layerwise_storer(
-                        layerwise_storer,
-                    )
-                )
-                self._layerwise_save_storers.pop(storer_key, None)
-                layerwise_storer = None
-                self._consume_completed_layerwise_store(
-                    request,
-                    kv_group,
-                    indexer_completed,
-                    store_result,
-                )
-
-            if (
-                indexer_group_last
-                and self._should_defer_latent_save_under_tp()
-            ):
-                self._flush_deferred_latent_store(request, save_spec)
+            except BaseException:
+                self._abort_save_step((request,))
+                raise
 
     def _effective_skip_leading_tokens(
         self,
@@ -5764,10 +5799,23 @@ class LMCacheConnectorV1Impl:
         """Block until this step's KV saves reach the connector boundary."""
 
         save_context: dict[str, Any] = {}
+        save_fence_complete = False
         try:
-            self._wait_for_save_impl(save_context)
-        finally:
-            self._finish_save_batch(save_context)
+            try:
+                self._wait_for_save_impl(save_context)
+            finally:
+                self._finish_save_batch(save_context)
+                save_fence_complete = True
+        except BaseException:
+            metadata = self._parent._get_connector_metadata()
+            assert isinstance(metadata, LMCacheConnectorMetadata)
+            self._abort_save_step(metadata.requests)
+            if save_fence_complete:
+                self._complete_worker_save_step()
+            raise
+        else:
+            for request in save_context.get("decode_window_saves", ()):
+                self._mark_decode_window_save_completed(request)
             self._complete_worker_save_step()
 
     def _wait_for_save_impl(self, save_context: dict[str, Any]) -> None:
@@ -5815,7 +5863,10 @@ class LMCacheConnectorV1Impl:
                             save_completed,
                             store_result,
                         )
-                self._mark_decode_window_save_completed(request)
+                if self._is_decode_window_save_request(request):
+                    save_context.setdefault("decode_window_saves", []).append(
+                        request
+                    )
                 self._maybe_lookup_unpin_for_request(request)
             return
 
@@ -5892,7 +5943,10 @@ class LMCacheConnectorV1Impl:
                     **store_kwargs,
                 )
                 self._record_decode_window_save_group_completed(request, 0)
-                self._mark_decode_window_save_completed(request)
+                if self._is_decode_window_save_request(request):
+                    save_context.setdefault("decode_window_saves", []).append(
+                        request
+                    )
 
                 if get_pp_group().is_last_rank:
                     save_spec.skip_leading_tokens = len(token_ids)
@@ -5923,8 +5977,10 @@ class LMCacheConnectorV1Impl:
                 self._finished_req_ids_waiting_for_save.update(waiting_req_ids)
                 releasable_req_ids -= waiting_req_ids
 
-        finished_sending = self._finalize_worker_requests_after_store(
-            releasable_req_ids
+        finished_sending = (
+            self._finalize_worker_requests_after_store(releasable_req_ids)
+            if releasable_req_ids
+            else set()
         )
         finished_sending.update(self._late_finished_sending)
         self._late_finished_sending.clear()

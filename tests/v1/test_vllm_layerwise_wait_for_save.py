@@ -186,6 +186,94 @@ def test_decode_window_save_completion_is_drained_after_wait() -> None:
     assert connector.get_completed_decode_window_saves() == {}
 
 
+def test_decode_window_completion_waits_for_final_store_fence() -> None:
+    request = _make_req("req-window")
+    request.is_decode_window_save = True
+    request.decode_window_start = 256
+    request.decode_window_end = 512
+    request.decode_window_size = 256
+    connector, _, _ = _make_connector([request])
+    connector._decode_window_save_expected_start = {"req-window": 256}
+
+    connector.save_kv_layer("layer0", torch.zeros(1), None)
+    connector._wait_for_save_done = False
+
+    def fail_store_fence(_context) -> None:
+        raise RuntimeError("store fence failed")
+
+    connector._finish_save_batch = fail_store_fence
+
+    with pytest.raises(RuntimeError, match="store fence failed"):
+        connector.wait_for_save()
+
+    assert connector.get_completed_decode_window_saves() == {}
+    assert connector._decode_window_save_completed_groups == set()
+    assert connector._decode_window_save_expected_start == {"req-window": 256}
+    assert connector._wait_for_save_done is False
+
+    connector._finish_save_batch = lambda _context: None
+    connector.save_kv_layer("layer0", torch.zeros(1), None)
+    connector.wait_for_save()
+
+    assert connector.get_completed_decode_window_saves() == {"req-window": 512}
+
+
+@pytest.mark.parametrize("failed_group", [0, 1])
+def test_decode_window_group_failure_is_atomic(failed_group: int) -> None:
+    request = _make_req("req-window")
+    request.is_decode_window_save = True
+    request.decode_window_start = 256
+    request.decode_window_end = 512
+    request.decode_window_size = 256
+    request.save_spec.can_save_indexer = True
+    request.indexer_slot_mapping = [torch.arange(4, 8, dtype=torch.long)]
+    connector, _, engine = _make_connector([request])
+    connector.config.dsa_two_groups = True
+    connector.kv_caches = {
+        "layer0.attn": torch.zeros(1),
+        "layer0.indexer.k_cache": torch.zeros(1),
+    }
+    connector._decode_window_save_expected_start = {"req-window": 256}
+    original_store_layer = engine.store_layer
+
+    def failing_store_layer(token_ids, **kwargs):
+        if kwargs.get("kv_group", 0) != failed_group:
+            return original_store_layer(token_ids, **kwargs)
+
+        def storer():
+            yield None
+            raise RuntimeError(f"group {failed_group} failed")
+
+        return storer()
+
+    engine.store_layer = failing_store_layer
+    with pytest.raises(RuntimeError, match=f"group {failed_group} failed"):
+        connector.save_kv_layer("layer0.attn", torch.zeros(1), None)
+        connector.save_kv_layer(
+            "layer0.indexer.k_cache",
+            torch.zeros(1),
+            SimpleNamespace(slot_mapping=torch.arange(1, dtype=torch.long)),
+        )
+        connector.wait_for_save()
+    connector.wait_for_save()
+
+    assert connector.get_completed_decode_window_saves() == {}
+    assert connector._layerwise_save_storers == {}
+    assert connector._decode_window_save_completed_groups == set()
+    assert connector._decode_window_save_expected_start == {"req-window": 256}
+
+    engine.store_layer = original_store_layer
+    connector.save_kv_layer("layer0.attn", torch.zeros(1), None)
+    connector.save_kv_layer(
+        "layer0.indexer.k_cache",
+        torch.zeros(1),
+        SimpleNamespace(slot_mapping=torch.arange(1, dtype=torch.long)),
+    )
+    connector.wait_for_save()
+
+    assert connector.get_completed_decode_window_saves() == {"req-window": 512}
+
+
 def test_decode_window_save_completion_not_reported_by_passive_rank() -> None:
     request = _make_req("req-window")
     request.is_decode_window_save = True

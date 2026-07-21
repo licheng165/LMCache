@@ -818,6 +818,9 @@ class TestWorkerRetrieveState:
 
     def test_wait_for_save_failure_marks_step_complete(self):
         impl = _make_impl()
+        impl._parent = SimpleNamespace(
+            _get_connector_metadata=lambda: LMCacheConnectorMetadata()
+        )
         impl._wait_for_save_done = False
         impl._finished_req_ids_waiting_for_save = set()
         impl._wait_for_save_impl = MagicMock(
@@ -2446,6 +2449,86 @@ class TestWorkerRetrieveState:
         assert calls == [("sparse", False), ("dense", True)]
         impl._drain_layerwise_retrievers()
 
+    def test_start_load_kv_aborts_partial_sparse_batch(self):
+        requests = [
+            make_sparse_req_meta("req-1", token_count=4),
+            make_sparse_req_meta("req-2", token_count=4),
+        ]
+        for request in requests:
+            request.indexer_slot_mapping = [torch.arange(4, dtype=torch.long)]
+        impl, _, _ = make_worker_connector(
+            requests,
+            use_layerwise=True,
+            kv_role="kv_consumer",
+        )
+        impl.config.dsa_two_groups = True
+        impl.num_layers = 1
+        impl.kv_caches = {
+            "model.layers.0.self_attn.attn.k_cache": torch.zeros(1),
+            "model.layers.0.self_attn.indexer.k_cache": torch.zeros(1),
+        }
+        impl._refresh_kvcaches_list()
+        impl.layerwise_retrievers = []
+        impl._layerwise_requests = []
+        impl._layerwise_retriever_is_sparse = []
+        impl._layerwise_sparse_req_ids = []
+        impl._stats_monitor = SimpleNamespace(
+            update_interval_vllm_hit_tokens=lambda *_args: None,
+            update_interval_prompt_tokens=lambda *_args: None,
+        )
+        closed = []
+        indexer_calls = 0
+
+        class _FailingEngine:
+            enable_shared_cpu_cache = False
+
+            def __init__(self):
+                self.unpinned = []
+
+            def lookup_unpin(self, req_id):
+                self.unpinned.append(req_id)
+
+            def retrieve_layer_head_token_wise(self, tokens, mask, **kwargs):
+                nonlocal indexer_calls
+                req_id = kwargs["req_id"]
+                kv_group = kwargs["kv_group"]
+                if kv_group == 1:
+                    indexer_calls += 1
+                    if indexer_calls == 2:
+                        raise RuntimeError("index setup failed")
+
+                def _retriever():
+                    try:
+                        yield None
+                        while True:
+                            yield torch.ones(len(tokens), dtype=torch.bool)
+                    finally:
+                        closed.append((req_id, kv_group))
+
+                return _retriever()
+
+        engine = _FailingEngine()
+        impl._manager.lmcache_engine = engine
+
+        with pytest.raises(RuntimeError, match="index setup failed"):
+            impl.start_load_kv(SimpleNamespace(attn_metadata=SimpleNamespace()))
+
+        assert set(closed) == {
+            ("req-1", 0),
+            ("req-1", 1),
+            ("req-2", 0),
+        }
+        assert engine.unpinned == ["req-1", "req-2"]
+        assert impl.layerwise_retrievers == []
+        assert impl._layerwise_requests == []
+        assert impl._layerwise_retriever_is_sparse == []
+        assert impl._layerwise_sparse_req_ids == []
+        assert impl._worker_retrieve_state == {}
+
+        impl.start_load_kv(SimpleNamespace(attn_metadata=SimpleNamespace()))
+        assert impl._layerwise_sparse_req_ids == ["req-1", "req-2"]
+        impl._drain_layerwise_retrievers()
+
     def test_start_load_kv_without_attention_skips_step_setup(self):
         impl = _make_impl()
         impl._parent = SimpleNamespace(_get_connector_metadata=MagicMock())
@@ -2520,6 +2603,36 @@ class TestWorkerRetrieveState:
         release_request.assert_called_once_with("req-1")
         impl._drain_layerwise_retrievers.assert_called_once()
         assert "req-1" not in impl._worker_retrieve_state
+
+    def test_sparse_retrieve_cancellation_uses_the_same_abort(self):
+        impl = _make_impl()
+        impl._abort_layerwise_retrieve_step = MagicMock()
+        request = _make_request()
+
+        with pytest.raises(KeyboardInterrupt):
+            with impl._sparse_retrieve_state_guard([request]):
+                raise KeyboardInterrupt
+
+        impl._abort_layerwise_retrieve_step.assert_called_once_with([request])
+
+    def test_layerwise_abort_releases_dense_and_sparse_requests(self):
+        impl = _make_impl()
+        impl._drop_worker_retrieve_state = MagicMock()
+        impl._drain_layerwise_retrievers = MagicMock()
+        dense = _make_request()
+        dense.is_sparse_decode = False
+        sparse = _make_request()
+        sparse.req_id = "req-2"
+
+        impl._abort_layerwise_retrieve_step([dense, sparse])
+
+        assert [
+            invocation.args
+            for invocation in impl._drop_worker_retrieve_state.call_args_list
+        ] == [("req-1",), ("req-2",)]
+        impl._drain_layerwise_retrievers.assert_called_once_with(
+            finish_dense=False
+        )
 
     def test_store_results_remain_local_to_their_operation(self):
         impl = _make_impl()
