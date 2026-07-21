@@ -1353,6 +1353,10 @@ class LMCacheConnectorV1Impl:
         self._invalid_block_ids: set[int] = set()
         if role != KVConnectorRole.SCHEDULER:
             self._worker_retrieve_state: dict[str, WorkerRetrieveState] = {}
+            self._worker_retrieve_registry_version = 0
+            self._worker_retrieve_last_prune_key: Optional[
+                tuple[frozenset[str], int]
+            ] = None
             self._wait_for_save_done = True
             self._finished_req_ids_waiting_for_save: set[str] = set()
             self._late_finished_sending: set[str] = set()
@@ -2844,20 +2848,41 @@ class LMCacheConnectorV1Impl:
                 committed_end,
             )
 
+    def _mark_worker_retrieve_registry_changed(self) -> None:
+        self._worker_retrieve_registry_version = (
+            getattr(self, "_worker_retrieve_registry_version", 0) + 1
+        )
+
+    def _set_worker_retrieve_state(
+        self, req_id: str, state: WorkerRetrieveState
+    ) -> None:
+        self._worker_retrieve_state[req_id] = state
+        self._mark_worker_retrieve_registry_changed()
+
     def _prune_worker_retrieve_state(self, active_req_ids: set[str]) -> None:
         if not hasattr(self, "_worker_retrieve_state"):
+            return
+        active_key = frozenset(active_req_ids)
+        prune_key = (
+            active_key,
+            getattr(self, "_worker_retrieve_registry_version", 0),
+        )
+        if prune_key == getattr(self, "_worker_retrieve_last_prune_key", None):
             return
         dropped_req_ids = set(self._worker_retrieve_state) - active_req_ids
         for req_id in dropped_req_ids:
             state = self._worker_retrieve_state.get(req_id)
-            if state is not None and state.shared_request_active:
+            shared_request_active = bool(
+                state is not None and state.shared_request_active
+            )
+            if shared_request_active:
                 self._release_shared_worker_retrieve_state(
                     state,
                     getattr(self, "lmcache_engine", None),
                 )
             if state is not None and (state.metadata_warm or state.has_cache()):
                 continue
-            if state is not None:
+            if state is not None and not shared_request_active:
                 self._release_shared_worker_retrieve_state(
                     state,
                     getattr(self, "lmcache_engine", None),
@@ -2868,6 +2893,12 @@ class LMCacheConnectorV1Impl:
             for req_id, state in self._worker_retrieve_state.items()
             if req_id in active_req_ids or (state.metadata_warm or state.has_cache())
         }
+        if dropped_req_ids:
+            self._mark_worker_retrieve_registry_changed()
+        self._worker_retrieve_last_prune_key = (
+            active_key,
+            getattr(self, "_worker_retrieve_registry_version", 0),
+        )
 
     def _drop_worker_retrieve_state(self, req_id: str) -> None:
         engine = getattr(self, "lmcache_engine", None)
@@ -2876,6 +2907,7 @@ class LMCacheConnectorV1Impl:
             state = self._worker_retrieve_state.pop(req_id, None)
         if state is not None:
             self._release_shared_worker_retrieve_state(state, engine)
+            self._mark_worker_retrieve_registry_changed()
         elif engine is not None:
             release_fn = getattr(engine, "release_shared_cpu_sparse_request", None)
             if callable(release_fn):
@@ -3867,7 +3899,7 @@ class LMCacheConnectorV1Impl:
                 and self._state_has_retrieve_tensor_cache(state)
             ):
                 self._retain_shared_store_seed_state(state)
-                self._worker_retrieve_state[request.req_id] = state
+                self._set_worker_retrieve_state(request.req_id, state)
                 return
 
             state.location = (
@@ -3898,7 +3930,7 @@ class LMCacheConnectorV1Impl:
 
             self._refresh_prepared_sparse_sources(state, state.token_count)
             self._retain_shared_store_seed_state(state)
-            self._worker_retrieve_state[request.req_id] = state
+            self._set_worker_retrieve_state(request.req_id, state)
         except Exception:
             if is_new_state:
                 self._release_shared_worker_retrieve_state(
@@ -4028,8 +4060,9 @@ class LMCacheConnectorV1Impl:
             )
             if states.get(request.req_id) is state:
                 states.pop(request.req_id, None)
+                self._mark_worker_retrieve_registry_changed()
             raise
-        states[request.req_id] = state
+        self._set_worker_retrieve_state(request.req_id, state)
 
     def _finalize_worker_retrieve_state_from_metadata(
         self, metadata: LMCacheConnectorMetadata
@@ -4487,7 +4520,9 @@ class LMCacheConnectorV1Impl:
                         or retrieve_state.has_cache()
                     )
                     if shared_cpu_enabled and latent_prepared is None:
-                        self._worker_retrieve_state[request.req_id] = retrieve_state
+                        self._set_worker_retrieve_state(
+                            request.req_id, retrieve_state
+                        )
                         retrieve_state.location = (
                             retrieve_location or retrieve_state.location
                         )

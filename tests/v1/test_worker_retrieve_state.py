@@ -32,6 +32,8 @@ from tests.v1.connector_test_utils import (
 def _make_impl() -> LMCacheConnectorV1Impl:
     impl = object.__new__(LMCacheConnectorV1Impl)
     impl._worker_retrieve_state = {}
+    impl._worker_retrieve_registry_version = 0
+    impl._worker_retrieve_last_prune_key = None
     impl._layerwise_save_storers = {}
     impl._deferred_latent_pending = set()
     impl.kv_role = "kv_both"
@@ -3552,6 +3554,36 @@ class TestWorkerRetrieveState:
         }
         impl._prune_worker_retrieve_state({"req-1"})
         assert set(impl._worker_retrieve_state) == {"req-1", "req-2"}
+
+    def test_prune_skips_unchanged_registry(self):
+        impl = _make_impl()
+        impl._worker_retrieve_state = {
+            "req-1": WorkerRetrieveState(metadata_warm=True, cached_keys=[["k"]])
+        }
+
+        impl._prune_worker_retrieve_state({"req-1"})
+        pruned_states = impl._worker_retrieve_state
+        impl._prune_worker_retrieve_state({"req-1"})
+
+        assert impl._worker_retrieve_state is pruned_states
+
+    def test_registry_change_invalidates_prune_key(self):
+        impl = _make_impl()
+        impl._worker_retrieve_state = {
+            "req-1": WorkerRetrieveState(metadata_warm=True, cached_keys=[["k"]])
+        }
+        active_req_ids = {"req-1", "req-2"}
+        impl._prune_worker_retrieve_state(active_req_ids)
+        pruned_states = impl._worker_retrieve_state
+
+        impl._set_worker_retrieve_state(
+            "req-2",
+            WorkerRetrieveState(metadata_warm=True, cached_keys=[["k2"]]),
+        )
+        impl._prune_worker_retrieve_state(active_req_ids)
+
+        assert impl._worker_retrieve_state is not pruned_states
+        assert set(impl._worker_retrieve_state) == active_req_ids
 
     def test_prune_releases_shared_scope_but_keeps_warm_metadata(self):
         class FakeMemObj:
