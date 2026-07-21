@@ -723,6 +723,15 @@ class ReqMeta:
     # Sparse decode only: shared with RequestTracker, reused across decode steps.
     decode_token_mask: Optional[torch.Tensor] = field(default=None, repr=False)
     decode_ret_mask: Optional[torch.Tensor] = field(default=None, repr=False)
+    # Bootstrap-only latent hydration for the final partial LMCache chunk. The
+    # source indices are absolute prompt positions and the destinations are
+    # ordinary vLLM paged-KV slots already allocated for the live request.
+    bootstrap_tail_token_indices: Optional[torch.Tensor] = field(
+        default=None, repr=False
+    )
+    bootstrap_tail_slot_mapping: Optional[torch.Tensor] = field(
+        default=None, repr=False
+    )
     # Decode window save metadata, separate from the regular request save progress.
     is_decode_window_save: bool = False
     decode_window_start: Optional[int] = None
@@ -1221,6 +1230,8 @@ class ReqMeta:
 
         decode_token_mask: Optional[torch.Tensor] = None
         decode_ret_mask: Optional[torch.Tensor] = None
+        bootstrap_tail_token_indices: Optional[torch.Tensor] = None
+        bootstrap_tail_slot_mapping: Optional[torch.Tensor] = None
         if is_sparse_decode and load_spec is not None:
             num_retrieve_tokens = len(token_ids)
             if load_spec.vllm_cached_tokens > 0:
@@ -1243,6 +1254,54 @@ class ReqMeta:
                     num_retrieve_tokens, dtype=torch.bool, device="cpu"
                 )
             decode_ret_mask = tracker.sparse_decode_ret_mask
+
+            if load_spec.bootstrap_sample:
+                prompt_len = min(
+                    tracker.prompt_len,
+                    load_spec.lmcache_cached_tokens,
+                    len(token_ids),
+                )
+                tail_start = (
+                    prompt_len // lmcache_chunk_size * lmcache_chunk_size
+                )
+                if tail_start < prompt_len:
+                    first_block = tail_start // block_size
+                    end_block = cdiv(prompt_len, block_size)
+                    tail_block_ids = tracker.allocated_block_ids[
+                        first_block:end_block
+                    ]
+                    expected_blocks = end_block - first_block
+                    if len(tail_block_ids) != expected_blocks or any(
+                        block_id == 0 for block_id in tail_block_ids
+                    ):
+                        raise RuntimeError(
+                            "Bootstrap partial tail has no ordinary vLLM KV "
+                            "block allocation: "
+                            f"req_id={tracker.req_id}, tail=[{tail_start},"
+                            f"{prompt_len}), block_range=[{first_block},"
+                            f"{end_block}), block_ids={tail_block_ids}"
+                        )
+                    bootstrap_tail_token_indices = torch.arange(
+                        tail_start,
+                        prompt_len,
+                        dtype=torch.int32,
+                    )
+                    bootstrap_tail_slot_mapping = _build_slot_mapping_window(
+                        tracker.allocated_block_ids,
+                        block_size,
+                        tail_start,
+                        prompt_len,
+                    )
+                    logger.info(
+                        "[BOOTSTRAP_PARTIAL_TAIL_PLAN] req=%s "
+                        "tail_start=%d tail_end=%d tail_tokens=%d "
+                        "vllm_blocks=%s storage=vllm_paged_kv",
+                        tracker.req_id,
+                        tail_start,
+                        prompt_len,
+                        prompt_len - tail_start,
+                        tail_block_ids,
+                    )
 
         # Note: We keep load_spec even when can_load=False to pass metrics to worker
         req_meta = ReqMeta(
@@ -1278,6 +1337,8 @@ class ReqMeta:
             cached_shared_handles_indexer=tracker.cached_shared_handles_indexer,
             decode_token_mask=decode_token_mask,
             decode_ret_mask=decode_ret_mask,
+            bootstrap_tail_token_indices=bootstrap_tail_token_indices,
+            bootstrap_tail_slot_mapping=bootstrap_tail_slot_mapping,
         )
         return req_meta
 
@@ -4838,6 +4899,20 @@ class LMCacheConnectorV1Impl:
                         device=self.device, dtype=torch.long
                     )
                 slot_mapping = request.slot_mapping[0]
+                tail_indices = request.bootstrap_tail_token_indices
+                tail_slots = request.bootstrap_tail_slot_mapping
+                if (tail_indices is None) != (tail_slots is None):
+                    raise RuntimeError(
+                        "Bootstrap partial-tail source/destination metadata is "
+                        f"incomplete: req_id={request.req_id}"
+                    )
+                if tail_indices is not None and tail_slots is not None:
+                    request.bootstrap_tail_token_indices = tail_indices.to(
+                        device=self.device, dtype=torch.int32
+                    )
+                    request.bootstrap_tail_slot_mapping = tail_slots.to(
+                        device=self.device, dtype=torch.long
+                    )
             else:
                 slot_mapping = request.slot_mapping[0].to(
                     device=self.device, dtype=torch.long
@@ -4868,7 +4943,8 @@ class LMCacheConnectorV1Impl:
                 logger.info(
                     "[BOOTSTRAP_LMCACHE_REQUEST] req=%s token_ids=%d "
                     "retrieve_tokens=%d vllm_cached=%d lmcache_cached=%d "
-                    "slot_mapping_shape=%s recalc_last=%s sync=%s",
+                    "slot_mapping_shape=%s tail_tokens=%d "
+                    "recalc_last=%s sync=%s",
                     request.req_id,
                     len(tokens),
                     token_count,
@@ -4877,6 +4953,9 @@ class LMCacheConnectorV1Impl:
                     tuple(slot_mapping.shape)
                     if hasattr(slot_mapping, "shape")
                     else None,
+                    int(request.bootstrap_tail_token_indices.numel())
+                    if request.bootstrap_tail_token_indices is not None
+                    else 0,
                     recalc_last_applied,
                     idx == last_idx,
                 )
@@ -5466,6 +5545,177 @@ class LMCacheConnectorV1Impl:
         )
         return missing_blocks
 
+    @staticmethod
+    def _flatten_sparse_payload_tensor(
+        value: Any,
+        *,
+        dtype: torch.dtype,
+        device: torch.device,
+    ) -> torch.Tensor:
+        if value is None:
+            return torch.empty(0, dtype=dtype, device=device)
+        if isinstance(value, torch.Tensor):
+            return value.reshape(-1).to(device=device, dtype=dtype)
+        if isinstance(value, (list, tuple)):
+            parts = [
+                LMCacheConnectorV1Impl._flatten_sparse_payload_tensor(
+                    item,
+                    dtype=dtype,
+                    device=device,
+                )
+                for item in value
+            ]
+            parts = [part for part in parts if part.numel() > 0]
+            if not parts:
+                return torch.empty(0, dtype=dtype, device=device)
+            return torch.cat(parts, dim=0)
+        return torch.as_tensor(value, dtype=dtype, device=device).reshape(-1)
+
+    @classmethod
+    def _legacy_sparse_target_slots(
+        cls,
+        slot_mapping: torch.Tensor,
+        selected_token_ids: Any,
+        token_start_index: Any,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Convert the legacy sparse payload to explicit source/destination pairs."""
+        device = slot_mapping.device
+        if selected_token_ids is None:
+            start = int(token_start_index or 0)
+            target_slots = slot_mapping[start:].reshape(-1)
+            source_indices = torch.arange(
+                target_slots.numel(),
+                dtype=torch.int32,
+                device=device,
+            )
+            return source_indices, target_slots
+
+        selected_shape = (
+            tuple(selected_token_ids.shape)
+            if isinstance(selected_token_ids, torch.Tensor)
+            else None
+        )
+        source_indices = cls._flatten_sparse_payload_tensor(
+            selected_token_ids,
+            dtype=torch.int32,
+            device=device,
+        )
+        if selected_shape is None or len(selected_shape) <= 1:
+            start = int(token_start_index or 0)
+            end = start + source_indices.numel()
+            target_slots = slot_mapping[start:end].reshape(-1)
+        else:
+            row_count = selected_shape[0]
+            row_width = source_indices.numel() // row_count
+            if isinstance(token_start_index, torch.Tensor):
+                starts = token_start_index.reshape(-1).to("cpu").tolist()
+            elif isinstance(token_start_index, (list, tuple)):
+                starts = list(token_start_index)
+            else:
+                starts = [int(token_start_index or 0)] * row_count
+            if len(starts) == 1 and row_count != 1:
+                starts *= row_count
+            if len(starts) != row_count:
+                raise ValueError(
+                    "token_start_index rows must match selected-token rows "
+                    "while hydrating bootstrap tail: "
+                    f"{len(starts)} vs {row_count}"
+                )
+            target_slots = torch.cat(
+                [
+                    slot_mapping[int(start) : int(start) + row_width]
+                    for start in starts
+                ],
+                dim=0,
+            )
+        if target_slots.numel() != source_indices.numel():
+            raise ValueError(
+                "Sparse slot_mapping is too short while hydrating bootstrap "
+                f"tail: targets={target_slots.numel()} "
+                f"selected={source_indices.numel()}"
+            )
+        return source_indices, target_slots
+
+    def _append_bootstrap_tail_to_sparse_payload(
+        self,
+        request: ReqMeta,
+        sparse_payload: Any,
+    ) -> Any:
+        tail_indices = request.bootstrap_tail_token_indices
+        tail_slots = request.bootstrap_tail_slot_mapping
+        if tail_indices is None and tail_slots is None:
+            return sparse_payload
+        if tail_indices is None or tail_slots is None:
+            raise RuntimeError(
+                "Bootstrap partial-tail source/destination metadata is incomplete: "
+                f"req_id={request.req_id}"
+            )
+
+        selected_token_ids = None
+        token_start_index = 0
+        target_slots = None
+        if isinstance(sparse_payload, dict):
+            selected_token_ids = sparse_payload.get("selected_token_ids")
+            token_start_index = sparse_payload.get("token_start_index", 0)
+            target_slots = sparse_payload.get("target_slot_mapping")
+        elif isinstance(sparse_payload, tuple):
+            if len(sparse_payload) == 3:
+                selected_token_ids, token_start_index, target_slots = sparse_payload
+            elif len(sparse_payload) == 2:
+                selected_token_ids, token_start_index = sparse_payload
+            else:
+                raise ValueError("Sparse payload tuple must have 2 or 3 items")
+        else:
+            selected_token_ids = sparse_payload
+
+        tail_device = tail_slots.device
+        if target_slots is None:
+            selected_flat, target_flat = self._legacy_sparse_target_slots(
+                request.slot_mapping[0],
+                selected_token_ids,
+                token_start_index,
+            )
+            selected_flat = selected_flat.to(device=tail_device, dtype=torch.int32)
+            target_flat = target_flat.to(device=tail_device, dtype=torch.long)
+        else:
+            selected_flat = self._flatten_sparse_payload_tensor(
+                selected_token_ids,
+                dtype=torch.int32,
+                device=tail_device,
+            )
+            target_flat = self._flatten_sparse_payload_tensor(
+                target_slots,
+                dtype=torch.long,
+                device=tail_device,
+            )
+            if selected_flat.numel() != target_flat.numel():
+                raise ValueError(
+                    "Sparse explicit source/destination lengths differ while "
+                    "hydrating bootstrap tail: "
+                    f"selected={selected_flat.numel()} "
+                    f"targets={target_flat.numel()}"
+                )
+
+        selected_flat = torch.cat(
+            [selected_flat, tail_indices.reshape(-1)],
+            dim=0,
+        )
+        target_flat = torch.cat(
+            [target_flat, tail_slots.reshape(-1)],
+            dim=0,
+        )
+        local_payload_event = _dsa_record_payload_event_if_needed(
+            selected_flat,
+            target_flat,
+        )
+        if local_payload_event is not None:
+            return {
+                "selected_token_ids": selected_flat,
+                "target_slot_mapping": target_flat,
+                "payload_event": local_payload_event,
+            }
+        return selected_flat, None, target_flat
+
     @_lmcache_nvtx_annotate
     def wait_for_layer_load(
         self,
@@ -5721,6 +5971,27 @@ class LMCacheConnectorV1Impl:
                     if payload is not None
                     else (selected_tokens_per_req, token_start_index_per_req)
                 )
+                if is_bootstrap_sample and wait_group == 0:
+                    sparse_payload = (
+                        self._append_bootstrap_tail_to_sparse_payload(
+                            request,
+                            sparse_payload,
+                        )
+                    )
+                    if (
+                        self.current_layer == 0
+                        and request.bootstrap_tail_token_indices is not None
+                        and request.bootstrap_tail_slot_mapping is not None
+                    ):
+                        logger.info(
+                            "[BOOTSTRAP_PARTIAL_TAIL_LOAD] req=%s "
+                            "tail_start=%d tail_tokens=%d target_slots=%d "
+                            "storage=vllm_paged_kv",
+                            request.req_id,
+                            int(request.bootstrap_tail_token_indices[0].item()),
+                            int(request.bootstrap_tail_token_indices.numel()),
+                            int(request.bootstrap_tail_slot_mapping.numel()),
+                        )
                 indexer_sent_key = (
                     (request.req_id, self.current_layer)
                     if indexer_retriever is not None
