@@ -88,8 +88,9 @@ def test_dsa_prefix_hit_uses_full_allocation_and_chunk_aligned_committed_end(
     impl = _make_scheduler_impl()
     impl.kv_role = kv_role
     impl.config.min_retrieve_tokens = hit_tokens + 1
-    impl.lookup_client = MagicMock()
-    impl.lookup_client.lookup_cache.return_value = hit_tokens
+    lookup_client = MagicMock()
+    lookup_client.lookup_cache.return_value = hit_tokens
+    impl._manager = SimpleNamespace(lookup_client=lookup_client)
     request = SimpleNamespace(
         request_id=f"{kv_role}-{hit_tokens}",
         num_tokens=hit_tokens,
