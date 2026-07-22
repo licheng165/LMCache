@@ -54,7 +54,7 @@ class TestSparseDecodePinLifecycle:
 
         connector.request_finished(make_stub_request("req-finish"), [])
         assert engine.unpinned == ["req-finish"]
-        connector._drop_layerwise_save_storers.assert_called_once_with("req-finish")
+        connector._drop_layerwise_save_storers.assert_not_called()
         connector._drop_worker_retrieve_state.assert_called_once_with("req-finish")
 
     def test_drop_worker_retrieve_state_releases_pins(self) -> None:
