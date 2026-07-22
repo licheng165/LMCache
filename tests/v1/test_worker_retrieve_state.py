@@ -2384,6 +2384,8 @@ class TestWorkerRetrieveState:
             "kv_group",
             "prepared_sparse_source",
             "ret_mask",
+            "req_id",
+            "lmcache_cached_tokens",
         }
         prepared_source = kwargs["prepared_sparse_source"]
         assert prepared_source.total_tokens == 256

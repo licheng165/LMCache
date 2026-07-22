@@ -1060,10 +1060,12 @@ class TestDecodeWindowSaveMetadata:
         assert not hasattr(impl, "_mtp_dw_deep_window_group_planned_reqs")
 
         monkeypatch.setenv("VLLM_ASCEND_MTP_DW_DEEP_DIAG", "1")
-        tracker.token_ids.extend(range(512, 768))
-        impl._add_decode_window_save_metas(MagicMock(), tracker)
-        tracker.token_ids.extend(range(768, 1024))
-        impl._add_decode_window_save_metas(MagicMock(), tracker)
+        deep_impl, _, deep_output = self._build_decode_window_case(
+            shared_cpu=False,
+            indexer_blocks=False,
+        )
+        deep_impl.build_connector_meta(deep_output)
+        deep_impl.build_connector_meta(deep_output)
 
         plans = [
             event for event in events if event.get("event") == "window_group_plan"

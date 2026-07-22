@@ -44,7 +44,7 @@ class TestSparseDecodePinLifecycle:
         connector.wait_for_save()
         assert engine.unpinned == ["req-prefill", "req-prefill"]
 
-    def test_scheduler_request_finished_only_releases_lookup_pins(self) -> None:
+    def test_scheduler_request_finished_releases_request_owned_state(self) -> None:
         sparse = make_sparse_req_meta("req-finish")
         connector, _, engine = make_worker_connector([sparse])
         connector.wait_for_save()
@@ -54,8 +54,8 @@ class TestSparseDecodePinLifecycle:
 
         connector.request_finished(make_stub_request("req-finish"), [])
         assert engine.unpinned == ["req-finish"]
-        connector._drop_layerwise_save_storers.assert_not_called()
-        connector._drop_worker_retrieve_state.assert_not_called()
+        connector._drop_layerwise_save_storers.assert_called_once_with("req-finish")
+        connector._drop_worker_retrieve_state.assert_called_once_with("req-finish")
 
     def test_drop_worker_retrieve_state_releases_pins(self) -> None:
         impl = make_worker_impl()
@@ -87,7 +87,7 @@ class TestSparseDecodePinLifecycle:
 
 
 class TestPruneWithoutRequestFinished:
-    def test_prune_drops_stray_state_and_unpins(self) -> None:
+    def test_prune_keeps_stray_warm_state_until_explicit_finish(self) -> None:
         impl = make_worker_impl()
         engine = MagicMock()
         impl._manager = type("M", (), {"lmcache_engine": engine})()
@@ -98,10 +98,10 @@ class TestPruneWithoutRequestFinished:
 
         impl._prune_worker_retrieve_state({"req-active"})
 
-        assert set(impl._worker_retrieve_state) == {"req-active"}
-        engine.lookup_unpin.assert_called_once_with("req-stray")
+        assert set(impl._worker_retrieve_state) == {"req-active", "req-stray"}
+        engine.lookup_unpin.assert_not_called()
 
-    def test_prune_without_request_finished_simulates_missed_finish_signal(self) -> None:
+    def test_prune_without_request_finished_keeps_warm_cached_state(self) -> None:
         impl = make_worker_impl()
         engine = MagicMock()
         impl._manager = type("M", (), {"lmcache_engine": engine})()
@@ -113,5 +113,5 @@ class TestPruneWithoutRequestFinished:
         # Next step metadata only schedules a different request.
         impl._prune_worker_retrieve_state({"req-other"})
 
-        assert "req-finished" not in impl._worker_retrieve_state
-        engine.lookup_unpin.assert_called_once_with("req-finished")
+        assert "req-finished" in impl._worker_retrieve_state
+        engine.lookup_unpin.assert_not_called()
