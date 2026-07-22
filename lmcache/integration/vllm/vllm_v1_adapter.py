@@ -444,6 +444,8 @@ class LoadSpec:
     can_load: bool
     # Block-aligned frontier that sparse decode may remap from LMCache.
     dsa_committed_end: Optional[int] = None
+    # Fixed resident prefix capacity used by DSA MTP union scratch.
+    dsa_scratch_capacity: Optional[int] = None
 
 
 @dataclass
@@ -1550,6 +1552,14 @@ class LMCacheConnectorV1Impl:
         self._latent_kvcaches: list[torch.Tensor] = []
         self._indexer_kvcaches: list[torch.Tensor] = []
         self._block_size = vllm_config.cache_config.block_size
+        hf_config = getattr(vllm_config.model_config, "hf_text_config", None)
+        if hf_config is None:
+            hf_config = getattr(vllm_config.model_config, "hf_config", None)
+        dsa_topk = int(getattr(hf_config, "index_topk", 0) or 0)
+        self._dsa_scratch_capacity = (
+            (1 + max(int(getattr(vllm_config, "num_speculative_tokens", 0)), 0))
+            * dsa_topk
+        )
         self.load_specs: dict[str, LoadSpec] = {}
         self.kv_cache_manager: Optional["KVCacheManager"] = None
         self._request_trackers: dict[str, RequestTracker] = {}
@@ -5353,50 +5363,65 @@ class LMCacheConnectorV1Impl:
             token_mask = self._load_token_mask_for_retrieve(
                 request, token_count, self._lmcache_chunk_size
             )
+            indexer_token_mask = token_mask
+            pd_resident_load = False
             # A PD decoder did not execute prefill locally. Materialize the
-            # prompt's final partial LMCache chunk into the request's ordinary paged
-            # NPU cache once, before sparse selected-token loads start using
-            # the request's retained front-prefix scratch blocks.
-            if request.is_sparse_decode and self.kv_role == "kv_consumer":
+            # entire prompt while it fits in the fixed scratch prefix; for a
+            # longer prompt materialize only the chunk containing its final
+            # token. The persisted middle has null block-table entries and
+            # must never be a retrieve destination.
+            if (
+                self.kv_role == "kv_consumer"
+                and request.load_spec.dsa_committed_end is not None
+                and request.load_spec.dsa_scratch_capacity is not None
+            ):
                 restored = getattr(self, "_pd_partial_restored_req_ids", None)
                 if restored is None:
                     restored = set()
                     self._pd_partial_restored_req_ids = restored
-                partial_start = int(
-                    request.load_spec.dsa_committed_end
-                    if request.load_spec.dsa_committed_end is not None
-                    else len(request.token_ids)
-                    // self._lmcache_chunk_size
-                    * self._lmcache_chunk_size
-                )
-                partial_end = min(
+                tail_start = int(request.load_spec.dsa_committed_end)
+                prompt_end = min(
                     request.load_spec.lmcache_cached_tokens,
                     len(request.token_ids),
                 )
-                if partial_start < partial_end and request.req_id not in restored:
-                    partial_mask = torch.zeros(token_count, dtype=torch.bool)
-                    partial_mask[partial_start:partial_end] = True
-                    partial_slots = slot_mapping[:token_count]
-                    restored_mask = self.lmcache_engine.retrieve(
-                        retrieve_tokens,
-                        partial_mask,
-                        kvcaches=kvcaches,
-                        slot_mapping=partial_slots,
-                        vllm_cached_tokens=partial_start,
-                        request_configs=request.request_configs,
-                        req_id=request.req_id,
-                    )
-                    if int(restored_mask[partial_start:partial_end].sum()) != (
-                        partial_end - partial_start
-                    ):
-                        raise RuntimeError(
-                            "PD decoder failed to restore prompt partial "
-                            "LMCache chunk "
-                            f"for request {request.req_id}: range="
-                            f"[{partial_start}, {partial_end}). Ensure "
-                            "save_unfull_chunk=true on the prefill worker."
+                load_start = (
+                    0
+                    if len(request.token_ids)
+                    <= request.load_spec.dsa_scratch_capacity
+                    else tail_start
+                )
+                if load_start < prompt_end and request.req_id not in restored:
+                    pd_mask = torch.zeros(token_count, dtype=torch.bool)
+                    pd_mask[load_start:prompt_end] = True
+                    if request.is_sparse_decode:
+                        pd_slots = slot_mapping[:token_count]
+                        restored_mask = self.lmcache_engine.retrieve(
+                            retrieve_tokens,
+                            pd_mask,
+                            kvcaches=kvcaches,
+                            slot_mapping=pd_slots,
+                            vllm_cached_tokens=load_start,
+                            request_configs=request.request_configs,
+                            req_id=request.req_id,
                         )
-                    restored.add(request.req_id)
+                        if int(restored_mask[load_start:prompt_end].sum()) != (
+                            prompt_end - load_start
+                        ):
+                            raise RuntimeError(
+                                "PD decoder failed to restore resident prompt "
+                                "LMCache range "
+                                f"for request {request.req_id}: range="
+                                f"[{load_start}, {prompt_end}). Ensure "
+                                "save_unfull_chunk=true on the prefill worker."
+                            )
+                        restored.add(request.req_id)
+                    else:
+                        # Initial PD load still uses the ordinary layerwise/full
+                        # retrieve path. Restrict that path to resident slots so
+                        # it never scatters into null middle blocks.
+                        token_mask = pd_mask
+                        pd_resident_load = True
+                        restored.add(request.req_id)
             if (
                 not request.is_sparse_decode
                 and token_count > len(slot_mapping)
@@ -5861,7 +5886,7 @@ class LMCacheConnectorV1Impl:
                         if idx_slot is not None:
                             indexer_retriever = self.lmcache_engine.retrieve_layer(
                                 retrieve_tokens,
-                                token_mask,
+                                indexer_token_mask,
                                 kvcaches=self._kvcaches_for_group(1),
                                 slot_mapping=idx_slot,
                                 vllm_cached_tokens=request.load_spec.vllm_cached_tokens,
@@ -5942,6 +5967,8 @@ class LMCacheConnectorV1Impl:
                 )
                 if recalc_last_applied:
                     num_expected_tokens -= 1
+                if pd_resident_load:
+                    num_expected_tokens = int(token_mask.sum().item())
                 if num_retrieved_tokens < num_expected_tokens:
                     logger.error(
                         "Request %s"
@@ -7175,6 +7202,23 @@ class LMCacheConnectorV1Impl:
         if below_min_retrieve or need_to_allocate <= 0:
             return 0
 
+        if (
+            self.kv_role == "kv_consumer"
+            and self.enable_sparse_attention
+            and self._dsa_scratch_capacity > 0
+            and request.num_prompt_tokens > 0
+        ):
+            tail_chunk_start = (
+                (request.num_prompt_tokens - 1)
+                // self._lmcache_chunk_size
+                * self._lmcache_chunk_size
+            )
+            request.dsa_external_tail_chunk_start = tail_chunk_start
+            self.load_specs[req_id].dsa_committed_end = tail_chunk_start
+            self.load_specs[req_id].dsa_scratch_capacity = (
+                self._dsa_scratch_capacity
+            )
+
         # TODO: Align to vLLM block size. Should test whether it can be removed
         # need_to_allocate = need_to_allocate // self._block_size * \
         #        self._block_size
@@ -7632,6 +7676,10 @@ class LMCacheConnectorV1Impl:
                 lmcache_cached_tokens,
                 skip_save,
             )
+            if load_spec is not None and load_spec.dsa_committed_end is not None:
+                request_tracker.decode_window_save_committed_end = int(
+                    load_spec.dsa_committed_end
+                )
             self._request_trackers[request.req_id] = request_tracker
 
             req_meta = ReqMeta.from_request_tracker(
@@ -7864,10 +7912,15 @@ class LMCacheConnectorV1Impl:
                         save_frontier,
                         token_len,
                     )
-                dsa_committed_end = (
+                committed_end = (
                     lmcache_cached_for_sparse
                     // self._lmcache_chunk_size
                     * self._lmcache_chunk_size
+                )
+                dsa_committed_end = (
+                    committed_end
+                    if committed_end > self._dsa_scratch_capacity
+                    else 0
                 )
                 if self.kv_role == "kv_consumer":
                     # Include the final partial prompt chunk in worker metadata;
@@ -7880,6 +7933,7 @@ class LMCacheConnectorV1Impl:
                     lmcache_cached_tokens=lmcache_cached_for_sparse,
                     can_load=lmcache_cached_for_sparse > 0,
                     dsa_committed_end=dsa_committed_end,
+                    dsa_scratch_capacity=self._dsa_scratch_capacity,
                 )
 
             req_meta = ReqMeta.from_request_tracker(

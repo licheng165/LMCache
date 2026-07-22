@@ -52,6 +52,7 @@ def _make_scheduler_impl() -> LMCacheConnectorV1Impl:
     impl._block_size = 16
     impl._lmcache_chunk_size = 256
     impl._decode_window_save_window_size = 0
+    impl._dsa_scratch_capacity = 4096
     impl._discard_partial_chunks = True
     impl._request_trackers = {}
     impl._unfinished_requests = {}
@@ -445,6 +446,7 @@ class TestBuildConnectorMetaSparseSyntheticLoadSpec:
     def test_decode_window_sparse_load_uses_committed_window_end(self) -> None:
         impl = _make_scheduler_impl()
         impl._decode_window_save_window_size = 256
+        impl._dsa_scratch_capacity = 256
 
         req_id = "sparse-window"
         prompt_len = 356
@@ -490,6 +492,7 @@ class TestBuildConnectorMetaSparseSyntheticLoadSpec:
         assert req_meta.load_spec is not None
         assert req_meta.load_spec.can_load is True
         assert req_meta.load_spec.lmcache_cached_tokens == 256
+        assert req_meta.load_spec.dsa_committed_end == 0
         assert req_meta.token_ids == all_tokens[:256]
         assert tracker.sparse_token_ids == all_tokens[:256]
         assert req_meta.slot_mapping[0].numel() == 256
@@ -516,6 +519,7 @@ class TestBuildConnectorMetaSparseSyntheticLoadSpec:
         assert req_meta.load_spec is not None
         assert req_meta.load_spec.can_load is True
         assert req_meta.load_spec.lmcache_cached_tokens == 512
+        assert req_meta.load_spec.dsa_committed_end == 512
         assert req_meta.token_ids == all_tokens[:512]
         assert tracker.sparse_token_ids == all_tokens[:512]
         assert req_meta.slot_mapping[0].numel() == 512
