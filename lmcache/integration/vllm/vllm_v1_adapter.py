@@ -5365,16 +5365,30 @@ class LMCacheConnectorV1Impl:
             )
             indexer_token_mask = token_mask
             pd_resident_load = False
+            pd_dsa_resident_load = (
+                self.kv_role == "kv_consumer"
+                and request.load_spec.dsa_committed_end is not None
+                and request.load_spec.dsa_scratch_capacity is not None
+            )
+            logger.info(
+                "PD DSA resident-load decision: req_id=%s kv_role=%s "
+                "is_sparse_decode=%s prompt_len=%d lmcache_cached_tokens=%d "
+                "dsa_committed_end=%s dsa_scratch_capacity=%s enabled=%s",
+                request.req_id,
+                self.kv_role,
+                request.is_sparse_decode,
+                len(request.token_ids),
+                request.load_spec.lmcache_cached_tokens,
+                request.load_spec.dsa_committed_end,
+                request.load_spec.dsa_scratch_capacity,
+                pd_dsa_resident_load,
+            )
             # A PD decoder did not execute prefill locally. Materialize the
             # entire prompt while it fits in the fixed scratch prefix; for a
             # longer prompt materialize only the chunk containing its final
             # token. The persisted middle has null block-table entries and
             # must never be a retrieve destination.
-            if (
-                self.kv_role == "kv_consumer"
-                and request.load_spec.dsa_committed_end is not None
-                and request.load_spec.dsa_scratch_capacity is not None
-            ):
+            if pd_dsa_resident_load:
                 restored = getattr(self, "_pd_partial_restored_req_ids", None)
                 if restored is None:
                     restored = set()
@@ -5389,6 +5403,15 @@ class LMCacheConnectorV1Impl:
                     if len(request.token_ids)
                     <= request.load_spec.dsa_scratch_capacity
                     else tail_start
+                )
+                logger.info(
+                    "PD DSA resident-load range: req_id=%s load_start=%d "
+                    "prompt_end=%d token_count=%d already_restored=%s",
+                    request.req_id,
+                    load_start,
+                    prompt_end,
+                    token_count,
+                    request.req_id in restored,
                 )
                 if load_start < prompt_end and request.req_id not in restored:
                     pd_mask = torch.zeros(token_count, dtype=torch.bool)
