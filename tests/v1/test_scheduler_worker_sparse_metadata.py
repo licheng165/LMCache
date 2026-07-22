@@ -77,6 +77,35 @@ def _make_vllm_request(
     )
 
 
+@pytest.mark.parametrize("kv_role", ["kv_consumer", "kv_both"])
+@pytest.mark.parametrize(
+    ("hit_tokens", "expected_committed"),
+    [(3000, 2816), (8192, 8192)],
+)
+def test_dsa_prefix_hit_uses_full_allocation_and_chunk_aligned_committed_end(
+    kv_role: str, hit_tokens: int, expected_committed: int
+) -> None:
+    impl = _make_scheduler_impl()
+    impl.kv_role = kv_role
+    impl.config.min_retrieve_tokens = hit_tokens + 1
+    impl.lookup_client = MagicMock()
+    impl.lookup_client.lookup_cache.return_value = hit_tokens
+    request = SimpleNamespace(
+        request_id=f"{kv_role}-{hit_tokens}",
+        num_tokens=hit_tokens,
+    )
+
+    # A full hit recomputes the final prompt token, so vLLM needs slots for
+    # hit_tokens - 1 external tokens here and the scheduled token completes
+    # the fully resident prompt layout.
+    assert impl.get_num_new_matched_tokens(request, 0) == hit_tokens - 1
+    load_spec = impl.load_specs[request.request_id]
+    assert load_spec.lmcache_cached_tokens == hit_tokens
+    assert load_spec.dsa_committed_end == expected_committed
+    assert load_spec.dsa_scratch_capacity == 4096
+    assert not hasattr(request, "dsa_external_tail_chunk_start")
+
+
 def test_chunk_size_must_be_integer_multiple_of_block_size() -> None:
     impl = _make_scheduler_impl()
     impl._lmcache_chunk_size = 250
