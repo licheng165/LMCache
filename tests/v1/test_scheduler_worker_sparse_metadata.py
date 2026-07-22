@@ -106,6 +106,26 @@ def test_dsa_prefix_hit_uses_full_allocation_and_chunk_aligned_committed_end(
     assert not hasattr(request, "dsa_external_tail_chunk_start")
 
 
+def test_first_sparse_step_publishes_initial_release_frontier_once() -> None:
+    impl = _make_scheduler_impl()
+    impl._completed_decode_window_saves = {}
+    request = SimpleNamespace(
+        req_id="initial-sparse-release",
+        is_sparse_decode=True,
+        load_spec=SimpleNamespace(dsa_committed_end=8192),
+    )
+
+    impl._mark_initial_sparse_release_ready(request)
+    assert impl.get_completed_decode_window_saves() == {
+        request.req_id: 8192,
+    }
+
+    # The one-shot marker prevents a later sparse step from publishing the
+    # initial frontier again after the completion output has been drained.
+    impl._mark_initial_sparse_release_ready(request)
+    assert impl.get_completed_decode_window_saves() == {}
+
+
 def test_chunk_size_must_be_integer_multiple_of_block_size() -> None:
     impl = _make_scheduler_impl()
     impl._lmcache_chunk_size = 250

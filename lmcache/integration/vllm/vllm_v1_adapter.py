@@ -3215,6 +3215,27 @@ class LMCacheConnectorV1Impl:
                 completed.get(request.req_id, 0), committed_end
             )
 
+    def _mark_initial_sparse_release_ready(self, request: ReqMeta) -> None:
+        """Publish the cache-hit frontier after the first sparse step completes."""
+        if not request.is_sparse_decode or request.load_spec is None:
+            return
+        committed_end = request.load_spec.dsa_committed_end
+        if committed_end is None or committed_end <= 0:
+            return
+        published = getattr(self, "_initial_sparse_release_published", None)
+        if published is None:
+            published = set()
+            self._initial_sparse_release_published = published
+        if request.req_id in published:
+            return
+        completed = getattr(self, "_completed_decode_window_saves", None)
+        if completed is None:
+            return
+        completed[request.req_id] = max(
+            completed.get(request.req_id, 0), int(committed_end)
+        )
+        published.add(request.req_id)
+
     def get_completed_decode_window_saves(self) -> dict[str, int]:
         completed = getattr(self, "_completed_decode_window_saves", None)
         if not completed:
@@ -3325,6 +3346,8 @@ class LMCacheConnectorV1Impl:
     def _prune_worker_retrieve_state(self, active_req_ids: set[str]) -> None:
         if hasattr(self, "_pd_partial_restored_req_ids"):
             self._pd_partial_restored_req_ids.intersection_update(active_req_ids)
+        if hasattr(self, "_initial_sparse_release_published"):
+            self._initial_sparse_release_published.intersection_update(active_req_ids)
         if not hasattr(self, "_worker_retrieve_state"):
             return
         dropped_req_ids = set(self._worker_retrieve_state) - active_req_ids
@@ -6889,6 +6912,7 @@ class LMCacheConnectorV1Impl:
                 self._maybe_seed_worker_retrieve_state_from_store(request)
                 self._mark_decode_window_save_completed(request)
                 self._mark_prefill_committed(request)
+                self._mark_initial_sparse_release_ready(request)
                 self._maybe_lookup_unpin_for_request(request)
             return
 
@@ -6899,6 +6923,7 @@ class LMCacheConnectorV1Impl:
 
         for request in connector_metadata.requests:
             self._maybe_lookup_unpin_for_request(request)
+            self._mark_initial_sparse_release_ready(request)
 
             save_spec = request.save_spec
             if (
@@ -7744,6 +7769,11 @@ class LMCacheConnectorV1Impl:
                     f"This might be due to an unsupported vLLM version."
                 )
             if preempted:
+                published = getattr(
+                    self, "_initial_sparse_release_published", None
+                )
+                if published is not None:
+                    published.discard(req_id)
                 assert load_spec is not None, (
                     f"Request {req_id} is preempted but was not given a load spec"
                 )
