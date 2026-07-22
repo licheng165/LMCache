@@ -2,6 +2,7 @@
 # Standard
 from collections import defaultdict
 from collections.abc import Iterable
+from dataclasses import dataclass, field
 from typing import (
     TYPE_CHECKING,
     Any,
@@ -62,6 +63,7 @@ from lmcache.v1.sampled_lookup import (
     first_last_layer_keys,
 )
 from lmcache.v1.shared_cpu_cache import (
+    SharedCPURequestLease,
     SharedChunkHandle,
     SharedHandleEnvelope,
     SharedSlabMapping,
@@ -89,6 +91,30 @@ LayerwiseRetrieveSegment = Tuple[
     List[int],
     List[List[CacheEngineKey]],
 ]
+
+
+@dataclass
+class LayerwiseStoreResult:
+    """Cache objects produced by one completed layerwise store generator.
+
+    Storage backends own the memory objects after a successful put. A consumer
+    that needs lifetime independent of backend residency must acquire its own
+    reference.
+    """
+
+    request_id: str
+    kv_group: int = 0
+    starts: List[int] = field(default_factory=list)
+    ends: List[int] = field(default_factory=list)
+    keys: List[List[CacheEngineKey]] = field(default_factory=list)
+    memory_objs: List[List[MemoryObj]] = field(default_factory=list)
+    tensors: List[List[torch.Tensor]] = field(default_factory=list)
+    chunk_dev_ptrs: List[List[int]] = field(default_factory=list)
+    chunk_ptrs: List[Optional[torch.Tensor]] = field(default_factory=list)
+
+    def has_cache(self) -> bool:
+        """Return whether the completed store produced reusable cache data."""
+        return bool(self.starts and self.ends and self.keys and self.memory_objs)
 
 
 class CacheEngineEndSignal:
@@ -154,7 +180,7 @@ class LMCacheEngine:
         self.shared_cpu_cache_generation = 0
         self.shared_cpu_cache_mapping: Optional[SharedSlabMapping] = None
         self.shared_cpu_cache_passive_allocator = None
-        self._shared_cpu_active_sparse_requests: dict[str, dict[str, Any]] = {}
+        self._shared_cpu_request_leases: dict[str, SharedCPURequestLease] = {}
         self._sampled_lookup_local_fallback_logged = False
         self._validate_shared_cpu_cache_contract()
         self._prepare_shared_cpu_cache_name()
@@ -1037,6 +1063,7 @@ class LMCacheEngine:
         mem_objs_layer: list[MemoryObj],
         layer_id: int,
         kv_group: int,
+        chunk_index_base: int = 0,
     ) -> list[SharedChunkHandle]:
         if self.shared_cpu_cache_name is None:
             raise ValueError("Shared CPU cache name is not initialized")
@@ -1048,9 +1075,10 @@ class LMCacheEngine:
                 f"memory_objs={len(mem_objs_layer)}"
             )
         handles: list[SharedChunkHandle] = []
-        for chunk_index, (key, mem_obj) in enumerate(
+        for chunk_offset, (key, mem_obj) in enumerate(
             zip(keys_layer, mem_objs_layer, strict=True)
         ):
+            chunk_index = chunk_index_base + chunk_offset
             self._validate_rank0_shared_mem_obj(
                 mem_obj,
                 req_id=req_id,
@@ -1404,33 +1432,143 @@ class LMCacheEngine:
                     evictable_bytes += physical_size
             snapshot["pinned_bytes"] = pinned_bytes
             snapshot["evictable_bytes"] = evictable_bytes
-            snapshot["active_sparse_requests"] = len(
-                self._shared_cpu_active_sparse_requests
+            snapshot["active_sparse_requests"] = sum(
+                lease.active
+                for lease in self._shared_cpu_request_leases.values()
             )
             return snapshot
         except Exception as exc:
             return {"capacity_snapshot_error": str(exc)}
 
+    def _get_shared_cpu_request_lease(
+        self,
+        req_id: str,
+    ) -> tuple[SharedCPURequestLease, bool]:
+        lease = self._shared_cpu_request_leases.get(req_id)
+        if (
+            lease is not None
+            and lease.generation != self.shared_cpu_cache_generation
+        ):
+            self._shared_cpu_request_leases.pop(req_id, None)
+            lease.close()
+            lease = None
+        if lease is not None:
+            return lease, False
+        return (
+            SharedCPURequestLease(
+                request_id=req_id,
+                generation=self.shared_cpu_cache_generation,
+                is_rank0=self.metadata.is_first_rank(),
+            ),
+            True,
+        )
+
     def register_shared_cpu_sparse_request(
         self,
         req_id: str,
         *,
-        token_count: int = 0,
-        phase: str = "sparse_decode_bootstrap",
+        owned_groups: Optional[dict[int, list[list[MemoryObj]]]] = None,
+        append_from: Optional[dict[int, int]] = None,
     ) -> None:
+        """Adopt complete groups or append-only suffixes for a live request.
+
+        Args:
+            req_id: Request whose shared objects remain live.
+            owned_groups: Complete per-layer object lists to adopt.
+            append_from: Existing chunk count per group for suffix adoption.
+
+        Raises:
+            ValueError: If suffix adoption is not append-aligned.
+        """
         if not req_id:
             return
-        self._shared_cpu_active_sparse_requests[req_id] = {
-            "token_count": int(token_count or 0),
-            "phase": phase,
-            "generation": self.shared_cpu_cache_generation,
-            "registered_at": time.time(),
-        }
+        lease, created = self._get_shared_cpu_request_lease(req_id)
+        try:
+            if append_from is not None and not created and owned_groups:
+                lease.append_groups(owned_groups, append_from)
+            elif owned_groups:
+                lease.replace_groups(owned_groups, retain=False)
+            lease.active = True
+            self._shared_cpu_request_leases[req_id] = lease
+        except Exception:
+            if created:
+                lease.close()
+            raise
+
+    def retain_shared_cpu_store_seed(
+        self,
+        req_id: str,
+        groups: dict[int, list[list[MemoryObj]]],
+    ) -> None:
+        if not req_id or not groups or not self.metadata.is_first_rank():
+            return
+        lease, created = self._get_shared_cpu_request_lease(req_id)
+        try:
+            lease.replace_groups(groups, retain=True)
+            self._shared_cpu_request_leases[req_id] = lease
+        except Exception:
+            if created:
+                lease.close()
+            raise
+
+    def shared_cpu_rank0_request_object_ids(
+        self,
+        req_id: Optional[str],
+        kv_group: int,
+    ) -> set[int]:
+        if not req_id:
+            return set()
+        lease = self._shared_cpu_request_leases.get(req_id)
+        if (
+            lease is None
+            or lease.generation != self.shared_cpu_cache_generation
+            or not lease.is_rank0
+        ):
+            return set()
+        return lease.object_ids(kv_group)
+
+    def release_shared_cpu_unowned_objects(
+        self,
+        req_id: Optional[str],
+        groups: dict[int, list[list[MemoryObj]]],
+    ) -> None:
+        """Release retrieved objects not adopted by the request lease."""
+
+        lease = self._shared_cpu_request_leases.get(req_id or "")
+        owned_ids = (
+            lease.object_ids()
+            if lease is not None
+            and lease.generation == self.shared_cpu_cache_generation
+            else set()
+        )
+        unowned_objects = [
+            memory_obj
+            for layers in groups.values()
+            for layer in layers
+            for memory_obj in layer
+            if id(memory_obj) not in owned_ids
+        ]
+        if not unowned_objects:
+            return
+        SharedCPURequestLease(
+            request_id=req_id or "unowned",
+            generation=self.shared_cpu_cache_generation,
+            is_rank0=self.metadata.is_first_rank(),
+            groups={0: [unowned_objects]},
+        ).close()
 
     def release_shared_cpu_sparse_request(self, req_id: Optional[str]) -> None:
         if not req_id:
             return
-        self._shared_cpu_active_sparse_requests.pop(req_id, None)
+        lease = self._shared_cpu_request_leases.pop(req_id, None)
+        if lease is not None:
+            lease.close()
+
+    def _release_all_shared_cpu_request_leases(self) -> None:
+        leases = list(self._shared_cpu_request_leases.values())
+        self._shared_cpu_request_leases.clear()
+        for lease in leases:
+            lease.close()
 
     def _shared_cpu_estimated_physical_chunk_bytes(
         self,
@@ -1566,7 +1704,11 @@ class LMCacheEngine:
                 evictable_bytes += physical_size
 
         available_after_eviction = free_bytes + evictable_bytes
-        active_sparse_requests = set(self._shared_cpu_active_sparse_requests)
+        active_sparse_requests = {
+            req_id
+            for req_id, lease in self._shared_cpu_request_leases.items()
+            if lease.active
+        }
         if req_id:
             active_sparse_requests.add(req_id)
         details = {
@@ -2705,7 +2847,7 @@ class LMCacheEngine:
         tokens: Union[torch.Tensor, list[int]],
         mask: Optional[torch.Tensor] = None,
         **kwargs,
-    ) -> Generator[None, None, None]:
+    ) -> Generator[Optional[LayerwiseStoreResult], None, None]:
         """
         Store the KV cache in a layerwise manner.
 
@@ -2718,14 +2860,21 @@ class LMCacheEngine:
         :param **kwargs: The additional arguments for the storage backend which
             will be passed into the gpu_connector.
 
-        return: A generator that yields None. In the first iteration, the
-            generator allocates the memory objects for all layers and moves
+        return: A generator that yields None for each layer and a
+            LayerwiseStoreResult after the final layer. In the first iteration,
+            the generator allocates the memory objects for all layers and moves
             the KV cache of the first layer from GPU to CPU. In the next
             iterations, it moves the KV cache of layer i from GPU to the memory
             objects (on CPU) and puts the memory objects of layer i-1 to the
             storage backends. In the last iteration, it puts the memory objects
-            of the last layer to the storage backends.
+            of the last layer to the storage backends and yields the completed
+            store output.
         """
+        store_result = LayerwiseStoreResult(
+            request_id=str(kwargs.get("req_id", "unspecified")),
+            kv_group=int(kwargs.get("kv_group", 0) or 0),
+        )
+
         # Health check: block operation if LMCache is unhealthy
         if not self.is_healthy():
             logger.warning("LMCache is unhealthy, skipping store_layer operation")
@@ -2742,7 +2891,7 @@ class LMCacheEngine:
             for layer_id in range(self.num_layers):
                 yield
             # Extra yield consumed by wait_for_save() after the last layer.
-            yield
+            yield store_result
             return
 
         assert self.storage_manager is not None
@@ -2752,6 +2901,7 @@ class LMCacheEngine:
 
         # Get req_id for logging
         req_id = self._get_req_id(kwargs)
+        store_result.request_id = req_id
 
         if mask is not None:
             num_to_store_tokens = torch.sum(mask).item()
@@ -2777,12 +2927,8 @@ class LMCacheEngine:
             # Still need to yield to avoid StopIteration
             for layer_id in range(self.num_layers):
                 yield
-            yield
+            yield store_result
             return
-
-        cached_keys = kwargs.get("cached_keys")
-        assert cached_keys is not None
-        assert isinstance(cached_keys, list)
 
         starts = []
         ends = []
@@ -2879,6 +3025,10 @@ class LMCacheEngine:
             # Transpose the keys and memory objects into layer major format
             memory_objs = [list(row) for row in zip(*memory_objs, strict=False)]
             keys = [list(row) for row in zip(*keys, strict=False)]
+            store_result.starts = starts
+            store_result.ends = ends
+            store_result.keys = keys
+            store_result.memory_objs = memory_objs
             pending_store_release: dict[int, MemoryObj] = {
                 id(mem_obj): mem_obj
                 for layer_objs in memory_objs
@@ -2943,7 +3093,7 @@ class LMCacheEngine:
                 yield
 
         self.stats_monitor.on_store_finished(monitor_req_id, tot_token_num)
-        yield
+        yield store_result
 
     @_lmcache_nvtx_annotate
     @torch.inference_mode()
@@ -4016,6 +4166,7 @@ class LMCacheEngine:
             except Exception as e:
                 logger.error(f"Error closing lmcache_worker: {e}")
 
+        self._release_all_shared_cpu_request_leases()
         try:
             logger.info("Closing storage_manager...")
             if self.storage_manager is not None:

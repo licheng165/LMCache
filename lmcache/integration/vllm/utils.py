@@ -33,7 +33,7 @@ _config_lock = threading.Lock()
 
 def is_false(value: str) -> bool:
     """Check if the given string value is equivalent to 'false'."""
-    return value.lower() in ("false", "0", "no", "n", "off")
+    return value.strip().lower() in ("false", "0", "no", "n", "off")
 
 
 def vllm_layout_hints() -> "LayoutHints":
