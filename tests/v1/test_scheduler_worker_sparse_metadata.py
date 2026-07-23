@@ -317,9 +317,99 @@ def test_prefill_completion_publishes_only_chunk_aligned_frontier() -> None:
     impl._mark_prefill_committed(request)
 
     assert impl._completed_decode_window_saves == {"prefill-partial": 256}
+class TestRequestTrackerPhase:
+    def test_one_token_prefill_boundary_remains_prefill(self) -> None:
+        tracker = RequestTracker(
+            req_id="phase-boundary",
+            prompt_len=4,
+            token_ids=[0, 1, 2],
+            allocated_block_ids=[0],
+        )
+
+        tracker.update([3], [])
+        assert not tracker.is_decode_phase
+
+        tracker.update([4], [])
+        assert tracker.is_decode_phase
 
 
+class TestDisaggSpecOwnership:
+    def test_build_meta_copies_spec_from_scheduler_owned_request(self) -> None:
+        impl = _make_scheduler_impl()
+        req_id = "vllm-req"
+        impl._unfinished_requests[req_id] = SimpleNamespace(
+            kv_transfer_params={
+                "disagg_spec": {
+                    "req_id": "transfer-req",
+                    "receiver_host": "decode-host",
+                    "receiver_init_port": 9000,
+                    "receiver_alloc_port": 9001,
+                }
+            }
+        )
+        new_request = SimpleNamespace(
+            req_id=req_id,
+            prompt_token_ids=[1],
+            block_ids=[0],
+            num_computed_tokens=0,
+            sampling_params=SimpleNamespace(extra_args=None),
+        )
+        scheduler_output = StubSchedulerOutput(
+            finished_req_ids=set(),
+            scheduled_new_reqs=[new_request],
+            scheduled_cached_reqs=StubCachedRequestData(
+                req_ids=[],
+                new_token_ids=[],
+                new_block_ids=[],
+            ),
+            num_scheduled_tokens={req_id: 1},
+        )
+
+        impl.build_connector_meta(scheduler_output)
+
+        tracker = impl._request_trackers[req_id]
+        assert tracker.disagg_spec is not None
+        assert tracker.disagg_spec.receiver_id == "decode-host9000"
 class TestBuildConnectorMetaSparseSyntheticLoadSpec:
+    def test_first_decode_step_keeps_short_prompt_resident(self) -> None:
+        impl = _make_scheduler_impl()
+        impl._decode_window_save_window_size = 256
+        req_id = "first-decode"
+        prompt_len = 300
+        decode_token = 999
+        vllm_req = _make_vllm_request(
+            req_id, prompt_len, prompt_len, decode_token
+        )
+
+        impl._unfinished_requests[req_id] = vllm_req
+        impl._request_trackers[req_id] = RequestTracker(
+            req_id=req_id,
+            prompt_len=prompt_len,
+            token_ids=list(range(prompt_len)),
+            allocated_block_ids=list(range(19)),
+            num_saved_tokens=prompt_len,
+        )
+        scheduler_output = StubSchedulerOutput(
+            finished_req_ids=set(),
+            scheduled_new_reqs=[],
+            scheduled_cached_reqs=StubCachedRequestData(
+                req_ids=[req_id],
+                new_token_ids=[[decode_token]],
+                new_block_ids=[[]],
+            ),
+            num_scheduled_tokens={req_id: 1},
+        )
+
+        meta = impl.build_connector_meta(scheduler_output)
+
+        assert len(meta.requests) == 1
+        req_meta = meta.requests[0]
+        assert req_meta.is_sparse_decode
+        assert req_meta.load_spec is not None
+        assert req_meta.load_spec.can_load is False
+        assert req_meta.load_spec.lmcache_cached_tokens == 0
+        assert req_meta.load_spec.dsa_committed_end == 0
+
     def test_sparse_decode_steps_synthesize_load_spec_and_sparse_tokens(self) -> None:
         impl = _make_scheduler_impl()
         req_id = "sparse-req"
@@ -360,7 +450,7 @@ class TestBuildConnectorMetaSparseSyntheticLoadSpec:
         assert req_meta.token_ids == list(range(prompt_len))
         assert req_meta.save_spec is not None
         assert req_meta.save_spec.can_save is False
-        assert req_meta.cached_keys == []
+        assert not hasattr(req_meta, "cached_keys")
 
     def test_sparse_decode_does_not_load_partial_only_prompt(self) -> None:
         impl = _make_scheduler_impl()

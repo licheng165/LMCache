@@ -36,31 +36,42 @@ def _make_sparse_request(*, resumed: bool = False) -> ReqMeta:
     )
 
 
+def _publish_sparse_state(
+    impl, request: ReqMeta, *, with_data: bool = True
+) -> WorkerRetrieveState:
+    state = WorkerRetrieveState(
+        cached_keys=[["layer-key"]],
+        cached_starts=[0],
+        cached_ends=[256],
+    )
+    if with_data:
+        state.cached_tensors = [[torch.zeros(256)]]
+        state.cached_chunk_ptrs_npu = [
+            torch.tensor([123], dtype=torch.int64)
+        ]
+    impl._publish_worker_retrieve_state(
+        state,
+        request,
+        location="LocalCPUBackend",
+        metadata_warm=True,
+        token_count=256,
+    )
+    return state
+
+
 class TestConnectorWarmColdInvalidate:
     def test_complete_layer_cache_is_resolved_without_legacy_binding(self) -> None:
         impl = make_worker_impl()
         impl._latent_kvcaches = [torch.zeros(1)]
         request = _make_sparse_request()
-        request.cached_keys = [["layer-key"]]
-        request.cached_starts = [0]
-        request.cached_ends = [256]
-        request.cached_tensors = [[torch.zeros(256)]]
-        request.cached_chunk_ptrs_npu = [torch.tensor([123], dtype=torch.int64)]
-
-        impl._save_worker_retrieve_state_from_request(
-            request,
-            location="LocalCPUBackend",
-            metadata_warm=True,
-            token_count=256,
-        )
+        state = _publish_sparse_state(impl, request)
 
         fresh = _make_sparse_request()
-        state = impl._worker_retrieve_state_for_request(fresh)
+        bound = impl._worker_retrieve_state_for_request(fresh)
 
-        assert state is not None
+        assert bound is state
         assert state.prepared_sparse_sources[0].total_tokens == 256
-        assert fresh.cached_keys == []
-        assert fresh.cached_tensors == []
+        assert not hasattr(fresh, "cached_keys")
 
         impl._drop_worker_retrieve_state(request.req_id)
         assert state.prepared_sparse_sources == {}
@@ -69,20 +80,7 @@ class TestConnectorWarmColdInvalidate:
         impl = make_worker_impl()
         impl._latent_kvcaches = [torch.zeros(1)]
         request = _make_sparse_request()
-        request.cached_keys = [["layer-key"]]
-        request.cached_starts = [0]
-        request.cached_ends = [256]
-        request.cached_tensors = [[torch.zeros(256)]]
-        request.cached_chunk_ptrs_npu = [
-            torch.tensor([123], dtype=torch.int64)
-        ]
-        impl._save_worker_retrieve_state_from_request(
-            request,
-            location="LocalCPUBackend",
-            metadata_warm=True,
-            token_count=256,
-        )
-        state = impl._worker_retrieve_state[request.req_id]
+        state = _publish_sparse_state(impl, request)
         impl.lmcache_engine = SimpleNamespace(enable_shared_cpu_cache=True)
 
         assert impl._prepared_sparse_source(state, 0, 256) is None
@@ -93,20 +91,7 @@ class TestConnectorWarmColdInvalidate:
         impl = make_worker_impl()
         impl._latent_kvcaches = [torch.zeros(1)]
         request = _make_sparse_request()
-        request.cached_keys = [["layer-key"]]
-        request.cached_starts = [0]
-        request.cached_ends = [256]
-        request.cached_tensors = [[torch.zeros(256)]]
-        request.cached_chunk_ptrs_npu = [
-            torch.tensor([123], dtype=torch.int64)
-        ]
-        impl._save_worker_retrieve_state_from_request(
-            request,
-            location="LocalCPUBackend",
-            metadata_warm=True,
-            token_count=256,
-        )
-        state = impl._worker_retrieve_state[request.req_id]
+        state = _publish_sparse_state(impl, request)
         state.shared_request_active = True
         state.shared_generation = 7
         impl.lmcache_engine = SimpleNamespace(
@@ -124,20 +109,7 @@ class TestConnectorWarmColdInvalidate:
         impl = make_worker_impl()
         impl._latent_kvcaches = [torch.zeros(1)]
         request = _make_sparse_request()
-        request.cached_keys = [["layer-key"]]
-        request.cached_starts = [0]
-        request.cached_ends = [256]
-        request.cached_tensors = [[torch.zeros(256)]]
-        request.cached_chunk_ptrs_npu = [
-            torch.tensor([123], dtype=torch.int64)
-        ]
-        impl._save_worker_retrieve_state_from_request(
-            request,
-            location="LocalCPUBackend",
-            metadata_warm=True,
-            token_count=256,
-        )
-        state = impl._worker_retrieve_state[request.req_id]
+        state = _publish_sparse_state(impl, request)
         state.shared_request_active = True
         state.shared_latent_status = "present"
         state.shared_generation = 7
@@ -153,52 +125,35 @@ class TestConnectorWarmColdInvalidate:
         assert impl._worker_retrieve_state_for_request(request) is state
         impl._cached_ranges_cover_prefix.assert_not_called()
 
-    def test_store_binds_request_owned_cache_only_when_needed(self) -> None:
+    def test_building_store_kwargs_does_not_mutate_retrieve_state(self) -> None:
         impl = make_worker_impl()
         request = _make_sparse_request()
-        request.cached_keys = [["layer-key"]]
-        request.cached_starts = [0]
-        request.cached_ends = [256]
-
-        impl._save_worker_retrieve_state_from_request(
-            request,
-            location="LocalCPUBackend",
-            metadata_warm=True,
-            token_count=256,
-        )
+        state = _publish_sparse_state(impl, request, with_data=False)
 
         fresh = _make_sparse_request()
         bound = impl._worker_retrieve_state_for_request(fresh)
-        assert bound is not None
-        assert fresh.cached_keys == []
-        impl._bind_worker_retrieve_state_for_store(fresh)
+        kwargs = impl._layerwise_store_kwargs(fresh, 0)
         warm = impl._sparse_decode_bootstrap_reuse_kwargs(256, bound)
 
-        assert fresh.cached_keys is bound.cached_keys
+        assert bound is state
+        assert not any(name.startswith("cached_") for name in kwargs)
+        assert not hasattr(fresh, "cached_keys")
         assert warm["_retrieve_metadata_warm"] is True
         assert warm["cached_retrieve_location"] == "LocalCPUBackend"
 
-    def test_store_kwargs_resolve_the_requested_group_once(self) -> None:
+    def test_store_kwargs_identify_requested_group_without_cache_state(
+        self,
+    ) -> None:
         impl = make_worker_impl()
         impl.config = SimpleNamespace(dsa_two_groups=True)
         impl.enable_sparse_attention = True
         request = _make_sparse_request()
-        request.cached_keys = [["latent-key"]]
-        request.cached_keys_indexer = [["index-key"]]
-        request.cached_tensors = [["latent-tensor"]]
-        request.cached_tensors_indexer = [["index-tensor"]]
-        request.cached_chunk_ptrs_npu = ["latent-ptrs"]
-        request.cached_chunk_ptrs_npu_indexer = ["index-ptrs"]
 
         kwargs = impl._layerwise_store_kwargs(request, 1)
 
         assert kwargs["kv_group"] == 1
-        assert kwargs["cached_keys"] is request.cached_keys_indexer
-        assert kwargs["cached_tensors"] is request.cached_tensors_indexer
-        assert (
-            kwargs["cached_chunk_ptrs_npu"]
-            is request.cached_chunk_ptrs_npu_indexer
-        )
+        assert not any(name.startswith("cached_") for name in kwargs)
+        assert not hasattr(request, "cached_keys")
 
     def test_preemption_invalidates_then_cold_reload(self) -> None:
         impl = make_worker_impl()

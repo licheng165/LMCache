@@ -101,8 +101,14 @@ def make_worker_connector(
 def make_worker_impl() -> LMCacheConnectorV1Impl:
     impl = LMCacheConnectorV1Impl.__new__(LMCacheConnectorV1Impl)
     impl._worker_retrieve_state = {}
+    impl.lmcache_engine = None
+    impl.kv_role = "kv_both"
+    impl._lmcache_chunk_size = 256
     return impl
 
 
 def make_stub_request(request_id: str) -> Any:
-    return SimpleNamespace(request_id=request_id, status=SimpleNamespace(name="FINISHED"))
+    return SimpleNamespace(
+        request_id=request_id,
+        status=SimpleNamespace(name="FINISHED"),
+    )

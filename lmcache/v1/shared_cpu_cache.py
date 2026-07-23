@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Shared CPU cache handle and passive-view primitives.
+"""Shared CPU cache request ownership, handles, and passive-view primitives.
 
 This module intentionally contains no storage-tier policy. Rank0 resolves real
 MemoryObjs through the existing StorageManager/LocalCPUBackend path, publishes
@@ -10,7 +10,7 @@ handles after strict validation.
 from __future__ import annotations
 
 import ctypes
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Iterable, Optional, Union
 
 import torch
@@ -34,6 +34,173 @@ class SharedCPUCacheError(RuntimeError):
 
 class SharedCPUCacheValidationError(SharedCPUCacheError):
     """Raised before view creation or pointer install when metadata is unsafe."""
+
+
+@dataclass
+class SharedCPURequestLease:
+    """Own the shared MemoryObjs retained for one live request."""
+
+    request_id: str
+    generation: int
+    is_rank0: bool
+    active: bool = False
+    groups: dict[int, list[list[MemoryObj]]] = field(default_factory=dict)
+
+    @staticmethod
+    def _unique_objects(
+        groups: dict[int, list[list[MemoryObj]]],
+    ) -> list[MemoryObj]:
+        seen: set[int] = set()
+        objects: list[MemoryObj] = []
+        for layers in groups.values():
+            for layer in layers:
+                for memory_obj in layer:
+                    identity = id(memory_obj)
+                    if identity not in seen:
+                        seen.add(identity)
+                        objects.append(memory_obj)
+        return objects
+
+    @staticmethod
+    def _is_valid(memory_obj: MemoryObj) -> bool:
+        is_valid = getattr(memory_obj, "is_valid", None)
+        return bool(is_valid()) if callable(is_valid) else True
+
+    def _release(self, objects: Iterable[MemoryObj]) -> None:
+        for memory_obj in objects:
+            if self.is_rank0 and getattr(memory_obj, "is_pinned", False):
+                try:
+                    memory_obj.unpin()
+                except Exception as exc:
+                    logger.warning(
+                        "Failed to unpin shared CPU request object: "
+                        "request_id=%s error=%s",
+                        self.request_id,
+                        exc,
+                    )
+            try:
+                if self._is_valid(memory_obj):
+                    memory_obj.ref_count_down()
+            except Exception as exc:
+                logger.warning(
+                    "Failed to release shared CPU request reference: "
+                    "request_id=%s error=%s",
+                    self.request_id,
+                    exc,
+                )
+
+    def replace_groups(
+        self,
+        groups: dict[int, list[list[MemoryObj]]],
+        *,
+        retain: bool,
+    ) -> None:
+        """Replace selected groups, retaining borrowed objects when requested."""
+
+        replacement = dict(self.groups)
+        for kv_group, layers in groups.items():
+            copied_layers = [list(layer) for layer in layers]
+            if any(copied_layers):
+                replacement[kv_group] = copied_layers
+            else:
+                replacement.pop(kv_group, None)
+
+        old_objects = self._unique_objects(self.groups)
+        old_ids = {id(memory_obj) for memory_obj in old_objects}
+        new_objects = self._unique_objects(replacement)
+        new_ids = {id(memory_obj) for memory_obj in new_objects}
+
+        retained: list[MemoryObj] = []
+        if retain:
+            try:
+                for memory_obj in new_objects:
+                    if id(memory_obj) in old_ids:
+                        continue
+                    memory_obj.ref_count_up()
+                    try:
+                        if not self._is_valid(memory_obj):
+                            raise RuntimeError(
+                                "Cannot retain an invalid shared CPU "
+                                "MemoryObj"
+                            )
+                        if self.is_rank0 and memory_obj.pin() is False:
+                            raise RuntimeError("MemoryObj.pin() returned False")
+                    except Exception:
+                        if self._is_valid(memory_obj):
+                            memory_obj.ref_count_down()
+                        raise
+                    retained.append(memory_obj)
+            except Exception:
+                self._release(reversed(retained))
+                raise
+
+        self.groups = replacement
+        self._release(
+            memory_obj for memory_obj in old_objects if id(memory_obj) not in new_ids
+        )
+
+    def append_groups(
+        self,
+        groups: dict[int, list[list[MemoryObj]]],
+        chunk_index_base: dict[int, int],
+    ) -> None:
+        """Adopt suffixes without rescanning or retaining the live prefix.
+
+        Args:
+            groups: Complete per-layer object lists after the append.
+            chunk_index_base: Existing chunk count for each owned group.
+
+        Raises:
+            ValueError: If a live group is not aligned with its append point.
+        """
+
+        updates: list[tuple[list[list[MemoryObj]], list[list[MemoryObj]]]] = []
+        additions: list[tuple[int, list[list[MemoryObj]]]] = []
+        for kv_group, layers in groups.items():
+            current = self.groups.get(kv_group)
+            if current is None:
+                additions.append((kv_group, [list(layer) for layer in layers]))
+                continue
+            if len(current) != len(layers):
+                raise ValueError(
+                    "Shared CPU request lease suffix has an incompatible "
+                    f"layer count: kv_group={kv_group}, "
+                    f"current={len(current)}, new={len(layers)}"
+                )
+            append_at = chunk_index_base[kv_group]
+            if any(len(layer) != append_at for layer in current):
+                raise ValueError(
+                    "Shared CPU request lease is not append-aligned: "
+                    f"kv_group={kv_group}, append_at={append_at}"
+                )
+            updates.append(
+                (current, [list(layer[append_at:]) for layer in layers])
+            )
+
+        for current, suffix in updates:
+            for layer, layer_suffix in zip(current, suffix, strict=True):
+                layer.extend(layer_suffix)
+        for kv_group, suffix in additions:
+            self.groups[kv_group] = suffix
+
+    def object_ids(self, kv_group: Optional[int] = None) -> set[int]:
+        groups = (
+            self.groups.values()
+            if kv_group is None
+            else (self.groups.get(kv_group, []),)
+        )
+        return {
+            id(memory_obj)
+            for layers in groups
+            for layer in layers
+            for memory_obj in layer
+        }
+
+    def close(self) -> None:
+        objects = self._unique_objects(self.groups)
+        self.groups.clear()
+        self.active = False
+        self._release(objects)
 
 
 def _dtype_to_str(dtype: Optional[torch.dtype]) -> Optional[str]:
@@ -77,7 +244,11 @@ def _expected_positions_match(
                 f"range({expected_positions.start}, "
                 f"{expected_positions.stop}, {expected_positions.step})",
             )
-        for cached, expected in zip(cached_positions, expected_positions):
+        for cached, expected in zip(
+            cached_positions,
+            expected_positions,
+            strict=True,
+        ):
             if int(cached) != int(expected):
                 return (
                     False,
@@ -137,8 +308,11 @@ def _shared_key_matches_expected(
         "tags",
         "kv_group",
     )
-    for field in comparable_fields:
-        if getattr(handle_key, field) != getattr(expected_key, field):
+    for field_name in comparable_fields:
+        if getattr(handle_key, field_name) != getattr(
+            expected_key,
+            field_name,
+        ):
             return False
     if hasattr(expected_key, "layer_id") and (
         getattr(handle_key, "layer_id", None)
@@ -153,7 +327,7 @@ def _load_lmc_ops(*, purpose: str):
         import lmcache.c_ops as lmc_ops
 
         return lmc_ops
-    except ImportError as c_ops_exc:
+    except ImportError:
         try:
             import lmcache.non_cuda_equivalents as lmc_ops
 
