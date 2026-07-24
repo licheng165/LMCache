@@ -63,6 +63,19 @@ class LookupClientFactory:
                 raise ValueError(
                     "Asynchronous loading is not supported for external lookup clients."
                 )
+            save_only_first_rank = config.get_extra_config_value(
+                "save_only_first_rank", metadata.use_mla
+            )
+            if (
+                metadata.use_mla
+                and metadata.world_size > 1
+                and not save_only_first_rank
+            ):
+                raise ValueError(
+                    "external_lookup_client does not support per-rank MLA "
+                    "cache keys. Use remote_url with LMCache's internal "
+                    "all-rank lookup, or enable save_only_first_rank."
+                )
             client = LookupClientFactory._create_external_lookup_client(
                 config.external_lookup_client, config, metadata
             )
