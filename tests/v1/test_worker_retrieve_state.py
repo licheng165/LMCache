@@ -2458,6 +2458,64 @@ class TestWorkerRetrieveState:
         assert impl._worker_retrieve_state[req.req_id] is state
         impl._drain_layerwise_retrievers()
 
+    def test_sparse_decode_defers_growing_state_until_layers_are_loaded(self):
+        req = make_sparse_req_meta("req-1", token_count=512)
+        state = WorkerRetrieveState(
+            cached_keys=[["k0"]],
+            cached_starts=[0],
+            cached_ends=[256],
+            cached_tensors=[[torch.zeros(256)]],
+            cached_chunk_ptrs_npu=[torch.tensor([123], dtype=torch.long)],
+        )
+        impl, _, _ = make_worker_connector([req], use_layerwise=True)
+        impl.config.dsa_two_groups = False
+        impl.num_layers = 1
+        impl._refresh_kvcaches_list()
+        impl.layerwise_retrievers = []
+        impl._layerwise_requests = []
+        impl._layerwise_retriever_is_sparse = []
+        impl._layerwise_sparse_req_ids = []
+        impl._stats_monitor = SimpleNamespace(
+            update_interval_vllm_hit_tokens=lambda *_args: None,
+            update_interval_prompt_tokens=lambda *_args: None,
+        )
+        impl._publish_worker_retrieve_state(
+            state,
+            req,
+            location="LocalCPUBackend",
+            metadata_warm=True,
+            token_count=256,
+        )
+
+        class _FakeEngine:
+            enable_shared_cpu_cache = False
+
+            def retrieve_layer_head_token_wise(self, tokens, mask, **kwargs):
+                def _retriever():
+                    kwargs["cached_keys"][0].append("k1")
+                    kwargs["cached_starts"].append(256)
+                    kwargs["cached_ends"].append(512)
+                    yield kwargs["ret_mask"]
+                    kwargs["cached_tensors"][0].append(torch.zeros(256))
+                    kwargs["cached_chunk_ptrs_npu"][0] = torch.tensor(
+                        [123, 456], dtype=torch.long
+                    )
+                    yield kwargs["ret_mask"]
+
+                return _retriever()
+
+        impl.lmcache_engine = _FakeEngine()
+
+        impl.start_load_kv(SimpleNamespace(attn_metadata=SimpleNamespace()))
+
+        assert state.token_count == 256
+        assert state.prepared_sparse_sources[0].total_tokens == 256
+
+        impl.wait_for_layer_load("model.layers.0.self_attn.attn")
+
+        assert state.token_count == 512
+        assert state.prepared_sparse_sources[0].total_tokens == 512
+
     def test_start_load_kv_aggregates_step_setup(self):
         sparse = make_sparse_req_meta("sparse", token_count=4)
         skipped = make_sparse_req_meta("skipped", can_load=False, token_count=4)
