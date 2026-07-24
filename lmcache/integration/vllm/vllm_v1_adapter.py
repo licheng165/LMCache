@@ -3976,15 +3976,7 @@ class LMCacheConnectorV1Impl:
             for field in fields
         ):
             return True
-        return any(
-            LMCacheConnectorV1Impl._deep_cache_values_present(cache.get(kv_group))
-            for cache in (
-                state.shared_handles_by_group,
-                state.shared_views_by_group,
-                state.shared_chunk_ptrs_npu_by_group,
-                state.rank0_backing_objs_by_group,
-            )
-        )
+        return False
 
     def _trace_deep_retrieve_state(
         self,
