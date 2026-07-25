@@ -327,6 +327,16 @@ _CONFIG_DEFINITIONS: dict[str, dict[str, Any]] = {
         "default": None,
         "env_converter": float,
     },
+    "shared_cpu_cache_numa_policy": {
+        "type": str,
+        "default": "first_touch",
+        "env_converter": str,
+    },
+    "shared_cpu_cache_numa_nodes": {
+        "type": str | int | list[int] | None,
+        "default": None,
+        "env_converter": lambda value: value,
+    },
     "shared_cpu_materialize_index_on_decode_cold": {
         "type": bool,
         "default": True,

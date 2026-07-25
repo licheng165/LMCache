@@ -389,6 +389,7 @@ def _resolve_pinned_alloc_free(
     numa_mapping: Optional[NUMAMapping] = None,
     shm_name: Optional[str] = None,
     size: Optional[int] = None,
+    shm_interleave_nodes: Optional[tuple[int, ...]] = None,
 ) -> Tuple[
     tuple,  # (alloc_fn, *alloc_args)
     tuple,  # (free_fn, *free_args_after_ptr)
@@ -401,8 +402,13 @@ def _resolve_pinned_alloc_free(
         - free_info: (free_fn, *args) to call as free_fn(ptr, *args)
     """
     if shm_name:
+        alloc_args = (
+            (shm_name, list(shm_interleave_nodes))
+            if shm_interleave_nodes
+            else (shm_name,)
+        )
         return (
-            (lmc_ops.alloc_shm_pinned_ptr, shm_name),
+            (lmc_ops.alloc_shm_pinned_ptr, *alloc_args),
             (lmc_ops.free_shm_pinned_ptr, size, shm_name),
         )
     elif numa_mapping:
@@ -430,6 +436,7 @@ def _allocate_cpu_memory(
     size: int,
     numa_mapping: Optional[NUMAMapping] = None,
     shm_name: Optional[str] = None,
+    shm_interleave_nodes: Optional[tuple[int, ...]] = None,
 ) -> torch.Tensor:
     if size == 0:
         return torch.empty(0, dtype=torch.uint8)
@@ -437,6 +444,7 @@ def _allocate_cpu_memory(
     alloc_info, _ = _resolve_pinned_alloc_free(
         numa_mapping,
         shm_name,
+        shm_interleave_nodes=shm_interleave_nodes,
     )
     alloc_fn, *alloc_args = alloc_info
     ptr = alloc_fn(size, *alloc_args)
@@ -2087,7 +2095,12 @@ class MixedMemoryAllocator(MemoryAllocatorInterface):
 
         self.size = size
 
-        self.buffer = _allocate_cpu_memory(size, self.numa_mapping, self.shm_name)
+        self.buffer = _allocate_cpu_memory(
+            size,
+            self.numa_mapping,
+            self.shm_name,
+            kwargs.get("shm_interleave_nodes", None),
+        )
 
         self._unregistered = False
 

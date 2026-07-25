@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # Standard
+from unittest.mock import mock_open
 import threading
 
 # Third Party
@@ -601,6 +602,46 @@ class TestLocalCPUBackend:
         local_cpu_backend.remove(key)
         assert memory_obj.get_ref_count() == initial_ref_count + 1
         local_cpu_backend.memory_allocator.close()
+
+
+class TestLocalCPUBackendSharedCPUCacheNUMA:
+    def test_shared_cpu_interleave_reaches_mixed_allocator(
+        self, monkeypatch
+    ) -> None:
+        config = create_test_config(local_cpu=True)
+        config.max_local_cpu_size = 0.01
+        config.enable_shared_cpu_cache = True
+        config.shared_cpu_cache_numa_policy = "interleave"
+        config.shared_cpu_cache_numa_nodes = [0, 2]
+        config.extra_config = {"shm_name": "/lmcache-shared-numa-test"}
+        metadata = create_test_metadata()
+
+        captured: dict[str, object] = {}
+
+        class DummyMixedMemoryAllocator:
+            def __init__(self, size, **kwargs):
+                captured["kwargs"] = kwargs
+
+            def close(self):
+                return None
+
+        monkeypatch.setattr(
+            local_cpu_backend_module,
+            "MixedMemoryAllocator",
+            DummyMixedMemoryAllocator,
+        )
+        monkeypatch.setattr(
+            "builtins.open",
+            mock_open(read_data="Mems_allowed_list:\t0-3\n"),
+        )
+
+        backend = LocalCPUBackend(config=config, metadata=metadata, dst_device="cpu")
+        try:
+            kwargs = captured["kwargs"]
+            assert isinstance(kwargs, dict)
+            assert kwargs["shm_interleave_nodes"] == (0, 2)
+        finally:
+            backend.memory_allocator.close()
 
 
 class TestLocalCPUBackendAllocatorAlignment:

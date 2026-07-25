@@ -114,10 +114,33 @@ def free_pinned_ptr(ptr: int) -> None:
     _tensor_registry.pop(ptr, None)
 
 
-def alloc_shm_pinned_ptr(size: int, shm_name: str = "") -> int:
-    """Non-CUDA equivalent of allocating shared memory pinned pointer.
-    Uses multiprocessing.shared_memory for cross-platform POSIX shm."""
+def alloc_shm_pinned_ptr(
+    size: int,
+    shm_name: str = "",
+    interleave_nodes: list[int] | None = None,
+) -> int:
+    """Allocate a shared-memory pointer on a non-CUDA platform.
 
+    Args:
+        size: Allocation size in bytes.
+        shm_name: Cross-process shared-memory name.
+        interleave_nodes: NUMA nodes requested by the native allocator API.
+
+    Returns:
+        The host address of the shared-memory allocation.
+
+    Raises:
+        RuntimeError: If NUMA interleaving is requested without the native
+            allocator.
+        ValueError: If ``size`` or ``shm_name`` is invalid.
+        FileExistsError: If ``shm_name`` already exists.
+    """
+
+    if interleave_nodes:
+        raise RuntimeError(
+            "shared CPU cache NUMA interleaving requires the native "
+            "LMCache memory allocator"
+        )
     if size <= 0:
         raise ValueError(
             f"alloc_shm_pinned_ptr requires size > 0, got {size}"

@@ -476,17 +476,36 @@ class LocalCPUBackend(AllocatorBackendInterface):
                     f"({config.lazy_memory_safe_size:.2f} GB). "
                     f"Using MixedMemoryAllocator instead."
                 )
+            shared_cpu_cache = config.get_extra_config_value(
+                "enable_shared_cpu_cache",
+                getattr(config, "enable_shared_cpu_cache", False),
+            )
+            shm_interleave_nodes = (
+                NUMADetector.get_shared_cpu_interleave_nodes(config)
+                if (
+                    shared_cpu_cache
+                    and config.get_extra_config_value("shm_name", None)
+                )
+                else None
+            )
+            if shm_interleave_nodes:
+                logger.info(
+                    "Shared CPU cache NUMA interleave nodes %s",
+                    shm_interleave_nodes,
+                )
             if allocator_align_bytes is not None:
                 return MixedMemoryAllocator(
                     cpu_size_bytes,
                     numa_mapping=numa_mapping,
                     align_bytes=allocator_align_bytes,
                     config=config,
+                    shm_interleave_nodes=shm_interleave_nodes,
                 )
             return MixedMemoryAllocator(
                 cpu_size_bytes,
                 numa_mapping=numa_mapping,
                 config=config,
+                shm_interleave_nodes=shm_interleave_nodes,
             )
 
     @staticmethod

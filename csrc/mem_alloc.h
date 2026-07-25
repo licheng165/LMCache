@@ -1,11 +1,14 @@
 #include <cstdint>
 #include <cstddef>
 #include <string>
+#include <vector>
 
 uintptr_t alloc_pinned_ptr(size_t size, unsigned int flags);
 uintptr_t alloc_numa_ptr(size_t size, int node);
 uintptr_t alloc_pinned_numa_ptr(size_t size, int node);
-uintptr_t alloc_shm_pinned_ptr(size_t size, const std::string& shm_name);
+uintptr_t alloc_shm_pinned_ptr(
+    size_t size, const std::string& shm_name,
+    const std::vector<int>& interleave_nodes = {});
 uintptr_t attach_shm_pinned_ptr(size_t size, const std::string& shm_name,
                                 bool writable);
 

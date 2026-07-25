@@ -1,4 +1,5 @@
 #include <cuda_runtime.h>
+#include <algorithm>
 #include <stdexcept>
 #include <string>
 #include <sys/mman.h>
@@ -7,7 +8,8 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <cstring>            // for strerror
-#include <linux/mempolicy.h>  // for MPOL_BIND, MPOL_MF_MOVE, MPOL_MF_STRICT
+#include <linux/mempolicy.h>
+#include <vector>
 #include "mem_alloc.h"
 
 uintptr_t alloc_pinned_ptr(size_t size, unsigned int flags) {
@@ -40,6 +42,70 @@ static inline int mbind_sys(void* addr, unsigned long len, int mode,
   long rc = syscall(SYS_mbind, addr, len, mode, nodemask, maxnode, flags);
   return (rc == -1) ? -errno : 0;
 }
+
+static inline int get_mempolicy_sys(int* mode) {
+  long rc = syscall(SYS_get_mempolicy, mode, nullptr, 0, nullptr, 0);
+  return (rc == -1) ? -errno : 0;
+}
+
+static inline int set_mempolicy_sys(int mode, const unsigned long* nodemask,
+                                    unsigned long maxnode) {
+  long rc = syscall(SYS_set_mempolicy, mode, nodemask, maxnode);
+  return (rc == -1) ? -errno : 0;
+}
+
+namespace {
+
+class ScopedInterleavePolicy {
+ public:
+  explicit ScopedInterleavePolicy(const std::vector<int>& nodes) {
+    if (nodes.empty()) return;
+
+    int mode;
+    int rc = get_mempolicy_sys(&mode);
+    if (rc != 0)
+      throw std::runtime_error(std::string("get_mempolicy failed: ") +
+                               strerror(-rc));
+    if (mode != MPOL_DEFAULT)
+      throw std::runtime_error(
+          "shared CPU cache NUMA interleave requires the default thread "
+          "memory policy; remove the external numactl policy");
+
+    int max_node = *std::max_element(nodes.begin(), nodes.end());
+    if (max_node < 0)
+      throw std::runtime_error("NUMA interleave nodes must be non-negative");
+    constexpr size_t bits_per_word = sizeof(unsigned long) * 8;
+    std::vector<unsigned long> mask(max_node / bits_per_word + 1);
+    for (int node : nodes) {
+      if (node < 0)
+        throw std::runtime_error("NUMA interleave nodes must be non-negative");
+      mask[node / bits_per_word] |= 1UL << (node % bits_per_word);
+    }
+    rc = set_mempolicy_sys(MPOL_INTERLEAVE, mask.data(), max_node + 1);
+    if (rc != 0)
+      throw std::runtime_error(std::string("set_mempolicy failed: ") +
+                               strerror(-rc));
+    active_ = true;
+  }
+
+  ~ScopedInterleavePolicy() {
+    if (active_) set_mempolicy_sys(MPOL_DEFAULT, nullptr, 0);
+  }
+
+  void restore() {
+    if (!active_) return;
+    int rc = set_mempolicy_sys(MPOL_DEFAULT, nullptr, 0);
+    if (rc != 0)
+      throw std::runtime_error(std::string("restore mempolicy failed: ") +
+                               strerror(-rc));
+    active_ = false;
+  }
+
+ private:
+  bool active_ = false;
+};
+
+}  // namespace
 
 uintptr_t alloc_numa_ptr(size_t size, int node) {
   void* ptr = mmap(nullptr, size, PROT_READ | PROT_WRITE,
@@ -96,13 +162,16 @@ void free_pinned_numa_ptr(uintptr_t ptr, size_t size) {
   }
 }
 
-uintptr_t alloc_shm_pinned_ptr(size_t size, const std::string& shm_name) {
+uintptr_t alloc_shm_pinned_ptr(
+    size_t size, const std::string& shm_name,
+    const std::vector<int>& interleave_nodes) {
   if (size == 0)
     throw std::runtime_error("alloc_shm_pinned_ptr requires size > 0 for " +
                              shm_name);
   if (shm_name.empty())
     throw std::runtime_error("alloc_shm_pinned_ptr requires a shm_name");
 
+  ScopedInterleavePolicy numa_policy(interleave_nodes);
   int fd = shm_open(shm_name.c_str(), O_CREAT | O_EXCL | O_RDWR, 0600);
   if (fd < 0)
     throw std::runtime_error(std::string("shm_open create failed for ") +
@@ -129,7 +198,14 @@ uintptr_t alloc_shm_pinned_ptr(size_t size, const std::string& shm_name) {
     throw std::runtime_error(std::string("mmap failed: ") + strerror(errno));
   }
 
-  first_touch(ptr, size);
+  try {
+    first_touch(ptr, size);
+    numa_policy.restore();
+  } catch (...) {
+    munmap(ptr, size);
+    shm_unlink(shm_name.c_str());
+    throw;
+  }
 
   cudaError_t st = cudaHostRegister(ptr, size, 0);
   if (st != cudaSuccess) {
