@@ -5267,7 +5267,7 @@ class LMCacheConnectorV1Impl:
                         retrieve_kwargs.get("_retrieve_metadata_warm")
                         or retrieve_state.has_cache()
                     )
-                    if shared_cpu_enabled and latent_prepared is None:
+                    if latent_prepared is None:
                         self._set_worker_retrieve_state(
                             request.req_id, retrieve_state
                         )
@@ -5278,17 +5278,9 @@ class LMCacheConnectorV1Impl:
                             metadata_warm or retrieve_state.metadata_warm
                         )
                         logger.debug(
-                            "Deferring shared CPU sparse retrieve state save "
-                            "until pointer-cache install completes: req_id=%s",
+                            "Deferring sparse retrieve state publication until "
+                            "layer loading completes: req_id=%s",
                             request.req_id,
-                        )
-                    elif latent_prepared is None:
-                        self._publish_worker_retrieve_state(
-                            retrieve_state,
-                            request,
-                            location=retrieve_location,
-                            metadata_warm=metadata_warm,
-                            token_count=token_count,
                         )
                     post_retrieve_state = (
                         self._worker_retrieve_state.get(request.req_id)

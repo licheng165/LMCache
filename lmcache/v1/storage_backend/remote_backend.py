@@ -74,11 +74,11 @@ class RemoteBackend(StorageBackendInterface):
             and metadata.world_size > 1
             and not save_only_first_rank
         ):
-            logger.warning(
+            raise ValueError(
                 "remote_enable_mla_worker_id_as0=True with "
-                "save_only_first_rank=False is inconsistent for per-rank "
-                "MLA store/lookup; non-zero rank remote writes will be "
-                "skipped and decoders may miss those ranks."
+                "save_only_first_rank=False would replace per-rank MLA cache "
+                "data with rank-0 data. Disable worker-ID collapsing or "
+                "enable save_only_first_rank."
             )
 
         self._mla_worker_id_as0_mode = (
