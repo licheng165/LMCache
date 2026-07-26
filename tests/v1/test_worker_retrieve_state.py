@@ -22,6 +22,7 @@ from lmcache.integration.vllm.vllm_v1_adapter import (
     WorkerRetrieveState,
 )
 from lmcache.v1.cache_engine import LayerwiseStoreResult, LMCacheEngine
+from lmcache.v1.gpu_connector.sparse import PreparedSparseSource
 from lmcache.v1.kv_layer_groups import KVLayerGroupsManager
 from tests.v1.connector_test_utils import (
     make_sparse_req_meta,
@@ -2708,6 +2709,124 @@ class TestWorkerRetrieveState:
         assert not hasattr(req, "cached_keys")
         assert impl._worker_retrieve_state[req.req_id] is state
         impl._drain_layerwise_retrievers()
+
+    def test_sparse_warm_ref_reuses_worker_metadata(self):
+        req = make_sparse_req_meta("req-1", token_count=256)
+        req.load_spec.vllm_cached_tokens = 128
+        req.token_ids = []
+        req.slot_mapping = []
+        req.sparse_warm_ref = True
+        ret_mask = torch.zeros(256, dtype=torch.bool)
+        state = WorkerRetrieveState(
+            cached_keys=[["layer-key"]],
+            cached_starts=[0],
+            cached_ends=[512],
+            cached_tensors=[[torch.zeros(512)]],
+            cached_chunk_ptrs_npu=[torch.tensor([123], dtype=torch.long)],
+            slot_mapping=torch.arange(256, dtype=torch.long),
+            decode_ret_mask=ret_mask,
+        )
+        impl, _, _ = make_worker_connector([req], use_layerwise=True)
+        impl.config.dsa_two_groups = False
+        impl.num_layers = 1
+        impl._refresh_kvcaches_list()
+        impl.layerwise_retrievers = []
+        impl._layerwise_requests = []
+        impl._layerwise_retriever_is_sparse = []
+        impl._layerwise_sparse_req_ids = []
+        impl._stats_monitor = SimpleNamespace(
+            update_interval_vllm_hit_tokens=lambda *_args: None,
+            update_interval_prompt_tokens=lambda *_args: None,
+        )
+        calls = []
+
+        class _FakeEngine:
+            enable_shared_cpu_cache = False
+
+            def retrieve_layer_head_token_wise(self, tokens, mask, **kwargs):
+                calls.append((tokens, mask, kwargs))
+
+                def _retriever():
+                    yield kwargs.get("ret_mask")
+                    while True:
+                        yield kwargs.get("ret_mask")
+
+                return _retriever()
+
+        impl.lmcache_engine = _FakeEngine()
+        impl._publish_worker_retrieve_state(
+            state,
+            req,
+            location="LocalCPUBackend",
+            metadata_warm=True,
+            token_count=512,
+        )
+
+        impl.start_load_kv(SimpleNamespace(attn_metadata=SimpleNamespace()))
+
+        tokens, mask, kwargs = calls[0]
+        assert tokens == []
+        assert mask is None
+        assert kwargs["slot_mapping"] is state.slot_mapping
+        assert kwargs["ret_mask"] is ret_mask
+        assert kwargs["prepared_sparse_source"].total_tokens == 512
+
+        impl.wait_for_layer_load("model.layers.0.self_attn.attn")
+
+        assert state.token_count == 512
+        assert state.prepared_sparse_sources[0].total_tokens == 512
+
+    def test_sparse_warm_ref_accepts_shared_prepared_superset(self):
+        impl = _make_impl()
+        impl.config = SimpleNamespace(dsa_two_groups=False)
+        impl.lmcache_engine = SimpleNamespace(
+            enable_shared_cpu_cache=True,
+            shared_cpu_cache_generation=5,
+        )
+        request = make_sparse_req_meta("req-1", token_count=256)
+        request.token_ids = []
+        request.slot_mapping = []
+        request.sparse_warm_ref = True
+        source = PreparedSparseSource(layers=(), total_tokens=512)
+        state = WorkerRetrieveState(
+            req_id="req-1",
+            cached_keys=[["k0"]],
+            metadata_warm=True,
+            token_count=512,
+            slot_mapping=torch.arange(256, dtype=torch.long),
+            prepared_sparse_sources={0: source},
+            shared_latent_status="present",
+            shared_index_status="skipped",
+            shared_generation=5,
+            pointer_cache_generation=5,
+            shared_request_active=True,
+            request_scope_token="req-1:5:512",
+        )
+        impl._worker_retrieve_state["req-1"] = state
+
+        assert impl._worker_retrieve_state_for_warm_ref(request) is state
+
+    def test_sparse_warm_ref_requires_matching_worker_state(self):
+        req = make_sparse_req_meta("req-1", token_count=256)
+        req.token_ids = []
+        req.slot_mapping = []
+        req.sparse_warm_ref = True
+        impl, _, _ = make_worker_connector([req], use_layerwise=True)
+        impl.lmcache_engine = SimpleNamespace(enable_shared_cpu_cache=False)
+        impl.config.dsa_two_groups = False
+        impl.num_layers = 1
+        impl._refresh_kvcaches_list()
+        impl.layerwise_retrievers = []
+        impl._layerwise_requests = []
+        impl._layerwise_retriever_is_sparse = []
+        impl._layerwise_sparse_req_ids = []
+        impl._stats_monitor = SimpleNamespace(
+            update_interval_vllm_hit_tokens=lambda *_args: None,
+            update_interval_prompt_tokens=lambda *_args: None,
+        )
+
+        with pytest.raises(RuntimeError, match="no matching prepared worker state"):
+            impl.start_load_kv(SimpleNamespace(attn_metadata=SimpleNamespace()))
 
     def test_sparse_decode_defers_growing_state_until_layers_are_loaded(self):
         req = make_sparse_req_meta("req-1", token_count=512)
