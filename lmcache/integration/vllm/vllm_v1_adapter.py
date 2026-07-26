@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # Standard
+from collections import deque
 from collections.abc import Iterable
 from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass, field
@@ -38,6 +39,9 @@ from lmcache.integration.vllm.utils import (
     is_false,
     lmcache_get_or_create_config,
 )
+from lmcache.integration.vllm.decode_window_commit import (
+    publish_delayed_decode_window_commit,
+)
 from lmcache.integration.vllm.vllm_service_factory import VllmServiceFactory
 from lmcache.logging import init_logger
 from lmcache.observability import LMCStatsMonitor, PrometheusLogger
@@ -69,6 +73,9 @@ SPARSE_DECODE_RETRIEVE_TOKENS = int(
     os.environ.get("LMCACHE_SPARSE_DECODE_RETRIEVE_TOKENS", "2048")
 )
 SPARSE_DECODE_SHARED_CPU_PHASE = "sparse_decode_bootstrap"
+DECODE_WINDOW_SAVE_COMMIT_DELAY_WINDOWS_ENV = (
+    "VLLM_ASCEND_LMCACHE_DECODE_WINDOW_SAVE_COMMIT_DELAY_WINDOWS"
+)
 LayerwiseSaveKey = tuple[str, str, int, int, int]
 
 
@@ -519,6 +526,11 @@ class RequestTracker:
     # Decode window save only: highest token boundary confirmed readable from
     # LMCache by worker-side completion output.
     decode_window_save_committed_end: int = field(default=0, repr=False)
+    # Scheduler-side completions acknowledged to unblock subsequent saves but
+    # intentionally withheld from committed_end and local-block release.
+    decode_window_save_pending_commits: deque[int] = field(
+        default_factory=deque, repr=False
+    )
 
     @_lmcache_nvtx_annotate
     @staticmethod
@@ -620,6 +632,7 @@ class RequestTracker:
             self.decode_window_save_next_start = None
             self.decode_window_save_anchor = None
             self.decode_window_save_inflight_end = None
+            self.decode_window_save_pending_commits.clear()
             num_computed_tokens = max(lmcache_cached_tokens, vllm_cached_tokens)
 
             # FIX: For preempted requests, restore token_ids from the full
@@ -1465,6 +1478,30 @@ class LMCacheConnectorV1Impl:
         self._decode_window_save_window_size = (
             self._get_decode_window_save_window_size(config)
         )
+        self._decode_window_save_commit_delay_windows = max(
+            int(
+                os.environ.get(
+                    DECODE_WINDOW_SAVE_COMMIT_DELAY_WINDOWS_ENV,
+                    "0",
+                )
+            ),
+            0,
+        )
+        if (
+            self._decode_window_save_commit_delay_windows > 0
+            and self._decode_window_save_window_size <= 0
+        ):
+            logger.warning(
+                "%s=%d is ignored because decode-window save is disabled.",
+                DECODE_WINDOW_SAVE_COMMIT_DELAY_WINDOWS_ENV,
+                self._decode_window_save_commit_delay_windows,
+            )
+        elif self._decode_window_save_commit_delay_windows > 0:
+            logger.info(
+                "Decode-window committed_end and local release will lag by "
+                "%d completed saves.",
+                self._decode_window_save_commit_delay_windows,
+            )
 
         self.skip_last_n_tokens = vllm_config.kv_transfer_config.get_from_extra_config(
             "skip_last_n_tokens", 0
@@ -3099,18 +3136,22 @@ class LMCacheConnectorV1Impl:
         completed = getattr(connector_output, "completed_decode_window_saves", None)
         if not completed:
             return
+        published: dict[str, int] = {}
         for req_id, window_end in completed.items():
             tracker = self._request_trackers.get(req_id)
             if tracker is None:
                 continue
             committed_end = int(window_end)
             window_size = int(getattr(self, "_decode_window_save_window_size", 0) or 0)
+            prefill_end = (
+                tracker.prompt_len
+                // self._lmcache_chunk_size
+                * self._lmcache_chunk_size
+            )
+            is_initial_frontier = (
+                window_size > 0 and committed_end == prefill_end
+            )
             if window_size > 0 and tracker.decode_window_save_next_start is None:
-                prefill_end = (
-                    tracker.prompt_len
-                    // self._lmcache_chunk_size
-                    * self._lmcache_chunk_size
-                )
                 if committed_end != prefill_end:
                     logger.debug(
                         "Ignoring completion before the initial prefill "
@@ -3161,15 +3202,50 @@ class LMCacheConnectorV1Impl:
                     f"decode-window lattice anchor={anchor}, window_size={window_size} "
                     f"for request {req_id}."
                 )
-            committed_before = tracker.decode_window_save_committed_end
-            tracker.decode_window_save_committed_end = max(
-                committed_before, committed_end
-            )
+            # Acknowledge the physical save immediately so another window can
+            # be emitted even when committed_end/release are intentionally
+            # delayed.
             if (
                 tracker.decode_window_save_inflight_end is not None
                 and committed_end >= tracker.decode_window_save_inflight_end
             ):
                 tracker.decode_window_save_inflight_end = None
+
+            delay_windows = int(
+                getattr(
+                    self,
+                    "_decode_window_save_commit_delay_windows",
+                    0,
+                )
+                or 0
+            )
+            publish_end = publish_delayed_decode_window_commit(
+                tracker.decode_window_save_pending_commits,
+                committed_end,
+                delay_windows if window_size > 0 else 0,
+                is_initial_frontier=is_initial_frontier,
+            )
+
+            if publish_end is None:
+                _mtp_dw_event(
+                    "commit",
+                    req=req_id,
+                    event="frontier_delayed",
+                    frontier=len(tracker.token_ids),
+                    completed_end=committed_end,
+                    committed_end=tracker.decode_window_save_committed_end,
+                    pending_windows=len(
+                        tracker.decode_window_save_pending_commits
+                    ),
+                    delay_windows=delay_windows,
+                )
+                continue
+
+            committed_before = tracker.decode_window_save_committed_end
+            tracker.decode_window_save_committed_end = max(
+                committed_before, publish_end
+            )
+            published[req_id] = publish_end
             _mtp_dw_event(
                 "commit",
                 req=req_id,
@@ -3183,6 +3259,7 @@ class LMCacheConnectorV1Impl:
                 committed_before=committed_before,
                 committed_after=tracker.decode_window_save_committed_end,
                 completed_end=int(window_end),
+                published_end=publish_end,
             )
             if tracker.decode_window_save_committed_end < committed_before:
                 _mtp_dw_event(
@@ -3193,6 +3270,11 @@ class LMCacheConnectorV1Impl:
                     committed_before=committed_before,
                     committed_after=tracker.decode_window_save_committed_end,
                 )
+        # The vLLM scheduler consumes this same mapping after this callback to
+        # release local blocks. Replacing raw completions with delayed
+        # frontiers keeps release and split_boundary on the same commit point.
+        completed.clear()
+        completed.update(published)
 
     def _mark_worker_retrieve_registry_changed(self) -> None:
         self._worker_retrieve_registry_version = (
@@ -7479,6 +7561,7 @@ class LMCacheConnectorV1Impl:
                 request_tracker.decode_window_save_next_start = None
                 request_tracker.decode_window_save_anchor = None
                 request_tracker.decode_window_save_inflight_end = None
+                request_tracker.decode_window_save_pending_commits.clear()
 
             # Pass all_token_ids for preempted requests to restore
             # token_ids correctly for chunk key computation

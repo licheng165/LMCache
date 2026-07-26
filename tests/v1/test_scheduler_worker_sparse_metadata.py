@@ -52,6 +52,7 @@ def _make_scheduler_impl() -> LMCacheConnectorV1Impl:
     impl._block_size = 16
     impl._lmcache_chunk_size = 256
     impl._decode_window_save_window_size = 0
+    impl._decode_window_save_commit_delay_windows = 0
     impl._dsa_scratch_capacity = 4096
     impl._discard_partial_chunks = True
     impl._request_trackers = {}
@@ -773,6 +774,144 @@ class TestBuildConnectorMetaSparseSyntheticLoadSpec:
         assert tracker.decode_window_save_committed_end == 768
         assert tracker.decode_window_save_inflight_end is None
 
+    def test_decode_window_commit_delay_keeps_save_pipeline_moving(self) -> None:
+        impl = _make_scheduler_impl()
+        impl._decode_window_save_window_size = 256
+        impl._decode_window_save_commit_delay_windows = 1
+        req_id = "sparse-window"
+        tracker = RequestTracker(
+            req_id=req_id,
+            prompt_len=256,
+            token_ids=list(range(1024)),
+            allocated_block_ids=list(range(64)),
+            num_saved_tokens=256,
+        )
+        tracker.decode_window_save_anchor = 256
+        tracker.decode_window_save_next_start = 512
+        tracker.decode_window_save_inflight_end = 512
+        tracker.decode_window_save_committed_end = 256
+        impl._request_trackers[req_id] = tracker
+
+        first_output = SimpleNamespace(
+            completed_decode_window_saves={req_id: 512}
+        )
+        impl.update_connector_output(first_output)
+
+        assert tracker.decode_window_save_inflight_end is None
+        assert tracker.decode_window_save_committed_end == 256
+        assert list(tracker.decode_window_save_pending_commits) == [512]
+        # vLLM releases from this mapping after the connector callback.
+        assert first_output.completed_decode_window_saves == {}
+
+        # The cleared in-flight marker allows the scheduler to emit this next
+        # save while committed_end and split_boundary still remain at 256.
+        tracker.decode_window_save_next_start = 768
+        tracker.decode_window_save_inflight_end = 768
+        second_output = SimpleNamespace(
+            completed_decode_window_saves={req_id: 768}
+        )
+        impl.update_connector_output(second_output)
+
+        assert tracker.decode_window_save_inflight_end is None
+        assert tracker.decode_window_save_committed_end == 512
+        assert list(tracker.decode_window_save_pending_commits) == [768]
+        assert second_output.completed_decode_window_saves == {req_id: 512}
+
+    def test_decode_window_commit_delay_two(self) -> None:
+        impl = _make_scheduler_impl()
+        impl._decode_window_save_window_size = 256
+        impl._decode_window_save_commit_delay_windows = 2
+        req_id = "sparse-window"
+        tracker = RequestTracker(
+            req_id=req_id,
+            prompt_len=256,
+            token_ids=list(range(1280)),
+            allocated_block_ids=list(range(80)),
+            num_saved_tokens=256,
+        )
+        tracker.decode_window_save_anchor = 256
+        tracker.decode_window_save_committed_end = 256
+        impl._request_trackers[req_id] = tracker
+
+        published = []
+        for window_end in (512, 768, 1024):
+            tracker.decode_window_save_next_start = window_end
+            tracker.decode_window_save_inflight_end = window_end
+            output = SimpleNamespace(
+                completed_decode_window_saves={req_id: window_end}
+            )
+            impl.update_connector_output(output)
+            published.append(dict(output.completed_decode_window_saves))
+            assert tracker.decode_window_save_inflight_end is None
+
+        assert published == [{}, {}, {req_id: 512}]
+        assert tracker.decode_window_save_committed_end == 512
+        assert list(tracker.decode_window_save_pending_commits) == [768, 1024]
+
+    def test_decode_window_commit_delay_does_not_hold_initial_frontier(
+        self,
+    ) -> None:
+        impl = _make_scheduler_impl()
+        impl._decode_window_save_window_size = 256
+        impl._decode_window_save_commit_delay_windows = 2
+        req_id = "sparse-window"
+        tracker = RequestTracker(
+            req_id=req_id,
+            prompt_len=300,
+            token_ids=list(range(512)),
+            allocated_block_ids=list(range(32)),
+            num_saved_tokens=0,
+        )
+        # build_connector_meta may initialize next_start before the worker
+        # publishes the initial sparse/prefill frontier.
+        tracker.decode_window_save_anchor = 256
+        tracker.decode_window_save_next_start = 256
+        tracker.decode_window_save_committed_end = 0
+        impl._request_trackers[req_id] = tracker
+        output = SimpleNamespace(
+            completed_decode_window_saves={req_id: 256}
+        )
+
+        impl.update_connector_output(output)
+
+        assert tracker.decode_window_save_committed_end == 256
+        assert list(tracker.decode_window_save_pending_commits) == []
+        assert output.completed_decode_window_saves == {req_id: 256}
+
+    def test_decode_window_commit_delay_counts_catch_up_save_once(self) -> None:
+        impl = _make_scheduler_impl()
+        impl._decode_window_save_window_size = 256
+        impl._decode_window_save_commit_delay_windows = 1
+        req_id = "sparse-window"
+        tracker = RequestTracker(
+            req_id=req_id,
+            prompt_len=256,
+            token_ids=list(range(1536)),
+            allocated_block_ids=list(range(96)),
+            num_saved_tokens=256,
+        )
+        tracker.decode_window_save_anchor = 256
+        tracker.decode_window_save_committed_end = 256
+        impl._request_trackers[req_id] = tracker
+
+        tracker.decode_window_save_next_start = 1024
+        tracker.decode_window_save_inflight_end = 1024
+        first_output = SimpleNamespace(
+            completed_decode_window_saves={req_id: 1024}
+        )
+        impl.update_connector_output(first_output)
+        assert first_output.completed_decode_window_saves == {}
+
+        tracker.decode_window_save_next_start = 1280
+        tracker.decode_window_save_inflight_end = 1280
+        second_output = SimpleNamespace(
+            completed_decode_window_saves={req_id: 1280}
+        )
+        impl.update_connector_output(second_output)
+
+        assert second_output.completed_decode_window_saves == {req_id: 1024}
+        assert tracker.decode_window_save_committed_end == 1024
+
     def test_decode_window_completion_rejects_partial_value(self) -> None:
         impl = _make_scheduler_impl()
         impl._decode_window_save_window_size = 512
@@ -1065,6 +1204,7 @@ class TestDecodeWindowSaveMetadata:
         )
         tracker.decode_window_save_next_start = 768
         tracker.decode_window_save_committed_end = 768
+        tracker.decode_window_save_pending_commits.extend([512, 768])
 
         tracker.update(
             new_token_ids=[999],
@@ -1077,6 +1217,7 @@ class TestDecodeWindowSaveMetadata:
 
         assert tracker.decode_window_save_next_start is None
         assert tracker.decode_window_save_committed_end == 256
+        assert list(tracker.decode_window_save_pending_commits) == []
 
     def test_decode_window_frontier_resets_after_token_rollback(self) -> None:
         impl = _make_scheduler_impl()
@@ -1103,6 +1244,7 @@ class TestDecodeWindowSaveMetadata:
         tracker.is_decode_phase = True
         tracker.decode_window_save_next_start = 768
         tracker.decode_window_save_committed_end = 768
+        tracker.decode_window_save_pending_commits.extend([512, 768])
         impl._request_trackers[req_id] = tracker
 
         scheduler_output = StubSchedulerOutput(
@@ -1120,6 +1262,7 @@ class TestDecodeWindowSaveMetadata:
 
         assert tracker.decode_window_save_next_start == 256
         assert tracker.decode_window_save_committed_end == 256
+        assert list(tracker.decode_window_save_pending_commits) == []
 
     def test_two_group_decode_window_save_without_shared_cpu_allows_latent_only(
         self,
