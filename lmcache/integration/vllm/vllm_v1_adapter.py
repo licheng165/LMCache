@@ -6,6 +6,7 @@ from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass, field
 import json
 import os
+import time
 from types import SimpleNamespace
 from typing import TYPE_CHECKING, Any, Generator, Optional, Union
 
@@ -76,6 +77,9 @@ SPARSE_DECODE_SHARED_CPU_PHASE = "sparse_decode_bootstrap"
 DECODE_WINDOW_SAVE_COMMIT_DELAY_WINDOWS_ENV = (
     "VLLM_ASCEND_LMCACHE_DECODE_WINDOW_SAVE_COMMIT_DELAY_WINDOWS"
 )
+RETRIEVE_STATS_INTERVAL_SECONDS_ENV = (
+    "VLLM_ASCEND_LMCACHE_RETRIEVE_STATS_INTERVAL_SECONDS"
+)
 LayerwiseSaveKey = tuple[str, str, int, int, int]
 
 
@@ -95,6 +99,27 @@ def _mtp_dw_event(stage: str, **fields: Any) -> None:
     payload = {"schema": 1, "stage": stage, "owner": "lmcache"}
     payload.update(fields)
     logger.info("[MTP_DW] %s", json.dumps(payload, separators=(",", ":")))
+
+
+def _retrieve_stats_interval_seconds() -> int:
+    raw_value = os.environ.get(RETRIEVE_STATS_INTERVAL_SECONDS_ENV, "0")
+    try:
+        interval = int(raw_value)
+    except ValueError:
+        logger.warning(
+            "Ignoring invalid %s=%r; expected a non-negative integer.",
+            RETRIEVE_STATS_INTERVAL_SECONDS_ENV,
+            raw_value,
+        )
+        return 0
+    if interval < 0:
+        logger.warning(
+            "Ignoring invalid %s=%d; expected a non-negative integer.",
+            RETRIEVE_STATS_INTERVAL_SECONDS_ENV,
+            interval,
+        )
+        return 0
+    return interval
 
 
 def _dsa_debug_enabled() -> bool:
@@ -1420,6 +1445,22 @@ class LMCacheConnectorV1Impl:
         self._deferred_latent_pending: set[LayerwiseSaveKey] = set()
         self._stats_monitor = LMCStatsMonitor.GetOrCreate()
         self.enable_sparse_attention = config.enable_sparse_attention
+        self._retrieve_stats_interval_seconds = (
+            _retrieve_stats_interval_seconds()
+        )
+        self._retrieve_stats_window_started_at: Optional[float] = None
+        self._retrieve_stats_request_count = 0
+        self._retrieve_stats_row_count = 0
+        self._retrieve_stats_token_count = 0
+        if (
+            role != KVConnectorRole.SCHEDULER
+            and self._retrieve_stats_interval_seconds > 0
+        ):
+            logger.info(
+                "LMCache sparse retrieve statistics enabled; reporting every "
+                "%d seconds.",
+                self._retrieve_stats_interval_seconds,
+            )
 
         # Role-specific initialization
         if role == KVConnectorRole.SCHEDULER:
@@ -1872,6 +1913,81 @@ class LMCacheConnectorV1Impl:
 
     def _is_dsa_two_groups(self) -> bool:
         return bool(getattr(getattr(self, "config", None), "dsa_two_groups", False))
+
+    def _ensure_retrieve_stats_state(self) -> int:
+        """Lazily initialize stats for lightweight/test connector instances."""
+        interval = getattr(self, "_retrieve_stats_interval_seconds", None)
+        if interval is None:
+            interval = _retrieve_stats_interval_seconds()
+            self._retrieve_stats_interval_seconds = interval
+            self._retrieve_stats_window_started_at = None
+            self._retrieve_stats_request_count = 0
+            self._retrieve_stats_row_count = 0
+            self._retrieve_stats_token_count = 0
+        return int(interval)
+
+    def _record_sparse_retrieve_stats(
+        self,
+        selected_tokens: Any,
+        selected_token_counts: Any,
+        row_count: int,
+    ) -> None:
+        """Record one request, combining all of its MTP rows."""
+        interval = self._ensure_retrieve_stats_state()
+        if interval <= 0:
+            return
+
+        if selected_token_counts is not None:
+            if isinstance(selected_token_counts, torch.Tensor):
+                retrieved_tokens = int(
+                    selected_token_counts.detach().sum().to(device="cpu").item()
+                )
+            elif isinstance(selected_token_counts, (list, tuple)):
+                retrieved_tokens = sum(
+                    int(count) for count in selected_token_counts
+                )
+            else:
+                retrieved_tokens = int(selected_token_counts)
+        elif selected_tokens is not None:
+            if isinstance(selected_tokens, torch.Tensor):
+                retrieved_tokens = int(selected_tokens.numel())
+            elif hasattr(selected_tokens, "__len__"):
+                retrieved_tokens = len(selected_tokens)
+            else:
+                retrieved_tokens = 1
+        else:
+            return
+
+        now = time.monotonic()
+        if self._retrieve_stats_window_started_at is None:
+            self._retrieve_stats_window_started_at = now
+        self._retrieve_stats_request_count += 1
+        self._retrieve_stats_row_count += max(int(row_count), 1)
+        self._retrieve_stats_token_count += retrieved_tokens
+
+        elapsed = now - self._retrieve_stats_window_started_at
+        if elapsed < interval:
+            return
+
+        request_count = self._retrieve_stats_request_count
+        average = (
+            self._retrieve_stats_token_count / request_count
+            if request_count
+            else 0.0
+        )
+        logger.info(
+            "[LMCacheRetrieveStats] elapsed=%.3fs requests=%d rows=%d "
+            "retrieved_tokens=%d avg_retrieved_tokens_per_request=%.3f",
+            elapsed,
+            request_count,
+            self._retrieve_stats_row_count,
+            self._retrieve_stats_token_count,
+            average,
+        )
+        self._retrieve_stats_window_started_at = now
+        self._retrieve_stats_request_count = 0
+        self._retrieve_stats_row_count = 0
+        self._retrieve_stats_token_count = 0
 
     def _is_indexer_layer_wait(self, layer_name: str) -> bool:
         if not self._is_dsa_two_groups():
@@ -5920,6 +6036,12 @@ class LMCacheConnectorV1Impl:
                             else:
                                 selected_tokens_per_req = selected_tokens_payload
                                 token_start_index_per_req = token_start_payload
+                    if self.current_layer == 0 and wait_group == 0:
+                        self._record_sparse_retrieve_stats(
+                            selected_tokens_per_req,
+                            selected_token_counts_per_req,
+                            row_count,
+                        )
                     sparse_payload = (
                         payload
                         if payload is not None
