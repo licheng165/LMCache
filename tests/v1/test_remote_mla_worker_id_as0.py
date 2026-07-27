@@ -1,13 +1,12 @@
 # SPDX-License-Identifier: Apache-2.0
 # Standard
-from typing import List
-
-# Add import for mock
-from unittest import mock
 import asyncio
 import threading
+from typing import List
+from unittest import mock
 
 # Third Party
+import pytest
 import torch
 
 # First Party
@@ -40,6 +39,58 @@ class MockConnector(RemoteConnector):
 
     async def list(self) -> List[str]:
         return []
+
+
+@mock.patch(
+    "lmcache.v1.storage_backend.remote_backend.CreateSerde",
+    return_value=(mock.Mock(), mock.Mock()),
+)
+@mock.patch.object(
+    RemoteBackend,
+    "init_connection",
+    lambda self: setattr(self, "connection", None),
+)
+def test_remote_worker_id_collapse_rejects_per_rank_mla(
+    _mock_serde: mock.Mock,
+) -> None:
+    config = LMCacheEngineConfig(
+        chunk_size=256,
+        local_cpu=True,
+        max_local_cpu_size=5.0,
+        local_disk=None,
+        max_local_disk_size=0.0,
+        remote_url="lm://localhost:65432",
+        remote_serde="naive",
+        use_layerwise=True,
+        save_decode_cache=False,
+        enable_blending=False,
+        extra_config={
+            "save_only_first_rank": False,
+            "remote_enable_mla_worker_id_as0": True,
+        },
+    )
+    metadata = LMCacheMetadata(
+        model_name="test-model",
+        kv_dtype=torch.float16,
+        kv_shape=(32, 1, 256, 64, 128),
+        use_mla=True,
+        world_size=4,
+        local_world_size=4,
+        worker_id=2,
+        local_worker_id=2,
+    )
+
+    loop = asyncio.new_event_loop()
+    try:
+        with pytest.raises(ValueError, match="replace per-rank MLA cache data"):
+            RemoteBackend(
+                config=config,
+                metadata=metadata,
+                loop=loop,
+                local_cpu_backend=mock.Mock(),
+            )
+    finally:
+        loop.close()
 
 
 # Mock the entire torch.cuda.Stream class

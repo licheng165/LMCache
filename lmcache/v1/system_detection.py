@@ -54,6 +54,80 @@ class SystemMemoryDetector:
 
 class NUMADetector:
     @staticmethod
+    def get_shared_cpu_interleave_nodes(
+        config: LMCacheEngineConfig,
+    ) -> Optional[tuple[int, ...]]:
+        """Resolve NUMA nodes for shared CPU cache interleaving.
+
+        Args:
+            config: LMCache engine configuration.
+
+        Returns:
+            The selected NUMA nodes for ``MPOL_INTERLEAVE``, or ``None`` to
+            preserve the existing first-touch allocation policy.
+
+        Raises:
+            ValueError: If the policy or configured node list is invalid.
+            RuntimeError: If interleaving is requested and the process
+                memory-node allowance cannot be detected.
+        """
+        policy = str(
+            config.get_extra_config_value(
+                "shared_cpu_cache_numa_policy",
+                getattr(config, "shared_cpu_cache_numa_policy", "first_touch"),
+            )
+        ).strip().lower()
+        configured_nodes = config.get_extra_config_value(
+            "shared_cpu_cache_numa_nodes",
+            getattr(config, "shared_cpu_cache_numa_nodes", None),
+        )
+        if policy not in {"first_touch", "interleave"}:
+            raise ValueError(
+                "shared_cpu_cache_numa_policy must be 'first_touch' or "
+                f"'interleave', got {policy!r}"
+            )
+        if policy == "first_touch":
+            if configured_nodes is not None:
+                raise ValueError(
+                    "shared_cpu_cache_numa_nodes requires "
+                    "shared_cpu_cache_numa_policy='interleave'"
+                )
+            return None
+
+        allowed_nodes = NUMADetector._read_allowed_numa_nodes()
+        if not allowed_nodes:
+            raise RuntimeError(
+                "shared CPU cache NUMA interleave policy could not detect "
+                "the process Mems_allowed_list"
+            )
+        if configured_nodes is None:
+            return allowed_nodes
+
+        try:
+            if isinstance(configured_nodes, str):
+                nodes = NUMADetector._parse_numa_node_list(configured_nodes)
+            elif isinstance(configured_nodes, int):
+                nodes = (configured_nodes,)
+            else:
+                nodes = tuple(sorted({int(node) for node in configured_nodes}))
+        except (TypeError, ValueError) as exc:
+            raise ValueError(
+                "shared_cpu_cache_numa_nodes must contain NUMA node IDs"
+            ) from exc
+        if not nodes or any(node < 0 for node in nodes):
+            raise ValueError(
+                "shared_cpu_cache_numa_nodes must contain non-negative NUMA "
+                "node IDs"
+            )
+        if not set(nodes).issubset(allowed_nodes):
+            raise ValueError(
+                "shared_cpu_cache_numa_nodes contains nodes outside the "
+                f"process Mems_allowed_list: nodes={nodes}, "
+                f"allowed={allowed_nodes}"
+            )
+        return nodes
+
+    @staticmethod
     def get_numa_mapping(config: LMCacheEngineConfig) -> Optional[NUMAMapping]:
         """
         Get NUMA mapping.
@@ -109,3 +183,34 @@ class NUMADetector:
         except Exception as e:
             logger.warning(f"Failed to auto read NUMA mapping from system: {e}")
             return None
+
+    @staticmethod
+    def _read_allowed_numa_nodes() -> Optional[tuple[int, ...]]:
+        try:
+            with open("/proc/self/status") as status_file:
+                for line in status_file:
+                    if line.startswith("Mems_allowed_list:"):
+                        return NUMADetector._parse_numa_node_list(
+                            line.partition(":")[2]
+                        )
+        except OSError as exc:
+            logger.warning("Failed to read process NUMA allowance: %s", exc)
+        return None
+
+    @staticmethod
+    def _parse_numa_node_list(value: str) -> tuple[int, ...]:
+        nodes: set[int] = set()
+        try:
+            for item in value.strip().split(","):
+                if not item:
+                    continue
+                if "-" not in item:
+                    nodes.add(int(item))
+                    continue
+                first, last = (int(part) for part in item.split("-", 1))
+                if first > last:
+                    raise ValueError
+                nodes.update(range(first, last + 1))
+        except ValueError as exc:
+            raise ValueError(f"Invalid NUMA node list: {value!r}") from exc
+        return tuple(sorted(nodes))
