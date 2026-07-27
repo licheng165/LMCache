@@ -2857,12 +2857,12 @@ class TestWorkerRetrieveState:
                     kwargs["cached_keys"][0].append("k1")
                     kwargs["cached_starts"].append(256)
                     kwargs["cached_ends"].append(512)
-                    yield kwargs["ret_mask"]
+                    yield kwargs.get("ret_mask")
                     kwargs["cached_tensors"][0].append(torch.zeros(256))
                     kwargs["cached_chunk_ptrs_npu"][0] = torch.tensor(
                         [123, 456], dtype=torch.long
                     )
-                    yield kwargs["ret_mask"]
+                    yield kwargs.get("ret_mask")
 
                 return _retriever()
 
