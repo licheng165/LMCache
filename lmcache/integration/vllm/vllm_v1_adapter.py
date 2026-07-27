@@ -544,6 +544,8 @@ class RequestTracker:
     # Sparse decode only: reused across decode steps to avoid per-step allocation.
     sparse_decode_token_mask: Optional[torch.Tensor] = field(default=None, repr=False)
     sparse_decode_ret_mask: Optional[torch.Tensor] = field(default=None, repr=False)
+    # Sparse decode only: frontier whose full metadata has been emitted.
+    sparse_meta_frontier: Optional[int] = field(default=None, repr=False)
     # Decode window save only: independent progress for decode-window chunks.
     decode_window_save_next_start: Optional[int] = field(default=None, repr=False)
     decode_window_save_anchor: Optional[int] = field(default=None, repr=False)
@@ -648,6 +650,7 @@ class RequestTracker:
             self.sparse_indexer_slot_mapping.clear()
             self.sparse_decode_token_mask = None
             self.sparse_decode_ret_mask = None
+            self.sparse_meta_frontier = None
             # the block ids will change after preemption
             self.allocated_block_ids = new_block_ids
             self.allocated_block_ids_indexer = new_indexer_block_ids
@@ -737,6 +740,9 @@ class WorkerRetrieveState:
     location: Optional[str] = None
     metadata_warm: bool = False
     token_count: int = 0
+    slot_mapping: Optional[torch.Tensor] = field(default=None, repr=False)
+    indexer_slot_mapping: Optional[torch.Tensor] = field(default=None, repr=False)
+    decode_ret_mask: Optional[torch.Tensor] = field(default=None, repr=False)
     prepared_sparse_sources: dict[int, PreparedSparseSource] = field(
         default_factory=dict,
         repr=False,
@@ -805,6 +811,9 @@ class ReqMeta:
 
     # Whether is sparse attention and decode or not
     is_sparse_decode: bool = False
+    # Warm sparse decode reuses request-owned worker state and omits
+    # sequence-length metadata from SchedulerOutput.
+    sparse_warm_ref: bool = False
 
     # Skip save or not
     save_spec: Optional[SaveSpec] = None
@@ -814,6 +823,12 @@ class ReqMeta:
     disagg_spec: Optional[DisaggSpec] = None
     # the configs of the request
     request_configs: Optional[dict] = None
+
+    def retrieve_token_count(self) -> int:
+        """Return the logical retrieve prefix represented by this metadata."""
+        if self.sparse_warm_ref and self.load_spec is not None:
+            return int(self.load_spec.lmcache_cached_tokens)
+        return len(self.token_ids)
 
     @staticmethod
     def from_decode_window_save(
@@ -967,11 +982,13 @@ class ReqMeta:
             and tracker.sparse_token_ids
         ):
             sparse_token_count = (
-                load_spec.lmcache_cached_tokens
+                int(load_spec.lmcache_cached_tokens)
                 if load_spec.can_load
                 else len(tracker.sparse_token_ids)
             )
-            if len(tracker.sparse_token_ids) >= sparse_token_count:
+            if len(tracker.sparse_token_ids) == sparse_token_count:
+                input_token_ids = tracker.sparse_token_ids
+            elif len(tracker.sparse_token_ids) > sparse_token_count:
                 input_token_ids = tracker.sparse_token_ids[:sparse_token_count]
         input_token_len = len(input_token_ids)
 
@@ -1092,18 +1109,36 @@ class ReqMeta:
 
         # Calculate the token ids and slot mappings for load and save
         if is_sparse_decode and load_spec is not None and skip_save:
-            sparse_token_count = min(
-                load_spec.lmcache_cached_tokens,
-                len(input_token_ids),
-            )
+            sparse_token_count = int(load_spec.lmcache_cached_tokens)
+            if (
+                load_spec.can_load
+                and sparse_token_count == tracker.sparse_meta_frontier
+                and not save_entire_prefix
+            ):
+                return ReqMeta(
+                    req_id=tracker.req_id,
+                    token_ids=[],
+                    is_last_prefill=True,
+                    is_sparse_decode=True,
+                    sparse_warm_ref=True,
+                    save_spec=save_spec,
+                    load_spec=load_spec,
+                    disagg_spec=tracker.disagg_spec,
+                    request_configs=tracker.request_configs,
+                )
             if (
                 not tracker.sparse_token_ids
                 or len(tracker.sparse_token_ids) != sparse_token_count
             ):
-                tracker.seed_sparse_decode_tokens(
-                    input_token_ids,
-                    token_count=sparse_token_count,
-                )
+                if len(tracker.sparse_token_ids) >= sparse_token_count:
+                    tracker.sparse_token_ids = tracker.sparse_token_ids[
+                        :sparse_token_count
+                    ]
+                else:
+                    tracker.seed_sparse_decode_tokens(
+                        input_token_ids,
+                        token_count=sparse_token_count,
+                    )
             token_ids = tracker.sparse_token_ids
             if len(token_ids) < load_spec.lmcache_cached_tokens:
                 logger.warning(
@@ -1114,7 +1149,7 @@ class ReqMeta:
                     len(token_ids),
                     load_spec.lmcache_cached_tokens,
                     tracker.prompt_len,
-            )
+                )
         else:
             retrieve_token_len = 0
             if load_spec is not None and load_spec.can_load:
@@ -1309,6 +1344,18 @@ class ReqMeta:
             decode_token_mask=decode_token_mask,
             decode_ret_mask=decode_ret_mask,
         )
+        if (
+            is_sparse_decode
+            and load_spec is not None
+            and load_spec.can_load
+            and skip_save
+            and not save_entire_prefix
+            and len(token_ids) == load_spec.lmcache_cached_tokens
+            and slot_mapping
+            and slot_mapping[0].numel()
+            == _sparse_slot_mapping_len(load_spec.lmcache_cached_tokens)
+        ):
+            tracker.sparse_meta_frontier = int(load_spec.lmcache_cached_tokens)
         return req_meta
 
 
@@ -2229,9 +2276,11 @@ class LMCacheConnectorV1Impl:
         retrieve_token_count = self._shared_retrieve_token_count_for_request(
             request
         )
-        validated_token_count = min(
-            retrieve_token_count,
-            int(state.token_count or retrieve_token_count),
+        state_token_count = int(state.token_count or retrieve_token_count)
+        validated_token_count = (
+            state_token_count
+            if request.sparse_warm_ref and state_token_count >= retrieve_token_count
+            else min(retrieve_token_count, state_token_count)
         )
         prepared_latent = state.prepared_sparse_sources.get(0)
         if (
@@ -3527,6 +3576,9 @@ class LMCacheConnectorV1Impl:
         state.shared_request_active = False
         state.request_scope_token = None
         state.shared_validation_signature = None
+        state.slot_mapping = None
+        state.indexer_slot_mapping = None
+        state.decode_ret_mask = None
         state.req_id = None
 
     @staticmethod
@@ -3761,6 +3813,9 @@ class LMCacheConnectorV1Impl:
             "location": state.location,
             "metadata_warm": state.metadata_warm,
             "token_count": state.token_count,
+            "slot_mapping": state.slot_mapping,
+            "indexer_slot_mapping": state.indexer_slot_mapping,
+            "decode_ret_mask": state.decode_ret_mask,
             "shared_generation": state.shared_generation,
             "pointer_cache_generation": state.pointer_cache_generation,
             "request_scope_token": state.request_scope_token,
@@ -3978,7 +4033,7 @@ class LMCacheConnectorV1Impl:
         return bool(
             committed > 0
             and token_count > committed
-            and token_count <= len(request.token_ids)
+            and token_count <= request.retrieve_token_count()
             and load_spec is not None
             and int(load_spec.lmcache_cached_tokens) == token_count
             and committed % chunk_size == 0
@@ -4033,7 +4088,7 @@ class LMCacheConnectorV1Impl:
             # A shorter current prefix means the cached request state is stale.
             if state.token_count and (
                 token_count < state.token_count
-                or len(request.token_ids) < state.token_count
+                or request.retrieve_token_count() < state.token_count
             ):
                 return True
             if token_count > state.token_count:
@@ -4055,6 +4110,37 @@ class LMCacheConnectorV1Impl:
         if state is None or not (state.metadata_warm or state.has_cache()):
             return None
         self._validate_shared_worker_retrieve_state(state, request)
+        return state
+
+    def _worker_retrieve_state_for_warm_ref(
+        self, request: ReqMeta
+    ) -> WorkerRetrieveState:
+        load_spec = request.load_spec
+        if (
+            not request.is_sparse_decode
+            or load_spec is None
+            or not load_spec.can_load
+        ):
+            raise RuntimeError(
+                f"Invalid sparse warm metadata for request {request.req_id}"
+            )
+        token_count = int(load_spec.lmcache_cached_tokens)
+        state = self._worker_retrieve_state_for_request(request)
+        # Async scheduling may queue one or more references before a
+        # decode-window completion reaches the scheduler. The worker can
+        # already own a larger prefix; that superset safely covers the older
+        # scheduler frontier until a full refresh arrives.
+        if (
+            state is None
+            or state.token_count < token_count
+            or state.slot_mapping is None
+            or self._prepared_sparse_source(state, 0, state.token_count) is None
+        ):
+            raise RuntimeError(
+                "Sparse warm metadata has no matching prepared worker state: "
+                f"req_id={request.req_id}, frontier={token_count}, "
+                f"state_frontier={getattr(state, 'token_count', None)}"
+            )
         return state
 
     @staticmethod
@@ -4112,7 +4198,7 @@ class LMCacheConnectorV1Impl:
             # A shorter current prefix means the cached request state is stale.
             if state.token_count and (
                 token_count < state.token_count
-                or len(request.token_ids) < state.token_count
+                or request.retrieve_token_count() < state.token_count
             ):
                 return "retrieve_prefix_shrunk"
             return None
@@ -4936,6 +5022,10 @@ class LMCacheConnectorV1Impl:
                 continue
 
             token_count = int(request.load_spec.lmcache_cached_tokens)
+            if request.sparse_warm_ref:
+                # Do not shrink state while consuming an async reference that
+                # predates a worker-side decode-save promotion.
+                token_count = max(token_count, int(state.token_count))
             if self._prepared_sparse_sources_current(
                 state,
                 request,
@@ -4998,11 +5088,23 @@ class LMCacheConnectorV1Impl:
         Optional[PreparedSparseSource],
     ]:
         assert request.load_spec is not None
+        prepared_token_count = (
+            retrieve_state.token_count
+            if request.sparse_warm_ref
+            else token_count
+        )
         prepared_source = self._prepared_sparse_source(
             retrieve_state,
             kv_group,
-            token_count,
+            prepared_token_count,
         )
+        if request.sparse_warm_ref and prepared_source is None:
+            raise RuntimeError(
+                "Sparse warm metadata cannot enter bootstrap without token "
+                f"metadata: req_id={request.req_id}, kv_group={kv_group}, "
+                f"frontier={token_count}, "
+                f"state_frontier={retrieve_state.token_count}"
+            )
         if prepared_source is not None:
             retrieve_kwargs: dict[str, Any] = {
                 "kvcaches": kvcaches,
@@ -5038,8 +5140,13 @@ class LMCacheConnectorV1Impl:
             retrieve_kwargs.update(
                 self._sparse_decode_bootstrap_reuse_kwargs(token_count, bound_state)
             )
-        if request.decode_ret_mask is not None:
-            retrieve_kwargs["ret_mask"] = request.decode_ret_mask
+        ret_mask = (
+            request.decode_ret_mask
+            if request.decode_ret_mask is not None
+            else retrieve_state.decode_ret_mask
+        )
+        if ret_mask is not None:
+            retrieve_kwargs["ret_mask"] = ret_mask
         return retrieve_kwargs, shared_cpu_preflight_state, prepared_source
 
     @staticmethod
@@ -5125,7 +5232,7 @@ class LMCacheConnectorV1Impl:
                 continue
             has_load_spec = True
             vllm_hit_tokens += load_spec.vllm_cached_tokens
-            prompt_tokens += len(request.token_ids)
+            prompt_tokens += request.retrieve_token_count()
             if not load_spec.can_load:
                 continue
             loadable_requests.append((idx, request))
@@ -5159,9 +5266,17 @@ class LMCacheConnectorV1Impl:
             tokens = request.token_ids
             assert request.load_spec is not None
             lmcache_cached_tokens = request.load_spec.lmcache_cached_tokens
-            assert request.slot_mapping
+            sparse_bound_state = (
+                self._worker_retrieve_state_for_warm_ref(request)
+                if request.sparse_warm_ref
+                else None
+            )
 
-            if request.is_sparse_decode:
+            if sparse_bound_state is not None:
+                assert sparse_bound_state.slot_mapping is not None
+                slot_mapping = sparse_bound_state.slot_mapping
+            elif request.is_sparse_decode:
+                assert request.slot_mapping
                 if (
                     request.slot_mapping[0].device.type
                     != torch.device(self.device).type
@@ -5172,6 +5287,7 @@ class LMCacheConnectorV1Impl:
                     )
                 slot_mapping = request.slot_mapping[0]
             else:
+                assert request.slot_mapping
                 slot_mapping = request.slot_mapping[0].to(
                     device=self.device, dtype=torch.long
                 )
@@ -5179,23 +5295,35 @@ class LMCacheConnectorV1Impl:
             if not request.is_sparse_decode:
                 assert len(tokens) == len(slot_mapping)
 
-            retrieve_tokens = self._load_tokens_for_retrieve(
-                tokens,
-                lmcache_cached_tokens,
-                is_sparse_decode=request.is_sparse_decode,
+            retrieve_tokens = (
+                []
+                if request.sparse_warm_ref
+                else self._load_tokens_for_retrieve(
+                    tokens,
+                    lmcache_cached_tokens,
+                    is_sparse_decode=request.is_sparse_decode,
+                )
             )
             recalc_last_applied = self._full_hit_recalc_last_token(
                 request.load_spec,
-                len(request.token_ids),
+                request.retrieve_token_count(),
                 is_sparse_decode=request.is_sparse_decode,
             )
             if recalc_last_applied:
                 retrieve_tokens, slot_mapping = self._trim_prefill_for_recalc_last(
                     request, retrieve_tokens, slot_mapping
                 )
-            token_count = len(retrieve_tokens)
-            token_mask = self._load_token_mask_for_retrieve(
-                request, token_count, self._lmcache_chunk_size
+            token_count = (
+                lmcache_cached_tokens
+                if request.sparse_warm_ref
+                else len(retrieve_tokens)
+            )
+            token_mask = (
+                None
+                if request.sparse_warm_ref
+                else self._load_token_mask_for_retrieve(
+                    request, token_count, self._lmcache_chunk_size
+                )
             )
             indexer_token_mask = token_mask
             if (
@@ -5226,14 +5354,15 @@ class LMCacheConnectorV1Impl:
                         vllm_cached_tokens=request.load_spec.vllm_cached_tokens,
                     )
                 elif request.is_sparse_decode:
-                    prior_retrieve_state = None
+                    prior_retrieve_state = sparse_bound_state
                     prior_retrieve_snapshot = None
                     invalidation_reason = None
                     retrieve_state_invalidated = False
                     if hasattr(self, "_worker_retrieve_state"):
-                        prior_retrieve_state = self._worker_retrieve_state.get(
-                            request.req_id
-                        )
+                        if prior_retrieve_state is None:
+                            prior_retrieve_state = self._worker_retrieve_state.get(
+                                request.req_id
+                            )
                         if (
                             _mtp_dw_deep_diag_enabled()
                             and prior_retrieve_state is not None
@@ -5279,7 +5408,8 @@ class LMCacheConnectorV1Impl:
                                 ),
                             }
                         retrieve_state_invalidated = (
-                            self._should_invalidate_worker_retrieve_state(
+                            not request.sparse_warm_ref
+                            and self._should_invalidate_worker_retrieve_state(
                                 request, token_count
                             )
                         )
@@ -5295,8 +5425,10 @@ class LMCacheConnectorV1Impl:
                                         )
                                     )
                             self._drop_worker_retrieve_state(request.req_id)
-                        bound_state = self._worker_retrieve_state_for_request(
-                            request
+                        bound_state = (
+                            sparse_bound_state
+                            if sparse_bound_state is not None
+                            else self._worker_retrieve_state_for_request(request)
                         )
                     else:
                         bound_state = None
@@ -5304,6 +5436,10 @@ class LMCacheConnectorV1Impl:
                     retrieve_state = bound_state
                     if retrieve_state is None:
                         retrieve_state = WorkerRetrieveState(req_id=request.req_id)
+                    if not request.sparse_warm_ref:
+                        retrieve_state.slot_mapping = slot_mapping
+                        if request.decode_ret_mask is not None:
+                            retrieve_state.decode_ret_mask = request.decode_ret_mask
 
                     dsa_two_groups = self._is_dsa_two_groups()
                     shared_cpu_enabled = bool(
@@ -5396,9 +5532,13 @@ class LMCacheConnectorV1Impl:
                                 else slot_mapping
                             )
                             request_indexer_slots = (
-                                request.indexer_slot_mapping[0]
-                                if request.indexer_slot_mapping
-                                else None
+                                retrieve_state.indexer_slot_mapping
+                                if request.sparse_warm_ref
+                                else (
+                                    request.indexer_slot_mapping[0]
+                                    if request.indexer_slot_mapping
+                                    else None
+                                )
                             )
                             if (
                                 request_indexer_slots is not None
@@ -5408,14 +5548,17 @@ class LMCacheConnectorV1Impl:
                                     or request_indexer_slots.dtype != torch.long
                                 )
                             ):
-                                request.indexer_slot_mapping[0] = (
-                                    request_indexer_slots.to(
-                                        device=self.device, dtype=torch.long
+                                request_indexer_slots = request_indexer_slots.to(
+                                    device=self.device, dtype=torch.long
+                                )
+                                if request.sparse_warm_ref:
+                                    retrieve_state.indexer_slot_mapping = (
+                                        request_indexer_slots
                                     )
-                                )
-                                request_indexer_slots = (
-                                    request.indexer_slot_mapping[0]
-                                )
+                                else:
+                                    request.indexer_slot_mapping[0] = (
+                                        request_indexer_slots
+                                    )
                             idx_slot = self._sparse_indexer_slot_mapping(
                                 attn_metadata,
                                 latent_sparse_slots,
@@ -5424,6 +5567,8 @@ class LMCacheConnectorV1Impl:
                                 strict=shared_cpu_enabled,
                             )
                             assert idx_slot is not None
+                            if not request.sparse_warm_ref:
+                                retrieve_state.indexer_slot_mapping = idx_slot
                             (
                                 indexer_kwargs,
                                 shared_cpu_preflight_state,
@@ -7676,6 +7821,7 @@ class LMCacheConnectorV1Impl:
                 request_tracker.decode_window_save_anchor = None
                 request_tracker.decode_window_save_inflight_end = None
                 request_tracker.decode_window_save_pending_commits.clear()
+                request_tracker.sparse_meta_frontier = None
 
             # Pass all_token_ids for preempted requests to restore
             # token_ids correctly for chunk key computation
@@ -7695,14 +7841,6 @@ class LMCacheConnectorV1Impl:
                 request.num_computed_tokens >= request_tracker.prompt_len
             )
             if is_sparse_decode:
-                if (
-                    not request_tracker.sparse_token_ids
-                    or len(request_tracker.sparse_token_ids)
-                    < request_tracker.prompt_len
-                ):
-                    request_tracker.seed_sparse_decode_tokens(
-                        list(request.all_token_ids)
-                    )
                 # Sparse direct decode should only retrieve the prefix whose
                 # boundary is also used by SFA scratch_remap. Keep the final
                 # partial prompt chunk in the live vLLM tail by default; the
@@ -7740,6 +7878,14 @@ class LMCacheConnectorV1Impl:
                     # the release/remap frontier remains LMCache-chunk aligned below.
                     lmcache_cached_for_sparse = max(
                         lmcache_cached_for_sparse, request_tracker.prompt_len
+                    )
+                if (
+                    len(request_tracker.sparse_token_ids)
+                    < lmcache_cached_for_sparse
+                ):
+                    request_tracker.seed_sparse_decode_tokens(
+                        list(request.all_token_ids),
+                        token_count=lmcache_cached_for_sparse,
                     )
                 load_spec = LoadSpec(
                     vllm_cached_tokens=0,

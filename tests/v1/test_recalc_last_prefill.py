@@ -181,7 +181,40 @@ class TestFullHitRecalcLast:
         )
 
         assert req_meta_again is not None
-        assert req_meta_again.indexer_slot_mapping[0] is first_indexer_slots
+        assert req_meta_again.sparse_warm_ref
+        assert req_meta_again.token_ids == []
+        assert req_meta_again.slot_mapping == []
+        assert req_meta_again.indexer_slot_mapping == []
+        assert tracker.sparse_indexer_slot_mapping[0] is first_indexer_slots
+
+    def test_sparse_producer_keeps_full_metadata(self) -> None:
+        tracker = RequestTracker(
+            req_id="req-producer",
+            prompt_len=256,
+            token_ids=list(range(257)),
+            allocated_block_ids=_block_ids(257, 16),
+            num_saved_tokens=256,
+        )
+        tracker.is_decode_phase = True
+        load_spec = LoadSpec(
+            vllm_cached_tokens=0,
+            lmcache_cached_tokens=256,
+            can_load=True,
+        )
+
+        for _ in range(2):
+            req_meta = ReqMeta.from_request_tracker(
+                tracker,
+                block_size=16,
+                lmcache_chunk_size=256,
+                load_spec=load_spec,
+                is_sparse_decode=True,
+                save_entire_prefix=True,
+            )
+
+            assert req_meta is not None
+            assert not req_meta.sparse_warm_ref
+            assert len(req_meta.token_ids) >= 256
 
     def test_sparse_indexer_slot_mapping_prefers_request_slots(self) -> None:
         impl = object.__new__(LMCacheConnectorV1Impl)
