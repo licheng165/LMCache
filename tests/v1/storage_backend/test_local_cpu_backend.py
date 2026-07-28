@@ -310,6 +310,51 @@ class TestLocalCPUBackend:
         third_obj.ref_count_down()
         local_cpu_backend.memory_allocator.close()
 
+    def test_batched_get_prefixes_with_misses_preserves_layer_order(
+        self,
+        local_cpu_backend,
+    ):
+        keys = [
+            [create_test_key(f"layer_0_key_{i}") for i in range(3)],
+            [create_test_key(f"layer_1_key_{i}") for i in range(3)],
+        ]
+        layer0_first = create_test_memory_obj()
+        layer1_first = create_test_memory_obj()
+        layer1_second = create_test_memory_obj()
+        local_cpu_backend.submit_put_task(keys[0][0], layer0_first)
+        local_cpu_backend.submit_put_task(keys[1][0], layer1_first)
+        local_cpu_backend.submit_put_task(keys[1][1], layer1_second)
+
+        before = [
+            layer0_first.get_ref_count(),
+            layer1_first.get_ref_count(),
+            layer1_second.get_ref_count(),
+        ]
+        results = local_cpu_backend.batched_get_prefixes_with_misses(keys)
+
+        assert len(results) == 2
+        assert results[0].local_memory_objs == [layer0_first]
+        assert results[0].remote_positions == [1, 2]
+        assert results[0].remote_keys == keys[0][1:]
+        assert results[1].local_memory_objs == [layer1_first, layer1_second]
+        assert results[1].remote_positions == [2]
+        assert results[1].remote_keys == keys[1][2:]
+        assert [
+            layer0_first.get_ref_count(),
+            layer1_first.get_ref_count(),
+            layer1_second.get_ref_count(),
+        ] == [count + 1 for count in before]
+
+        for result in results:
+            result.release()
+        for layer_keys in keys:
+            for key in layer_keys:
+                local_cpu_backend.remove(key, force=True)
+        layer0_first.ref_count_down()
+        layer1_first.ref_count_down()
+        layer1_second.ref_count_down()
+        local_cpu_backend.memory_allocator.close()
+
     def test_pin_unpin(self, local_cpu_backend):
         """Test pin() and unpin() operations."""
         key = create_test_key("test_key")

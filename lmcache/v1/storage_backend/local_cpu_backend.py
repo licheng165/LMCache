@@ -282,6 +282,57 @@ class LocalCPUBackend(AllocatorBackendInterface):
                 local_memory_objs.append(memory_obj)
         return LocalCPUPrefixGetResult(local_memory_objs, [], [])
 
+    def batched_get_prefixes_with_misses(
+        self,
+        keys_layer_major: List[List[CacheEngineKey]],
+    ) -> List[LocalCPUPrefixGetResult]:
+        """Get several layer prefixes while holding the cache lock once.
+
+        Args:
+            keys_layer_major: Cache keys grouped by model layer. Each layer is
+                resolved only up to its first local miss, matching
+                :meth:`batched_get_prefix_with_misses`.
+
+        Returns:
+            One prefix result per input layer, in the same order. Every local
+            object in a returned result owns a caller reference that must be
+            released by the consumer.
+
+        Notes:
+            Sparse cold bootstrap probes every layer before issuing its
+            Mooncake request. Acquiring the same lock once avoids one Python
+            call and one lock round trip per model layer without changing
+            prefix or reference-count semantics.
+        """
+        results: List[LocalCPUPrefixGetResult] = []
+        retained: List[MemoryObj] = []
+        try:
+            with self.cpu_lock:
+                for keys in keys_layer_major:
+                    local_memory_objs: List[Optional[MemoryObj]] = []
+                    first_miss = len(keys)
+                    for position, key in enumerate(keys):
+                        memory_obj = self.hot_cache.get(key)
+                        if memory_obj is None:
+                            first_miss = position
+                            break
+                        memory_obj.ref_count_up()
+                        retained.append(memory_obj)
+                        local_memory_objs.append(memory_obj)
+                    results.append(
+                        LocalCPUPrefixGetResult(
+                            local_memory_objs,
+                            list(range(first_miss, len(keys))),
+                            list(keys[first_miss:]),
+                        )
+                    )
+            return results
+        except Exception:
+            for memory_obj in reversed(retained):
+                if memory_obj.is_valid():
+                    memory_obj.ref_count_down()
+            raise
+
     async def batched_get_non_blocking(
         self,
         lookup_id: str,
