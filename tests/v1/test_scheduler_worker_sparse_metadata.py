@@ -111,6 +111,10 @@ def test_dsa_prefix_hit_uses_full_allocation_and_chunk_aligned_committed_end(
 def test_first_sparse_step_publishes_initial_release_frontier_once() -> None:
     impl = _make_scheduler_impl()
     impl._completed_decode_window_saves = {}
+    # Simulate the worker-role candidate map (§15.2 false-ready fix): the
+    # initial sparse frontier is staged as a candidate, NOT written to the
+    # formal completion map until the final backend fence promotes it.
+    impl._decode_window_save_candidates = {}
     request = SimpleNamespace(
         req_id="initial-sparse-release",
         is_sparse_decode=True,
@@ -118,13 +122,22 @@ def test_first_sparse_step_publishes_initial_release_frontier_once() -> None:
     )
 
     impl._mark_initial_sparse_release_ready(request)
+    # Candidate staged, formal map still empty (no false-ready release).
+    assert impl._completed_decode_window_saves == {}
+    assert impl._decode_window_save_candidates == {request.req_id: 8192}
+
+    # Promotion after the final fence moves the candidate to the formal map.
+    impl._promote_decode_window_save_candidates()
     assert impl.get_completed_decode_window_saves() == {
         request.req_id: 8192,
     }
+    # Candidates are drained by promotion.
+    assert impl._decode_window_save_candidates == {}
 
-    # The one-shot marker prevents a later sparse step from publishing the
+    # The one-shot marker prevents a later sparse step from re-staging the
     # initial frontier again after the completion output has been drained.
     impl._mark_initial_sparse_release_ready(request)
+    assert impl._decode_window_save_candidates == {}
     assert impl.get_completed_decode_window_saves() == {}
 
 
@@ -307,6 +320,7 @@ def test_decode_window_merges_all_complete_windows_that_are_ready() -> None:
 def test_prefill_completion_publishes_only_chunk_aligned_frontier() -> None:
     impl = _make_scheduler_impl()
     impl._completed_decode_window_saves = {}
+    impl._decode_window_save_candidates = {}
     request = SimpleNamespace(
         req_id="prefill-partial",
         token_ids=list(range(300)),
@@ -317,7 +331,16 @@ def test_prefill_completion_publishes_only_chunk_aligned_frontier() -> None:
 
     impl._mark_prefill_committed(request)
 
+    # The prefill frontier is staged as a candidate (§15.2), not yet in the
+    # formal completion map: a still-in-flight backend save must not gate a
+    # latent release until the final fence promotes it.
+    assert impl._completed_decode_window_saves == {}
+    assert impl._decode_window_save_candidates == {"prefill-partial": 256}
+
+    impl._promote_decode_window_save_candidates()
     assert impl._completed_decode_window_saves == {"prefill-partial": 256}
+    assert impl._decode_window_save_candidates == {}
+
 class TestRequestTrackerPhase:
     def test_one_token_prefill_boundary_remains_prefill(self) -> None:
         tracker = RequestTracker(

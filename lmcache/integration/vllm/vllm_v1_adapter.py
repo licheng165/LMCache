@@ -84,6 +84,11 @@ LayerwiseSaveKey = tuple[str, str, int, int, int]
 
 
 def _mtp_dw_diag_enabled() -> bool:
+    # Legacy [MTP_DW] emitters are disabled once the unified dsa_offload.v1
+    # protocol is active (see §4 of the DSA log enhancement design).
+    from lmcache.dsa_offload import DiagLevel, get_dsa_diag_level
+    if get_dsa_diag_level() != DiagLevel.OFF:
+        return False
     return os.environ.get("VLLM_ASCEND_MTP_DW_DIAG", "0") == "1"
 
 
@@ -99,6 +104,17 @@ def _mtp_dw_event(stage: str, **fields: Any) -> None:
     payload = {"schema": 1, "stage": stage, "owner": "lmcache"}
     payload.update(fields)
     logger.info("[MTP_DW] %s", json.dumps(payload, separators=(",", ":")))
+
+
+# Structured dsa_offload.v1 emitter for the LMCache integration adapter. Stays
+# a no-op until VLLM_ASCEND_DSA_DIAG_LEVEL is set; legacy [MTP_DW] emitters are
+# atomically disabled once it is (see _mtp_dw_diag_enabled above).
+from lmcache.dsa_offload import DiagLevel as _DSADiagLevel
+from lmcache.dsa_offload import QUORUM_UNPROVEN_MAX_MERGE as _QUORUM_UNPROVEN
+from lmcache.dsa_offload import SOURCE_UNKNOWN_AT_CONNECTOR as _DSA_LOOKUP_SOURCE_UNKNOWN
+from lmcache.dsa_offload import dsa_logger_for as _dsa_logger_for
+
+_dsa_log = _dsa_logger_for("lmcache.worker")
 
 
 def _retrieve_stats_interval_seconds() -> int:
@@ -525,6 +541,15 @@ class RequestTracker:
     # The configs of the request, includes tags and other configs
     request_configs: Optional[dict] = None
 
+    # DSA offload correlation (§5.3), copied from NewRequestData so worker-side
+    # events can attach the same RequestKey/trace.
+    trace_id: Optional[str] = None
+    scope_id: int = 0
+    request_process_instance: Optional[str] = None
+    transfer_id: Optional[str] = None
+    dispatch_epoch: int = 0
+    route_epoch: int = 0
+
     # Whether the request is in decode phase
     is_decode_phase: bool = False
 
@@ -613,6 +638,13 @@ class RequestTracker:
             request_configs=request_configs,
             num_lmcache_cached_tokens=lmcache_cached_tokens,
             decode_window_save_committed_end=lmcache_cached_tokens,
+            trace_id=getattr(new_request, "trace_id", None),
+            scope_id=getattr(new_request, "scope_id", 0),
+            request_process_instance=getattr(
+                new_request, "request_process_instance", None),
+            transfer_id=getattr(new_request, "transfer_id", None),
+            dispatch_epoch=getattr(new_request, "dispatch_epoch", 0),
+            route_epoch=getattr(new_request, "route_epoch", 0),
         )
 
     def update(
@@ -824,6 +856,29 @@ class ReqMeta:
     # the configs of the request
     request_configs: Optional[dict] = None
 
+    # DSA offload correlation (§5.3). Carried from vLLM NewRequestData so worker-
+    # side store/retrieve events attach the same RequestKey/trace. Defaults keep
+    # existing ReqMeta constructors working.
+    trace_id: Optional[str] = None
+    scope_id: int = 0
+    request_process_instance: Optional[str] = None
+    transfer_id: Optional[str] = None
+    dispatch_epoch: int = 0
+    route_epoch: int = 0
+
+    def dsa_correlation_fields(self) -> dict[str, Any]:
+        """Cheap correlation fields for structured log events (no tensors)."""
+        out: dict[str, Any] = {
+            "trace_id": self.trace_id,
+            "request_process_instance": self.request_process_instance,
+            "scope_id": self.scope_id,
+            "route_epoch": self.route_epoch or None,
+        }
+        if self.transfer_id is not None:
+            out["transfer_id"] = self.transfer_id
+            out["dispatch_epoch"] = self.dispatch_epoch or None
+        return out
+
     def retrieve_token_count(self) -> int:
         """Return the logical retrieve prefix represented by this metadata."""
         if self.sparse_warm_ref and self.load_spec is not None:
@@ -941,6 +996,12 @@ class ReqMeta:
             decode_window_start=window_start,
             decode_window_end=window_end,
             decode_window_size=window_size,
+            trace_id=tracker.trace_id,
+            scope_id=tracker.scope_id,
+            request_process_instance=tracker.request_process_instance,
+            transfer_id=tracker.transfer_id,
+            dispatch_epoch=tracker.dispatch_epoch,
+            route_epoch=tracker.route_epoch,
         )
 
     @staticmethod
@@ -1125,6 +1186,12 @@ class ReqMeta:
                     load_spec=load_spec,
                     disagg_spec=tracker.disagg_spec,
                     request_configs=tracker.request_configs,
+                    trace_id=tracker.trace_id,
+                    scope_id=tracker.scope_id,
+                    request_process_instance=tracker.request_process_instance,
+                    transfer_id=tracker.transfer_id,
+                    dispatch_epoch=tracker.dispatch_epoch,
+                    route_epoch=tracker.route_epoch,
                 )
             if (
                 not tracker.sparse_token_ids
@@ -1343,6 +1410,12 @@ class ReqMeta:
             request_configs=tracker.request_configs,
             decode_token_mask=decode_token_mask,
             decode_ret_mask=decode_ret_mask,
+            trace_id=tracker.trace_id,
+            scope_id=tracker.scope_id,
+            request_process_instance=tracker.request_process_instance,
+            transfer_id=tracker.transfer_id,
+            dispatch_epoch=tracker.dispatch_epoch,
+            route_epoch=tracker.route_epoch,
         )
         if (
             is_sparse_decode
@@ -1624,6 +1697,13 @@ class LMCacheConnectorV1Impl:
             self._finished_req_ids_waiting_for_save: set[str] = set()
             self._late_finished_sending: set[str] = set()
             self._completed_decode_window_saves: dict[str, int] = {}
+            # Operation-local pre-fence candidates (§15.2 false-ready fix).
+            # _mark_prefill_committed / _mark_initial_sparse_release_ready stage
+            # frontiers here; they are promoted to _completed_decode_window_saves
+            # ONLY after the final backend fence (_finish_save_batch) succeeds.
+            # On fence failure the candidates are discarded atomically so no
+            # frontier ever reaches the formal completion map unsafely.
+            self._decode_window_save_candidates: dict[str, int] = {}
             self._decode_window_save_completed_groups: set[LayerwiseSaveKey] = set()
             self._decode_window_save_expected_start: dict[str, int] = {}
             self._warn_mla_per_rank_lookup_config(config)
@@ -3014,6 +3094,23 @@ class LMCacheConnectorV1Impl:
                 self._decode_window_save_required_groups(request)
             ),
         )
+        # Structured group-local readiness (§6.2/§7.4). This proves only that
+        # this group's per-layer generator finished locally; it is NOT a remote
+        # storage guarantee or a global bundle.
+        if _dsa_log.enabled(_DSADiagLevel.LIFECYCLE):
+            _dsa_log.emit(
+                "store.group.local_ready",
+                outcome="ok",
+                level=_DSADiagLevel.LIFECYCLE,
+                req_id=request.req_id,
+                kv_group=kv_group,
+                kv_kind="latent" if kv_group == 0 else "indexer",
+                window_start=request.decode_window_start,
+                window_end=request.decode_window_end,
+                required_groups=sorted(
+                    self._decode_window_save_required_groups(request)),
+                **request.dsa_correlation_fields(),
+            )
 
     def _note_decode_window_save_seen(self, request: ReqMeta) -> None:
         if not self._is_decode_window_save_request(request):
@@ -3250,7 +3347,13 @@ class LMCacheConnectorV1Impl:
         self._clear_decode_window_save_groups_for_window(request)
 
     def _mark_prefill_committed(self, request: ReqMeta) -> None:
-        """Publish the full-chunk prefill frontier after its save completes."""
+        """Stage the full-chunk prefill frontier as an operation-local candidate.
+
+        Per the DSA log enhancement §6.2/§15.2 this MUST NOT write the formal
+        completion map directly: the prefill save may still be in flight to the
+        backend (notably Mooncake put). The candidate is promoted to the formal
+        map only after the final backend fence succeeds in ``wait_for_save``.
+        """
         if (
             not request.is_last_prefill
             or request.is_sparse_decode
@@ -3262,14 +3365,30 @@ class LMCacheConnectorV1Impl:
             // self._lmcache_chunk_size
             * self._lmcache_chunk_size
         )
-        completed = getattr(self, "_completed_decode_window_saves", None)
-        if completed is not None and committed_end > 0:
-            completed[request.req_id] = max(
-                completed.get(request.req_id, 0), committed_end
+        candidates = getattr(self, "_decode_window_save_candidates", None)
+        if candidates is not None and committed_end > 0:
+            candidates[request.req_id] = max(
+                candidates.get(request.req_id, 0), committed_end
             )
+            if _dsa_log.enabled(_DSADiagLevel.DEEP):
+                _dsa_log.emit(
+                    "frontier.candidate",
+                    outcome="ok",
+                    level=_DSADiagLevel.DEEP,
+                    trace_id=getattr(request, "trace_id", None),
+                    request_process_instance=getattr(
+                        request, "request_process_instance", None),
+                    scope_id=getattr(request, "scope_id", None),
+                    req_id=request.req_id,
+                    frontier_kind="prefill_full_chunk",
+                    candidate_end=committed_end,
+                )
 
     def _mark_initial_sparse_release_ready(self, request: ReqMeta) -> None:
-        """Publish the cache-hit frontier after the first sparse step completes."""
+        """Stage the cache-hit frontier as an operation-local candidate.
+
+        See ``_mark_prefill_committed``: staged only, promoted post-fence.
+        """
         if not request.is_sparse_decode or request.load_spec is None:
             return
         committed_end = request.load_spec.dsa_committed_end
@@ -3281,13 +3400,76 @@ class LMCacheConnectorV1Impl:
             self._initial_sparse_release_published = published
         if request.req_id in published:
             return
-        completed = getattr(self, "_completed_decode_window_saves", None)
-        if completed is None:
+        candidates = getattr(self, "_decode_window_save_candidates", None)
+        if candidates is None:
             return
-        completed[request.req_id] = max(
-            completed.get(request.req_id, 0), int(committed_end)
+        candidates[request.req_id] = max(
+            candidates.get(request.req_id, 0), int(committed_end)
         )
         published.add(request.req_id)
+        if _dsa_log.enabled(_DSADiagLevel.DEEP):
+            _dsa_log.emit(
+                "frontier.candidate",
+                outcome="ok",
+                level=_DSADiagLevel.DEEP,
+                trace_id=getattr(request, "trace_id", None),
+                request_process_instance=getattr(
+                    request, "request_process_instance", None),
+                scope_id=getattr(request, "scope_id", None),
+                req_id=request.req_id,
+                frontier_kind="initial_sparse_release",
+                candidate_end=int(committed_end),
+            )
+
+    def _promote_decode_window_save_candidates(self) -> None:
+        """Promote staged candidates into the formal completion map.
+
+        Called from ``wait_for_save`` ONLY after ``_finish_save_batch`` (the
+        final backend fence) returned without raising. Until exact-set receipt
+        aggregation lands (§15.4) the merge is still ``max()``, so the emitted
+        observation is the compat ``route.observed`` form with
+        ``quorum_status=unproven_current_max_merge`` rather than a canonical
+        ``frontier.publish`` claiming ``proven``.
+        """
+        candidates = getattr(self, "_decode_window_save_candidates", None)
+        if not candidates:
+            return
+        completed = getattr(self, "_completed_decode_window_saves", None)
+        if completed is None:
+            candidates.clear()
+            return
+        promoted: dict[str, int] = {}
+        for req_id, end in candidates.items():
+            prev = completed.get(req_id, 0)
+            if end > prev:
+                completed[req_id] = end
+                promoted[req_id] = end
+        candidates.clear()
+        if promoted and _dsa_log.enabled(_DSADiagLevel.LIFECYCLE):
+            for req_id, end in promoted.items():
+                _dsa_log.emit(
+                    "route.observed",
+                    outcome="ok",
+                    level=_DSADiagLevel.LIFECYCLE,
+                    req_id=req_id,
+                    frontier_kind="decode_window_candidate_promoted",
+                    sparse_source_end=end,
+                    quorum_status=_QUORUM_UNPROVEN,
+                )
+
+    def _discard_decode_window_save_candidates(self) -> None:
+        """Atomic rollback: drop staged candidates on fence failure (§15.2)."""
+        candidates = getattr(self, "_decode_window_save_candidates", None)
+        if candidates:
+            if _dsa_log.enabled(_DSADiagLevel.LIFECYCLE):
+                _dsa_log.emit(
+                    "store.batch.fenced",
+                    outcome="error",
+                    level=_DSADiagLevel.LIFECYCLE,
+                    reason="save_fence_failed_candidate_rolled_back",
+                    rolled_back_req_count=len(candidates),
+                )
+            candidates.clear()
 
     def get_completed_decode_window_saves(self) -> dict[str, int]:
         completed = getattr(self, "_completed_decode_window_saves", None)
@@ -6844,6 +7026,10 @@ class LMCacheConnectorV1Impl:
                 self._finish_save_batch(save_context)
                 save_fence_complete = True
         except BaseException:
+            # Final backend fence failed (or _wait_for_save_impl raised): the
+            # staged prefill/sparse candidates must NOT reach the formal
+            # completion map. Roll them back atomically (§15.2).
+            self._discard_decode_window_save_candidates()
             metadata = self._parent._get_connector_metadata()
             assert isinstance(metadata, LMCacheConnectorMetadata)
             self._abort_save_step(metadata.requests)
@@ -6851,9 +7037,23 @@ class LMCacheConnectorV1Impl:
                 self._complete_worker_save_step()
             raise
         else:
+            # Fence succeeded: promote staged candidates to the formal map,
+            # then mark the per-window decode-window saves completed.
+            self._promote_decode_window_save_candidates()
             for request in save_context.get("decode_window_saves", ()):
                 self._mark_decode_window_save_completed(request)
             self._complete_worker_save_step()
+            if _dsa_log.enabled(_DSADiagLevel.LIFECYCLE):
+                # Participant-local final fence receipt (§6.2/§7.4). This is NOT
+                # a global bundle: until exact-set aggregation lands (§15.4) it
+                # only proves this participant's save step fenced.
+                _dsa_log.emit(
+                    "store.batch.fenced",
+                    outcome="ok",
+                    level=_DSADiagLevel.LIFECYCLE,
+                    kv_role=self.kv_role,
+                    quorum_status=_QUORUM_UNPROVEN,
+                )
 
     def _wait_for_save_impl(self, save_context: dict[str, Any]) -> None:
         connector_metadata = self._parent._get_connector_metadata()
@@ -7129,6 +7329,24 @@ class LMCacheConnectorV1Impl:
                 num_computed_tokens,
             )
             return None
+
+        # Structured lookup observation (§7.4). The lookup client currently
+        # returns a bare hit-token count, so the true tier is not knowable here;
+        # report it honestly rather than guessing from remote_url config. Upgrade
+        # the client to return LookupResult to fill source/duration precisely.
+        if _dsa_log.enabled(_DSADiagLevel.LIFECYCLE):
+            _dsa_log.emit(
+                "cache.lookup",
+                outcome="ok",
+                level=_DSADiagLevel.LIFECYCLE,
+                req_id=req_id,
+                prompt_tokens=request.num_tokens,
+                vllm_cached_tokens=num_computed_tokens,
+                lmcache_hit_tokens=num_external_hit_tokens,
+                need_load_tokens=max(
+                    num_external_hit_tokens - num_computed_tokens, 0),
+                source=_DSA_LOOKUP_SOURCE_UNKNOWN,
+            )
 
         # When prompt length is divisible by the block size and all
         # blocks are cached, we need to recompute the last token.
@@ -7912,6 +8130,25 @@ class LMCacheConnectorV1Impl:
         request: "Request",
         block_ids: list[int],
     ) -> tuple[bool, Optional[dict[str, Any]]]:
+        # Structured request.finish (§6.4). Emitted first so the lifecycle is
+        # recorded before worker-owned state is torn down below. Cheap fields
+        # only; no token values.
+        if _dsa_log.enabled(_DSADiagLevel.LIFECYCLE):
+            _dsa_log.emit(
+                "request.finish",
+                outcome="ok",
+                level=_DSADiagLevel.LIFECYCLE,
+                req_id=request.request_id,
+                finish_reason=str(getattr(request, "status", None)),
+                final_context_tokens=getattr(request, "num_tokens", None),
+                **getattr(request, "dsa_correlation_fields",
+                          lambda: {})(),
+            )
+            # Clear per-scope sampling state (§8.3).
+            _dsa_log.request_finished(
+                (getattr(request, "trace_id", None),
+                 getattr(request, "request_process_instance", None),
+                 getattr(request, "scope_id", None)))
         # This callback runs in the scheduler process. Worker-owned state is
         # released when the same request ID reaches worker-side get_finished().
         self._release_request_lookup_pins(request.request_id)

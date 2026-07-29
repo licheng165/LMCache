@@ -1086,6 +1086,22 @@ class MooncakestoreConnector(RemoteConnector):
                 asyncio.shield(task), timeout=self.config.transfer_timeout
             )
         except asyncio.TimeoutError as e:
+            # Structured wait-timeout observation (§7.6). ``asyncio.wait_for``
+            # timing out does NOT prove the shielded put thread was cancelled or
+            # that it ultimately failed, so this event's completion semantics are
+            # explicitly ``api_wait_timeout`` (never transfer final success/fail).
+            from lmcache.dsa_offload import DiagLevel, dsa_logger_for
+            mlog = dsa_logger_for("lmcache.mooncake")
+            if mlog.enabled(DiagLevel.LIFECYCLE):
+                mlog.emit(
+                    "remote.put.wait_timeout",
+                    outcome="degraded",
+                    level=DiagLevel.LIFECYCLE,
+                    operation=operation,
+                    timeout=self.config.transfer_timeout,
+                    completion_semantics="api_wait_timeout",
+                    key_count=len(memory_objs),
+                )
             raise TimeoutError(
                 f"Mooncake {operation} timed out after "
                 f"{self.config.transfer_timeout}s"
@@ -1130,6 +1146,21 @@ class MooncakestoreConnector(RemoteConnector):
             await self._batched_put_with_metadata(keys, memory_objs)
         else:
             await self._batched_put_zero_copy(keys, memory_objs)
+        # Structured put-fenced observation (§7.6). With replica_num==1 this only
+        # proves the local Mooncake put call returned success (put_fenced); it is
+        # NOT fault-domain durability and must not be relabeled handoff_leased.
+        from lmcache.dsa_offload import DiagLevel, dsa_logger_for
+        mlog = dsa_logger_for("lmcache.mooncake")
+        if mlog.enabled(DiagLevel.LIFECYCLE):
+            mlog.emit(
+                "remote.put.fenced",
+                outcome="ok",
+                level=DiagLevel.LIFECYCLE,
+                operation="batched_put",
+                key_count=len(keys),
+                bytes_completed=sum(mo.get_size() for mo in memory_objs),
+                remote_guarantee="put_fenced",
+            )
 
     async def _batched_put_zero_copy(
         self,
