@@ -117,6 +117,14 @@ class LayerwiseStoreResult:
         return bool(self.starts and self.ends and self.keys and self.memory_objs)
 
 
+@dataclass(frozen=True, slots=True)
+class _SharedRank0ObjectContext:
+    parent_allocator: MemoryAllocatorInterface
+    slab_size: int
+    dtype: torch.dtype
+    fmt: MemoryFormat
+
+
 class CacheEngineEndSignal:
     pass
 
@@ -1767,6 +1775,50 @@ class LMCacheEngine:
         except Exception:
             return False
 
+    def _shared_rank0_object_context(
+        self,
+        kv_group: int,
+    ) -> Optional[_SharedRank0ObjectContext]:
+        """Cache stable shared-slab invariants for one remote batch."""
+        try:
+            allocator = self._shared_local_cpu_backend().memory_allocator
+            parent = allocator.pin_allocator
+            if (
+                allocator.shm_name != self.shared_cpu_cache_name
+                or parent is None
+                or allocator.buffer is None
+            ):
+                return None
+            return _SharedRank0ObjectContext(
+                parent,
+                int(allocator.buffer.numel()),
+                self._shared_cpu_dtype_for_kv_group(kv_group),
+                self._memory_format_for_kv_group(kv_group),
+            )
+        except Exception:
+            return None
+
+    @staticmethod
+    def _shared_rank0_object_metadata(
+        mem_obj: MemoryObj,
+        context: _SharedRank0ObjectContext,
+    ) -> Optional[MemoryObjMetadata]:
+        """Return metadata only for an object contained by the expected slab."""
+        try:
+            metadata = mem_obj.metadata
+            offset = int(metadata.address)
+            physical_size = int(metadata.phy_size)
+            if (
+                mem_obj.parent() is not context.parent_allocator
+                or offset < 0
+                or physical_size <= 0
+                or offset + physical_size > context.slab_size
+            ):
+                return None
+            return metadata
+        except Exception:
+            return None
+
     def _copy_memory_obj_bytes(
         self,
         dst: MemoryObj,
@@ -1860,74 +1912,68 @@ class LMCacheEngine:
         layer_id: int,
         kv_group: int,
         chunk_index: int,
+        _context: Optional[_SharedRank0ObjectContext] = None,
+        _metadata: Optional[MemoryObjMetadata] = None,
     ) -> None:
-        local_cpu_backend = self._shared_local_cpu_backend()
-        allocator = getattr(local_cpu_backend, "memory_allocator", None)
-        if allocator is None:
-            raise ValueError("LocalCPUBackend has no memory allocator")
-        if getattr(allocator, "shm_name", None) != self.shared_cpu_cache_name:
+        context = _context or self._shared_rank0_object_context(kv_group)
+        if context is None:
             raise ValueError(
                 "Shared CPU cache object is not backed by the resolved shm slab: "
                 f"request_id={req_id}, phase={phase}, layer_id={layer_id}, "
-                f"kv_group={kv_group}, chunk_index={chunk_index}, "
-                f"allocator_shm={getattr(allocator, 'shm_name', None)!r}, "
-                f"expected={self.shared_cpu_cache_name!r}"
+                f"kv_group={kv_group}, chunk_index={chunk_index}"
             )
-        expected_parent = getattr(allocator, "pin_allocator", None)
-        if mem_obj.parent() is not expected_parent:
+        metadata = _metadata or mem_obj.metadata
+        if _metadata is None and mem_obj.parent() is not context.parent_allocator:
             raise ValueError(
                 "Shared CPU cache object does not belong to rank0's shm-backed "
                 "LocalCPUBackend allocator: "
                 f"request_id={req_id}, phase={phase}, layer_id={layer_id}, "
                 f"kv_group={kv_group}, chunk_index={chunk_index}"
             )
-        if mem_obj.get_dtype() is None:
+        if metadata.dtype is None:
             raise ValueError(
                 "Shared CPU cache cannot publish dtype-less MemoryObj: "
                 f"request_id={req_id}, phase={phase}, layer_id={layer_id}, "
                 f"kv_group={kv_group}, chunk_index={chunk_index}"
             )
-        expected_dtype = self._shared_cpu_dtype_for_kv_group(kv_group)
-        if mem_obj.get_dtype() != expected_dtype:
+        if metadata.dtype != context.dtype:
             raise ValueError(
                 "Shared CPU cache object dtype does not match KV group: "
                 f"request_id={req_id}, phase={phase}, layer_id={layer_id}, "
                 f"kv_group={kv_group}, chunk_index={chunk_index}, "
-                f"dtype={mem_obj.get_dtype()}, expected={expected_dtype}"
+                f"dtype={metadata.dtype}, expected={context.dtype}"
             )
-        expected_fmt = self._memory_format_for_kv_group(kv_group)
-        if mem_obj.get_memory_format() == MemoryFormat.UNDEFINED:
+        if metadata.fmt == MemoryFormat.UNDEFINED:
             raise ValueError(
                 "Shared CPU cache cannot publish MemoryObj with undefined format: "
                 f"request_id={req_id}, phase={phase}, layer_id={layer_id}, "
                 f"kv_group={kv_group}, chunk_index={chunk_index}"
             )
-        if mem_obj.get_memory_format() != expected_fmt:
+        if metadata.fmt != context.fmt:
             raise ValueError(
                 "Shared CPU cache object format does not match KV group: "
                 f"request_id={req_id}, phase={phase}, layer_id={layer_id}, "
                 f"kv_group={kv_group}, chunk_index={chunk_index}, "
-                f"fmt={mem_obj.get_memory_format()}, expected={expected_fmt}"
+                f"fmt={metadata.fmt}, expected={context.fmt}"
             )
-        slab_size = int(allocator.buffer.numel())
-        offset = int(mem_obj.metadata.address)
-        physical_size = int(mem_obj.metadata.phy_size)
+        offset = int(metadata.address)
+        physical_size = int(metadata.phy_size)
         logical_size = int(mem_obj.get_size())
         if (
             offset < 0
             or physical_size <= 0
             or logical_size <= 0
             or logical_size > physical_size
-            or offset + physical_size > slab_size
+            or offset + physical_size > context.slab_size
         ):
             raise ValueError(
                 "Shared CPU cache object has invalid slab bounds: "
                 f"request_id={req_id}, phase={phase}, layer_id={layer_id}, "
                 f"kv_group={kv_group}, chunk_index={chunk_index}, "
                 f"offset={offset}, logical_size={logical_size}, "
-                f"physical_size={physical_size}, slab_size={slab_size}"
+                f"physical_size={physical_size}, slab_size={context.slab_size}"
             )
-        if not mem_obj.is_pinned:
+        if metadata.pin_count <= 0:
             raise ValueError(
                 "Shared CPU cache object must be pinned before handle publication: "
                 f"request_id={req_id}, phase={phase}, layer_id={layer_id}, "
@@ -2186,28 +2232,52 @@ class LMCacheEngine:
         ]
         acquired: list[MemoryObj] = []
         pinned: list[MemoryObj] = []
+        context = self._shared_rank0_object_context(kv_group)
+        timing_hook = getattr(
+            self,
+            "_shared_rank0_resolver_timing_hook",
+            None,
+        )
+        if not callable(timing_hook):
+            timing_hook = None
+
+        def start_stage() -> float:
+            return time.perf_counter() if timing_hook is not None else 0.0
+
+        def finish_stage(stage: str, started: float) -> None:
+            if timing_hook is not None:
+                timing_hook(stage, time.perf_counter() - started)
+
+        started = start_stage()
+        windows: list[
+            tuple[int, int, list[tuple[int, int]], list[CacheEngineKey]]
+        ] = []
+        for window_start in range(0, len(keys_layer_major), layers_per_batch):
+            window_end = min(
+                window_start + layers_per_batch,
+                len(keys_layer_major),
+            )
+            coordinates: list[tuple[int, int]] = []
+            fetch_keys: list[CacheEngineKey] = []
+            for layer_id in range(window_start, window_end):
+                for chunk_index, key in enumerate(keys_layer_major[layer_id]):
+                    coordinates.append((layer_id, chunk_index))
+                    fetch_keys.append(key)
+            windows.append((window_start, window_end, coordinates, fetch_keys))
+        finish_stage("windows", started)
 
         try:
-            for window_start in range(
-                0, len(keys_layer_major), layers_per_batch
-            ):
-                window_end = min(
-                    window_start + layers_per_batch,
-                    len(keys_layer_major),
-                )
-                coordinates: list[tuple[int, int]] = []
-                fetch_keys: list[CacheEngineKey] = []
-                for layer_id in range(window_start, window_end):
-                    for chunk_index, key in enumerate(
-                        keys_layer_major[layer_id]
-                    ):
-                        coordinates.append((layer_id, chunk_index))
-                        fetch_keys.append(key)
-
+            for (
+                window_start,
+                window_end,
+                coordinates,
+                fetch_keys,
+            ) in windows:
                 fetched = self.storage_manager.batched_get(
                     fetch_keys,
                     location="RemoteBackend",
                 )
+                started = start_stage()
                 if len(fetched) != len(fetch_keys):
                     for fetched_obj in fetched:
                         if fetched_obj is not None:
@@ -2236,14 +2306,27 @@ class LMCacheEngine:
                         f"request_id={req_id}, phase={phase}, "
                         f"kv_group={kv_group}, missing={missing}"
                     )
+                finish_stage("results", started)
 
                 pending_fetched = list(fetched)
                 try:
+                    started = start_stage()
+                    window_objects: list[
+                        tuple[int, int, MemoryObj, Optional[MemoryObjMetadata]]
+                    ] = []
                     for index, (layer_id, chunk_index) in enumerate(coordinates):
                         fetched_obj = pending_fetched[index]
                         assert fetched_obj is not None
                         key = fetch_keys[index]
-                        if self._is_rank0_shared_mem_obj(fetched_obj):
+                        metadata = (
+                            self._shared_rank0_object_metadata(fetched_obj, context)
+                            if context is not None
+                            else None
+                        )
+                        if metadata is not None or (
+                            context is None
+                            and self._is_rank0_shared_mem_obj(fetched_obj)
+                        ):
                             mem_obj = fetched_obj
                             pending_fetched[index] = None
                         else:
@@ -2260,10 +2343,32 @@ class LMCacheEngine:
                             finally:
                                 fetched_obj.ref_count_down()
                                 pending_fetched[index] = None
+                            if context is not None:
+                                metadata = self._shared_rank0_object_metadata(
+                                    mem_obj,
+                                    context,
+                                )
 
                         acquired.append(mem_obj)
-                        mem_obj.pin()
+                        window_objects.append(
+                            (layer_id, chunk_index, mem_obj, metadata)
+                        )
+                    finish_stage("classification", started)
+
+                    started = start_stage()
+                    for layer_id, chunk_index, mem_obj, _metadata in window_objects:
+                        if mem_obj.pin() is False:
+                            raise ValueError(
+                                "Shared CPU cache failed to pin a resolved object: "
+                                f"request_id={req_id}, phase={phase}, "
+                                f"layer_id={layer_id}, kv_group={kv_group}, "
+                                f"chunk_index={chunk_index}"
+                            )
                         pinned.append(mem_obj)
+                    finish_stage("pinning", started)
+
+                    started = start_stage()
+                    for layer_id, chunk_index, mem_obj, metadata in window_objects:
                         self._validate_rank0_shared_mem_obj(
                             mem_obj,
                             req_id=req_id,
@@ -2271,8 +2376,15 @@ class LMCacheEngine:
                             layer_id=layer_id,
                             kv_group=kv_group,
                             chunk_index=chunk_index,
+                            _context=context,
+                            _metadata=metadata,
                         )
+                    finish_stage("validation", started)
+
+                    started = start_stage()
+                    for layer_id, _chunk_index, mem_obj, _metadata in window_objects:
                         resolved_layers[layer_id].append(mem_obj)
+                    finish_stage("scatter", started)
                 finally:
                     for fetched_obj in pending_fetched:
                         if fetched_obj is not None:
@@ -2280,12 +2392,14 @@ class LMCacheEngine:
 
             return resolved_layers
         except Exception:
+            started = start_stage()
             for mem_obj in reversed(pinned):
                 if mem_obj.is_pinned:
                     mem_obj.unpin()
             for mem_obj in reversed(acquired):
                 if mem_obj.is_valid():
                     mem_obj.ref_count_down()
+            finish_stage("rollback", started)
             raise
 
     @staticmethod
