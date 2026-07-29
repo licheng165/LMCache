@@ -227,6 +227,17 @@ class TokenDatabase(metaclass=abc.ABCMeta):
         if kv_group == 1 and bool(getattr(config, "dsa_two_groups", False)):
             request_configs = dict(request_configs or {})
             request_configs[DSA_INDEX_CACHE_SCHEMA_TAG] = DSA_INDEX_CACHE_SCHEMA
+        # DSA v2 cache namespace isolation (design section 14.5 item 4).  When
+        # the threshold state machine is enabled, fold the data-compatibility
+        # fingerprint into the key as a synthetic tag so historical objects from
+        # a different weight/layout/quantization cannot be mis-hit.  threshold=0
+        # leaves request_configs untouched so the byte-level v1 key is preserved.
+        extra_config = getattr(config, "extra_config", None) or {}
+        if extra_config.get("dsa_cache_namespace_version") == "v2":
+            fingerprint = extra_config.get("dsa_data_compatibility_fingerprint")
+            if fingerprint:
+                request_configs = dict(request_configs or {})
+                request_configs["lmcache.tag.dsa_ns_v2"] = fingerprint
         # When save_only_first_rank is enabled (for MLA), we deliberately
         # collapse the CacheEngineKey.world_size to 1 so that cache keys
         # become world-size agnostic across compatible deployments.

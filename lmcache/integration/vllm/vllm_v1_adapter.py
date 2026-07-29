@@ -419,14 +419,25 @@ def _split_kv_group_block_ids(block_ids) -> tuple[list[int], Optional[list[int]]
 class LoadSpec:
     # Number of tokens cached in vLLM
     vllm_cached_tokens: int
-    # Number of tokens that are cached in LMCache
+    # Number of tokens cached in LMCache
     lmcache_cached_tokens: int
     # Whether the scheduler allow us to load the tokens
     can_load: bool
     # Block-aligned frontier that sparse decode may remap from LMCache.
+    # LEGACY / threshold=0 path only.
     dsa_committed_end: Optional[int] = None
     # Fixed resident prefix capacity used by DSA MTP union scratch.
     dsa_scratch_capacity: Optional[int] = None
+    # Authoritative remap end from the Scheduler's route snapshot for the
+    # positive-threshold SPARSE path (design section 10.4). Do NOT overload
+    # dsa_committed_end with this semantic; the threshold=0 compatibility
+    # path keeps the legacy field.
+    dsa_remap_end: Optional[int] = None
+    # DSA route state string from the Scheduler snapshot
+    # ("legacy"/"resident"/"promoting"/"sparse"/"recovering"/
+    # "fallback_resident"/"finished").  None == no snapshot (LEGACY).
+    dsa_route_state: Optional[str] = None
+
 
 
 @dataclass
@@ -558,6 +569,12 @@ class RequestTracker:
     decode_window_save_pending_commits: deque[int] = field(
         default_factory=deque, repr=False
     )
+    # DSA threshold routing fields populated from the Scheduler's route
+    # snapshot (design section 8.5). must_persist_decode_windows overrides the
+    # legacy disagg guard in _should_decode_window_save; route_state is the
+    # authoritative per-request NPU execution mode.
+    dsa_must_persist_decode_windows: bool = field(default=False, repr=False)
+    dsa_route_state: Optional[str] = field(default=None, repr=False)
 
     @_lmcache_nvtx_annotate
     @staticmethod
@@ -1453,6 +1470,25 @@ class LMCacheConnectorV1Impl:
             if max_num_batched_tokens is not None:
                 config.extra_config["vllm_max_num_batched_tokens"] = (
                     max_num_batched_tokens
+                )
+
+        # Seed the DSA data-compatibility fingerprint into the LMCache config
+        # (design section 14.5 item 4 / 18.3).  When the threshold state machine
+        # is enabled (positive threshold), this fingerprint selects an isolated
+        # v2 cache namespace so historical objects from a different
+        # weight/layout/quantization cannot be mis-hit.  threshold=0 leaves the
+        # fingerprint empty so the byte-level v1 cache key is unchanged.
+        additional = getattr(vllm_config, "additional_config", None) or {}
+        dsa_cfg = additional.get("dsa") if isinstance(additional, dict) else None
+        if isinstance(dsa_cfg, dict):
+            fingerprint = dsa_cfg.get("data_compatibility_fingerprint")
+            threshold = dsa_cfg.get("threshold", 0)
+            if fingerprint and threshold:
+                config.extra_config["dsa_data_compatibility_fingerprint"] = fingerprint
+                config.extra_config["dsa_cache_namespace_version"] = "v2"
+            else:
+                config.extra_config.setdefault(
+                    "dsa_cache_namespace_version", "v1"
                 )
 
     def _init_connector_state(
@@ -7256,7 +7292,13 @@ class LMCacheConnectorV1Impl:
             return False
         if self.kv_role == "kv_consumer":
             return False
-        if tracker.disagg_spec is not None:
+        # Authoritative transfer obligation from the Scheduler's route snapshot
+        # (design section 10.5). When must_persist_decode_windows is set, the
+        # decode window save MUST run even for PD Decoder requests that carry a
+        # disagg_spec -- otherwise exactly the PD Decoder long request's window
+        # save gets disabled by the legacy disagg guard.
+        must_persist = bool(getattr(tracker, "dsa_must_persist_decode_windows", False))
+        if tracker.disagg_spec is not None and not must_persist:
             return False
         if tracker.skip_save:
             return False
@@ -7704,7 +7746,23 @@ class LMCacheConnectorV1Impl:
                     all_token_ids=all_token_ids,
                 )
 
-                self._add_decode_window_save_metas(meta, request_tracker)
+            self._add_decode_window_save_metas(meta, request_tracker)
+            # Populate the authoritative transfer obligation from the route
+            # snapshot so _should_decode_window_save honors must_persist even
+            # for PD Decoder requests carrying a disagg_spec (design 10.5).
+            _dsa_routes_map = getattr(scheduler_output, "dsa_routes", None)
+            _dsa_route = _dsa_routes_map.get(req_id) if _dsa_routes_map else None
+            if _dsa_route is not None:
+                _plan = getattr(_dsa_route, "transfer_plan", None)
+                request_tracker.dsa_must_persist_decode_windows = bool(
+                    getattr(_plan, "must_persist_decode_windows", False)
+                )
+                request_tracker.dsa_route_state = (
+                    getattr(getattr(_dsa_route, "route_state", None), "value", None)
+                )
+            else:
+                request_tracker.dsa_must_persist_decode_windows = False
+                request_tracker.dsa_route_state = None
                 req_meta = self._build_request_meta(request_tracker, load_spec)
                 if req_meta is not None:
                     req_meta.resumed_from_preemption = req.resumed_from_preemption
@@ -7837,9 +7895,28 @@ class LMCacheConnectorV1Impl:
             )
 
             self._add_decode_window_save_metas(meta, request_tracker)
-            is_sparse_decode = self.enable_sparse_attention and (
-                request.num_computed_tokens >= request_tracker.prompt_len
-            )
+            # DSA threshold routing: the Scheduler publishes an authoritative
+            # per-request route snapshot in scheduler_output.dsa_routes.  When
+            # present and not LEGACY, sparse decode is decided by the snapshot
+            # (SPARSE -> True, everything else -> False) and the remap frontier
+            # comes from snapshot.remap_end (design section 10.1 / 10.4).  When
+            # absent or LEGACY (threshold=0), fall back to the legacy local
+            # classification so the compatibility path is unchanged.
+            dsa_route = None
+            dsa_routes_map = getattr(scheduler_output, "dsa_routes", None)
+            if dsa_routes_map:
+                dsa_route = dsa_routes_map.get(req_id)
+            route_state_str = None
+            if dsa_route is not None:
+                rs = getattr(dsa_route, "route_state", None)
+                route_state_str = getattr(rs, "value", None) if rs is not None else None
+
+            if route_state_str is not None and route_state_str != "legacy":
+                is_sparse_decode = route_state_str == "sparse"
+            else:
+                is_sparse_decode = self.enable_sparse_attention and (
+                    request.num_computed_tokens >= request_tracker.prompt_len
+                )
             if is_sparse_decode:
                 # Sparse direct decode should only retrieve the prefix whose
                 # boundary is also used by SFA scratch_remap. Keep the final
@@ -7873,6 +7950,13 @@ class LMCacheConnectorV1Impl:
                     if committed_end > self._dsa_scratch_capacity
                     else 0
                 )
+                # Authoritative remap end from the snapshot (positive-threshold
+                # path). Falls back to the legacy committed_end when no snapshot.
+                dsa_remap_end = None
+                if dsa_route is not None:
+                    dsa_remap_end = int(getattr(dsa_route, "remap_end", 0) or 0)
+                    if dsa_remap_end <= self._dsa_scratch_capacity:
+                        dsa_remap_end = 0
                 if self.kv_role == "kv_consumer":
                     # Include the final partial prompt chunk in worker metadata;
                     # the release/remap frontier remains LMCache-chunk aligned below.
@@ -7893,6 +7977,8 @@ class LMCacheConnectorV1Impl:
                     can_load=lmcache_cached_for_sparse > 0,
                     dsa_committed_end=dsa_committed_end,
                     dsa_scratch_capacity=self._dsa_scratch_capacity,
+                    dsa_remap_end=dsa_remap_end,
+                    dsa_route_state=route_state_str,
                 )
 
             req_meta = self._build_request_meta(

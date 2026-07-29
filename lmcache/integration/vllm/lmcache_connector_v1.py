@@ -42,7 +42,52 @@ class LMCacheConnectorV1Dynamic(KVConnectorBase_V1):
             )
         else:
             super().__init__(vllm_config=vllm_config, role=role)
+        # This scheduler-side connector is the UNIQUE owner of the DSA
+        # deployment / node role keys (design section 14.6). Parse and validate
+        # them here, then REMOVE them from kv_connector_extra_config so they do
+        # not reach LMCacheEngineConfig (which has no such fields) via
+        # _apply_extra_config.
+        self.dsa_deployment_mode, self.dsa_node_role = (
+            self._consume_dsa_role_keys(vllm_config)
+        )
         self._lmcache_engine = LMCacheConnectorV1Impl(vllm_config, role, self)
+
+    @staticmethod
+    def _consume_dsa_role_keys(
+        vllm_config: "VllmConfig",
+    ) -> tuple[str, str]:
+        """Parse dsa_deployment_mode / dsa_node_role and strip them.
+
+        Returns (deployment_mode, node_role).  Defaults to
+        ("standalone", "standalone").  Validates the values against the
+        allowed set so a typo fails fast rather than silently degrading PD.
+        """
+        ktc = getattr(vllm_config, "kv_transfer_config", None)
+        if ktc is None:
+            return "standalone", "standalone"
+        extra = getattr(ktc, "kv_connector_extra_config", None) or {}
+        if not isinstance(extra, dict):
+            return "standalone", "standalone"
+        deployment = str(extra.pop("dsa_deployment_mode", "standalone")).lower()
+        node_role = str(extra.pop("dsa_node_role", deployment)).lower()
+        allowed_deployment = {"standalone", "pd"}
+        allowed_role = {"standalone", "prefill", "decode"}
+        if deployment not in allowed_deployment:
+            raise ValueError(
+                f"dsa_deployment_mode must be one of {allowed_deployment}, "
+                f"got {deployment!r}"
+            )
+        if node_role not in allowed_role:
+            raise ValueError(
+                f"dsa_node_role must be one of {allowed_role}, got {node_role!r}"
+            )
+        if deployment == "standalone" and node_role != "standalone":
+            raise ValueError(
+                "dsa_deployment_mode=standalone requires dsa_node_role="
+                f"standalone, got {node_role!r}"
+            )
+        return deployment, node_role
+
 
     # ==============================
     # Worker-side methods
