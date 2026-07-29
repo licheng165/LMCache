@@ -635,11 +635,18 @@ class MooncakestoreConnector(RemoteConnector):
         list[tuple[list[torch.Size], list[torch.dtype], MemoryFormat, int]],
         str,
     ]:
-        key_metadata = [self._metadata_for_raw_key(key) for key in keys]
+        first_key = keys[0]
+        first_metadata = self._metadata_for_raw_key(first_key)
+        same_group = all(key.kv_group == first_key.kv_group for key in keys)
+        key_metadata = [first_metadata]
+        if same_group:
+            key_metadata *= len(keys)
+        else:
+            key_metadata.extend(self._metadata_for_raw_key(key) for key in keys[1:])
         memory_objs: list[Optional[MemoryObj]] = []
         allocation_mode = "individual"
         first_shapes, first_dtypes, first_fmt, _ = key_metadata[0]
-        uniform_metadata = all(
+        uniform_metadata = same_group or all(
             shapes == first_shapes and dtypes == first_dtypes and fmt == first_fmt
             for shapes, dtypes, fmt, _ in key_metadata
         )

@@ -14,6 +14,7 @@ import torch
 
 # First Party
 from lmcache.utils import CacheEngineKey, LayerCacheEngineKey
+from lmcache.v1.memory_management import MemoryFormat
 from lmcache.v1.storage_backend.connector import (
     mooncakestore_connector as mooncake_connector,
 )
@@ -153,6 +154,55 @@ def test_instrumented_put_preserves_connector_failure_policy(
 def test_mooncake_requires_put_completion() -> None:
     connector = object.__new__(MooncakestoreConnector)
     assert connector.requires_put_completion()
+
+
+def test_mooncake_zero_copy_metadata_reuses_homogeneous_group() -> None:
+    def metadata_for_key(
+        key: CacheEngineKey,
+    ) -> tuple[list[torch.Size], list[torch.dtype], MemoryFormat, int]:
+        fmt = (
+            MemoryFormat.KV_DSA_INDEX_FMT
+            if key.kv_group == 1
+            else MemoryFormat.KV_MLA_LATENT_FMT
+        )
+        return ([torch.Size([4])], [torch.float16], fmt, 8)
+
+    metadata = Mock(side_effect=metadata_for_key)
+    backend = SimpleNamespace(
+        batched_allocate=Mock(
+            side_effect=lambda *args, batch_size, **kwargs: [
+                _MemoryObj() for _ in range(batch_size)
+            ]
+        ),
+        allocate=Mock(side_effect=lambda *args: _MemoryObj()),
+    )
+    connector = object.__new__(MooncakestoreConnector)
+    connector._metadata_for_raw_key = metadata
+    connector.local_cpu_backend = backend
+
+    keys = [_layer_key(1, layer) for layer in range(3)]
+    memory_objs, key_metadata, mode = connector._allocate_zero_copy_buffers(keys)
+
+    assert metadata.call_count == 1
+    assert all(value is key_metadata[0] for value in key_metadata)
+    assert len(memory_objs) == len(keys)
+    assert mode == "batched"
+
+    metadata.reset_mock()
+    backend.batched_allocate.reset_mock()
+    backend.allocate.reset_mock()
+    keys[1].kv_group = 1
+    _, key_metadata, mode = connector._allocate_zero_copy_buffers(keys)
+
+    assert metadata.call_count == len(keys)
+    assert backend.batched_allocate.call_count == 0
+    assert backend.allocate.call_count == len(keys)
+    assert [value[2] for value in key_metadata] == [
+        MemoryFormat.KV_MLA_LATENT_FMT,
+        MemoryFormat.KV_DSA_INDEX_FMT,
+        MemoryFormat.KV_MLA_LATENT_FMT,
+    ]
+    assert mode == "individual"
 
 
 def test_mooncake_batch_status_failure_is_not_silenced() -> None:

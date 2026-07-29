@@ -142,6 +142,45 @@ def test_tensor_allocator(use_paging):
     allocator.close()
 
 
+def test_tensor_batched_allocate_contiguous_and_fragmented() -> None:
+    block_size = 4096
+
+    class TracingAllocator(TensorMemoryAllocator):
+        def __init__(self, tensor: torch.Tensor) -> None:
+            super().__init__(tensor)
+            self.slice_calls: list[tuple[int, int]] = []
+
+        def _get_buffer_slice(self, start: int, size: int) -> torch.Tensor:
+            self.slice_calls.append((start, size))
+            return super()._get_buffer_slice(start, size)
+
+    allocator = TracingAllocator(torch.zeros(block_size * 5, dtype=torch.uint8))
+    assert allocator.batched_allocate(torch.Size([block_size]), torch.uint8, 0) == []
+    assert allocator.slice_calls == []
+    contiguous = allocator.batched_allocate(torch.Size([block_size]), torch.uint8, 3)
+    assert contiguous is not None
+    assert allocator.slice_calls == [(0, block_size * 3)]
+    assert [obj.meta.address for obj in contiguous] == [0, block_size, block_size * 2]
+    allocator.batched_free(contiguous)
+
+    allocated = [
+        allocator.allocate(torch.Size([block_size]), torch.uint8) for _ in range(5)
+    ]
+    allocated_objs = [obj for obj in allocated if obj is not None]
+    assert len(allocated_objs) == 5
+    allocator.free(allocated_objs[0])
+    allocator.free(allocated_objs[2])
+    allocator.slice_calls.clear()
+
+    fragmented = allocator.batched_allocate(torch.Size([block_size]), torch.uint8, 2)
+    assert fragmented is not None
+    assert allocator.slice_calls == [(0, block_size), (block_size * 2, block_size)]
+
+    allocator.batched_free(fragmented)
+    allocator.batched_free([allocated_objs[index] for index in (1, 3, 4)])
+    assert allocator.memcheck()
+
+
 def test_paged_allocator_refreshes_size_for_reused_partial_pages():
     full_shape = torch.Size([32, 8])
     partial_shape = torch.Size([19, 8])

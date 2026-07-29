@@ -1409,9 +1409,20 @@ class TensorMemoryAllocator(MemoryAllocatorInterface):
         except RuntimeError:
             return None
         addresses = [addr for addr, _ in alloc_results]
-        raw_datas = [
-            self._get_buffer_slice(addr, unit_aligned_size) for addr in addresses
-        ]
+        contiguous = len(addresses) > 1 and all(
+            curr == prev + unit_aligned_size
+            for prev, curr in zip(addresses, addresses[1:], strict=False)
+        )
+        if contiguous:
+            raw_datas = list(
+                self._get_buffer_slice(
+                    addresses[0], unit_aligned_size * batch_size
+                ).split(unit_aligned_size)
+            )
+        else:
+            raw_datas = [
+                self._get_buffer_slice(addr, unit_aligned_size) for addr in addresses
+            ]
 
         # For debug
         self.num_active_allocations += batch_size

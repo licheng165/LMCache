@@ -38,11 +38,11 @@ from lmcache.v1.storage_backend.local_cpu_backend import LocalCPUBackend
 ALIGN_BYTES = 4096
 TOKEN_DIMS = {0: 576, 1: 128}
 VARIANTS = {
-    "production": ("production", "production"),
+    "production": ("production", "cached"),
     "staged": ("staged", "production"),
     "single_loop": ("single_loop", "production"),
     "contiguous_split": ("contiguous_split", "production"),
-    "cached_metadata": ("production", "cached"),
+    "cached_metadata": ("staged", "cached"),
     "cached_split": ("contiguous_split", "cached"),
 }
 ALLOCATOR_STAGES = (
@@ -259,6 +259,8 @@ def prepare_metadata(
     # Private access is intentional: this is the production path under measurement.
     if mode == "cached":
         value = connector._metadata_for_raw_key(keys[0])  # noqa: SLF001
+        if not all(key.kv_group == keys[0].kv_group for key in keys):
+            raise RuntimeError("cached metadata requires one KV group")
         return [value] * len(keys)
 
     metadata = [
