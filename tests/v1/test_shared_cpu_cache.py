@@ -1437,10 +1437,7 @@ def test_runtime_capacity_details_exclude_required_hot_chunks_from_evictable():
         chunk_token_lengths=[1, 1],
     )
 
-    expected_missing_bytes = engine._shared_cpu_estimated_physical_chunk_bytes(
-        0,
-        num_tokens=1,
-    )
+    expected_missing_bytes = engine._shared_cpu_estimated_physical_chunk_bytes(0)
     assert details["required_bytes"] == expected_missing_bytes
     assert details["available_after_eviction"] == 9064
     assert details["protected_hot_bytes"] == 64
@@ -1518,15 +1515,12 @@ def test_runtime_capacity_details_report_failure_before_materialization():
 
     assert details[
         "required_bytes"
-    ] == engine._shared_cpu_estimated_physical_chunk_bytes(
-        0,
-        num_tokens=1,
-    )
+    ] == engine._shared_cpu_estimated_physical_chunk_bytes(0)
     assert details["available_after_eviction"] == 0
     assert details["fits"] is False
 
 
-def test_runtime_capacity_estimates_each_token_size_once():
+def test_runtime_capacity_uses_full_chunks_for_remote_fetch():
     engine = _make_engine_for_sparse_capacity(max_local_cpu_size=1)
     engine._shared_local_cpu_backend = lambda: _FakeLocalCPUBackend(
         free_bytes=0, hot_cache={}
@@ -1547,8 +1541,8 @@ def test_runtime_capacity_estimates_each_token_size_once():
         chunk_token_lengths=[1],
     )
 
-    assert details["required_bytes"] == 2
-    assert calls == [None, 1]
+    assert details["required_bytes"] == 8
+    assert calls == [None]
 
 
 def test_rank0_resolver_rematerializes_non_shm_hot_cache_hit():

@@ -363,7 +363,7 @@ def run_hot_sample(
     shape: torch.Size,
     fmt: MemoryFormat,
     policy: LRUCachePolicy,
-    unique_policy: LRUCachePolicy,
+    batched_policy: LRUCachePolicy,
 ) -> dict[str, float]:
     allocator = TensorMemoryAllocator(buffer, align_bytes=ALIGN_BYTES)
     objects = allocator.batched_allocate(
@@ -399,9 +399,8 @@ def run_hot_sample(
     sample["policy_s"] = time.perf_counter() - started
 
     started = time.perf_counter()
-    for chunk_hash in dict.fromkeys(key.chunk_hash for key in keys):
-        unique_policy.update_on_put(chunk_hash)
-    sample["unique_lru_policy_s"] = time.perf_counter() - started
+    batched_policy.update_on_put_many(keys)
+    sample["batched_lru_policy_s"] = time.perf_counter() - started
 
     if len(hot_cache) != len(keys) or any(
         hot_cache.get(key) is not obj
@@ -472,7 +471,7 @@ def print_results(
     print("\nHot-cache isolated stages (median ms)")
     print(
         f"{'group':>5} {'rebind':>9} {'refcount':>10} {'dict':>9} "
-        f"{'LRU policy':>11} {'unique hash':>12}"
+        f"{'LRU/key':>11} {'LRU/batch':>12}"
     )
     for group, sample in hot_results.items():
         print(
@@ -480,7 +479,7 @@ def print_results(
             f"{ms(sample['refcount_s']):10.3f} "
             f"{ms(sample['dictionary_s']):9.3f} "
             f"{ms(sample['policy_s']):11.3f} "
-            f"{ms(sample['unique_lru_policy_s']):12.3f}"
+            f"{ms(sample['batched_lru_policy_s']):12.3f}"
         )
 
 
@@ -570,18 +569,18 @@ def main() -> None:
         )
         hot_samples = []
         hot_policy = LRUCachePolicy()
-        unique_policy = LRUCachePolicy()
+        batched_policy = LRUCachePolicy()
         for repeat in range(args.warmup + args.repeats):
             gc.collect()
             hot_policy.chunk_hash_to_init_timestamp.clear()
-            unique_policy.chunk_hash_to_init_timestamp.clear()
+            batched_policy.chunk_hash_to_init_timestamp.clear()
             sample = run_hot_sample(
                 buffer,
                 keys,
                 torch.Size([args.chunk_size * TOKEN_DIMS[group]]),
                 fmt,
                 hot_policy,
-                unique_policy,
+                batched_policy,
             )
             if repeat >= args.warmup:
                 hot_samples.append(sample)

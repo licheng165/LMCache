@@ -1664,6 +1664,9 @@ class LMCacheEngine:
                 ):
                     continue
                 missing_chunk_count += 1
+                if location != "LocalCPUBackend":
+                    required_bytes += default_chunk_bytes
+                    continue
                 if (
                     chunk_token_lengths is not None
                     and chunk_index < len(chunk_token_lengths)

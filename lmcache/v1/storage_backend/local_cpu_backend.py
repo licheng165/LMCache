@@ -232,8 +232,10 @@ class LocalCPUBackend(AllocatorBackendInterface):
                     continue
                 memory_obj.ref_count_up()
                 self.hot_cache[key] = memory_obj
-                self.cache_policy.update_on_put(key)
                 stored_keys.append(key)
+            if stored_keys:
+                self.cache_policy.update_on_put_many(stored_keys)
+            for key in stored_keys:
                 if self.batched_msg_sender is not None:
                     self.batched_msg_sender.add_kv_op(
                         op_type=OpType.ADMIT,

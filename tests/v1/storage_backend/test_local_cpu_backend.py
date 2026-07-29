@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # Standard
-from unittest.mock import mock_open
+from unittest.mock import Mock, mock_open
 import threading
 
 # Third Party
@@ -230,6 +230,10 @@ class TestLocalCPUBackend:
         """Test batched_submit_put_task()."""
         keys = [create_test_key(f"key_{i}") for i in range(3)]
         memory_objs = [create_test_memory_obj() for _ in range(3)]
+        update_many = Mock(
+            wraps=local_cpu_backend.cache_policy.update_on_put_many
+        )
+        local_cpu_backend.cache_policy.update_on_put_many = update_many
 
         futures = local_cpu_backend.batched_submit_put_task(keys, memory_objs)
 
@@ -240,6 +244,12 @@ class TestLocalCPUBackend:
         for key, memory_obj in zip(keys, memory_objs, strict=False):
             assert key in local_cpu_backend.hot_cache
             assert local_cpu_backend.hot_cache[key] == memory_obj
+        update_many.assert_called_once_with(keys)
+
+        duplicate_objs = [create_test_memory_obj() for _ in keys]
+        local_cpu_backend.batched_submit_put_task(keys, duplicate_objs)
+        update_many.assert_called_once()
+        assert all(obj.get_ref_count() == 1 for obj in duplicate_objs)
 
         local_cpu_backend.memory_allocator.close()
 

@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # Standard
-from collections.abc import MutableMapping
+from collections.abc import Iterable, MutableMapping
 from typing import Generic, TypeVar
 import abc
 
@@ -52,6 +52,11 @@ class BaseCachePolicy(Generic[KeyType, MapType], metaclass=abc.ABCMeta):
             key: an object of KeyType
         """
         raise NotImplementedError
+
+    def update_on_put_many(self, keys: Iterable[KeyType]) -> None:
+        """Update policy state for a batch of newly stored cache keys."""
+        for key in keys:
+            self.update_on_put(key)
 
     # TODO(Jiayi): we need to unify the `Any` type in the `MutableMapping`
     @abc.abstractmethod
