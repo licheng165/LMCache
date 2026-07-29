@@ -53,6 +53,14 @@ ALLOCATOR_STAGES = (
     "combined_build_s",
     "accounting_s",
 )
+TENSOR_ACCESS_STAGES = (
+    "tensor_s",
+    "raw_tensor_s",
+    "data_ptr_s",
+    "cached_build_s",
+    "cached_reuse_s",
+    "bulk_typed_s",
+)
 
 
 def _verify_result(
@@ -415,6 +423,167 @@ def run_hot_sample(
     return sample
 
 
+def _typed_views(objects: list[TensorMemoryObj]) -> list[torch.Tensor]:
+    views = []
+    for obj in objects:
+        view = obj.tensor
+        if view is None:
+            raise RuntimeError("valid TensorMemoryObj returned no tensor")
+        views.append(view)
+    return views
+
+
+def _bulk_typed_views(
+    buffer: torch.Tensor,
+    objects: list[TensorMemoryObj],
+    full_shape: torch.Size,
+) -> list[torch.Tensor]:
+    first = objects[0].metadata
+    dtype = first.dtype
+    if dtype is None or len(full_shape) != 1:
+        raise RuntimeError("bulk typed-view benchmark requires one flat dtype/shape")
+    stride_bytes = first.phy_size
+    if (
+        stride_bytes % dtype.itemsize
+        or full_shape.numel() * dtype.itemsize > stride_bytes
+    ):
+        raise RuntimeError("physical stride cannot hold the typed view")
+    if any(
+        obj.metadata.address != first.address + index * stride_bytes
+        or obj.metadata.phy_size != stride_bytes
+        or obj.metadata.dtype != dtype
+        for index, obj in enumerate(objects)
+    ):
+        raise RuntimeError("bulk typed-view benchmark requires contiguous objects")
+
+    whole = buffer[first.address : first.address + len(objects) * stride_bytes]
+    matrix = torch.as_strided(
+        whole.view(dtype),
+        (len(objects), full_shape.numel()),
+        (stride_bytes // dtype.itemsize, 1),
+    )
+    views = list(matrix.unbind())
+    for index, obj in enumerate(objects):
+        if obj.get_shape() != full_shape:
+            view = obj.tensor
+            if view is None:
+                raise RuntimeError("partial TensorMemoryObj returned no tensor")
+            views[index] = view
+    return views
+
+
+def _verify_tensor_access(
+    objects: list[TensorMemoryObj],
+    typed_views: list[torch.Tensor],
+    raw_views: list[torch.Tensor],
+    pointers: list[int],
+) -> None:
+    if not (
+        len(objects) == len(typed_views) == len(raw_views) == len(pointers)
+    ):
+        raise AssertionError("tensor-access result count mismatch")
+    for obj, view, raw, pointer in zip(
+        objects, typed_views, raw_views, pointers, strict=True
+    ):
+        if (
+            view.data_ptr() != obj.data_ptr
+            or view.dtype != obj.metadata.dtype
+            or view.shape != obj.get_shape()
+            or raw.data_ptr() != obj.data_ptr
+            or raw.dtype != torch.uint8
+            or raw.numel() < obj.get_size()
+            or pointer != obj.data_ptr
+        ):
+            raise AssertionError("tensor-access view or pointer mismatch")
+
+
+def run_tensor_access_sample(
+    buffer: torch.Tensor,
+    keys: list[LayerCacheEngineKey],
+    chunk_size: int,
+    num_tokens: int,
+    kv_group: int,
+) -> dict[str, float]:
+    full_shape = torch.Size([chunk_size * TOKEN_DIMS[kv_group]])
+    fmt = (
+        MemoryFormat.KV_DSA_INDEX_FMT
+        if kv_group == 1
+        else MemoryFormat.KV_MLA_LATENT_FMT
+    )
+    allocator = TensorMemoryAllocator(buffer, align_bytes=ALIGN_BYTES)
+    objects = allocator.batched_allocate(
+        [full_shape],
+        [torch.bfloat16],
+        len(keys),
+        fmt,
+    )
+    if objects is None:
+        raise RuntimeError("tensor-access setup allocation failed")
+
+    tail_tokens = num_tokens % chunk_size
+    if tail_tokens:
+        tail_chunk = math.ceil(num_tokens / chunk_size) - 1
+        tail_bytes = tail_tokens * TOKEN_DIMS[kv_group] * 2
+        tail_count = 0
+        for key, obj in zip(keys, objects, strict=True):
+            if key.chunk_hash == tail_chunk:
+                tail_count += 1
+                MooncakestoreConnector._reshape_partial_chunk_with_token_size(
+                    obj,
+                    tail_bytes,
+                    TOKEN_DIMS[kv_group] * 2,
+                )
+        if tail_count * math.ceil(num_tokens / chunk_size) != len(objects):
+            raise AssertionError("partial-tail object count mismatch")
+
+    sample = {name: 0.0 for name in TENSOR_ACCESS_STAGES}
+    started = time.perf_counter()
+    typed_views = _typed_views(objects)
+    sample["tensor_s"] = time.perf_counter() - started
+
+    started = time.perf_counter()
+    raw_views = []
+    for obj in objects:
+        raw = obj.raw_tensor
+        if raw is None:
+            raise RuntimeError("valid TensorMemoryObj returned no raw tensor")
+        raw_views.append(raw)
+    sample["raw_tensor_s"] = time.perf_counter() - started
+
+    started = time.perf_counter()
+    pointers = [obj.data_ptr for obj in objects]
+    sample["data_ptr_s"] = time.perf_counter() - started
+
+    started = time.perf_counter()
+    cached_views = []
+    for obj in objects:
+        view = obj.tensor
+        if view is None:
+            raise RuntimeError("valid TensorMemoryObj returned no tensor")
+        obj._benchmark_cached_tensor = view  # type: ignore[attr-defined]
+        cached_views.append(view)
+    sample["cached_build_s"] = time.perf_counter() - started
+
+    started = time.perf_counter()
+    reused_views = [
+        obj._benchmark_cached_tensor  # type: ignore[attr-defined]
+        for obj in objects
+    ]
+    sample["cached_reuse_s"] = time.perf_counter() - started
+
+    started = time.perf_counter()
+    bulk_views = _bulk_typed_views(buffer, objects, full_shape)
+    sample["bulk_typed_s"] = time.perf_counter() - started
+
+    for views in (typed_views, cached_views, reused_views, bulk_views):
+        _verify_tensor_access(objects, views, raw_views, pointers)
+    for obj in objects:
+        del obj._benchmark_cached_tensor  # type: ignore[attr-defined]
+    del typed_views, raw_views, pointers, cached_views, reused_views, bulk_views
+    allocator.batched_free(objects)
+    return sample
+
+
 def medians(samples: list[dict[str, float]]) -> dict[str, float]:
     return {
         name: statistics.median(sample[name] for sample in samples)
@@ -429,6 +598,7 @@ def ms(seconds: float) -> float:
 def print_results(
     results: list[dict],
     hot_results: dict[int, dict[str, float]],
+    tensor_access_results: dict[int, dict[str, float]],
 ) -> None:
     print("\nEnd-to-end production-object path (median ms)")
     print(
@@ -482,6 +652,23 @@ def print_results(
             f"{ms(sample['batched_lru_policy_s']):12.3f}"
         )
 
+    print("\nTensorMemoryObj access (median ms; correctness checks excluded)")
+    print(
+        f"{'group':>5} {'tensor':>9} {'raw':>9} {'pointer':>9} "
+        f"{'cache build':>12} {'cache reuse':>12} {'bulk typed':>12} "
+        f"{'bulk speedup':>13}"
+    )
+    for group, sample in tensor_access_results.items():
+        print(
+            f"{group:5d} {ms(sample['tensor_s']):9.3f} "
+            f"{ms(sample['raw_tensor_s']):9.3f} "
+            f"{ms(sample['data_ptr_s']):9.3f} "
+            f"{ms(sample['cached_build_s']):12.3f} "
+            f"{ms(sample['cached_reuse_s']):12.3f} "
+            f"{ms(sample['bulk_typed_s']):12.3f} "
+            f"{sample['tensor_s'] / sample['bulk_typed_s']:13.3f}x"
+        )
+
 
 def build_parser() -> ArgumentParser:
     parser = ArgumentParser(description=__doc__)
@@ -519,6 +706,7 @@ def main() -> None:
     connector = make_connector(args.chunk_size)
     results: list[dict] = []
     hot_results: dict[int, dict[str, float]] = {}
+    tensor_access_results: dict[int, dict[str, float]] = {}
     print(
         f"tokens={args.num_tokens} chunks={chunks} layers={args.num_layers} "
         f"objects/group={object_count}"
@@ -585,10 +773,24 @@ def main() -> None:
             if repeat >= args.warmup:
                 hot_samples.append(sample)
         hot_results[group] = medians(hot_samples)
+
+        tensor_access_samples = []
+        for repeat in range(args.warmup + args.repeats):
+            gc.collect()
+            sample = run_tensor_access_sample(
+                buffer,
+                keys,
+                args.chunk_size,
+                args.num_tokens,
+                group,
+            )
+            if repeat >= args.warmup:
+                tensor_access_samples.append(sample)
+        tensor_access_results[group] = medians(tensor_access_samples)
         del buffer
         gc.collect()
 
-    print_results(results, hot_results)
+    print_results(results, hot_results, tensor_access_results)
     if args.output_json:
         args.output_json.parent.mkdir(parents=True, exist_ok=True)
         payload = {
@@ -603,6 +805,7 @@ def main() -> None:
             },
             "results": results,
             "hot_results": hot_results,
+            "tensor_access_results": tensor_access_results,
         }
         args.output_json.write_text(
             json.dumps(payload, indent=2),
