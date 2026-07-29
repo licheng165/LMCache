@@ -83,6 +83,7 @@ class LMCacheConnectorV1Dynamic(KVConnectorBase_V1):
         target_slot_mapping=None,
         payload_event=None,
         selected_token_counts=None,
+        require_complete_sparse_load: bool = False,
     ) -> None:
         """
         Block until the KV for a specific layer is loaded into vLLM's
@@ -110,6 +111,7 @@ class LMCacheConnectorV1Dynamic(KVConnectorBase_V1):
             target_slot_mapping=target_slot_mapping,
             payload_event=payload_event,
             selected_token_counts=selected_token_counts,
+            require_complete_sparse_load=require_complete_sparse_load,
         )
 
     def save_kv_layer(

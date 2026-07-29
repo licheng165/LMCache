@@ -5912,6 +5912,42 @@ class LMCacheConnectorV1Impl:
             self._abort_layerwise_retrieve_step(requests)
             raise
 
+    @staticmethod
+    def _validate_complete_sparse_retrieve(
+        request: ReqMeta,
+        ret_token_mask: Optional[torch.Tensor],
+    ) -> None:
+        """Fail before attention can consume an optimistic resident update."""
+        if ret_token_mask is None:
+            raise RuntimeError(
+                "Resident sparse LMCache retrieve returned no completion "
+                f"mask for request {request.req_id}"
+            )
+        actual = ret_token_mask.to(device="cpu", dtype=torch.bool)
+        expected = request.decode_token_mask
+        if expected is None:
+            missing = ~actual
+        else:
+            expected = expected.to(device="cpu", dtype=torch.bool)
+            if actual.shape != expected.shape:
+                raise RuntimeError(
+                    "Resident sparse LMCache retrieve mask shape differs "
+                    f"from the requested prefix for request {request.req_id}: "
+                    f"actual={tuple(actual.shape)}, "
+                    f"expected={tuple(expected.shape)}"
+                )
+            missing = expected & ~actual
+        missing_count = int(missing.sum().item())
+        if missing_count:
+            first_missing = int(
+                torch.nonzero(missing, as_tuple=False)[0].item()
+            )
+            raise RuntimeError(
+                "Resident sparse LMCache retrieve was partial for request "
+                f"{request.req_id}: missing_tokens={missing_count}, "
+                f"first_missing_position={first_missing}"
+            )
+
     @_lmcache_nvtx_annotate
     def wait_for_layer_load(
         self,
@@ -5922,6 +5958,7 @@ class LMCacheConnectorV1Impl:
         target_slot_mapping=None,
         payload_event=None,
         selected_token_counts=None,
+        require_complete_sparse_load: bool = False,
     ) -> None:
         """Blocking until the KV for a specific layer is loaded into vLLM's
         paged buffer.
@@ -6230,6 +6267,15 @@ class LMCacheConnectorV1Impl:
                             sparse_indexer_sent_layers.add(indexer_sent_key)
                             if ret_token_mask is None:
                                 ret_token_mask = indexer_ret_mask
+                    if (
+                        require_complete_sparse_load
+                        and wait_group == 0
+                        and self.current_layer == 0
+                    ):
+                        self._validate_complete_sparse_retrieve(
+                            request,
+                            ret_token_mask,
+                        )
                     decode_row += row_count
                 else:
                     if wait_group == 1:

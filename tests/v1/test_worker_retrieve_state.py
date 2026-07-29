@@ -42,6 +42,38 @@ def _make_impl() -> LMCacheConnectorV1Impl:
     return impl
 
 
+def test_complete_sparse_retrieve_validation_accepts_requested_mask():
+    request = SimpleNamespace(
+        req_id="req",
+        decode_token_mask=torch.tensor([False, True, True]),
+    )
+    LMCacheConnectorV1Impl._validate_complete_sparse_retrieve(
+        request,
+        torch.tensor([False, True, True]),
+    )
+
+
+def test_complete_sparse_retrieve_validation_rejects_partial_mask():
+    request = SimpleNamespace(
+        req_id="req",
+        decode_token_mask=torch.tensor([False, True, True]),
+    )
+    with pytest.raises(RuntimeError, match="partial"):
+        LMCacheConnectorV1Impl._validate_complete_sparse_retrieve(
+            request,
+            torch.tensor([False, True, False]),
+        )
+
+
+def test_complete_sparse_retrieve_validation_rejects_missing_mask():
+    request = SimpleNamespace(req_id="req", decode_token_mask=None)
+    with pytest.raises(RuntimeError, match="no completion mask"):
+        LMCacheConnectorV1Impl._validate_complete_sparse_retrieve(
+            request,
+            None,
+        )
+
+
 def _make_shared_engine(
     *,
     rank0: bool,
@@ -2923,7 +2955,10 @@ class TestWorkerRetrieveState:
         req.slot_mapping = []
         req.sparse_warm_ref = True
         impl, _, _ = make_worker_connector([req], use_layerwise=True)
-        impl.lmcache_engine = SimpleNamespace(enable_shared_cpu_cache=False)
+        impl.lmcache_engine = SimpleNamespace(
+            enable_shared_cpu_cache=False,
+            lookup_unpin=MagicMock(),
+        )
         impl.config.dsa_two_groups = False
         impl.num_layers = 1
         impl._refresh_kvcaches_list()
