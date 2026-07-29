@@ -173,28 +173,36 @@ def test_mooncake_batch_status_failure_is_not_silenced() -> None:
 def test_mooncake_page_get_scatter_returns_layer_objects() -> None:
     class _PageStore:
         def batch_get_into_multi_buffers(self, page_keys, ptrs, sizes):
-            assert len(page_keys) == 1
-            assert ptrs == [[100, 300]]
-            assert sizes == [[16, 16]]
-            return [32]
+            assert page_keys == ["page-1", "page-2"]
+            assert ptrs == [[100, 200], [300, 400]]
+            assert sizes == [[16, 16], [16, 16]]
+            return [32, 0]
 
     connector = object.__new__(MooncakestoreConnector)
     connector._page_num_layers = 2
     connector.store = _PageStore()
-    memory_objs = [_MemoryObj(16, 100), _MemoryObj(16, 300)]
+    memory_objs = [_MemoryObj(16, address) for address in (100, 200, 300, 400)]
     connector._allocate_zero_copy_buffers = lambda _keys: (
         memory_objs,
         [],
         "batched",
     )
-    keys = [_layer_key(1, 0), _layer_key(1, 1)]
+    keys = [
+        _layer_key(1, 0),
+        _layer_key(2, 0),
+        _layer_key(1, 1),
+        _layer_key(2, 1),
+    ]
 
     loaded = asyncio.run(
-        connector._batch_get_pages(keys, [("page-key", [0, 1])])
+        connector._batch_get_pages(
+            keys,
+            [("page-1", [0, 2]), ("page-2", [1, 3])],
+        )
     )
 
-    assert loaded == {0: memory_objs[0], 1: memory_objs[1]}
-    assert all(memory_obj.ref_count == 1 for memory_obj in memory_objs)
+    assert loaded == [memory_objs[0], None, memory_objs[1], None]
+    assert [memory_obj.ref_count for memory_obj in memory_objs] == [1, 1, 0, 0]
 
 
 def test_mooncake_page_grouping_serializes_each_page_once(

@@ -791,43 +791,42 @@ class MooncakestoreConnector(RemoteConnector):
         self,
         keys: List[CacheEngineKey],
         page_groups: list[tuple[str, list[int]]],
-    ) -> dict[int, MemoryObj]:
-        flat_indices = [index for _, indices in page_groups for index in indices]
-        page_keys = [keys[index] for index in flat_indices]
+    ) -> List[Optional[MemoryObj]]:
+        results: List[Optional[MemoryObj]] = [None] * len(keys)
+        page_keys = [keys[index] for _, indices in page_groups for index in indices]
         memory_objs, _, _ = self._allocate_zero_copy_buffers(page_keys)
-        object_by_index = {
-            original_index: memory_objs[position]
-            for position, original_index in enumerate(flat_indices)
-        }
 
-        submitted_groups: list[tuple[str, list[int]]] = []
+        submitted_groups: list[tuple[str, list[int], int]] = []
         all_buffer_ptrs: list[list[int]] = []
         all_buffer_sizes: list[list[int]] = []
+        offset = 0
         for page_key, indices in page_groups:
-            group_objects = [object_by_index[index] for index in indices]
-            if any(
-                obj is None or obj.raw_tensor is None for obj in group_objects
-            ):
+            end = offset + len(indices)
+            page_objects = [
+                obj
+                for obj in memory_objs[offset:end]
+                if obj is not None and obj.raw_tensor is not None
+            ]
+            if len(page_objects) != len(indices):
+                offset = end
                 continue
-            submitted_groups.append((page_key, indices))
-            all_buffer_ptrs.append(
-                [obj.data_ptr for obj in group_objects if obj is not None]
-            )
-            all_buffer_sizes.append(
-                [obj.get_size() for obj in group_objects if obj is not None]
-            )
+            submitted_groups.append((page_key, indices, offset))
+            all_buffer_ptrs.append([obj.data_ptr for obj in page_objects])
+            all_buffer_sizes.append([obj.get_size() for obj in page_objects])
+            offset = end
 
-        loaded: dict[int, MemoryObj] = {}
         try:
             if not submitted_groups:
-                return loaded
+                return results
             statuses = await asyncio.to_thread(
                 self.store.batch_get_into_multi_buffers,
-                [page_key for page_key, _ in submitted_groups],
+                [page_key for page_key, _, _ in submitted_groups],
                 all_buffer_ptrs,
                 all_buffer_sizes,
             )
-            for group_index, (page_key, indices) in enumerate(submitted_groups):
+            for group_index, (page_key, indices, offset) in enumerate(
+                submitted_groups
+            ):
                 if group_index >= len(statuses):
                     logger.warning(
                         "Mooncake page get omitted status for page=%s", page_key
@@ -844,18 +843,18 @@ class MooncakestoreConnector(RemoteConnector):
                         expected_bytes,
                     )
                     continue
-                for index in indices:
-                    memory_obj = object_by_index[index]
+                for position, index in enumerate(indices, start=offset):
+                    memory_obj = memory_objs[position]
                     assert memory_obj is not None
-                    loaded[index] = memory_obj
-                    object_by_index[index] = None
+                    results[index] = memory_obj
+                    memory_objs[position] = None
 
-            return loaded
+            return results
         except Exception as exc:
             logger.error("Mooncake page-first get failed: %s", exc)
-            return loaded
+            return results
         finally:
-            for memory_obj in object_by_index.values():
+            for memory_obj in memory_objs:
                 if memory_obj is not None and memory_obj.is_valid():
                     memory_obj.ref_count_down()
 
@@ -883,11 +882,11 @@ class MooncakestoreConnector(RemoteConnector):
             for group in complete_groups[len(page_exists) :]:
                 legacy_indices.extend(group[1])
 
-        results: list[Optional[MemoryObj]] = [None] * len(keys)
-        if page_groups:
-            page_results = await self._batch_get_pages(keys, page_groups)
-            for index, memory_obj in page_results.items():
-                results[index] = memory_obj
+        results = (
+            await self._batch_get_pages(keys, page_groups)
+            if page_groups
+            else [None] * len(keys)
+        )
 
         if legacy_indices:
             legacy_indices = sorted(set(legacy_indices))
