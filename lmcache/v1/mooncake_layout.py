@@ -12,16 +12,10 @@ def mooncake_page_key(key: CacheEngineKey, num_layers: int) -> str:
     """
     if num_layers < 1:
         raise ValueError("num_layers must be at least 1")
-    chunk_key = CacheEngineKey(
-        model_name=key.model_name,
-        world_size=key.world_size,
-        worker_id=key.worker_id,
-        chunk_hash=key.chunk_hash,
-        dtype=key.dtype,
-        request_configs=key.request_configs,
-        kv_group=key.kv_group,
-    )
-    return f"__lmcache_page_v1__@{num_layers}@{chunk_key.to_string()}"
+    # Explicit base dispatch omits LayerCacheEngineKey.layer_id without
+    # rebuilding and revalidating an equivalent chunk key.
+    chunk_key = CacheEngineKey.to_string(key)
+    return f"__lmcache_page_v1__@{num_layers}@{chunk_key}"
 
 
 def mooncake_page_layout_enabled(config: object) -> bool:

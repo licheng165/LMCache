@@ -1064,6 +1064,7 @@ class LMCacheEngine:
         layer_id: int,
         kv_group: int,
         chunk_index_base: int = 0,
+        validate_memory_objs: bool = True,
     ) -> list[SharedChunkHandle]:
         if self.shared_cpu_cache_name is None:
             raise ValueError("Shared CPU cache name is not initialized")
@@ -1079,14 +1080,15 @@ class LMCacheEngine:
             zip(keys_layer, mem_objs_layer, strict=True)
         ):
             chunk_index = chunk_index_base + chunk_offset
-            self._validate_rank0_shared_mem_obj(
-                mem_obj,
-                req_id=req_id,
-                phase=phase,
-                layer_id=layer_id,
-                kv_group=kv_group,
-                chunk_index=chunk_index,
-            )
+            if validate_memory_objs:
+                self._validate_rank0_shared_mem_obj(
+                    mem_obj,
+                    req_id=req_id,
+                    phase=phase,
+                    layer_id=layer_id,
+                    kv_group=kv_group,
+                    chunk_index=chunk_index,
+                )
             handles.append(
                 SharedChunkHandle.from_memory_obj(
                     request_id=req_id,
@@ -1645,6 +1647,7 @@ class LMCacheEngine:
         default_chunk_bytes = self._shared_cpu_estimated_physical_chunk_bytes(
             kv_group
         )
+        chunk_bytes_by_tokens = {int(self.config.chunk_size): default_chunk_bytes}
         for layer_keys, layer_locations in zip(
             keys_layer_major,
             chunk_locations_layer_major,
@@ -1666,10 +1669,14 @@ class LMCacheEngine:
                     and chunk_index < len(chunk_token_lengths)
                     and chunk_token_lengths[chunk_index] > 0
                 ):
-                    required_bytes += self._shared_cpu_estimated_physical_chunk_bytes(
-                        kv_group,
-                        num_tokens=chunk_token_lengths[chunk_index],
-                    )
+                    num_tokens = int(chunk_token_lengths[chunk_index])
+                    if num_tokens not in chunk_bytes_by_tokens:
+                        chunk_bytes_by_tokens[num_tokens] = (
+                            self._shared_cpu_estimated_physical_chunk_bytes(
+                                kv_group, num_tokens=num_tokens
+                            )
+                        )
+                    required_bytes += chunk_bytes_by_tokens[num_tokens]
                 else:
                     required_bytes += default_chunk_bytes
 
@@ -2383,6 +2390,7 @@ class LMCacheEngine:
                     mem_objs_layer=mem_objs_layer,
                     layer_id=layer_id,
                     kv_group=kv_group,
+                    validate_memory_objs=False,
                 )
                 self._broadcast_shared_envelope(
                     SharedHandleEnvelope(

@@ -542,8 +542,35 @@ class MooncakestoreConnector(RemoteConnector):
             return None
         return mooncake_page_key(key, self._page_num_layers)
 
+    def _page_keys_for(self, keys: List[CacheEngineKey]) -> list[Optional[str]]:
+        """Resolve one serialized page key per unique layer-key identity."""
+        if not getattr(self, "_page_first_multi_buffer", False):
+            return [None] * len(keys)
+
+        page_keys_by_identity: dict[tuple[Any, ...], str] = {}
+        page_keys: list[Optional[str]] = []
+        for key in keys:
+            if not isinstance(key, LayerCacheEngineKey):
+                page_keys.append(None)
+                continue
+            identity = (
+                key.model_name,
+                key.world_size,
+                key.worker_id,
+                key.chunk_hash,
+                key.dtype,
+                key.tags,
+                key.kv_group,
+            )
+            page_key = page_keys_by_identity.get(identity)
+            if page_key is None:
+                page_key = mooncake_page_key(key, self._page_num_layers)
+                page_keys_by_identity[identity] = page_key
+            page_keys.append(page_key)
+        return page_keys
+
     def _page_aware_exists_many(self, keys: List[CacheEngineKey]) -> list[bool]:
-        page_keys = [self._page_key_for(key) for key in keys]
+        page_keys = self._page_keys_for(keys)
         page_results = [0] * len(keys)
         page_positions = [index for index, key in enumerate(page_keys) if key]
         if page_positions:
@@ -577,8 +604,7 @@ class MooncakestoreConnector(RemoteConnector):
     ) -> tuple[list[tuple[str, list[int]]], list[int]]:
         grouped: dict[str, list[int]] = {}
         legacy_indices: list[int] = []
-        for index, key in enumerate(keys):
-            page_key = self._page_key_for(key)
+        for index, page_key in enumerate(self._page_keys_for(keys)):
             if page_key is None:
                 legacy_indices.append(index)
                 continue

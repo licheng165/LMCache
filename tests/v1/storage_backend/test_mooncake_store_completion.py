@@ -4,6 +4,7 @@
 # Standard
 from concurrent.futures import Future
 from types import SimpleNamespace
+from unittest.mock import Mock
 import asyncio
 import threading
 
@@ -13,6 +14,9 @@ import torch
 
 # First Party
 from lmcache.utils import CacheEngineKey, LayerCacheEngineKey
+from lmcache.v1.storage_backend.connector import (
+    mooncakestore_connector as mooncake_connector,
+)
 from lmcache.v1.storage_backend.connector.instrumented_connector import (
     InstrumentedRemoteConnector,
 )
@@ -191,6 +195,28 @@ def test_mooncake_page_get_scatter_returns_layer_objects() -> None:
 
     assert loaded == {0: memory_objs[0], 1: memory_objs[1]}
     assert all(memory_obj.ref_count == 1 for memory_obj in memory_objs)
+
+
+def test_mooncake_page_grouping_serializes_each_page_once(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    connector = object.__new__(MooncakestoreConnector)
+    connector._page_first_multi_buffer = True
+    connector._page_num_layers = 3
+    keys = [
+        _layer_key(chunk_hash, layer_id)
+        for layer_id in range(3)
+        for chunk_hash in (1, 2)
+    ]
+    page_key = Mock(wraps=mooncake_connector.mooncake_page_key)
+    monkeypatch.setattr(mooncake_connector, "mooncake_page_key", page_key)
+
+    groups, legacy_indices = connector._complete_page_groups(keys)
+
+    assert legacy_indices == []
+    assert len(groups) == 2
+    assert sorted(indices for _, indices in groups) == [[0, 2, 4], [1, 3, 5]]
+    assert page_key.call_count == 2
 
 
 def test_mooncake_page_put_keeps_partial_tail_in_legacy_layout() -> None:

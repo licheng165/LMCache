@@ -1526,6 +1526,31 @@ def test_runtime_capacity_details_report_failure_before_materialization():
     assert details["fits"] is False
 
 
+def test_runtime_capacity_estimates_each_token_size_once():
+    engine = _make_engine_for_sparse_capacity(max_local_cpu_size=1)
+    engine._shared_local_cpu_backend = lambda: _FakeLocalCPUBackend(
+        free_bytes=0, hot_cache={}
+    )
+    engine.config.chunk_size = 4
+    calls = []
+    engine._shared_cpu_estimated_physical_chunk_bytes = (
+        lambda _group, num_tokens=None: calls.append(num_tokens)
+        or (num_tokens or 4)
+    )
+
+    details = engine._shared_cpu_runtime_capacity_details(
+        req_id="req-1",
+        phase="sparse_decode_bootstrap",
+        kv_group=0,
+        keys_layer_major=[[_make_key()], [_make_key()]],
+        chunk_locations_layer_major=[["MooncakeStore"], ["MooncakeStore"]],
+        chunk_token_lengths=[1],
+    )
+
+    assert details["required_bytes"] == 2
+    assert calls == [None, 1]
+
+
 def test_rank0_resolver_rematerializes_non_shm_hot_cache_hit():
     engine = object.__new__(LMCacheEngine)
     engine.storage_manager = object()
@@ -1774,6 +1799,17 @@ def test_rank0_handle_builder_validates_objects_before_publication():
             layer_id=0,
             kv_group=0,
         )
+
+    handles = engine._make_shared_handles_for_layer(
+        req_id="req-1",
+        phase="dense_prefix",
+        keys_layer=[_make_key()],
+        mem_objs_layer=[_make_memory_obj(backing)],
+        layer_id=0,
+        kv_group=0,
+        validate_memory_objs=False,
+    )
+    assert len(handles) == 1
 
 
 def test_shared_chunk_handle_preserves_key_and_cached_positions():
