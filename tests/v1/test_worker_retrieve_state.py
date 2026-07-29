@@ -149,6 +149,19 @@ class TestWorkerRetrieveState:
             "pointer_cache_generation": 0,
         }
 
+    def test_clear_group_drops_its_prepared_source(self) -> None:
+        state = WorkerRetrieveState(
+            cached_memory_objs=[[object()]],
+            cached_memory_objs_indexer=[[object()]],
+            prepared_sparse_sources={0: object(), 1: object()},
+        )
+
+        state.clear_group(1)
+
+        assert state.cached_memory_objs
+        assert state.cached_memory_objs_indexer == []
+        assert set(state.prepared_sparse_sources) == {0}
+
     def test_deep_retrieve_state_requires_both_gates_and_is_bounded_once(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
@@ -2753,11 +2766,12 @@ class TestWorkerRetrieveState:
 
     def test_sparse_decode_start_uses_minimal_prepared_kwargs(self):
         req = make_sparse_req_meta("req-1", token_count=256)
+        owner = object()
         state = WorkerRetrieveState(
             cached_keys=[["layer-key"]],
             cached_starts=[0],
             cached_ends=[256],
-            cached_tensors=[[torch.zeros(256)]],
+            cached_memory_objs=[[owner]],
             cached_chunk_ptrs_npu=[torch.tensor([123], dtype=torch.long)],
         )
         impl, _, _ = make_worker_connector([req], use_layerwise=True)
@@ -2817,6 +2831,8 @@ class TestWorkerRetrieveState:
         assert prepared_source.total_tokens == 256
         assert prepared_source.chunk_token_counts == (256,)
         assert prepared_source.pointer_device == torch.device("cpu")
+        assert prepared_source.layers[0].tensors == ()
+        assert prepared_source.layers[0].memory_objs == (owner,)
         assert not hasattr(req, "cached_keys")
         assert impl._worker_retrieve_state[req.req_id] is state
         impl._drain_layerwise_retrievers()
@@ -3431,7 +3447,7 @@ class TestWorkerRetrieveState:
             cached_starts=[0],
             cached_ends=[256],
             cached_memory_objs=[["m0"]],
-            cached_tensors=[["t0"]],
+            cached_tensors=[],
             cached_chunk_dev_ptrs=[[111]],
             cached_chunk_ptrs_npu=[old_ptrs],
             cached_shared_handles=[["h0"]],
@@ -3460,6 +3476,7 @@ class TestWorkerRetrieveState:
         state = impl._worker_retrieve_state["req-1"]
         assert state.cached_starts == [0, 256]
         assert state.cached_ends == [256, 512]
+        assert state.cached_tensors == []
         assert state.cached_chunk_dev_ptrs == [[111, 222]]
         assert state.cached_chunk_ptrs_npu[0].tolist() == [111, 222]
         # Decode-save does not broadcast shm handles. The next retrieve must

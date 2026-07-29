@@ -768,6 +768,7 @@ class WorkerRetrieveState:
     def clear_group(self, kv_group: int) -> None:
         for values in self.cache_kwargs(kv_group, dsa_two_groups=True).values():
             values.clear()
+        self.prepared_sparse_sources.pop(kv_group, None)
 
     def has_cache(self) -> bool:
         return bool(self.cached_keys)
@@ -4569,6 +4570,7 @@ class LMCacheConnectorV1Impl:
                 if isinstance(ptrs, torch.Tensor):
                     dst_chunk_ptrs_npu[layer_id] = ptrs[:replace_at]
 
+        cached_prefix_chunks = len(dst_starts)
         for chunk_idx in append_indices:
             dst_starts.append(src_starts[chunk_idx])
             dst_ends.append(src_ends[chunk_idx])
@@ -4582,9 +4584,30 @@ class LMCacheConnectorV1Impl:
                     if chunk_idx < len(src_layer):
                         dst[layer_id].append(src_layer[chunk_idx])
 
+        complete_tensors = (
+            len(src_tensors) == source_layer_count
+            and all(
+                all(chunk_idx < len(layer) for chunk_idx in append_indices)
+                for layer in src_tensors
+            )
+            and (
+                (cached_prefix_chunks == 0 and not any(dst_tensors))
+                or (
+                    len(dst_tensors) == source_layer_count
+                    and all(
+                        len(layer) == cached_prefix_chunks for layer in dst_tensors
+                    )
+                )
+            )
+        )
         append_layer_values(dst_keys, src_keys)
         append_layer_values(dst_memory_objs, src_memory_objs)
-        append_layer_values(dst_tensors, src_tensors)
+        if complete_tensors:
+            append_layer_values(dst_tensors, src_tensors)
+        else:
+            # Never expose a suffix-only tensor cache; the complete MemoryObj
+            # and pointer caches remain authoritative.
+            dst_tensors.clear()
         append_layer_values(dst_chunk_dev_ptrs, src_chunk_dev_ptrs)
         append_layer_values(dst_shared_handles, src_shared_handles)
 
@@ -4919,6 +4942,7 @@ class LMCacheConnectorV1Impl:
                 total_tokens=token_count,
                 chunk_token_counts=chunk_token_counts,
                 expected_pointer_device=expected_pointer_device,
+                cached_memory_objs=cache["cached_memory_objs"],
             )
             if source is not None:
                 prepared[kv_group] = source
@@ -4954,7 +4978,7 @@ class LMCacheConnectorV1Impl:
             return False
         if (
             state is not None
-            and state.cached_tensors_indexer
+            and (state.cached_tensors_indexer or state.cached_memory_objs_indexer)
             and not request.shared_index_skipped
             and self._prepared_sparse_source(state, 1, token_count) is None
         ):
