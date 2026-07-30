@@ -2968,6 +2968,80 @@ def test_dense_prefix_zero_hit_broadcasts_skipped_not_miss():
     assert broadcasts[-1] == {"stats": 0}
 
 
+def test_shared_dense_page_first_remote_uses_all_layer_window(monkeypatch):
+    import lmcache.v1.cache_engine as cache_engine_module
+
+    monkeypatch.setattr(
+        cache_engine_module,
+        "assert_layerwise_gpu_connector",
+        lambda _connector: None,
+    )
+    engine = object.__new__(LMCacheEngine)
+    engine.config = SimpleNamespace(
+        extra_config={"mooncake_page_first_multi_buffer": True}
+    )
+    engine.storage_manager = SimpleNamespace()
+    engine.gpu_connector = _FakeLayerwiseGPUConnector()
+    engine.num_layers = 2
+    engine.shared_cpu_cache_generation = 9
+    engine.stats_monitor = SimpleNamespace(
+        on_retrieve_finished=lambda monitor_req_id, tokens: None
+    )
+    chunk_keys = [
+        replace(_make_key(), chunk_hash=0x700 + chunk).split_layers(2)
+        for chunk in range(2)
+    ]
+    keys_by_layer = [list(row) for row in zip(*chunk_keys, strict=True)]
+    mem_objs = [
+        [_FakeResolvableMemoryObj() for _ in range(2)]
+        for _ in range(engine.num_layers)
+    ]
+    for mem_obj in (obj for layer in mem_objs for obj in layer):
+        mem_obj.pin()
+    windowed_calls = []
+
+    def resolve_windowed(**kwargs):
+        windowed_calls.append(kwargs)
+        return mem_objs
+
+    engine._resolve_shared_rank0_remote_layers_windowed = resolve_windowed
+    engine._resolve_shared_rank0_layer_mem_objs = lambda **_kwargs: (
+        _ for _ in ()
+    ).throw(AssertionError("page-first remote reads must not fetch one layer"))
+    engine._make_shared_handles_for_layer = lambda **kwargs: [
+        object() for _ in kwargs["mem_objs_layer"]
+    ]
+    engine._broadcast_shared_envelope = lambda _envelope: None
+
+    list(
+        engine._retrieve_layer_shared_rank0(
+            starts=[0, 4],
+            ends=[4, 8],
+            keys_layer_major=keys_by_layer,
+            chunk_locations_layer_major=[
+                ["RemoteBackend", "RemoteBackend"]
+                for _ in range(engine.num_layers)
+            ],
+            location="RemoteBackend",
+            ret_mask=torch.ones(8, dtype=torch.bool),
+            monitor_req_id=123,
+            req_id="req-page-first",
+            kv_group=0,
+            kwargs={"shared_cpu_phase": "dense_prefix"},
+        )
+    )
+
+    assert len(windowed_calls) == 1
+    assert windowed_calls[0]["keys_layer_major"] == keys_by_layer
+    assert windowed_calls[0]["layers_per_batch"] == engine.num_layers
+    assert engine.gpu_connector.sent == mem_objs
+    assert all(
+        obj.ref_count_down_count == 1 and not obj.is_pinned
+        for layer in mem_objs
+        for obj in layer
+    )
+
+
 @pytest.mark.parametrize("kv_group", [0, 1])
 def test_shared_dense_rank0_retriever_releases_before_result_tail(
     monkeypatch, kv_group

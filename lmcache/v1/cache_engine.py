@@ -57,6 +57,7 @@ from lmcache.v1.memory_management import (  # noqa: E501
     TensorMemoryObj,
 )
 from lmcache.v1.metadata import LMCacheMetadata
+from lmcache.v1.mooncake_layout import mooncake_page_layout_enabled
 from lmcache.v1.pin_monitor import PinMonitor
 from lmcache.v1.sampled_lookup import (
     find_last_sampled_hit,
@@ -2501,17 +2502,40 @@ class LMCacheEngine:
         next(mem_obj_consumer)
 
         to_release: list[MemoryObj] = []
+        page_first_remote = (
+            location == "RemoteBackend"
+            and mooncake_page_layout_enabled(getattr(self, "config", None))
+        )
+        pre_resolved_layers: Optional[list[list[MemoryObj]]] = None
         try:
             for layer_id in range(self.num_layers):
                 try:
-                    mem_objs_layer = self._resolve_shared_rank0_layer_mem_objs(
-                        req_id=req_id,
-                        phase=phase,
-                        layer_id=layer_id,
-                        kv_group=kv_group,
-                        keys_layer=keys_layer_major[layer_id],
-                        chunk_locations=chunk_locations_layer_major[layer_id],
-                    )
+                    if page_first_remote:
+                        if pre_resolved_layers is None:
+                            pre_resolved_layers = (
+                                self._resolve_shared_rank0_remote_layers_windowed(
+                                    req_id=req_id,
+                                    phase=phase,
+                                    kv_group=kv_group,
+                                    keys_layer_major=keys_layer_major,
+                                    layers_per_batch=self.num_layers,
+                                )
+                            )
+                            to_release.extend(
+                                mem_obj
+                                for layer in pre_resolved_layers
+                                for mem_obj in layer
+                            )
+                        mem_objs_layer = pre_resolved_layers[layer_id]
+                    else:
+                        mem_objs_layer = self._resolve_shared_rank0_layer_mem_objs(
+                            req_id=req_id,
+                            phase=phase,
+                            layer_id=layer_id,
+                            kv_group=kv_group,
+                            keys_layer=keys_layer_major[layer_id],
+                            chunk_locations=chunk_locations_layer_major[layer_id],
+                        )
                 except Exception as exc:
                     message = (
                         "Shared CPU cache rank0 materialization failed before "
@@ -2532,7 +2556,8 @@ class LMCacheEngine:
                         )
                     )
                     raise
-                to_release.extend(mem_objs_layer)
+                if pre_resolved_layers is None:
+                    to_release.extend(mem_objs_layer)
 
                 handles = self._make_shared_handles_for_layer(
                     req_id=req_id,
