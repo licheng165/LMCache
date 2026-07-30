@@ -1783,6 +1783,13 @@ def test_rank0_windowed_remote_resolver_uses_cached_slab_context(monkeypatch):
             buffer=root_allocator.buffer,
         )
     )
+    metadata_checks = []
+
+    def checked_metadata(mem_obj, context):
+        metadata_checks.append(mem_obj)
+        return LMCacheEngine._shared_rank0_object_metadata(mem_obj, context)
+
+    engine._shared_rank0_object_metadata = checked_metadata
     engine._is_rank0_shared_mem_obj = lambda _obj: (_ for _ in ()).throw(
         AssertionError("cached-context path must not repeat shared-object checks")
     )
@@ -1809,6 +1816,7 @@ def test_rank0_windowed_remote_resolver_uses_cached_slab_context(monkeypatch):
     assert all(obj.is_pinned for obj in objects)
     assert len(batch_pins) == 1
     assert {id(obj) for obj in batch_pins[0]} == {id(obj) for obj in objects}
+    assert metadata_checks == [foreign_obj, objects_by_key[fallback_key]]
     assert foreign_obj.ref_count_down_count == 1
     assert stages == [
         "windows",
@@ -1825,18 +1833,20 @@ def test_rank0_windowed_remote_resolver_uses_cached_slab_context(monkeypatch):
 def test_rank0_windowed_cached_context_validation_failure_rolls_back(monkeypatch):
     keys = [[_make_key(), replace(_make_key(), chunk_hash=0x601)]]
     root_allocator = TensorMemoryAllocator(torch.empty(8192, dtype=torch.uint8))
-    valid = root_allocator.allocate(
+    valid_batch = root_allocator.batched_allocate(
         torch.Size([8]),
         torch.float16,
+        1,
         MemoryFormat.KV_MLA_LATENT_FMT,
     )
-    invalid = root_allocator.allocate(
+    invalid_batch = root_allocator.batched_allocate(
         torch.Size([8]),
         torch.bfloat16,
+        1,
         MemoryFormat.KV_MLA_LATENT_FMT,
     )
-    assert valid is not None and invalid is not None
-    objects = [valid, invalid]
+    assert valid_batch is not None and invalid_batch is not None
+    objects = [valid_batch[0], invalid_batch[0]]
     batch_pins = []
     monitor = SimpleNamespace(
         on_pin=lambda _obj: None,

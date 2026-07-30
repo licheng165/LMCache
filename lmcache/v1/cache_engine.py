@@ -2317,6 +2317,7 @@ class LMCacheEngine:
                 pending_fetched = list(fetched)
                 try:
                     started = start_stage()
+                    batch_validation: dict[int, bool] = {}
                     window_objects: list[
                         tuple[int, int, MemoryObj, Optional[MemoryObjMetadata]]
                     ] = []
@@ -2324,12 +2325,23 @@ class LMCacheEngine:
                         fetched_obj = pending_fetched[index]
                         assert fetched_obj is not None
                         key = fetch_keys[index]
+                        trusted_batch_member = (
+                            context is not None
+                            and type(fetched_obj) is TensorMemoryObj
+                            and fetched_obj.is_trusted_allocation_batch_member(
+                                batch_validation,
+                                parent=context.parent_allocator,
+                                slab_size=context.slab_size,
+                                dtype=context.dtype,
+                                fmt=context.fmt,
+                            )
+                        )
                         metadata = (
                             self._shared_rank0_object_metadata(fetched_obj, context)
-                            if context is not None
+                            if context is not None and not trusted_batch_member
                             else None
                         )
-                        if metadata is not None or (
+                        if trusted_batch_member or metadata is not None or (
                             context is None
                             and self._is_rank0_shared_mem_obj(fetched_obj)
                         ):
@@ -2356,17 +2368,18 @@ class LMCacheEngine:
                                 )
 
                         acquired.append(mem_obj)
-                        self._validate_rank0_shared_mem_obj(
-                            mem_obj,
-                            req_id=req_id,
-                            phase=phase,
-                            layer_id=layer_id,
-                            kv_group=kv_group,
-                            chunk_index=chunk_index,
-                            _context=context,
-                            _metadata=metadata,
-                            _require_pinned=False,
-                        )
+                        if not trusted_batch_member:
+                            self._validate_rank0_shared_mem_obj(
+                                mem_obj,
+                                req_id=req_id,
+                                phase=phase,
+                                layer_id=layer_id,
+                                kv_group=kv_group,
+                                chunk_index=chunk_index,
+                                _context=context,
+                                _metadata=metadata,
+                                _require_pinned=False,
+                            )
                         window_objects.append(
                             (layer_id, chunk_index, mem_obj, metadata)
                         )

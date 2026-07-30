@@ -195,6 +195,40 @@ class MemoryObjMetadata:
         return self.shape.numel() * self.dtype.itemsize  # type: ignore
 
 
+@dataclass(frozen=True, slots=True)
+class _TensorAllocationBatch:
+    """Immutable provenance for one homogeneous tensor allocation."""
+
+    parent: Any
+    slab_size: int
+    dtype: torch.dtype
+    fmt: MemoryFormat
+    addresses: tuple[int, ...]
+    physical_size: int
+    member_ids: tuple[int, ...]
+
+    def matches(
+        self,
+        parent: Any,
+        slab_size: int,
+        dtype: torch.dtype,
+        fmt: MemoryFormat,
+    ) -> bool:
+        return (
+            self.parent is parent
+            and self.slab_size == slab_size
+            and self.dtype == dtype
+            and self.fmt == fmt
+            and len(self.addresses) == len(self.member_ids)
+            and self.physical_size > 0
+            and all(
+                address >= 0
+                and address + self.physical_size <= slab_size
+                for address in self.addresses
+            )
+        )
+
+
 class MemoryObj(metaclass=abc.ABCMeta):
     """
     MemoryObj interface.
@@ -511,6 +545,8 @@ class TensorMemoryObj(MemoryObj):
         self.lock = threading.Lock()
         self.parent_allocator = parent_allocator
         self.group_prefix_sum: list[int] = []
+        self._allocation_batch: Optional[_TensorAllocationBatch] = None
+        self._allocation_batch_index = -1
         self.refresh_metadata_view()
 
     def refresh_metadata_view(self) -> None:
@@ -546,12 +582,48 @@ class TensorMemoryObj(MemoryObj):
 
     def invalidate(self):
         self.valid = False
+        self._allocation_batch = None
+        self._allocation_batch_index = -1
 
     def is_valid(self):
         return self.valid
 
     def get_size(self) -> int:
         return self.group_prefix_sum[-1]
+
+    def is_trusted_allocation_batch_member(
+        self,
+        validation_cache: dict[int, bool],
+        *,
+        parent: Any,
+        slab_size: int,
+        dtype: torch.dtype,
+        fmt: MemoryFormat,
+    ) -> bool:
+        """Validate batch invariants once, then only this object's membership."""
+        batch = self._allocation_batch
+        if batch is None:
+            return False
+        batch_id = id(batch)
+        if batch_id not in validation_cache:
+            validation_cache[batch_id] = batch.matches(
+                parent, slab_size, dtype, fmt
+            )
+        index = self._allocation_batch_index
+        metadata = self.meta
+        logical_size = self.get_size()
+        return (
+            self.valid
+            and validation_cache[batch_id]
+            and 0 <= index < len(batch.member_ids)
+            and batch.member_ids[index] == id(self)
+            and self.parent_allocator is batch.parent
+            and metadata.address == batch.addresses[index]
+            and metadata.phy_size == batch.physical_size
+            and metadata.dtype == batch.dtype
+            and metadata.fmt == batch.fmt
+            and 0 < logical_size <= batch.physical_size
+        )
 
     # TODO(chunxiaozheng): use get_shapes and get_dtypes to replace
     #  get_shape and get_dtype
@@ -1485,6 +1557,19 @@ class TensorMemoryAllocator(MemoryAllocatorInterface):
                     parent_allocator=self,
                 )
             )
+
+        batch = _TensorAllocationBatch(
+            self,
+            int(self.buffer.numel()),
+            dtypes[0],
+            fmt,
+            tuple(addresses),
+            unit_aligned_size,
+            tuple(map(id, tensor_mem_objs)),
+        )
+        for index, memory_obj in enumerate(tensor_mem_objs):
+            memory_obj._allocation_batch = batch
+            memory_obj._allocation_batch_index = index
 
         return tensor_mem_objs
 

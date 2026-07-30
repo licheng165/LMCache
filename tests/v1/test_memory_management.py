@@ -181,6 +181,57 @@ def test_tensor_batched_allocate_contiguous_and_fragmented() -> None:
     assert allocator.memcheck()
 
 
+def test_tensor_batched_allocation_provenance_validates_tail_size() -> None:
+    allocator = TensorMemoryAllocator(torch.zeros(16384, dtype=torch.uint8))
+    objects = allocator.batched_allocate(
+        torch.Size([1024]),
+        torch.uint8,
+        3,
+        MemoryFormat.KV_MLA_LATENT_FMT,
+    )
+    assert objects is not None
+
+    validation_cache = {}
+    expected = {
+        "parent": allocator,
+        "slab_size": allocator.buffer.numel(),
+        "dtype": torch.uint8,
+        "fmt": MemoryFormat.KV_MLA_LATENT_FMT,
+    }
+    assert all(
+        obj.is_trusted_allocation_batch_member(validation_cache, **expected)
+        for obj in objects
+    )
+    assert len(validation_cache) == 1
+
+    logical_size = objects[-1].get_size()
+    objects[-1].group_prefix_sum[-1] = objects[-1].meta.phy_size + 1
+    assert not objects[-1].is_trusted_allocation_batch_member(
+        validation_cache, **expected
+    )
+    objects[-1].group_prefix_sum[-1] = logical_size
+    objects[-1].meta.dtype = torch.float16
+    assert not objects[-1].is_trusted_allocation_batch_member(
+        validation_cache, **expected
+    )
+    objects[-1].meta.dtype = torch.uint8
+    objects[-1].parent_allocator = None
+    assert not objects[-1].is_trusted_allocation_batch_member(
+        validation_cache, **expected
+    )
+    objects[-1].parent_allocator = allocator
+    assert not objects[0].is_trusted_allocation_batch_member(
+        {},
+        **{**expected, "fmt": MemoryFormat.KV_DSA_INDEX_FMT},
+    )
+
+    allocator.batched_free(objects)
+    assert not any(
+        obj.is_trusted_allocation_batch_member(validation_cache, **expected)
+        for obj in objects
+    )
+
+
 def test_paged_allocator_refreshes_size_for_reused_partial_pages():
     full_shape = torch.Size([32, 8])
     partial_shape = torch.Size([19, 8])
