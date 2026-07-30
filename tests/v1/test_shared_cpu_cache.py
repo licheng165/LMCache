@@ -25,9 +25,11 @@ from lmcache.v1.shared_cpu_cache import (
     SharedChunkHandle,
     SharedCPUCacheError,
     SharedCPUCacheValidationError,
+    SharedHandleBatch,
     SharedHandleEnvelope,
     SharedCPURequestLease,
     SharedSlabMapping,
+    validate_shared_handle_batch,
 )
 from lmcache.v1.storage_backend.connector.base_connector import RemoteConnector
 from lmcache.v1.storage_backend.local_cpu_backend import LocalCPUPrefixGetResult
@@ -1336,11 +1338,16 @@ class _FakePassiveSharedView:
 class _FakePassiveSharedAllocator:
     def __init__(self):
         self.views = []
+        self.shm_name = "/lmcache-test"
+        self.slab_size = 4096
 
     def create_view(self, *args, **kwargs):
         view = _FakePassiveSharedView()
         self.views.append(view)
         return view
+
+    def create_batch_view(self, *args, **kwargs):
+        return self.create_view()
 
 
 def _make_passive_shared_retrieve_engine(
@@ -3046,6 +3053,70 @@ def test_skipped_index_envelope_round_trips_without_handles():
     assert decoded.message is not None
 
 
+def test_compact_shared_handle_batch_round_trip_and_view():
+    batch = SharedHandleBatch(
+        shm_name="/lmcache-test",
+        producer_rank=0,
+        num_layers=2,
+        num_chunks=2,
+        physical_sizes=[64, 32],
+        chunk_hashes=[11, 22],
+        offsets=[0, 64, 128, 192],
+    )
+    envelope = SharedHandleEnvelope(
+        request_id="req-1",
+        phase="dense_prefix",
+        request_ordinal=0,
+        layer_id=0,
+        kv_group=0,
+        status="ok",
+        generation=9,
+        handles=[],
+        batch=batch,
+    )
+    decoded = SharedHandleEnvelope.from_dict(envelope.to_dict())
+    assert decoded.batch == batch
+
+    allocator = PassiveSharedViewAllocator(
+        slab_tensor=torch.arange(256, dtype=torch.uint8),
+        shm_name="/lmcache-test",
+        generation=9,
+    )
+    view = allocator.create_batch_view(
+        batch,
+        layer_id=1,
+        chunk_index=0,
+        shape=torch.Size([8]),
+        dtype=torch.float16,
+        fmt=MemoryFormat.KV_MLA_LATENT_FMT,
+        cached_positions=range(4),
+    )
+    assert view.metadata.address == 128
+    assert view.metadata.phy_size == 64
+    assert view.tensor.shape == torch.Size([8])
+    tail = allocator.create_batch_view(
+        batch,
+        layer_id=1,
+        chunk_index=1,
+        shape=torch.Size([4]),
+        dtype=torch.float16,
+        fmt=MemoryFormat.KV_MLA_LATENT_FMT,
+        cached_positions=range(2),
+    )
+    assert tail.metadata.address == 192
+    assert tail.metadata.phy_size == 32
+    with pytest.raises(SharedCPUCacheValidationError, match="physical sizes"):
+        validate_shared_handle_batch(
+            replace(batch, physical_sizes=[]),
+            expected_shm_name=batch.shm_name,
+            expected_producer_rank=0,
+            expected_num_layers=2,
+            expected_num_chunks=2,
+            expected_chunk_hashes=batch.chunk_hashes,
+            slab_size=256,
+        )
+
+
 def test_shared_envelope_rejects_missing_required_field():
     envelope = SharedHandleEnvelope(
         request_id="req-1",
@@ -3222,6 +3293,77 @@ def test_shared_dense_page_first_remote_uses_all_layer_window(monkeypatch):
     )
 
 
+def test_shared_dense_page_first_publishes_one_compact_batch(monkeypatch):
+    import lmcache.v1.cache_engine as cache_engine_module
+
+    monkeypatch.setattr(
+        cache_engine_module,
+        "assert_layerwise_gpu_connector",
+        lambda _connector: None,
+    )
+    engine = object.__new__(LMCacheEngine)
+    engine.config = SimpleNamespace(
+        extra_config={"mooncake_page_first_multi_buffer": True}
+    )
+    engine.storage_manager = SimpleNamespace()
+    engine.gpu_connector = _FakeLayerwiseGPUConnector()
+    engine.num_layers = 2
+    engine.shared_cpu_cache_name = "/lmcache-test"
+    engine.shared_cpu_cache_generation = 9
+    engine.metadata = SimpleNamespace(first_rank=0, worker_id=0)
+    engine.stats_monitor = SimpleNamespace(
+        on_retrieve_finished=lambda monitor_req_id, tokens: None
+    )
+    backing = torch.empty(192, dtype=torch.uint8)
+    mem_objs = [
+        [
+            _make_memory_obj(backing, offset=0),
+            _make_memory_obj(backing, offset=64, physical_size=32),
+        ],
+        [
+            _make_memory_obj(backing, offset=96),
+            _make_memory_obj(backing, offset=160, physical_size=32),
+        ],
+    ]
+    for obj in (obj for layer in mem_objs for obj in layer):
+        obj.pin()
+    engine._resolve_shared_rank0_remote_layers_windowed = lambda **_kwargs: mem_objs
+    engine._make_shared_handles_for_layer = lambda **_kwargs: (
+        _ for _ in ()
+    ).throw(AssertionError("compact page-first path must not build handles"))
+    broadcasts = []
+    engine._broadcast_shared_envelope = lambda envelope: broadcasts.append(envelope)
+    chunk_keys = [
+        replace(_make_key(), chunk_hash=0x900 + chunk).split_layers(2)
+        for chunk in range(2)
+    ]
+    keys_by_layer = [list(row) for row in zip(*chunk_keys, strict=True)]
+
+    list(
+        engine._retrieve_layer_shared_rank0(
+            starts=[0, 4],
+            ends=[4, 8],
+            keys_layer_major=keys_by_layer,
+            chunk_locations_layer_major=[
+                ["RemoteBackend", "RemoteBackend"]
+                for _ in range(engine.num_layers)
+            ],
+            location="RemoteBackend",
+            ret_mask=torch.ones(8, dtype=torch.bool),
+            monitor_req_id=123,
+            req_id="req-page-first",
+            kv_group=0,
+            kwargs={"shared_cpu_phase": "dense_prefix"},
+        )
+    )
+
+    assert len(broadcasts) == 1
+    assert broadcasts[0].batch is not None
+    assert broadcasts[0].batch.physical_sizes == [64, 32]
+    assert broadcasts[0].batch.offsets == [0, 64, 96, 160]
+    assert engine.gpu_connector.sent == mem_objs
+
+
 @pytest.mark.parametrize("kv_group", [0, 1])
 def test_shared_dense_rank0_retriever_releases_before_result_tail(
     monkeypatch, kv_group
@@ -3323,6 +3465,55 @@ def test_shared_dense_passive_retriever_releases_before_result_tail(
     ] == [1, 1]
     with pytest.raises(StopIteration):
         next(retriever)
+
+
+def test_shared_dense_passive_compact_batch_preserves_layerwise_consumption(
+    monkeypatch,
+):
+    import lmcache.v1.cache_engine as cache_engine_module
+
+    monkeypatch.setattr(
+        cache_engine_module,
+        "assert_layerwise_gpu_connector",
+        lambda _connector: None,
+    )
+    engine = _make_passive_shared_retrieve_engine(kv_group=0)
+    receive_count = 0
+    batch = SharedHandleBatch(
+        shm_name="/lmcache-test",
+        producer_rank=0,
+        num_layers=2,
+        num_chunks=1,
+        physical_sizes=[64],
+        chunk_hashes=[_make_key().chunk_hash],
+        offsets=[0, 64],
+    )
+
+    def receive():
+        nonlocal receive_count
+        receive_count += 1
+        return SharedHandleEnvelope(
+            request_id="req-1",
+            phase="dense_prefix",
+            request_ordinal=0,
+            layer_id=0,
+            kv_group=0,
+            status="ok",
+            generation=9,
+            handles=[],
+            batch=batch,
+        )
+
+    engine._receive_shared_envelope = receive
+    retriever, ret_mask = _make_passive_shared_retriever(engine)
+    yielded = list(retriever)
+
+    assert receive_count == 1
+    assert engine.gpu_connector.sent == [
+        [engine.shared_cpu_cache_passive_allocator.views[0]],
+        [engine.shared_cpu_cache_passive_allocator.views[1]],
+    ]
+    assert torch.equal(yielded[-1], ret_mask)
 
 
 def test_shared_dense_passive_views_remain_request_owned(monkeypatch):

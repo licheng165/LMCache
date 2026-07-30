@@ -5,6 +5,9 @@ from typing import Any, Callable, List, Optional, no_type_check
 import asyncio
 import json
 import os
+import statistics
+import threading
+import time
 
 # Third Party
 import torch
@@ -272,6 +275,19 @@ class MooncakestoreConnector(RemoteConnector):
         self.local_cpu_backend = local_cpu_backend
         self.registered_buffer_ptr = None
         self._inflight_put_tasks: set[asyncio.Task[Any]] = set()
+        self._overlap_probe = (
+            os.getenv("LMCACHE_MOONCAKE_OVERLAP_BENCHMARK", "0") == "1"
+        )
+        self._overlap_probe_repeats = (
+            max(
+                1,
+                int(os.getenv("LMCACHE_MOONCAKE_OVERLAP_REPEATS", "3")),
+            )
+            if self._overlap_probe
+            else 1
+        )
+        self._overlap_probe_pending = None
+        self._overlap_probe_done = False
 
         # Initialize ReplicateConfig
         self.replica_config = ReplicateConfig()
@@ -811,6 +827,223 @@ class MooncakestoreConnector(RemoteConnector):
             num_hit_counts += 1
         return num_hit_counts
 
+    @staticmethod
+    def _release_overlap_probe_batch(batch) -> None:
+        if batch is not None:
+            for obj in batch[3]:
+                if obj.is_valid():
+                    obj.ref_count_down()
+
+    def _run_page_overlap_probe(self, first, second) -> dict[str, Any]:
+        def call(batch):
+            keys, ptrs, sizes, _ = batch
+            started = time.perf_counter()
+            statuses = self.store.batch_get_into_multi_buffers(keys, ptrs, sizes)
+            expected = [sum(group) for group in sizes]
+            return (time.perf_counter() - started), list(statuses) == expected
+
+        stop = threading.Event()
+        ready = threading.Event()
+        progress = [0]
+
+        def count_python():
+            ready.set()
+            while not stop.is_set():
+                progress[0] += 1
+
+        counter = threading.Thread(target=count_python)
+        counter.start()
+        ready.wait()
+        before = progress[0]
+        gil_started = time.perf_counter()
+        try:
+            gil_statuses = self.store.batch_get_into_multi_buffers(
+                first[0],
+                first[1],
+                first[2],
+            )
+            gil_s = time.perf_counter() - gil_started
+            during_steps = progress[0] - before
+        finally:
+            stop.set()
+            counter.join()
+        gil_ok = list(gil_statuses) == [sum(group) for group in first[2]]
+        during_rate = during_steps / max(gil_s, 1e-9)
+
+        stop = threading.Event()
+        ready = threading.Event()
+        progress[0] = 0
+        counter = threading.Thread(target=count_python)
+        counter.start()
+        ready.wait()
+        before = progress[0]
+        baseline_started = time.perf_counter()
+        time.sleep(gil_s)
+        baseline_s = time.perf_counter() - baseline_started
+        baseline_steps = progress[0] - before
+        stop.set()
+        counter.join()
+        baseline_rate = baseline_steps / max(baseline_s, 1e-9)
+
+        combined = (
+            first[0] + second[0],
+            first[1] + second[1],
+            first[2] + second[2],
+            (),
+        )
+
+        def sequential_call():
+            started = time.perf_counter()
+            _, first_ok = call(first)
+            _, second_ok = call(second)
+            return time.perf_counter() - started, first_ok and second_ok
+
+        def combined_call():
+            started = time.perf_counter()
+            _, ok = call(combined)
+            return time.perf_counter() - started, ok
+
+        def concurrent_call():
+            started = [0.0]
+            barrier = threading.Barrier(
+                3,
+                action=lambda: started.__setitem__(0, time.perf_counter()),
+            )
+            results = [None, None]
+
+            def run(index, batch):
+                try:
+                    barrier.wait()
+                    results[index] = call(batch)
+                except Exception:
+                    results[index] = (0.0, False)
+
+            threads = [
+                threading.Thread(target=run, args=(0, first)),
+                threading.Thread(target=run, args=(1, second)),
+            ]
+            for thread in threads:
+                thread.start()
+            barrier.wait()
+            for thread in threads:
+                thread.join()
+            return (
+                time.perf_counter() - started[0],
+                all(result and result[1] for result in results),
+            )
+
+        measures = {
+            "sequential": sequential_call,
+            "concurrent": concurrent_call,
+            "combined": combined_call,
+        }
+        samples = {name: [] for name in measures}
+        all_ok = gil_ok
+        repeats = max(1, int(getattr(self, "_overlap_probe_repeats", 3)))
+        orders = (
+            ("sequential", "concurrent", "combined"),
+            ("combined", "sequential", "concurrent"),
+            ("concurrent", "combined", "sequential"),
+        )
+        for repeat in range(repeats):
+            for name in orders[repeat % len(orders)]:
+                elapsed, ok = measures[name]()
+                samples[name].append(elapsed)
+                all_ok = all_ok and ok
+        medians = {
+            name: statistics.median(values) for name, values in samples.items()
+        }
+        first_bytes = sum(map(sum, first[2]))
+        second_bytes = sum(map(sum, second[2]))
+        total_bytes = first_bytes + second_bytes
+
+        def gbps(seconds):
+            return round(total_bytes / max(seconds, 1e-9) / 1e9, 3)
+
+        def range_pct(name):
+            values = samples[name]
+            return round(
+                (max(values) - min(values))
+                / max(medians[name], 1e-9)
+                * 100,
+                2,
+            )
+
+        return {
+            "status": "ok" if all_ok else "short",
+            "scope": "page_first_multi_buffer",
+            "measurement": "same_key_replay",
+            "repeats": repeats,
+            "gil_progress_ratio": round(
+                during_rate / max(baseline_rate, 1e-9), 4
+            ),
+            "gil_call_ms": round(gil_s * 1000, 3),
+            "group0_pages": len(first[0]),
+            "group1_pages": len(second[0]),
+            "group0_bytes": first_bytes,
+            "group1_bytes": second_bytes,
+            **{
+                f"{name}_ms": round(seconds * 1000, 3)
+                for name, seconds in medians.items()
+            },
+            **{f"{name}_gbps": gbps(seconds) for name, seconds in medians.items()},
+            **{f"{name}_range_pct": range_pct(name) for name in medians},
+            "concurrent_speedup": round(
+                medians["sequential"] / medians["concurrent"], 4
+            ),
+            "combined_speedup": round(
+                medians["sequential"] / medians["combined"], 4
+            ),
+        }
+
+    async def _maybe_run_page_overlap_probe(
+        self,
+        kv_groups: list[int],
+        page_keys: list[str],
+        ptrs: list[list[int]],
+        sizes: list[list[int]],
+        results: list[Optional[MemoryObj]],
+    ) -> None:
+        if not getattr(self, "_overlap_probe", False) or getattr(
+            self, "_overlap_probe_done", False
+        ):
+            return
+        group = kv_groups[0] if len(kv_groups) == 1 else -1
+        if group == 0:
+            self._release_overlap_probe_batch(self._overlap_probe_pending)
+            refs = [obj for obj in results if obj is not None]
+            for obj in refs:
+                obj.ref_count_up()
+            self._overlap_probe_pending = (
+                list(page_keys),
+                [list(group) for group in ptrs],
+                [list(group) for group in sizes],
+                refs,
+            )
+            return
+        if group != 1 or self._overlap_probe_pending is None:
+            return
+
+        first = self._overlap_probe_pending
+        self._overlap_probe_pending = None
+        self._overlap_probe_done = True
+        try:
+            second = (
+                list(page_keys),
+                [list(group) for group in ptrs],
+                [list(group) for group in sizes],
+                (),
+            )
+            fields = await asyncio.to_thread(
+                self._run_page_overlap_probe, first, second
+            )
+        except Exception as exc:
+            fields = {"status": "error", "error": repr(exc)}
+        finally:
+            self._release_overlap_probe_batch(first)
+        logger.info("[LMCACHE_MOONCAKE_OVERLAP] %s", json.dumps(fields))
+        cold_start_perf_log(logger, "mooncake_overlap_benchmark", **fields)
+
     async def _batch_get_pages(
         self,
         keys: List[CacheEngineKey],
@@ -872,7 +1105,11 @@ class MooncakestoreConnector(RemoteConnector):
                 if perf_enabled
                 else 0.0
             )
-            result_status = "ok"
+            result_status = (
+                "ok"
+                if len(submitted_groups) == len(page_groups)
+                else "partial"
+            )
             for group_index, (page_key, indices, offset) in enumerate(
                 submitted_groups
             ):
@@ -901,6 +1138,19 @@ class MooncakestoreConnector(RemoteConnector):
                     results[index] = memory_obj
                     memory_objs[position] = None
 
+            if result_status == "ok":
+                await self._maybe_run_page_overlap_probe(
+                    sorted(
+                        {
+                            int(getattr(key, "kv_group", 0))
+                            for key in page_keys
+                        }
+                    ),
+                    [page_key for page_key, _, _ in submitted_groups],
+                    all_buffer_ptrs,
+                    all_buffer_sizes,
+                    results,
+                )
             return results
         except Exception as exc:
             result_status = "error"
@@ -1487,6 +1737,8 @@ class MooncakestoreConnector(RemoteConnector):
             await asyncio.gather(
                 *tuple(self._inflight_put_tasks), return_exceptions=True
             )
+        self._release_overlap_probe_batch(self._overlap_probe_pending)
+        self._overlap_probe_pending = None
 
         # Unregister buffer before closing the store
         self._unregister_cpu_buffer()

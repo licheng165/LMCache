@@ -7,6 +7,7 @@ from types import SimpleNamespace
 from unittest.mock import Mock
 import asyncio
 import threading
+import time
 
 # Third Party
 import pytest
@@ -274,6 +275,32 @@ def test_mooncake_page_get_scatter_returns_layer_objects() -> None:
 
     assert loaded == expected
     assert [memory_obj.ref_count for memory_obj in allocated] == [1, 1, 0, 0]
+
+
+def test_mooncake_overlap_probe_compares_sequential_concurrent_and_combined():
+    class _PageStore:
+        @staticmethod
+        def batch_get_into_multi_buffers(page_keys, ptrs, sizes):
+            time.sleep(0.01)
+            return [sum(group) for group in sizes]
+
+    connector = object.__new__(MooncakestoreConnector)
+    connector.store = _PageStore()
+    connector._overlap_probe_repeats = 3
+    first = (["g0"], [[100]], [[16]], ())
+    second = (["g1"], [[200]], [[8]], ())
+
+    result = connector._run_page_overlap_probe(first, second)
+
+    assert result["status"] == "ok"
+    assert result["scope"] == "page_first_multi_buffer"
+    assert result["measurement"] == "same_key_replay"
+    assert result["repeats"] == 3
+    assert result["gil_progress_ratio"] > 0.1
+    assert result["group0_bytes"] == 16
+    assert result["group1_bytes"] == 8
+    assert result["concurrent_speedup"] > 1
+    assert result["combined_speedup"] > 1
 
 
 def test_mooncake_page_grouping_serializes_each_page_once(

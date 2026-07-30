@@ -71,8 +71,10 @@ from lmcache.v1.sampled_lookup import (
 from lmcache.v1.shared_cpu_cache import (
     SharedCPURequestLease,
     SharedChunkHandle,
+    SharedHandleBatch,
     SharedHandleEnvelope,
     SharedSlabMapping,
+    validate_shared_handle_batch,
 )
 from lmcache.v1.storage_backend.local_cpu_backend import LocalCPUPrefixGetResult
 from lmcache.v1.storage_backend.storage_manager import StorageManager
@@ -993,6 +995,7 @@ class LMCacheEngine:
                 kv_group=envelope.kv_group,
                 layer=envelope.layer_id,
                 handles=len(envelope.handles),
+                batch_offsets=len(envelope.batch.offsets) if envelope.batch else 0,
                 status=envelope.status,
                 rank=self.metadata.worker_id,
             )
@@ -1023,6 +1026,7 @@ class LMCacheEngine:
                 kv_group=envelope.kv_group,
                 layer=envelope.layer_id,
                 handles=len(envelope.handles),
+                batch_offsets=len(envelope.batch.offsets) if envelope.batch else 0,
                 status=envelope.status,
                 rank=self.metadata.worker_id,
             )
@@ -1086,18 +1090,25 @@ class LMCacheEngine:
                 "Shared CPU cache envelope has unsupported status "
                 f"{envelope.status!r}"
             )
-        if envelope.status == "ok" and not envelope.handles:
+        if envelope.status == "ok" and not (envelope.handles or envelope.batch):
             raise ValueError(
-                "Shared CPU cache ok envelope must carry at least one handle: "
+                "Shared CPU cache ok envelope must carry handles or a batch: "
                 f"request_id={envelope.request_id}, phase={envelope.phase}, "
                 f"layer_id={envelope.layer_id}, kv_group={envelope.kv_group}"
             )
-        if envelope.status in ("miss", "skipped") and envelope.handles:
+        if envelope.status in ("miss", "skipped") and (
+            envelope.handles or envelope.batch
+        ):
             raise ValueError(
-                "Shared CPU cache non-present envelope must not carry handles: "
+                "Shared CPU cache non-present envelope must not carry handles "
+                "or a batch: "
                 f"status={envelope.status!r}, request_id={envelope.request_id}, "
                 f"phase={envelope.phase}, layer_id={envelope.layer_id}, "
                 f"kv_group={envelope.kv_group}, handles={len(envelope.handles)}"
+            )
+        if envelope.handles and envelope.batch:
+            raise ValueError(
+                "Shared CPU cache envelope cannot carry handles and a batch."
             )
 
     def _make_shared_handles_for_layer(
@@ -1165,6 +1176,61 @@ class LMCacheEngine:
                 rank=self.metadata.worker_id,
             )
         return handles
+
+    def _make_shared_handle_batch(
+        self,
+        memory_objs: list[list[MemoryObj]],
+        keys_layer_major: list[list[CacheEngineKey]],
+    ) -> Optional[SharedHandleBatch]:
+        """Compact a homogeneous all-layer page-first result."""
+        started = cold_start_perf_now() if cold_start_perf_enabled() else None
+        if (
+            getattr(self, "shared_cpu_cache_name", None) is None
+            or len(memory_objs) != self.num_layers
+            or not memory_objs
+            or not memory_objs[0]
+        ):
+            return None
+        chunks = len(memory_objs[0])
+        flat = [obj for layer in memory_objs for obj in layer]
+        if (
+            any(len(layer) != chunks for layer in memory_objs)
+            or len(keys_layer_major) != self.num_layers
+            or any(len(layer) != chunks for layer in keys_layer_major)
+            or any(type(obj) is not TensorMemoryObj for obj in flat)
+        ):
+            return None
+        physical_sizes = [
+            int(memory_objs[0][chunk].meta.phy_size) for chunk in range(chunks)
+        ]
+        if any(
+            int(obj.meta.phy_size) != physical_sizes[chunk]
+            or obj.get_size() > physical_sizes[chunk]
+            for layer in memory_objs
+            for chunk, obj in enumerate(layer)
+        ):
+            return None
+        batch = SharedHandleBatch(
+            shm_name=self.shared_cpu_cache_name,
+            producer_rank=self.metadata.worker_id,
+            num_layers=self.num_layers,
+            num_chunks=chunks,
+            physical_sizes=physical_sizes,
+            chunk_hashes=[
+                int(key.chunk_hash) for key in keys_layer_major[0][:chunks]
+            ],
+            offsets=[int(obj.meta.address) for obj in flat],
+        )
+        cold_start_perf_log(
+            logger,
+            "shared_handle_batch_build",
+            started=started,
+            layers=self.num_layers,
+            chunks=chunks,
+            offsets=len(batch.offsets),
+            rank=self.metadata.worker_id,
+        )
+        return batch
 
     def _layerwise_chunk_location_if_fully_stored(
         self,
@@ -2618,7 +2684,7 @@ class LMCacheEngine:
         ends: list[int],
         keys_layer_major: list[list[CacheEngineKey]],
         memory_objs: list[list[MemoryObj]],
-        handles: list[list[SharedChunkHandle]],
+        handles: list[list[Any]],
         kv_group: int,
         kwargs: dict[str, Any],
     ) -> bool:
@@ -2720,12 +2786,13 @@ class LMCacheEngine:
 
         to_release: list[MemoryObj] = []
         resolved_layers: list[list[MemoryObj]] = []
-        handles_by_layer: list[list[SharedChunkHandle]] = []
+        handles_by_layer: list[list[Any]] = []
         page_first_remote = (
             location == "RemoteBackend"
             and mooncake_page_layout_enabled(getattr(self, "config", None))
         )
         pre_resolved_layers: Optional[list[list[MemoryObj]]] = None
+        compact_batch: Optional[SharedHandleBatch] = None
         try:
             for layer_id in range(self.num_layers):
                 try:
@@ -2745,6 +2812,24 @@ class LMCacheEngine:
                                 for layer in pre_resolved_layers
                                 for mem_obj in layer
                             )
+                            compact_batch = self._make_shared_handle_batch(
+                                pre_resolved_layers,
+                                keys_layer_major,
+                            )
+                            if compact_batch is not None:
+                                self._broadcast_shared_envelope(
+                                    SharedHandleEnvelope(
+                                        request_id=req_id,
+                                        phase=phase,
+                                        request_ordinal=request_ordinal,
+                                        layer_id=0,
+                                        kv_group=kv_group,
+                                        status="ok",
+                                        generation=self.shared_cpu_cache_generation,
+                                        handles=[],
+                                        batch=compact_batch,
+                                    )
+                                )
                         mem_objs_layer = pre_resolved_layers[layer_id]
                     else:
                         mem_objs_layer = self._resolve_shared_rank0_layer_mem_objs(
@@ -2779,28 +2864,33 @@ class LMCacheEngine:
                     to_release.extend(mem_objs_layer)
                 resolved_layers.append(mem_objs_layer)
 
-                handles = self._make_shared_handles_for_layer(
-                    req_id=req_id,
-                    phase=phase,
-                    keys_layer=keys_layer_major[layer_id],
-                    mem_objs_layer=mem_objs_layer,
-                    layer_id=layer_id,
-                    kv_group=kv_group,
-                    validate_memory_objs=False,
-                )
-                handles_by_layer.append(handles)
-                self._broadcast_shared_envelope(
-                    SharedHandleEnvelope(
-                        request_id=req_id,
+                handles = (
+                    [None] * len(mem_objs_layer)
+                    if compact_batch is not None
+                    else self._make_shared_handles_for_layer(
+                        req_id=req_id,
                         phase=phase,
-                        request_ordinal=request_ordinal,
+                        keys_layer=keys_layer_major[layer_id],
+                        mem_objs_layer=mem_objs_layer,
                         layer_id=layer_id,
                         kv_group=kv_group,
-                        status="ok",
-                        generation=self.shared_cpu_cache_generation,
-                        handles=handles,
+                        validate_memory_objs=False,
                     )
                 )
+                handles_by_layer.append(handles)
+                if compact_batch is None:
+                    self._broadcast_shared_envelope(
+                        SharedHandleEnvelope(
+                            request_id=req_id,
+                            phase=phase,
+                            request_ordinal=request_ordinal,
+                            layer_id=layer_id,
+                            kv_group=kv_group,
+                            status="ok",
+                            generation=self.shared_cpu_cache_generation,
+                            handles=handles,
+                        )
+                    )
 
                 if layer_id == 0:
                     yield torch.sum(ret_mask)
@@ -2870,30 +2960,62 @@ class LMCacheEngine:
         mem_obj_consumer = None
         to_release: list[MemoryObj] = []
         resolved_layers: list[list[MemoryObj]] = []
-        handles_by_layer: list[list[SharedChunkHandle]] = []
+        handles_by_layer: list[list[Any]] = []
         expected_handle_count: Optional[int] = None
+        compact_batch: Optional[SharedHandleBatch] = None
 
         try:
             for layer_id in range(self.num_layers):
-                envelope = self._receive_shared_envelope()
-                self._validate_shared_layerwise_envelope(
-                    envelope,
-                    req_id=req_id,
-                    phase=phase,
-                    request_ordinal=request_ordinal,
-                    layer_id=layer_id,
-                    kv_group=kv_group,
-                )
-
-                if envelope.status in ("miss", "skipped"):
-                    if layer_id == 0:
-                        yield torch.sum(ret_mask)
-                    else:
-                        yield None
-                    continue
+                envelope = None
+                if compact_batch is None:
+                    envelope = self._receive_shared_envelope()
+                    self._validate_shared_layerwise_envelope(
+                        envelope,
+                        req_id=req_id,
+                        phase=phase,
+                        request_ordinal=request_ordinal,
+                        layer_id=layer_id,
+                        kv_group=kv_group,
+                    )
+                    if envelope.status in ("miss", "skipped"):
+                        if layer_id == 0:
+                            yield torch.sum(ret_mask)
+                        else:
+                            yield None
+                        continue
+                    if envelope.batch is not None:
+                        compact_batch = envelope.batch
+                        if not 0 < compact_batch.num_chunks <= len(starts_all):
+                            raise ValueError(
+                                "Shared CPU compact batch chunk count exceeds "
+                                "passive metadata."
+                            )
+                        validate_shared_handle_batch(
+                            compact_batch,
+                            expected_shm_name=(
+                                self.shared_cpu_cache_passive_allocator.shm_name
+                            ),
+                            expected_producer_rank=self.metadata.first_rank,
+                            expected_num_layers=self.num_layers,
+                            expected_num_chunks=compact_batch.num_chunks,
+                            expected_chunk_hashes=[
+                                int(key.chunk_hash)
+                                for key in keys_layer_major[0][
+                                    : compact_batch.num_chunks
+                                ]
+                            ],
+                            slab_size=(
+                                self.shared_cpu_cache_passive_allocator.slab_size
+                            ),
+                        )
 
                 if expected_handle_count is None:
-                    expected_handle_count = len(envelope.handles)
+                    assert envelope is not None
+                    expected_handle_count = (
+                        compact_batch.num_chunks
+                        if compact_batch is not None
+                        else len(envelope.handles)
+                    )
                     starts = starts_all[:expected_handle_count]
                     ends = ends_all[:expected_handle_count]
                     for start, end in zip(starts, ends, strict=False):
@@ -2904,7 +3026,11 @@ class LMCacheEngine:
                         **kwargs,
                     )
                     next(mem_obj_consumer)
-                elif len(envelope.handles) != expected_handle_count:
+                elif (
+                    compact_batch is None
+                    and envelope is not None
+                    and len(envelope.handles) != expected_handle_count
+                ):
                     raise ValueError(
                         "Shared CPU cache passive received inconsistent handle "
                         f"count at layer {layer_id}: {len(envelope.handles)} != "
@@ -2912,7 +3038,12 @@ class LMCacheEngine:
                     )
 
                 mem_objs_layer: list[MemoryObj] = []
-                for chunk_index, handle in enumerate(envelope.handles):
+                layer_handles = (
+                    [None] * expected_handle_count
+                    if compact_batch is not None
+                    else envelope.handles  # type: ignore[union-attr]
+                )
+                for chunk_index, handle in enumerate(layer_handles):
                     expected_shape, expected_dtype, expected_fmt = (
                         self._expected_shared_cpu_chunk_metadata(
                             kv_group=kv_group,
@@ -2921,27 +3052,40 @@ class LMCacheEngine:
                             ),
                         )
                     )
-                    mem_obj = self.shared_cpu_cache_passive_allocator.create_view(
-                        handle,
-                        expected_request_id=req_id,
-                        expected_phase=phase,
-                        expected_layer_id=layer_id,
-                        expected_kv_group=kv_group,
-                        expected_chunk_index=chunk_index,
-                        expected_key=keys_layer_major[layer_id][chunk_index],
-                        expected_shape=expected_shape,
-                        expected_dtype=expected_dtype,
-                        expected_fmt=expected_fmt,
-                        expected_cached_positions=range(
-                            int(starts_all[chunk_index]),
-                            int(ends_all[chunk_index]),
-                        ),
-                        expected_producer_rank=self.metadata.first_rank,
+                    positions = range(
+                        int(starts_all[chunk_index]),
+                        int(ends_all[chunk_index]),
+                    )
+                    mem_obj = (
+                        self.shared_cpu_cache_passive_allocator.create_batch_view(
+                            compact_batch,
+                            layer_id=layer_id,
+                            chunk_index=chunk_index,
+                            shape=expected_shape,
+                            dtype=expected_dtype,
+                            fmt=expected_fmt,
+                            cached_positions=positions,
+                        )
+                        if compact_batch is not None
+                        else self.shared_cpu_cache_passive_allocator.create_view(
+                            handle,
+                            expected_request_id=req_id,
+                            expected_phase=phase,
+                            expected_layer_id=layer_id,
+                            expected_kv_group=kv_group,
+                            expected_chunk_index=chunk_index,
+                            expected_key=keys_layer_major[layer_id][chunk_index],
+                            expected_shape=expected_shape,
+                            expected_dtype=expected_dtype,
+                            expected_fmt=expected_fmt,
+                            expected_cached_positions=positions,
+                            expected_producer_rank=self.metadata.first_rank,
+                        )
                     )
                     mem_objs_layer.append(mem_obj)
                     to_release.append(mem_obj)
                 resolved_layers.append(mem_objs_layer)
-                handles_by_layer.append(envelope.handles)
+                handles_by_layer.append(layer_handles)
 
                 if layer_id == 0:
                     yield torch.sum(ret_mask)
