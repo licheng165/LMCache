@@ -39,6 +39,7 @@ ALIGN_BYTES = 4096
 TOKEN_DIMS = {0: 576, 1: 128}
 VARIANTS = {
     "production": ("production", "cached"),
+    "address_backed": ("address_backed", "cached"),
     "staged": ("staged", "production"),
     "single_loop": ("single_loop", "production"),
     "contiguous_split": ("contiguous_split", "production"),
@@ -291,9 +292,14 @@ def allocate_objects(
 ) -> tuple[list[TensorMemoryObj], dict[str, float]]:
     shapes, dtypes, fmt, _ = metadata[0]
     stages = {name: 0.0 for name in ALLOCATOR_STAGES}
-    if mode == "production":
+    if mode in ("production", "address_backed"):
         started = time.perf_counter()
-        objects = allocator.batched_allocate(
+        allocate = (
+            allocator.batched_allocate_address_backed
+            if mode == "address_backed"
+            else allocator.batched_allocate
+        )
+        objects = allocate(
             shapes,
             dtypes,
             len(metadata),
@@ -344,7 +350,7 @@ def run_sample(
     allocator_mode, metadata_mode = VARIANTS[variant]
     allocator_cls = (
         TensorMemoryAllocator
-        if allocator_mode == "production"
+        if allocator_mode in ("production", "address_backed")
         else ProfiledTensorMemoryAllocator
     )
     allocator = allocator_cls(buffer, align_bytes=ALIGN_BYTES)

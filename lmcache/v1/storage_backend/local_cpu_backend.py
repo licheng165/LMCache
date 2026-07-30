@@ -739,12 +739,16 @@ class LocalCPUBackend(AllocatorBackendInterface):
         fmt: Optional[MemoryFormat] = None,
         eviction: bool = True,
         busy_loop: bool = True,
+        address_backed: bool = False,
     ) -> Optional[List[MemoryObj]]:
         """
         Batched allocate `batch_size` memory objects of shape and dtype
         evict if necessary. Storage manager should always call
         local_cpu_backend.allocate() to get memory objects
         regardless of whether local_cpu is True or False
+
+        ``address_backed`` requests lazy tensor-view construction when the
+        configured allocator supports it; otherwise allocation remains eager.
 
         busy_loop should only be used for retrieve
         the reasoning is that:
@@ -771,9 +775,14 @@ class LocalCPUBackend(AllocatorBackendInterface):
             else:
                 fmt = MemoryFormat.KV_2LTD
 
-        memory_objs = self.memory_allocator.batched_allocate(
-            shapes, dtypes, batch_size, fmt
-        )
+        allocate_batch = self.memory_allocator.batched_allocate
+        if address_backed:
+            allocate_batch = getattr(
+                self.memory_allocator,
+                "batched_allocate_address_backed",
+                allocate_batch,
+            )
+        memory_objs = allocate_batch(shapes, dtypes, batch_size, fmt)
 
         if memory_objs is not None or not eviction:
             return memory_objs
@@ -842,9 +851,7 @@ class LocalCPUBackend(AllocatorBackendInterface):
                 # do not hold the lock during sleep
                 time.sleep(time_to_wait)
 
-            memory_objs = self.memory_allocator.batched_allocate(
-                shapes, dtypes, batch_size, fmt
-            )
+            memory_objs = allocate_batch(shapes, dtypes, batch_size, fmt)
             if memory_objs:
                 break
 

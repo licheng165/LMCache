@@ -179,6 +179,7 @@ def test_mooncake_zero_copy_metadata_reuses_homogeneous_group() -> None:
     connector = object.__new__(MooncakestoreConnector)
     connector._metadata_for_raw_key = metadata
     connector.local_cpu_backend = backend
+    connector._page_first_multi_buffer = True
 
     keys = [_layer_key(1, layer) for layer in range(3)]
     memory_objs, key_metadata, mode = connector._allocate_zero_copy_buffers(keys)
@@ -187,6 +188,7 @@ def test_mooncake_zero_copy_metadata_reuses_homogeneous_group() -> None:
     assert all(value is key_metadata[0] for value in key_metadata)
     assert len(memory_objs) == len(keys)
     assert mode == "batched"
+    assert backend.batched_allocate.call_args.kwargs["address_backed"] is True
 
     metadata.reset_mock()
     backend.batched_allocate.reset_mock()
@@ -220,6 +222,23 @@ def test_mooncake_batch_status_failure_is_not_silenced() -> None:
         )
 
 
+def test_mooncake_zero_copy_put_does_not_require_tensor_view() -> None:
+    connector = object.__new__(MooncakestoreConnector)
+    connector.config = SimpleNamespace(transfer_timeout=1)
+    connector.replica_config = object()
+    connector._inflight_put_tasks = set()
+    connector._page_first_multi_buffer = False
+    connector.save_chunk_meta = False
+    connector.store = SimpleNamespace(batch_put_from=lambda *args: [0])
+    memory_obj = _MemoryObj()
+    memory_obj.has_tensor_storage = True
+    del memory_obj.raw_tensor
+
+    asyncio.run(connector.batched_put([_key(1)], [memory_obj]))
+
+    assert memory_obj.ref_count == 1
+
+
 def test_mooncake_page_get_scatter_returns_layer_objects() -> None:
     class _PageStore:
         def batch_get_into_multi_buffers(self, page_keys, ptrs, sizes):
@@ -232,6 +251,7 @@ def test_mooncake_page_get_scatter_returns_layer_objects() -> None:
     connector._page_num_layers = 2
     connector.store = _PageStore()
     memory_objs = [_MemoryObj(16, address) for address in (100, 200, 300, 400)]
+    allocated = list(memory_objs)
     connector._allocate_zero_copy_buffers = lambda _keys: (
         memory_objs,
         [],
@@ -243,6 +263,7 @@ def test_mooncake_page_get_scatter_returns_layer_objects() -> None:
         _layer_key(1, 1),
         _layer_key(2, 1),
     ]
+    expected = [memory_objs[0], None, memory_objs[1], None]
 
     loaded = asyncio.run(
         connector._batch_get_pages(
@@ -251,8 +272,8 @@ def test_mooncake_page_get_scatter_returns_layer_objects() -> None:
         )
     )
 
-    assert loaded == [memory_objs[0], None, memory_objs[1], None]
-    assert [memory_obj.ref_count for memory_obj in memory_objs] == [1, 1, 0, 0]
+    assert loaded == expected
+    assert [memory_obj.ref_count for memory_obj in allocated] == [1, 1, 0, 0]
 
 
 def test_mooncake_page_grouping_serializes_each_page_once(

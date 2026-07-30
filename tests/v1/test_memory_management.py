@@ -205,11 +205,11 @@ def test_tensor_batched_allocation_provenance_validates_tail_size() -> None:
     assert len(validation_cache) == 1
 
     logical_size = objects[-1].get_size()
-    objects[-1].group_prefix_sum[-1] = objects[-1].meta.phy_size + 1
+    objects[-1].group_prefix_sum = (0, objects[-1].meta.phy_size + 1)
     assert not objects[-1].is_trusted_allocation_batch_member(
         validation_cache, **expected
     )
-    objects[-1].group_prefix_sum[-1] = logical_size
+    objects[-1].group_prefix_sum = (0, logical_size)
     objects[-1].meta.dtype = torch.float16
     assert not objects[-1].is_trusted_allocation_batch_member(
         validation_cache, **expected
@@ -230,6 +230,48 @@ def test_tensor_batched_allocation_provenance_validates_tail_size() -> None:
         obj.is_trusted_allocation_batch_member(validation_cache, **expected)
         for obj in objects
     )
+
+
+def test_tensor_address_backed_batch_preserves_tensor_access() -> None:
+    block_size = 4096
+    buffer = torch.zeros(block_size * 3, dtype=torch.uint8)
+    allocator = TensorMemoryAllocator(buffer)
+    objects = allocator.batched_allocate_address_backed(
+        torch.Size([block_size]), torch.uint8, 3
+    )
+    assert objects is not None
+    assert all(obj.has_tensor_storage for obj in objects)
+    assert len({id(obj.group_prefix_sum) for obj in objects}) == 1
+    assert [obj.data_ptr for obj in objects] == [
+        buffer.data_ptr() + obj.meta.address for obj in objects
+    ]
+
+    objects[-1].resize_raw_view(1024)
+    objects[-1].meta.shape = torch.Size([1024])
+    objects[-1].meta.shapes = [torch.Size([1024])]
+    objects[-1].refresh_metadata_view()
+    assert objects[0].get_size() == block_size
+    raw_tensor = objects[-1].raw_tensor
+    assert raw_tensor is not None and raw_tensor.numel() == 1024
+    assert objects[-1].raw_data is raw_tensor
+    assert objects[-1].tensor is not None
+    assert objects[-1].tensor.shape == torch.Size([1024])
+    with pytest.raises(ValueError, match="Invalid raw tensor view size"):
+        objects[-1].resize_raw_view(2048)
+
+    allocator.batched_free(objects)
+    assert allocator.memcheck()
+
+
+def test_mixed_address_backed_batch_preserves_format_validation() -> None:
+    allocator = object.__new__(MixedMemoryAllocator)
+    allocator.pin_allocator = TensorMemoryAllocator(
+        torch.zeros(4096, dtype=torch.uint8)
+    )
+    with pytest.raises(ValueError, match="Unsupported memory format"):
+        allocator.batched_allocate_address_backed(
+            torch.Size([1024]), torch.uint8, 1, MemoryFormat.UNDEFINED
+        )
 
 
 def test_paged_allocator_refreshes_size_for_reused_partial_pages():

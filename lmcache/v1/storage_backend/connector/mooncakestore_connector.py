@@ -492,7 +492,11 @@ class MooncakestoreConnector(RemoteConnector):
             shape_list[token_dim] = bytes_read // single_token_size
 
         actual_shape = torch.Size(shape_list)
-        memory_obj.raw_data = memory_obj.raw_data[:bytes_read]
+        resize_raw_view = getattr(memory_obj, "resize_raw_view", None)
+        if callable(resize_raw_view):
+            resize_raw_view(bytes_read)
+        else:
+            memory_obj.raw_data = memory_obj.raw_data[:bytes_read]
         memory_obj.meta.shape = actual_shape
         if memory_obj.meta.shapes:
             memory_obj.meta.shapes = [actual_shape]
@@ -628,6 +632,13 @@ class MooncakestoreConnector(RemoteConnector):
         legacy_indices.sort()
         return complete, legacy_indices
 
+    @staticmethod
+    def _has_zero_copy_storage(memory_obj: MemoryObj) -> bool:
+        available = getattr(memory_obj, "has_tensor_storage", None)
+        return bool(
+            memory_obj.raw_tensor is not None if available is None else available
+        )
+
     def _allocate_zero_copy_buffers(
         self, keys: List[CacheEngineKey]
     ) -> tuple[
@@ -658,10 +669,11 @@ class MooncakestoreConnector(RemoteConnector):
                 fmt=first_fmt,
                 eviction=False,
                 busy_loop=False,
+                address_backed=getattr(self, "_page_first_multi_buffer", False),
             )
             if batched is not None:
                 if len(batched) == len(keys) and all(
-                    obj.raw_tensor is not None for obj in batched
+                    self._has_zero_copy_storage(obj) for obj in batched
                 ):
                     memory_objs = list(batched)
                     allocation_mode = "batched"
@@ -812,7 +824,8 @@ class MooncakestoreConnector(RemoteConnector):
             page_objects = [
                 obj
                 for obj in memory_objs[offset:end]
-                if obj is not None and obj.raw_tensor is not None
+                if obj is not None
+                and self._has_zero_copy_storage(obj)
             ]
             if len(page_objects) != len(indices):
                 offset = end
@@ -938,7 +951,7 @@ class MooncakestoreConnector(RemoteConnector):
             zip(keys, key_metadata, memory_objs, strict=True)
         ):
             single_token_size = metadata_entry[3]
-            if obj is not None and obj.raw_tensor is not None:
+            if obj is not None and self._has_zero_copy_storage(obj):
                 valid_idx.append(i)
                 single_token_sizes[i] = single_token_size
 
@@ -1238,7 +1251,8 @@ class MooncakestoreConnector(RemoteConnector):
         buffer_ptrs: list[int] = []
         buffer_sizes: list[int] = []
         for obj in memory_objs:
-            assert obj.raw_tensor is not None
+            if not self._has_zero_copy_storage(obj):
+                raise ValueError("Mooncake zero-copy put requires tensor storage")
             buffer_ptrs.append(obj.data_ptr)
             buffer_sizes.append(obj.get_size())
 
@@ -1264,7 +1278,8 @@ class MooncakestoreConnector(RemoteConnector):
         This is used when save_chunk_meta=False (matches _batch_get_into).
         """
         try:
-            assert memory_obj.raw_tensor is not None
+            if not self._has_zero_copy_storage(memory_obj):
+                raise ValueError("Mooncake zero-copy put requires tensor storage")
             buffer_ptr = memory_obj.data_ptr
             buffer_size = memory_obj.get_size()
 
