@@ -168,6 +168,10 @@ class LMCacheConnectorV1Dynamic(KVConnectorBase_V1):
     def get_completed_decode_window_saves(self) -> dict[str, int]:
         return self._lmcache_engine.get_completed_decode_window_saves()
 
+    def get_dsa_commit_evidence(self):
+        """Drain typed DSA commit evidences produced this step (worker-side)."""
+        return self._lmcache_engine.get_dsa_commit_evidence()
+
     def shutdown(self):
         """
         Shutdown the connector. This is called when the worker process
@@ -224,10 +228,22 @@ class LMCacheConnectorV1Dynamic(KVConnectorBase_V1):
         return self._lmcache_engine.build_connector_meta(scheduler_output)
 
     def update_connector_output(self, connector_output: "KVConnectorOutput"):
+        """Update scheduler-side LMCache state from worker-side connector output.
+
+        Returns the validated DSA release permits produced by the engine's
+        arbitration (raw worker evidence is never released directly).
         """
-        Update scheduler-side LMCache state from worker-side connector output.
+        return self._lmcache_engine.update_connector_output(connector_output)
+
+    def arbitrate_dsa_release(self, evidences, invalidated_req_ids=None):
+        """Delegate typed DSA evidence arbitration to the engine.
+
+        Present so the multi-connector designates this connector as the DSA
+        release owner (see ``MultiConnector.get_dsa_release_owner``).
         """
-        self._lmcache_engine.update_connector_output(connector_output)
+        return self._lmcache_engine.arbitrate_dsa_release(
+            list(evidences), set(invalidated_req_ids or ())
+        )
 
     def request_finished(
         self,

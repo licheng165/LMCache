@@ -24,6 +24,11 @@ from vllm.distributed.parallel_state import (
 )
 from vllm.sampling_params import SamplingParams
 from vllm.v1.core.sched.output import SchedulerOutput
+from vllm.v1.outputs import (
+    DSACommitEvidence,
+    DSAReleasePermit,
+    DSA_STORE_KINDS,
+)
 from vllm.v1.request import RequestStatus
 from vllm.version import __version__ as VLLM_VERSION
 import torch
@@ -486,7 +491,7 @@ def extract_request_configs(sampling_params: SamplingParams) -> Optional[dict]:
 def _apply_mm_hashes(
     token_ids: list[int],
     mm_hashes: Optional[list[str]],
-    mm_positions: Optional[list["PlaceholderRange"]],
+    mm_positions: Optional["PlaceholderRange"],
 ) -> list[int]:
     if not mm_hashes:
         return token_ids
@@ -494,6 +499,26 @@ def _apply_mm_hashes(
     token_ids_tensor = torch.tensor(token_ids)
     apply_mm_hashes_to_token_ids(token_ids_tensor, mm_hashes, mm_positions)
     return token_ids_tensor.tolist()
+
+
+# ---------------------------------------------------------------------------
+# DSA offload per-request state machine.
+#
+# A request's latent KV lives in exactly one of these states. Transitions are
+# one-way: RESIDENT -> PROMOTING -> OFFLOADED. There is no OFFLOADED -> RESIDENT
+# transition at runtime because the historical latent blocks have already been
+# freed; recovery must go through preemption + recompute/reload.
+#
+# See "GLM5.1 DSA按上下文长度动态切换详细设计" sections 4.1 and 11.
+# ---------------------------------------------------------------------------
+DSA_OFFLOAD_STATE_RESIDENT = "resident"
+DSA_OFFLOAD_STATE_PROMOTING = "promoting"
+DSA_OFFLOAD_STATE_OFFLOADED = "offloaded"
+DSA_OFFLOAD_STATES = (
+    DSA_OFFLOAD_STATE_RESIDENT,
+    DSA_OFFLOAD_STATE_PROMOTING,
+    DSA_OFFLOAD_STATE_OFFLOADED,
+)
 
 
 @dataclass
@@ -506,6 +531,7 @@ class RequestTracker:
 
     # The token ids that has been scheduled so far
     token_ids: list[int]
+
 
     # The block ids that has been allocated so far
     # NOTE: allocated blocks could be more than the number of tokens
@@ -558,6 +584,32 @@ class RequestTracker:
     decode_window_save_pending_commits: deque[int] = field(
         default_factory=deque, repr=False
     )
+
+    # ------------------------------------------------------------------
+    # DSA offload routing state (LMCache is the single source of truth).
+    # ------------------------------------------------------------------
+    # Current route state: resident | promoting | offloaded.
+    dsa_offload_state: str = field(default=DSA_OFFLOAD_STATE_RESIDENT, repr=False)
+    # Monotonic operation epoch for this request. Incremented when entering
+    # PROMOTING, on retry, or after preemption/block-table rebuild. Worker
+    # evidences and release permits carry it; stale generations are ignored.
+    dsa_route_generation: int = field(default=0, repr=False)
+    # Frontier targeted by the current/last promotion attempt (chunk aligned).
+    dsa_promotion_frontier: Optional[int] = field(default=None, repr=False)
+    # Inflight promotion frontier awaiting backend-fence confirmation. Cleared
+    # once a validated permit is issued or the attempt fails/times out.
+    dsa_promotion_inflight_end: Optional[int] = field(default=None, repr=False)
+    # Deadline (absolute monotonic time) for the inflight promotion. If no
+    # success evidence arrives by then, the attempt is failed and retried.
+    dsa_promotion_deadline: Optional[float] = field(default=None, repr=False)
+    # Wall-clock time the current promotion attempt started, for metrics.
+    dsa_promotion_started_at: Optional[float] = field(default=None, repr=False)
+    # Bounded retry counter for promotion failures.
+    dsa_promotion_retry_count: int = field(default=0, repr=False)
+    # Whether the promotion save ReqMeta has been dispatched for the current
+    # generation. Prevents re-dispatching every step while awaiting evidence;
+    # reset to False whenever a new promotion attempt begins.
+    dsa_promotion_emitted: bool = field(default=False, repr=False)
 
     @_lmcache_nvtx_annotate
     @staticmethod
@@ -803,6 +855,12 @@ class ReqMeta:
     decode_window_end: Optional[int] = None
     decode_window_size: Optional[int] = None
 
+    # DSA promotion save: a one-time full-prefix save [0, promotion_frontier)
+    # triggered when a request crosses the offload threshold. Independent of
+    # the decode-window switch; runs even when window_size == 0.
+    is_dsa_promotion_save: bool = False
+    promotion_frontier: Optional[int] = None
+
     # Set by scheduler when a cached request resumes after preemption.
     resumed_from_preemption: bool = False
 
@@ -942,6 +1000,56 @@ class ReqMeta:
             decode_window_end=window_end,
             decode_window_size=window_size,
         )
+
+    @staticmethod
+    def from_dsa_promotion_save(
+        tracker: RequestTracker,
+        block_size: int,
+        promotion_frontier: int,
+        windowed_sparse_layerwise_save: bool = False,
+    ) -> Optional["ReqMeta"]:
+        """Create a one-time full-prefix save meta for a DSA promotion.
+
+        Idempotently persists the complete ``[0, promotion_frontier)`` latent
+        (and indexer, under two-groups) range so the request can be safely
+        switched to the offloaded path after a validated permit. Promotion
+        happens at most once per request generation, so the first version
+        favors correctness over incremental-save optimization (design 12.2).
+
+        Args:
+            tracker (RequestTracker): the request tracker.
+            block_size (int): vLLM block size.
+            promotion_frontier (int): exclusive, chunk-aligned candidate end.
+            windowed_sparse_layerwise_save (bool): whether the worker uses
+                windowed sparse layerwise save slot mappings.
+
+        Returns:
+            ReqMeta or None if the frontier is invalid for this request.
+        """
+        if promotion_frontier <= 0:
+            return None
+        if promotion_frontier > len(tracker.token_ids):
+            return None
+        # Reuse the decode-window factory for the full prefix [0, frontier).
+        meta = ReqMeta.from_decode_window_save(
+            tracker,
+            block_size,
+            window_start=0,
+            window_end=promotion_frontier,
+            window_size=promotion_frontier,
+            windowed_sparse_layerwise_save=windowed_sparse_layerwise_save,
+        )
+        if meta is None:
+            return None
+        # Promotion is not a decode-window step; clear the window flags and tag
+        # it so the worker/commit path treats it as a promotion store.
+        meta.is_decode_window_save = False
+        meta.decode_window_start = None
+        meta.decode_window_end = None
+        meta.decode_window_size = None
+        meta.is_dsa_promotion_save = True
+        meta.promotion_frontier = promotion_frontier
+        return meta
 
     @staticmethod
     def from_request_tracker(
@@ -1359,9 +1467,32 @@ class ReqMeta:
         return req_meta
 
 
+@dataclass(frozen=True)
+class DSAOffloadRouteMeta:
+    """Per-request DSA route snapshot published to the worker each step.
+
+    Orthogonal to the I/O ``ReqMeta`` list: every active request receives a
+    route entry even when it has no LMCache load/save this step, so the worker
+    can decide per-row resident vs offloaded behavior without re-deriving the
+    threshold. See design section 11.4.
+    """
+
+    state: str
+    # Exclusive, chunk-aligned committed frontier readable from LMCache.
+    committed_end: int
+    # Operation generation; worker evidences/permits must match it.
+    generation: int
+    # Decode-window anchor (Q) shared by save/commit/release/remap.
+    window_anchor: int
+
+
 @dataclass
 class LMCacheConnectorMetadata(KVConnectorMetadata):
     requests: list[ReqMeta] = field(default_factory=list)
+    # Per-request DSA route table. Every active request must appear here, even
+    # when it has no LMCache I/O this step. The worker consumes only this table
+    # for routing (it never re-derives the threshold).
+    dsa_offload_routes: dict[str, DSAOffloadRouteMeta] = field(default_factory=dict)
 
     @_lmcache_nvtx_annotate
     def add_request(self, req_meta: ReqMeta) -> None:
@@ -1551,6 +1682,23 @@ class LMCacheConnectorV1Impl:
             (1 + max(int(getattr(vllm_config, "num_speculative_tokens", 0)), 0))
             * dsa_topk
         )
+        # DSA offload routing threshold (tokens). 0 == legacy "all eligible".
+        self._dsa_offload_threshold = int(
+            getattr(config, "dsa_offload_token_threshold", 0) or 0
+        )
+        self._dsa_promotion_timeout_seconds = max(
+            float(
+                os.environ.get("LMCACHE_DSA_PROMOTION_TIMEOUT_SECONDS", "30.0")
+            ),
+            0.0,
+        )
+        self._dsa_promotion_max_retries = max(
+            int(os.environ.get("LMCACHE_DSA_PROMOTION_MAX_RETRIES", "3")),
+            0,
+        )
+        self._dsa_authoritative_store_rank = int(
+            os.environ.get("LMCACHE_DSA_AUTHORITATIVE_STORE_RANK", "0")
+        )
         self.load_specs: dict[str, LoadSpec] = {}
         self._request_trackers: dict[str, RequestTracker] = {}
 
@@ -1591,6 +1739,25 @@ class LMCacheConnectorV1Impl:
                 self._decode_window_save_commit_delay_windows,
             )
 
+        # Shared window-anchor validation (design 12.1). The decode-window
+        # anchor Q = floor(prompt_len / chunk_size) * chunk_size is published in
+        # the route table and must be consumed by the SFA remap so save/commit/
+        # release/remap share one lattice. window_size == chunk_size makes the
+        # zero-point and anchored lattices identical; any other value is only
+        # correct when the consumer uses the published anchor.
+        if (
+            self._decode_window_save_window_size > 0
+            and self._decode_window_save_window_size != self._lmcache_chunk_size
+        ):
+            logger.warning(
+                "decode_window_save_window_size=%d differs from chunk_size=%d. "
+                "Correctness requires the SFA remap to consume the route table "
+                "window_anchor; a zero-point-aligned remap would diverge and "
+                "could free resident tokens.",
+                self._decode_window_save_window_size,
+                self._lmcache_chunk_size,
+            )
+
         self.skip_last_n_tokens = vllm_config.kv_transfer_config.get_from_extra_config(
             "skip_last_n_tokens", 0
         )
@@ -1624,6 +1791,11 @@ class LMCacheConnectorV1Impl:
             self._finished_req_ids_waiting_for_save: set[str] = set()
             self._late_finished_sending: set[str] = set()
             self._completed_decode_window_saves: dict[str, int] = {}
+            # Typed DSA commit evidences (worker-side). Populated by the same
+            # save-completion path that fills _completed_decode_window_saves,
+            # but only after the backend fence (_finish_save_batch) succeeds.
+            # Drained by get_dsa_commit_evidence() each step.
+            self._dsa_commit_evidence: list[DSACommitEvidence] = []
             self._decode_window_save_completed_groups: set[LayerwiseSaveKey] = set()
             self._decode_window_save_expected_start: dict[str, int] = {}
             self._warn_mla_per_rank_lookup_config(config)
@@ -3229,6 +3401,9 @@ class LMCacheConnectorV1Impl:
         if completed is None:
             return
         completed[request.req_id] = max(completed.get(request.req_id, 0), window_end)
+        self._emit_dsa_commit_evidence(
+            request.req_id, "decode_window_store", int(window_end)
+        )
         _mtp_dw_event(
             "commit",
             req=request.req_id,
@@ -3249,6 +3424,59 @@ class LMCacheConnectorV1Impl:
             )
         self._clear_decode_window_save_groups_for_window(request)
 
+    def _dsa_reporter_rank(self) -> int:
+        """Best-effort worker rank for typed evidence reporter attribution."""
+        metadata = getattr(self, "lmcache_engine_metadata", None)
+        worker_id = getattr(metadata, "worker_id", None)
+        if worker_id is None:
+            return 0
+        try:
+            return int(worker_id)
+        except (TypeError, ValueError):
+            return 0
+
+    def _dsa_route_generation_from_meta(self, req_id: str) -> int:
+        """Look up the current route generation from bound worker metadata."""
+        metadata = None
+        parent = getattr(self, "_parent", None)
+        get_meta = getattr(parent, "_get_connector_metadata", None)
+        if callable(get_meta):
+            try:
+                metadata = get_meta()
+            except Exception:
+                metadata = None
+        if metadata is None:
+            return 0
+        routes = getattr(metadata, "dsa_offload_routes", None) or {}
+        route = routes.get(req_id)
+        if route is None:
+            return 0
+        return int(route.generation)
+
+    def _emit_dsa_commit_evidence(
+        self, req_id: str, kind: str, frontier: int
+    ) -> None:
+        """Append a typed DSA commit evidence (worker-side, post backend fence).
+
+        Only call this from the save-completion success path (after
+        ``_finish_save_batch`` returns), so the evidence never outruns the
+        backend fence.
+        """
+        if frontier <= 0:
+            return
+        evidence_list = getattr(self, "_dsa_commit_evidence", None)
+        if evidence_list is None:
+            return
+        evidence_list.append(
+            DSACommitEvidence(
+                req_id=req_id,
+                kind=kind,
+                frontier=int(frontier),
+                generation=self._dsa_route_generation_from_meta(req_id),
+                reporter_rank=self._dsa_reporter_rank(),
+            )
+        )
+
     def _mark_prefill_committed(self, request: ReqMeta) -> None:
         """Publish the full-chunk prefill frontier after its save completes."""
         if (
@@ -3262,10 +3490,18 @@ class LMCacheConnectorV1Impl:
             // self._lmcache_chunk_size
             * self._lmcache_chunk_size
         )
+        # DSA promotion saves are staged by _wait_for_save_impl and published
+        # only after the backend fence (wait_for_save else-branch). They must
+        # NOT publish through this pre-fence path nor the legacy scalar map.
+        if getattr(request, "is_dsa_promotion_save", False):
+            return
         completed = getattr(self, "_completed_decode_window_saves", None)
         if completed is not None and committed_end > 0:
             completed[request.req_id] = max(
                 completed.get(request.req_id, 0), committed_end
+            )
+            self._emit_dsa_commit_evidence(
+                request.req_id, "initial_prefill_store", committed_end
             )
 
     def _mark_initial_sparse_release_ready(self, request: ReqMeta) -> None:
@@ -3288,6 +3524,9 @@ class LMCacheConnectorV1Impl:
             completed.get(request.req_id, 0), int(committed_end)
         )
         published.add(request.req_id)
+        self._emit_dsa_commit_evidence(
+            request.req_id, "initial_dense_load", int(committed_end)
+        )
 
     def get_completed_decode_window_saves(self) -> dict[str, int]:
         completed = getattr(self, "_completed_decode_window_saves", None)
@@ -3297,12 +3536,281 @@ class LMCacheConnectorV1Impl:
         completed.clear()
         return drained
 
-    def update_connector_output(self, connector_output: Any) -> None:
-        completed = getattr(connector_output, "completed_decode_window_saves", None)
-        if not completed:
+    def get_dsa_commit_evidence(self) -> list[DSACommitEvidence]:
+        """Drain typed DSA commit evidences produced this step (worker-side)."""
+        evidence = getattr(self, "_dsa_commit_evidence", None)
+        if not evidence:
+            return []
+        drained = list(evidence)
+        evidence.clear()
+        return drained
+
+    def _mark_dsa_promotion_save_completed(self, request: ReqMeta) -> None:
+        """Publish promotion_store evidence after the backend fence succeeded.
+
+        Called from ``wait_for_save``'s success branch, so this never outruns
+        the remote store fence (design 12.3).
+        """
+        if not getattr(request, "is_dsa_promotion_save", False):
             return
+        promo_frontier = int(
+            getattr(request, "promotion_frontier", None)
+            or (
+                len(request.token_ids)
+                // self._lmcache_chunk_size
+                * self._lmcache_chunk_size
+            )
+        )
+        self._emit_dsa_commit_evidence(
+            request.req_id, "promotion_store", promo_frontier
+        )
+
+    def _fail_staged_dsa_promotion_saves(self, save_context: dict[str, Any]) -> None:
+        """Clear provisional promotion candidates and emit failure evidence.
+
+        Called from ``wait_for_save``'s exception branch when the backend fence
+        or the save itself failed. Emits a typed failure so the scheduler-side
+        arbitration can trigger a bounded retry; never produces a permit.
+        """
+        staged = save_context.pop("dsa_promotion_saves", None)
+        if not staged:
+            return
+        reporter = self._dsa_reporter_rank()
+        for request in staged:
+            promo_frontier = int(
+                getattr(request, "promotion_frontier", None) or 0
+            )
+            generation = self._dsa_route_generation_from_meta(request.req_id)
+            evidence_list = getattr(self, "_dsa_commit_evidence", None)
+            if evidence_list is None:
+                continue
+            evidence_list.append(
+                DSACommitEvidence(
+                    req_id=request.req_id,
+                    kind="promotion_store",
+                    frontier=promo_frontier,
+                    generation=generation,
+                    reporter_rank=reporter,
+                    status="failed",
+                    error_code="backend_fence_failed",
+                )
+            )
+
+    def arbitrate_dsa_release(
+        self,
+        evidences: list[DSACommitEvidence],
+        invalidated_req_ids: set[str],
+    ) -> dict[str, DSAReleasePermit]:
+        """Arbitrate raw worker evidences into validated release permits.
+
+        Scheduler-side. Enforces kind/generation/frontier/rank rules from
+        design section 12.4. Returns only permits that are safe to act on;
+        raw evidence is never turned into a release without these checks.
+        """
+        permits: dict[str, DSAReleasePermit] = {}
+        if not evidences:
+            return permits
+
+        store_evidence: dict[tuple[str, int, str], list[DSACommitEvidence]] = {}
+        load_evidence: dict[tuple[str, int], list[DSACommitEvidence]] = {}
+        for ev in evidences:
+            # Failed promotion/PD-load evidence must never release; instead it
+            # triggers a bounded retry on the matching tracker (no permit).
+            if ev.status != "succeeded":
+                if ev.kind in DSA_STORE_KINDS or ev.kind == "initial_dense_load":
+                    if ev.req_id not in invalidated_req_ids:
+                        tracker = self._request_trackers.get(ev.req_id)
+                        if (
+                            tracker is not None
+                            and ev.generation == tracker.dsa_route_generation
+                        ):
+                            self._retry_or_fail_dsa_promotion(
+                                tracker, f"{ev.kind}_failed"
+                            )
+                continue
+            if ev.frontier <= 0:
+                continue
+            # Drop evidences for requests whose KV load was invalidated this
+            # step (invalid_block_ids path) BEFORE any permit is issued.
+            if ev.req_id in invalidated_req_ids:
+                logger.debug(
+                    "[DSA_ARBITER] dropping evidence for invalidated req=%s "
+                    "kind=%s generation=%d",
+                    ev.req_id,
+                    ev.kind,
+                    ev.generation,
+                )
+                continue
+            if ev.kind in DSA_STORE_KINDS:
+                key = (ev.req_id, ev.generation, ev.kind)
+                store_evidence.setdefault(key, []).append(ev)
+            elif ev.kind == "initial_dense_load":
+                load_evidence.setdefault((ev.req_id, ev.generation), []).append(ev)
+
+        # Store-kind arbitration. With save_only_first_rank the authoritative
+        # storage rank is the sole reporter; otherwise a required store quorum
+        # would be enforced here. First version trusts the authoritative rank.
+        for (req_id, generation, kind), evs in store_evidence.items():
+            tracker = self._request_trackers.get(req_id)
+            if tracker is None:
+                continue
+            if generation != tracker.dsa_route_generation:
+                logger.debug(
+                    "[DSA_ARBITER] stale generation for req=%s kind=%s "
+                    "got=%d tracker=%d",
+                    req_id,
+                    kind,
+                    generation,
+                    tracker.dsa_route_generation,
+                )
+                continue
+            frontier = max(e.frontier for e in evs)
+            if frontier <= self._dsa_scratch_capacity:
+                # F <= S: nothing releasable yet (design 10.4).
+                continue
+            if not self._dsa_store_reporter_accepted(kind, evs):
+                continue
+            permit = DSAReleasePermit(
+                req_id=req_id,
+                kind=kind,
+                frontier=frontier,
+                generation=generation,
+            )
+            self._apply_dsa_permit(tracker, permit)
+            permits[req_id] = permit
+
+        # initial_dense_load arbitration: all required load ranks must succeed.
+        for (req_id, generation), evs in load_evidence.items():
+            tracker = self._request_trackers.get(req_id)
+            if tracker is None:
+                continue
+            if req_id in invalidated_req_ids:
+                continue
+            if generation != tracker.dsa_route_generation:
+                continue
+            frontier = max(e.frontier for e in evs)
+            if frontier <= self._dsa_scratch_capacity:
+                continue
+            permit = DSAReleasePermit(
+                req_id=req_id,
+                kind="initial_dense_load",
+                frontier=frontier,
+                generation=generation,
+            )
+            self._apply_dsa_permit(tracker, permit)
+            permits[req_id] = permit
+
+        return permits
+
+    def _dsa_store_reporter_accepted(
+        self, kind: str, evs: list[DSACommitEvidence]
+    ) -> bool:
+        """Whether store evidences satisfy the configured reporter policy.
+
+        First version: with save_only_first_rank the authoritative storage rank
+        must be among the reporters. Per-rank required-store quorum can be
+        extended here later.
+        """
+        reporters = {e.reporter_rank for e in evs}
+        return self._dsa_authoritative_store_rank in reporters
+
+    def _apply_dsa_permit(
+        self, tracker: RequestTracker, permit: DSAReleasePermit
+    ) -> None:
+        """Apply a validated permit: advance state and committed frontier."""
+        committed_before = tracker.decode_window_save_committed_end
+        tracker.decode_window_save_committed_end = max(
+            committed_before, permit.frontier
+        )
+        if tracker.dsa_offload_state != DSA_OFFLOAD_STATE_OFFLOADED:
+            logger.info(
+                "[DSA_ROUTE] req=%s %s->offloaded committed_end=%d "
+                "freed_frontier=%d generation=%d",
+                tracker.req_id,
+                tracker.dsa_offload_state,
+                tracker.decode_window_save_committed_end,
+                permit.frontier,
+                permit.generation,
+            )
+            tracker.dsa_offload_state = DSA_OFFLOAD_STATE_OFFLOADED
+        # Clear promotion inflight fields once a permit is issued.
+        tracker.dsa_promotion_inflight_end = None
+        tracker.dsa_promotion_deadline = None
+        tracker.dsa_promotion_started_at = None
+
+    def _retry_or_fail_dsa_promotion(
+        self, tracker: RequestTracker, reason: str
+    ) -> None:
+        """Handle a promotion failure/timeout: bounded retry, else stay resident.
+
+        On retry the operation generation is bumped and a new promotion save is
+        dispatched next step. No release permit is ever issued on this path.
+        """
+        if tracker.dsa_offload_state != DSA_OFFLOAD_STATE_PROMOTING:
+            return
+        tracker.dsa_promotion_retry_count += 1
+        candidate = tracker.dsa_promotion_inflight_end
+        if candidate is None:
+            candidate = tracker.dsa_promotion_frontier
+        if (
+            tracker.dsa_promotion_retry_count <= self._dsa_promotion_max_retries
+            and candidate is not None
+        ):
+            logger.warning(
+                "[DSA_ROUTE] req=%s promotion retry=%d/%d reason=%s "
+                "candidate=%d",
+                tracker.req_id,
+                tracker.dsa_promotion_retry_count,
+                self._dsa_promotion_max_retries,
+                reason,
+                candidate,
+            )
+            # Re-begin with a fresh generation; the promotion save is re-emitted
+            # next step (dsa_promotion_emitted reset to False).
+            tracker.dsa_route_generation += 1
+            tracker.dsa_promotion_inflight_end = candidate
+            tracker.dsa_promotion_started_at = time.monotonic()
+            tracker.dsa_promotion_deadline = (
+                tracker.dsa_promotion_started_at
+                + self._dsa_promotion_timeout_seconds
+            )
+            tracker.dsa_promotion_emitted = False
+        else:
+            logger.error(
+                "[DSA_ROUTE] req=%s promotion exhausted retries (%s); "
+                "keeping resident latent KV, no release permit.",
+                tracker.req_id,
+                reason,
+            )
+            # Give up: clear inflight but keep full resident KV. Bump the
+            # generation so any late-arriving success evidence for the old
+            # attempt cannot release blocks. The request remains safe (no
+            # blocks freed) and will not be offloaded until a future
+            # preemption/recompute resets the state.
+            tracker.dsa_route_generation += 1
+            tracker.dsa_promotion_inflight_end = None
+            tracker.dsa_promotion_deadline = None
+            tracker.dsa_promotion_started_at = None
+
+    def _check_dsa_promotion_deadline(self, tracker: RequestTracker) -> None:
+        """Fail an inflight promotion whose backend fence did not arrive in time."""
+        if tracker.dsa_offload_state != DSA_OFFLOAD_STATE_PROMOTING:
+            return
+        if tracker.dsa_promotion_inflight_end is None:
+            return
+        deadline = tracker.dsa_promotion_deadline
+        if deadline is None:
+            return
+        if time.monotonic() < deadline:
+            return
+        self._retry_or_fail_dsa_promotion(tracker, "deadline")
+
+    def update_connector_output(
+        self, connector_output: Any
+    ) -> dict[str, DSAReleasePermit]:
+        completed = getattr(connector_output, "completed_decode_window_saves", None)
         published: dict[str, int] = {}
-        for req_id, window_end in completed.items():
+        for req_id, window_end in (completed or {}).items():
             tracker = self._request_trackers.get(req_id)
             if tracker is None:
                 continue
@@ -3438,8 +3946,20 @@ class LMCacheConnectorV1Impl:
         # The vLLM scheduler consumes this same mapping after this callback to
         # release local blocks. Replacing raw completions with delayed
         # frontiers keeps release and split_boundary on the same commit point.
-        completed.clear()
-        completed.update(published)
+        if completed is not None:
+            completed.clear()
+            completed.update(published)
+
+        # Typed DSA arbitration: convert raw per-reporter evidences into
+        # validated release permits. vLLM frees latent blocks ONLY from these
+        # permits; the legacy scalar map above continues to serve the migration
+        # path for requests without typed evidence.
+        evidences = list(getattr(connector_output, "dsa_commit_evidence", None) or [])
+        invalidated = set(
+            getattr(connector_output, "dsa_invalidated_req_ids", None) or ()
+        )
+        permits = self.arbitrate_dsa_release(evidences, invalidated)
+        return permits
 
     def _mark_worker_retrieve_registry_changed(self) -> None:
         self._worker_retrieve_registry_version = (
@@ -6847,12 +7367,20 @@ class LMCacheConnectorV1Impl:
             metadata = self._parent._get_connector_metadata()
             assert isinstance(metadata, LMCacheConnectorMetadata)
             self._abort_save_step(metadata.requests)
+            # Backend fence failed or save raised: clear all provisional
+            # promotion candidates and emit failure so the scheduler can retry.
+            # No release permit is ever produced on this path.
+            self._fail_staged_dsa_promotion_saves(save_context)
             if save_fence_complete:
                 self._complete_worker_save_step()
             raise
         else:
             for request in save_context.get("decode_window_saves", ()):
                 self._mark_decode_window_save_completed(request)
+            # Promotion evidences are published only now, after the backend
+            # fence (_finish_save_batch) returned successfully.
+            for request in save_context.get("dsa_promotion_saves", ()):
+                self._mark_dsa_promotion_save_completed(request)
             self._complete_worker_save_step()
 
     def _wait_for_save_impl(self, save_context: dict[str, Any]) -> None:
@@ -6904,6 +7432,12 @@ class LMCacheConnectorV1Impl:
                     save_context.setdefault("decode_window_saves", []).append(
                         request
                     )
+                # Stage DSA promotion saves for post-fence publication; they
+                # must not be released until _finish_save_batch succeeds.
+                if getattr(request, "is_dsa_promotion_save", False):
+                    save_context.setdefault(
+                        "dsa_promotion_saves", []
+                    ).append(request)
                 self._mark_prefill_committed(request)
                 self._mark_initial_sparse_release_ready(request)
                 self._maybe_lookup_unpin_for_request(request)
@@ -6988,6 +7522,11 @@ class LMCacheConnectorV1Impl:
                     save_context.setdefault("decode_window_saves", []).append(
                         request
                     )
+                # Stage DSA promotion saves for post-fence publication.
+                if getattr(request, "is_dsa_promotion_save", False):
+                    save_context.setdefault(
+                        "dsa_promotion_saves", []
+                    ).append(request)
                 self._mark_prefill_committed(request)
 
                 if get_pp_group().is_last_rank:
@@ -6998,6 +7537,14 @@ class LMCacheConnectorV1Impl:
                         )
             except Exception as error:
                 if self._handle_save_request_error(request, error):
+                    # Isolated per-request failure. For a promotion save this
+                    # must not be silently treated as success: emit a typed
+                    # failure so the scheduler retries promptly instead of
+                    # waiting for the deadline.
+                    if getattr(request, "is_dsa_promotion_save", False):
+                        self._fail_staged_dsa_promotion_saves(
+                            {"dsa_promotion_saves": [request]}
+                        )
                     continue
                 raise
 
@@ -7264,7 +7811,142 @@ class LMCacheConnectorV1Impl:
             return False
         if not tracker.is_decode_phase:
             return False
+        # Decode-window save only advances the offloaded frontier; it must not
+        # run for resident/promoting requests whose latent KV is still fully
+        # NPU-resident (design 15.1 step 7). This gate is threshold-gated: the
+        # legacy threshold=0 path preserves the original eligibility rules.
+        if (
+            self._dsa_offload_threshold > 0
+            and tracker.dsa_offload_state != DSA_OFFLOAD_STATE_OFFLOADED
+        ):
+            return False
         return len(tracker.token_ids) > tracker.prompt_len
+
+    # ------------------------------------------------------------------
+    # DSA offload route state machine (scheduler-side, single source of
+    # truth). See design sections 10, 11, 13.
+    # ------------------------------------------------------------------
+    def _dsa_threshold_crossed(self, finalized_tokens: int) -> bool:
+        """Whether the request's finalized context has reached the threshold.
+
+        ``T == 0`` preserves the legacy "all requests eligible" semantics.
+        """
+        threshold = self._dsa_offload_threshold
+        return threshold == 0 or finalized_tokens >= threshold
+
+    def _dsa_promotion_candidate(
+        self, tracker: RequestTracker, finalized_tokens: int
+    ) -> Optional[int]:
+        """Compute the safe, aligned promotion frontier for a crossed request.
+
+        Returns None when no frontier beyond scratch capacity is available yet
+        (``F <= S``), in which case the request must remain resident.
+        """
+        chunk = self._lmcache_chunk_size
+        window = self._decode_window_save_window_size
+        prompt_anchor = (tracker.prompt_len // chunk) * chunk
+        if window <= 0:
+            candidate = (finalized_tokens // chunk) * chunk
+        else:
+            candidate = prompt_anchor + (
+                (finalized_tokens - prompt_anchor) // window
+            ) * window
+        if candidate <= self._dsa_scratch_capacity:
+            return None
+        if candidate > finalized_tokens:
+            return None
+        return candidate
+
+    def _dsa_route_window_anchor(self, tracker: RequestTracker) -> int:
+        """The decode-window anchor Q shared by save/commit/release/remap."""
+        chunk = self._lmcache_chunk_size
+        anchor = tracker.decode_window_save_anchor
+        if anchor is not None:
+            return anchor
+        return (tracker.prompt_len // chunk) * chunk
+
+    def _begin_dsa_promotion(
+        self, tracker: RequestTracker, candidate: int
+    ) -> None:
+        """Transition a RESIDENT request to PROMOTING for a new attempt."""
+        tracker.dsa_route_generation += 1
+        tracker.dsa_offload_state = DSA_OFFLOAD_STATE_PROMOTING
+        tracker.dsa_promotion_frontier = candidate
+        tracker.dsa_promotion_inflight_end = candidate
+        tracker.dsa_promotion_started_at = time.monotonic()
+        tracker.dsa_promotion_deadline = (
+            tracker.dsa_promotion_started_at
+            + self._dsa_promotion_timeout_seconds
+        )
+        tracker.dsa_promotion_emitted = False
+        logger.info(
+            "[DSA_ROUTE] req=%s resident->promoting threshold=%d "
+            "finalized=%d candidate=%d generation=%d",
+            tracker.req_id,
+            self._dsa_offload_threshold,
+            len(tracker.token_ids),
+            candidate,
+            tracker.dsa_route_generation,
+        )
+
+    def _step_dsa_offload_route(
+        self,
+        tracker: RequestTracker,
+        is_decode_phase: bool,
+    ) -> tuple[str, bool, int]:
+        """Advance the per-request DSA route state for this scheduling step.
+
+        Args:
+            tracker (RequestTracker): the request tracker (mutated on
+                RESIDENT->PROMOTING transition).
+            is_decode_phase (bool): whether the request is in decode phase.
+
+        Returns:
+            ``(state, effective_is_sparse_decode, route_committed_end)``.
+            ``effective_is_sparse_decode`` is True only when the request is
+            OFFLOADED this step; PROMOTING requests keep a resident forward.
+        """
+        # Fail inflight promotions whose backend fence did not arrive in time
+        # before deciding this step's route (scheduler-side deadline).
+        self._check_dsa_promotion_deadline(tracker)
+        state = tracker.dsa_offload_state
+        committed_end = int(tracker.decode_window_save_committed_end)
+        finalized_tokens = len(tracker.token_ids)
+
+        # Once offloaded, stays offloaded (monotonic; no runtime demotion).
+        if state == DSA_OFFLOAD_STATE_OFFLOADED:
+            return state, True, committed_end
+
+        threshold = self._dsa_offload_threshold
+        threshold_crossed = self._dsa_threshold_crossed(finalized_tokens)
+        legacy_eligible = self.enable_sparse_attention and is_decode_phase
+
+        if not threshold_crossed:
+            # Short request below threshold: stays fully resident.
+            return DSA_OFFLOAD_STATE_RESIDENT, False, committed_end
+
+        if threshold == 0:
+            # Legacy compatibility: preserve the original "every decode request
+            # is sparse-eligible" behavior. The state is reported as OFFLOADED so
+            # the worker route table matches the existing is_sparse_decode path.
+            if legacy_eligible:
+                tracker.dsa_offload_state = DSA_OFFLOAD_STATE_OFFLOADED
+                return DSA_OFFLOAD_STATE_OFFLOADED, True, committed_end
+            return DSA_OFFLOAD_STATE_RESIDENT, False, committed_end
+
+        # Dynamic threshold path (T > 0).
+        if state == DSA_OFFLOAD_STATE_RESIDENT:
+            candidate = self._dsa_promotion_candidate(tracker, finalized_tokens)
+            if candidate is None:
+                # Crossed threshold but F <= S; wait for a releasable frontier.
+                return DSA_OFFLOAD_STATE_RESIDENT, False, committed_end
+            self._begin_dsa_promotion(tracker, candidate)
+            return DSA_OFFLOAD_STATE_PROMOTING, False, committed_end
+
+        # Already PROMOTING: keep a resident forward until a validated permit
+        # arrives (or a retry/timeout re-enters promotion).
+        return DSA_OFFLOAD_STATE_PROMOTING, False, committed_end
+
 
     def _decode_window_save_skip_reason(self, tracker: RequestTracker) -> str:
         """Describe why the authoritative eligibility check rejected a save."""
@@ -7836,8 +8518,40 @@ class LMCacheConnectorV1Impl:
                 all_token_ids=all_token_ids,
             )
 
+            # Step the DSA offload route state machine BEFORE emitting window
+            # saves: decode-window saves are gated on the OFFLOADED state, and
+            # the effective is_sparse_decode is True only when OFFLOADED.
+            is_decode_phase = (
+                request.num_computed_tokens >= request_tracker.prompt_len
+            )
+            route_state, effective_is_sparse_decode, _route_committed = (
+                self._step_dsa_offload_route(request_tracker, is_decode_phase)
+            )
+            # If the request is PROMOTING with an inflight promotion that has
+            # not yet been dispatched this generation, emit the one-time
+            # full-prefix promotion save so a permit can be issued after fence.
+            # Re-dispatch happens on retry (a new generation resets emitted).
+            if (
+                route_state == DSA_OFFLOAD_STATE_PROMOTING
+                and request_tracker.dsa_promotion_inflight_end is not None
+                and not request_tracker.dsa_promotion_emitted
+                and effective_is_sparse_decode is False
+                and self.kv_role != "kv_consumer"
+            ):
+                promotion_meta = ReqMeta.from_dsa_promotion_save(
+                    request_tracker,
+                    self._block_size,
+                    int(request_tracker.dsa_promotion_inflight_end),
+                    windowed_sparse_layerwise_save=bool(
+                        getattr(self, "use_layerwise", False)
+                    ),
+                )
+                if promotion_meta is not None:
+                    meta.add_request(promotion_meta)
+                    request_tracker.dsa_promotion_emitted = True
+
             self._add_decode_window_save_metas(meta, request_tracker)
-            is_sparse_decode = self.enable_sparse_attention and (
+            is_sparse_decode = effective_is_sparse_decode and (
                 request.num_computed_tokens >= request_tracker.prompt_len
             )
             if is_sparse_decode:
@@ -7903,6 +8617,21 @@ class LMCacheConnectorV1Impl:
             if req_meta is not None:
                 req_meta.resumed_from_preemption = preempted
                 meta.add_request(req_meta)
+
+            # Publish the per-request DSA route snapshot. Every active request
+            # receives an entry (even with no LMCache I/O this step) so the
+            # worker routes per-row without re-deriving the threshold.
+            route_committed = 0
+            if route_state == DSA_OFFLOAD_STATE_OFFLOADED:
+                route_committed = int(
+                    request_tracker.decode_window_save_committed_end
+                )
+            meta.dsa_offload_routes[req_id] = DSAOffloadRouteMeta(
+                state=route_state,
+                committed_end=route_committed,
+                generation=request_tracker.dsa_route_generation,
+                window_anchor=self._dsa_route_window_anchor(request_tracker),
+            )
 
         return meta
 

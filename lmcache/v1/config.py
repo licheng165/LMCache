@@ -307,6 +307,19 @@ _CONFIG_DEFINITIONS: dict[str, dict[str, Any]] = {
         "default": False,
         "env_converter": _to_bool,
     },
+    # DSA offload routing threshold in tokens. 0 preserves the legacy
+    # "all requests eligible" semantics (every request may offload once its
+    # frontier safely exceeds the scratch capacity). N > 0 keeps a request's
+    # latent KV fully NPU-resident until its finalized context length (prompt +
+    # accepted output) reaches N, after which a one-way promotion to the
+    # offloaded path begins. A value greater than max_model_len forces every
+    # normal request to stay resident. See "GLM5.1 DSA按上下文长度动态切换详细设计"
+    # sections 10 and 11.
+    "dsa_offload_token_threshold": {
+        "type": int,
+        "default": 0,
+        "env_converter": int,
+    },
     "enable_shared_cpu_cache": {
         "type": bool,
         "default": False,
@@ -603,6 +616,12 @@ def _validate_config(self):
     if self.min_retrieve_tokens < 0:
         raise ValueError(
             "min_retrieve_tokens must be >= 0, got %d" % self.min_retrieve_tokens
+        )
+
+    if self.dsa_offload_token_threshold < 0:
+        raise ValueError(
+            "dsa_offload_token_threshold must be >= 0, got %d"
+            % self.dsa_offload_token_threshold
         )
 
     if self.enable_blending:

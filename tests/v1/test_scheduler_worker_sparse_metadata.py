@@ -54,6 +54,10 @@ def _make_scheduler_impl() -> LMCacheConnectorV1Impl:
     impl._decode_window_save_window_size = 0
     impl._decode_window_save_commit_delay_windows = 0
     impl._dsa_scratch_capacity = 4096
+    impl._dsa_offload_threshold = 0
+    impl._dsa_promotion_timeout_seconds = 30.0
+    impl._dsa_promotion_max_retries = 3
+    impl._dsa_authoritative_store_rank = 0
     impl._discard_partial_chunks = True
     impl._request_trackers = {}
     impl._unfinished_requests = {}
