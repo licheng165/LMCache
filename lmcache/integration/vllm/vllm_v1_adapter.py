@@ -48,6 +48,11 @@ from lmcache.logging import init_logger
 from lmcache.observability import LMCStatsMonitor, PrometheusLogger
 from lmcache.utils import CacheStoreEvent, _lmcache_nvtx_annotate, cdiv
 from lmcache.v1.cache_engine import LayerwiseStoreResult, LMCacheEngine
+from lmcache.v1.cold_start_perf import (
+    cold_start_perf_enabled,
+    cold_start_perf_log,
+    cold_start_perf_now,
+)
 from lmcache.v1.compute.blend import LMCBlenderBuilder
 from lmcache.v1.config import LMCacheEngineConfig
 from lmcache.v1.config_base import validate_and_set_config_value
@@ -1500,6 +1505,8 @@ class LMCacheConnectorV1Impl:
         self._retrieve_stats_request_count = 0
         self._retrieve_stats_row_count = 0
         self._retrieve_stats_token_count = 0
+        self._cold_perf_lookup_started: dict[str, float] = {}
+        self._cold_perf_load_started: dict[str, tuple[float, int]] = {}
         if (
             role != KVConnectorRole.SCHEDULER
             and self._retrieve_stats_interval_seconds > 0
@@ -2846,6 +2853,19 @@ class LMCacheConnectorV1Impl:
     ) -> None:
         """Release a partially constructed layerwise retrieve step."""
         for request in requests:
+            perf_state = self._cold_perf_load_started.pop(
+                request.req_id,
+                None,
+            )
+            if perf_state is not None:
+                request_started, token_count = perf_state
+                cold_start_perf_log(
+                    logger,
+                    "worker_load_abort",
+                    started=request_started,
+                    req_id=request.req_id,
+                    tokens=token_count,
+                )
             state = self._worker_retrieve_state.get(request.req_id)
             if state is not None:
                 self._release_unadopted_shared_request_objects(state, request)
@@ -5287,6 +5307,9 @@ class LMCacheConnectorV1Impl:
             self._stats_monitor.update_interval_prompt_tokens(prompt_tokens)
 
         for load_idx, (idx, request) in enumerate(loadable_requests):
+            request_perf_started = (
+                cold_start_perf_now() if cold_start_perf_enabled() else 0.0
+            )
             tokens = request.token_ids
             assert request.load_spec is not None
             lmcache_cached_tokens = request.load_spec.lmcache_cached_tokens
@@ -5492,6 +5515,32 @@ class LMCacheConnectorV1Impl:
                         shared_cpu_enabled=shared_cpu_enabled,
                         shared_cpu_preflight_state=shared_cpu_preflight_state,
                     )
+                    cold_perf_active = bool(
+                        request_perf_started and latent_prepared is None
+                    )
+                    if cold_perf_active:
+                        self._cold_perf_load_started[request.req_id] = (
+                            request_perf_started,
+                            token_count,
+                        )
+                        cold_start_perf_log(
+                            logger,
+                            "worker_load_start",
+                            req_id=request.req_id,
+                            tokens=token_count,
+                            layers=getattr(self.lmcache_engine, "num_layers", 0),
+                            dsa_two_groups=dsa_two_groups,
+                            setup_ms=round(
+                                (cold_start_perf_now() - request_perf_started)
+                                * 1000,
+                                3,
+                            ),
+                            rank=getattr(
+                                getattr(self.lmcache_engine, "metadata", None),
+                                "worker_id",
+                                None,
+                            ),
+                        )
 
                     layerwise_retriever = (
                         self.lmcache_engine.retrieve_layer_head_token_wise(
@@ -5507,7 +5556,20 @@ class LMCacheConnectorV1Impl:
                     self._layerwise_retriever_is_sparse.append(True)
                     self._layerwise_sparse_req_ids.append(request.req_id)
                     # NOTE: retrieve layers one by one with cpu prefetch
+                    prime_started = (
+                        cold_start_perf_now() if cold_perf_active else 0.0
+                    )
                     next(layerwise_retriever)
+                    if prime_started:
+                        cold_start_perf_log(
+                            logger,
+                            "prime_group",
+                            started=prime_started,
+                            req_id=request.req_id,
+                            kv_group=0,
+                            tokens=token_count,
+                            prepared=False,
+                        )
 
                     indexer_retriever = None
                     indexer_skipped = False
@@ -5550,6 +5612,11 @@ class LMCacheConnectorV1Impl:
                                     "kvcaches for kv_group=1."
                                 )
                         else:
+                            indexer_setup_started = (
+                                cold_start_perf_now()
+                                if cold_perf_active
+                                else 0.0
+                            )
                             latent_sparse_slots = (
                                 slot_mapping[0]
                                 if isinstance(slot_mapping, list)
@@ -5622,11 +5689,40 @@ class LMCacheConnectorV1Impl:
                                 layerwise_retriever,
                                 indexer_retriever,
                             )
+                            prime_started = (
+                                cold_start_perf_now()
+                                if cold_perf_active
+                                else 0.0
+                            )
                             next(indexer_retriever)
+                            if prime_started:
+                                cold_start_perf_log(
+                                    logger,
+                                    "prime_group",
+                                    started=prime_started,
+                                    req_id=request.req_id,
+                                    kv_group=1,
+                                    tokens=token_count,
+                                    prepared=False,
+                                    setup_ms=round(
+                                        (prime_started - indexer_setup_started)
+                                        * 1000,
+                                        3,
+                                    ),
+                                )
 
                     if indexer_skipped:
                         request.shared_index_skipped = True
                         retrieve_state.clear_group(1)
+                        if cold_perf_active:
+                            cold_start_perf_log(
+                                logger,
+                                "prime_group",
+                                req_id=request.req_id,
+                                kv_group=1,
+                                tokens=token_count,
+                                status="skipped",
+                            )
                     retrieve_location = retrieve_kwargs.get(
                         "cached_retrieve_location"
                     )
@@ -6278,14 +6374,45 @@ class LMCacheConnectorV1Impl:
         ):
             self.current_layer += 1
             if self.current_layer >= self.num_layers:
+                completed_requests = tuple(layerwise_requests)
+                finalize_started = (
+                    cold_start_perf_now()
+                    if any(
+                        request.req_id in self._cold_perf_load_started
+                        for request in completed_requests
+                    )
+                    else 0.0
+                )
                 with self._sparse_retrieve_state_guard(
-                    tuple(layerwise_requests)
+                    completed_requests
                 ):
                     if metadata is None:
                         metadata = self._parent._get_connector_metadata()
                         assert isinstance(metadata, LMCacheConnectorMetadata)
                     self._finalize_worker_retrieve_state_from_metadata(metadata)
                     self._drain_layerwise_retrievers()
+                finalize_ms = (
+                    (cold_start_perf_now() - finalize_started) * 1000
+                    if finalize_started
+                    else 0.0
+                )
+                for request in completed_requests:
+                    perf_state = self._cold_perf_load_started.pop(
+                        request.req_id,
+                        None,
+                    )
+                    if perf_state is None:
+                        continue
+                    request_started, token_count = perf_state
+                    cold_start_perf_log(
+                        logger,
+                        "worker_load_complete",
+                        started=request_started,
+                        req_id=request.req_id,
+                        tokens=token_count,
+                        layers=self.num_layers,
+                        finalize_ms=round(finalize_ms, 3),
+                    )
 
         return
 
@@ -7101,6 +7228,11 @@ class LMCacheConnectorV1Impl:
             return 0
 
         req_id = request.request_id
+        lookup_call_started = (
+            cold_start_perf_now() if cold_start_perf_enabled() else 0.0
+        )
+        if lookup_call_started:
+            self._cold_perf_lookup_started.setdefault(req_id, lookup_call_started)
 
         # lookup_client is always initialized for scheduler role
         assert self.lookup_client is not None
@@ -7153,6 +7285,26 @@ class LMCacheConnectorV1Impl:
                 num_computed_tokens,
             )
             return None
+
+        lookup_started = self._cold_perf_lookup_started.pop(
+            req_id,
+            lookup_call_started,
+        )
+        cold_start_perf_log(
+            logger,
+            "scheduler_lookup",
+            started=lookup_started or None,
+            req_id=req_id,
+            prompt_tokens=request.num_tokens,
+            vllm_cached_tokens=num_computed_tokens,
+            lmcache_cached_tokens=num_external_hit_tokens,
+            lookup_call_ms=round(
+                (cold_start_perf_now() - lookup_call_started) * 1000,
+                3,
+            )
+            if lookup_call_started
+            else 0.0,
+        )
 
         # When prompt length is divisible by the block size and all
         # blocks are cached, we need to recompute the last token.
@@ -7938,6 +8090,7 @@ class LMCacheConnectorV1Impl:
     ) -> tuple[bool, Optional[dict[str, Any]]]:
         # This callback runs in the scheduler process. Worker-owned state is
         # released when the same request ID reaches worker-side get_finished().
+        self._cold_perf_lookup_started.pop(request.request_id, None)
         self._release_request_lookup_pins(request.request_id)
         # Layerwise save uses request-scoped generators. If request finishes
         # without entering wait_for_save (abort/error/evict path), make sure

@@ -12,6 +12,11 @@ import torch
 # First Party
 from lmcache.logging import init_logger
 from lmcache.utils import CacheEngineKey, LayerCacheEngineKey
+from lmcache.v1.cold_start_perf import (
+    cold_start_perf_enabled,
+    cold_start_perf_log,
+    cold_start_perf_now,
+)
 from lmcache.v1.config import LMCacheEngineConfig
 from lmcache.v1.memory_management import MemoryFormat, MemoryObj
 from lmcache.v1.mooncake_layout import mooncake_page_key
@@ -811,10 +816,19 @@ class MooncakestoreConnector(RemoteConnector):
         keys: List[CacheEngineKey],
         page_groups: list[tuple[str, list[int]]],
     ) -> List[Optional[MemoryObj]]:
+        perf_enabled = cold_start_perf_enabled()
+        perf_started = cold_start_perf_now() if perf_enabled else 0.0
         results: List[Optional[MemoryObj]] = [None] * len(keys)
         page_keys = [keys[index] for _, indices in page_groups for index in indices]
+        allocation_started = cold_start_perf_now() if perf_enabled else 0.0
         memory_objs, _, _ = self._allocate_zero_copy_buffers(page_keys)
+        allocation_ms = (
+            (cold_start_perf_now() - allocation_started) * 1000
+            if perf_enabled
+            else 0.0
+        )
 
+        submission_started = cold_start_perf_now() if perf_enabled else 0.0
         submitted_groups: list[tuple[str, list[int], int]] = []
         all_buffer_ptrs: list[list[int]] = []
         all_buffer_sizes: list[list[int]] = []
@@ -834,35 +848,53 @@ class MooncakestoreConnector(RemoteConnector):
             all_buffer_ptrs.append([obj.data_ptr for obj in page_objects])
             all_buffer_sizes.append([obj.get_size() for obj in page_objects])
             offset = end
+        submission_ms = (
+            (cold_start_perf_now() - submission_started) * 1000
+            if perf_enabled
+            else 0.0
+        )
+        transfer_ms = 0.0
+        completed_pages = 0
+        result_status = "empty"
 
         try:
             if not submitted_groups:
                 return results
+            transfer_started = cold_start_perf_now() if perf_enabled else 0.0
             statuses = await asyncio.to_thread(
                 self.store.batch_get_into_multi_buffers,
                 [page_key for page_key, _, _ in submitted_groups],
                 all_buffer_ptrs,
                 all_buffer_sizes,
             )
+            transfer_ms = (
+                (cold_start_perf_now() - transfer_started) * 1000
+                if perf_enabled
+                else 0.0
+            )
+            result_status = "ok"
             for group_index, (page_key, indices, offset) in enumerate(
                 submitted_groups
             ):
                 if group_index >= len(statuses):
+                    result_status = "partial"
                     logger.warning(
                         "Mooncake page get omitted status for page=%s", page_key
                     )
                     continue
                 expected_bytes = sum(all_buffer_sizes[group_index])
-                status = statuses[group_index]
-                if status != expected_bytes:
+                page_status = statuses[group_index]
+                if page_status != expected_bytes:
                     logger.warning(
                         "Mooncake page get failed or was short: page=%s "
                         "status=%s expected_bytes=%d",
                         page_key,
-                        status,
+                        page_status,
                         expected_bytes,
                     )
+                    result_status = "partial"
                     continue
+                completed_pages += 1
                 for position, index in enumerate(indices, start=offset):
                     memory_obj = memory_objs[position]
                     assert memory_obj is not None
@@ -871,12 +903,31 @@ class MooncakestoreConnector(RemoteConnector):
 
             return results
         except Exception as exc:
+            result_status = "error"
             logger.error("Mooncake page-first get failed: %s", exc)
             return results
         finally:
             for memory_obj in memory_objs:
                 if memory_obj is not None and memory_obj.is_valid():
                     memory_obj.ref_count_down()
+            if perf_enabled:
+                cold_start_perf_log(
+                    logger,
+                    "mooncake_page_get",
+                    started=perf_started,
+                    kv_groups=sorted(
+                        {int(getattr(key, "kv_group", 0)) for key in page_keys}
+                    ),
+                    pages=len(page_groups),
+                    submitted_pages=len(submitted_groups),
+                    completed_pages=completed_pages,
+                    buffers=sum(len(indices) for _, indices in page_groups),
+                    bytes=sum(sum(sizes) for sizes in all_buffer_sizes),
+                    allocation_ms=round(allocation_ms, 3),
+                    submission_ms=round(submission_ms, 3),
+                    transfer_ms=round(transfer_ms, 3),
+                    status=result_status,
+                )
 
     async def _batch_get_into(
         self, keys: List[CacheEngineKey]
@@ -884,8 +935,24 @@ class MooncakestoreConnector(RemoteConnector):
         if not getattr(self, "_page_first_multi_buffer", False):
             return await self._batch_get_into_legacy(keys)
 
+        perf_enabled = cold_start_perf_enabled()
+        lookup_started = cold_start_perf_now() if perf_enabled else 0.0
         complete_groups, legacy_indices = self._complete_page_groups(keys)
         if not complete_groups:
+            if perf_enabled:
+                cold_start_perf_log(
+                    logger,
+                    "mooncake_page_lookup",
+                    started=lookup_started,
+                    kv_groups=sorted(
+                        {int(getattr(key, "kv_group", 0)) for key in keys}
+                    ),
+                    keys=len(keys),
+                    complete_pages=0,
+                    found_pages=0,
+                    legacy_keys=len(keys),
+                    status="legacy",
+                )
             return await self._batch_get_into_legacy(keys)
 
         page_exists = await asyncio.to_thread(
@@ -901,6 +968,20 @@ class MooncakestoreConnector(RemoteConnector):
         if len(page_exists) < len(complete_groups):
             for group in complete_groups[len(page_exists) :]:
                 legacy_indices.extend(group[1])
+        if perf_enabled:
+            cold_start_perf_log(
+                logger,
+                "mooncake_page_lookup",
+                started=lookup_started,
+                kv_groups=sorted(
+                    {int(getattr(key, "kv_group", 0)) for key in keys}
+                ),
+                keys=len(keys),
+                complete_pages=len(complete_groups),
+                found_pages=len(page_groups),
+                legacy_keys=len(set(legacy_indices)),
+                status="ok" if not legacy_indices else "partial",
+            )
 
         results = (
             await self._batch_get_pages(keys, page_groups)
@@ -937,14 +1018,22 @@ class MooncakestoreConnector(RemoteConnector):
 
         logger.debug(f"Using batch_get_into for {len(keys)} keys (zero-copy mode)")
 
+        perf_enabled = cold_start_perf_enabled()
+        perf_started = cold_start_perf_now() if perf_enabled else 0.0
         valid_idx: list[int] = []
         key_strs: list[str] = []
         buffer_ptrs: list[int] = []
         buffer_sizes: list[int] = []
 
         single_token_sizes: dict[int, int] = {}
+        allocation_started = cold_start_perf_now() if perf_enabled else 0.0
         memory_objs, key_metadata, allocation_mode = (
             self._allocate_zero_copy_buffers(keys)
+        )
+        allocation_ms = (
+            (cold_start_perf_now() - allocation_started) * 1000
+            if perf_enabled
+            else 0.0
         )
 
         for i, (key, metadata_entry, obj) in enumerate(
@@ -962,13 +1051,35 @@ class MooncakestoreConnector(RemoteConnector):
 
         if not valid_idx:
             logger.warning("Batch-get aborted: unable to allocate any buffers.")
+            if perf_enabled:
+                cold_start_perf_log(
+                    logger,
+                    "mooncake_legacy_get",
+                    started=perf_started,
+                    kv_groups=sorted(
+                        {int(getattr(key, "kv_group", 0)) for key in keys}
+                    ),
+                    keys=len(keys),
+                    valid_buffers=0,
+                    bytes=0,
+                    allocation_mode=allocation_mode,
+                    allocation_ms=round(allocation_ms, 3),
+                    transfer_ms=0.0,
+                    status="no_buffers",
+                )
             return [None] * len(keys)
 
         try:
             # Single RPC call for multiple chunks
             logger.debug(f"Calling batch_get_into with {len(key_strs)} keys")
+            transfer_started = cold_start_perf_now() if perf_enabled else 0.0
             bytes_read_list = await asyncio.to_thread(
                 self.store.batch_get_into, key_strs, buffer_ptrs, buffer_sizes
+            )
+            transfer_ms = (
+                (cold_start_perf_now() - transfer_started) * 1000
+                if perf_enabled
+                else 0.0
             )
             logger.debug(f"batch_get_into returned: {bytes_read_list}")
 
@@ -996,6 +1107,29 @@ class MooncakestoreConnector(RemoteConnector):
             for i in valid_idx[len(bytes_read_list) :]:
                 memory_objs[i].ref_count_down()  # type: ignore
 
+            if perf_enabled:
+                cold_start_perf_log(
+                    logger,
+                    "mooncake_legacy_get",
+                    started=perf_started,
+                    kv_groups=sorted(
+                        {int(getattr(key, "kv_group", 0)) for key in keys}
+                    ),
+                    keys=len(keys),
+                    valid_buffers=len(valid_idx),
+                    bytes=sum(buffer_sizes),
+                    bytes_read=sum(
+                        max(int(value), 0) for value in bytes_read_list
+                    ),
+                    allocation_mode=allocation_mode,
+                    allocation_ms=round(allocation_ms, 3),
+                    transfer_ms=round(transfer_ms, 3),
+                    status=(
+                        "ok"
+                        if all(results[index] is not None for index in valid_idx)
+                        else "partial"
+                    ),
+                )
             return results
 
         except Exception as exc:
@@ -1003,6 +1137,22 @@ class MooncakestoreConnector(RemoteConnector):
             # Release any buffers we successfully allocated
             for i in valid_idx:
                 memory_objs[i].ref_count_down()  # type: ignore
+            if perf_enabled:
+                cold_start_perf_log(
+                    logger,
+                    "mooncake_legacy_get",
+                    started=perf_started,
+                    kv_groups=sorted(
+                        {int(getattr(key, "kv_group", 0)) for key in keys}
+                    ),
+                    keys=len(keys),
+                    valid_buffers=len(valid_idx),
+                    bytes=sum(buffer_sizes),
+                    allocation_mode=allocation_mode,
+                    allocation_ms=round(allocation_ms, 3),
+                    status="error",
+                    error=type(exc).__name__,
+                )
             return [None] * len(keys)
 
     async def _batch_get_buffer(

@@ -42,6 +42,11 @@ from lmcache.utils import (
     compress_slot_mapping,
     convert_tokens_to_list,
 )
+from lmcache.v1.cold_start_perf import (
+    cold_start_perf_enabled,
+    cold_start_perf_log,
+    cold_start_perf_now,
+)
 from lmcache.v1.config import LMCacheEngineConfig
 from lmcache.v1.event_manager import EventManager, EventStatus, EventType
 from lmcache.v1.gpu_connector.gpu_connectors import GPUConnectorInterface
@@ -974,9 +979,26 @@ class LMCacheEngine:
         )
 
     def _broadcast_shared_envelope(self, envelope: SharedHandleEnvelope) -> None:
+        perf_enabled = cold_start_perf_enabled()
+        started = cold_start_perf_now() if perf_enabled else None
         self.broadcast_object_fn(envelope.to_dict(), self.metadata.first_rank)
+        if perf_enabled:
+            cold_start_perf_log(
+                logger,
+                "shared_handle_broadcast",
+                started=started,
+                req_id=envelope.request_id,
+                phase=envelope.phase,
+                kv_group=envelope.kv_group,
+                layer=envelope.layer_id,
+                handles=len(envelope.handles),
+                status=envelope.status,
+                rank=self.metadata.worker_id,
+            )
 
     def _receive_shared_envelope(self) -> SharedHandleEnvelope:
+        perf_enabled = cold_start_perf_enabled()
+        started = cold_start_perf_now() if perf_enabled else None
         raw = self.broadcast_object_fn(None, self.metadata.first_rank)
         if not isinstance(raw, dict):
             raise ValueError(
@@ -984,12 +1006,26 @@ class LMCacheEngine:
                 f"got {type(raw)!r}"
             )
         try:
-            return SharedHandleEnvelope.from_dict(raw)
+            envelope = SharedHandleEnvelope.from_dict(raw)
         except Exception as exc:
             raise ValueError(
                 "Shared CPU cache received corrupt envelope before view "
                 f"creation: error={exc}, raw={raw!r}"
             ) from exc
+        if perf_enabled:
+            cold_start_perf_log(
+                logger,
+                "shared_handle_receive",
+                started=started,
+                req_id=envelope.request_id,
+                phase=envelope.phase,
+                kv_group=envelope.kv_group,
+                layer=envelope.layer_id,
+                handles=len(envelope.handles),
+                status=envelope.status,
+                rank=self.metadata.worker_id,
+            )
+        return envelope
 
     def _validate_shared_layerwise_envelope(
         self,
@@ -1075,6 +1111,8 @@ class LMCacheEngine:
         chunk_index_base: int = 0,
         validate_memory_objs: bool = True,
     ) -> list[SharedChunkHandle]:
+        perf_enabled = cold_start_perf_enabled()
+        started = cold_start_perf_now() if perf_enabled else None
         if self.shared_cpu_cache_name is None:
             raise ValueError("Shared CPU cache name is not initialized")
         if len(keys_layer) != len(mem_objs_layer):
@@ -1111,6 +1149,19 @@ class LMCacheEngine:
                     generation=self.shared_cpu_cache_generation,
                     producer_rank=self.metadata.worker_id,
                 )
+            )
+        if perf_enabled:
+            cold_start_perf_log(
+                logger,
+                "shared_handle_build",
+                started=started,
+                req_id=req_id,
+                phase=phase,
+                kv_group=kv_group,
+                layer=layer_id,
+                handles=len(handles),
+                validate=validate_memory_objs,
+                rank=self.metadata.worker_id,
             )
         return handles
 
@@ -2247,13 +2298,25 @@ class LMCacheEngine:
         )
         if not callable(timing_hook):
             timing_hook = None
+        perf_enabled = cold_start_perf_enabled()
+        perf_started = cold_start_perf_now() if perf_enabled else 0.0
+        stage_times: dict[str, float] = defaultdict(float)
 
         def start_stage() -> float:
-            return time.perf_counter() if timing_hook is not None else 0.0
+            return (
+                time.perf_counter()
+                if timing_hook is not None or perf_enabled
+                else 0.0
+            )
 
         def finish_stage(stage: str, started: float) -> None:
+            if not started:
+                return
+            elapsed = time.perf_counter() - started
             if timing_hook is not None:
-                timing_hook(stage, time.perf_counter() - started)
+                timing_hook(stage, elapsed)
+            if perf_enabled:
+                stage_times[stage] += elapsed
 
         started = start_stage()
         windows: list[
@@ -2280,10 +2343,12 @@ class LMCacheEngine:
                 coordinates,
                 fetch_keys,
             ) in windows:
+                started = start_stage()
                 fetched = self.storage_manager.batched_get(
                     fetch_keys,
                     location="RemoteBackend",
                 )
+                finish_stage("remote_get", started)
                 started = start_stage()
                 if len(fetched) != len(fetch_keys):
                     for fetched_obj in fetched:
@@ -2425,8 +2490,28 @@ class LMCacheEngine:
                         if fetched_obj is not None:
                             fetched_obj.ref_count_down()
 
+            if perf_enabled:
+                cold_start_perf_log(
+                    logger,
+                    "remote_resolver",
+                    started=perf_started,
+                    req_id=req_id,
+                    phase=phase,
+                    kv_group=kv_group,
+                    layers=len(keys_layer_major),
+                    chunks=(
+                        len(keys_layer_major[0]) if keys_layer_major else 0
+                    ),
+                    objects=sum(len(layer) for layer in resolved_layers),
+                    windows=len(windows),
+                    status="ok",
+                    **{
+                        f"{stage}_ms": round(elapsed * 1000, 3)
+                        for stage, elapsed in stage_times.items()
+                    },
+                )
             return resolved_layers
-        except Exception:
+        except Exception as exc:
             started = start_stage()
             for mem_obj in reversed(pinned):
                 if mem_obj.is_pinned:
@@ -2435,6 +2520,26 @@ class LMCacheEngine:
                 if mem_obj.is_valid():
                     mem_obj.ref_count_down()
             finish_stage("rollback", started)
+            if perf_enabled:
+                cold_start_perf_log(
+                    logger,
+                    "remote_resolver",
+                    started=perf_started,
+                    req_id=req_id,
+                    phase=phase,
+                    kv_group=kv_group,
+                    layers=len(keys_layer_major),
+                    chunks=(
+                        len(keys_layer_major[0]) if keys_layer_major else 0
+                    ),
+                    windows=len(windows),
+                    status="error",
+                    error=type(exc).__name__,
+                    **{
+                        f"{stage}_ms": round(elapsed * 1000, 3)
+                        for stage, elapsed in stage_times.items()
+                    },
+                )
             raise
 
     @staticmethod
