@@ -603,6 +603,47 @@ def test_tensor_memory_obj_pin_monitor_integration():
     assert pin_monitor.get_monitored_count() == initial_count  # Fully unregistered
 
 
+def test_tensor_memory_obj_batch_pin_is_transactional(monkeypatch):
+    allocator = TensorMemoryAllocator(torch.empty(16384, dtype=torch.uint8))
+    memory_objs = allocator.batched_allocate(
+        torch.Size([16]),
+        torch.float32,
+        3,
+    )
+    assert memory_objs is not None
+
+    registered = []
+    monitor = type(
+        "_Monitor",
+        (),
+        {
+            "on_pin_many": lambda _self, objs: registered.append(tuple(objs)),
+            "on_unpin": lambda _self, _obj: None,
+        },
+    )()
+    monkeypatch.setattr(PinMonitor, "GetOrCreate", lambda _config=None: monitor)
+    initial_pinned = TensorMemoryObj.monitor.pinned_memory_objs_count
+
+    TensorMemoryObj.pin_many(memory_objs)
+    assert len(registered) == 1
+    assert {id(obj) for obj in registered[0]} == {id(obj) for obj in memory_objs}
+    assert all(obj.metadata.pin_count == 1 for obj in memory_objs)
+
+    for obj in memory_objs:
+        obj.unpin()
+
+    monitor.on_pin_many = lambda _objs: (_ for _ in ()).throw(
+        RuntimeError("registration failed")
+    )
+    with pytest.raises(RuntimeError, match="registration failed"):
+        TensorMemoryObj.pin_many(memory_objs)
+    assert all(obj.metadata.pin_count == 0 for obj in memory_objs)
+    assert TensorMemoryObj.monitor.pinned_memory_objs_count == initial_pinned
+
+    for obj in memory_objs:
+        obj.ref_count_down()
+
+
 # =============================================================================
 # LazyMemoryAllocator Tests
 # =============================================================================

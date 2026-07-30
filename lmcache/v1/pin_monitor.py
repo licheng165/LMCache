@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # Standard
 from contextlib import nullcontext
-from typing import TYPE_CHECKING, Optional
+from typing import TYPE_CHECKING, Optional, Sequence
 import threading
 import time
 
@@ -93,6 +93,18 @@ class PinMonitor(PeriodicThread):
                 "Registered pinned object %s for timeout monitoring at time %.2f",
                 obj_id,
                 current_time,
+            )
+
+    def on_pin_many(self, memory_objs: Sequence["MemoryObj"]):
+        """Register a batch with one timestamp and one monitor lock."""
+        with self._objects_lock:
+            current_time = time.time()
+            self._pinned_objects.update(
+                (id(obj), (obj, current_time)) for obj in memory_objs
+            )
+            logger.debug(
+                "Registered %d pinned objects for timeout monitoring",
+                len(memory_objs),
             )
 
     def on_unpin(self, memory_obj: "MemoryObj"):

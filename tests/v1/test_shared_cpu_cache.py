@@ -1740,7 +1740,7 @@ def test_rank0_windowed_remote_resolver_uses_cached_slab_context(monkeypatch):
         ]
         for layer in range(3)
     ]
-    root_allocator = TensorMemoryAllocator(torch.empty(4096, dtype=torch.uint8))
+    root_allocator = TensorMemoryAllocator(torch.empty(32768, dtype=torch.uint8))
     objects = root_allocator.batched_allocate(
         torch.Size([8]),
         torch.float16,
@@ -1759,7 +1759,12 @@ def test_rank0_windowed_remote_resolver_uses_cached_slab_context(monkeypatch):
     fallback_key = keys_layer_major[1][0]
     foreign_obj = _FakeResolvableMemoryObj()
     fetched_by_key[fallback_key] = foreign_obj
-    monitor = SimpleNamespace(on_pin=lambda _obj: None, on_unpin=lambda _obj: None)
+    batch_pins = []
+    monitor = SimpleNamespace(
+        on_pin=lambda _obj: None,
+        on_pin_many=lambda objs: batch_pins.append(tuple(objs)),
+        on_unpin=lambda _obj: None,
+    )
     monkeypatch.setattr(PinMonitor, "GetOrCreate", lambda _config=None: monitor)
     engine = object.__new__(LMCacheEngine)
     engine.storage_manager = SimpleNamespace(
@@ -1802,13 +1807,14 @@ def test_rank0_windowed_remote_resolver_uses_cached_slab_context(monkeypatch):
         for layer_keys in keys_layer_major
     ]
     assert all(obj.is_pinned for obj in objects)
+    assert len(batch_pins) == 1
+    assert {id(obj) for obj in batch_pins[0]} == {id(obj) for obj in objects}
     assert foreign_obj.ref_count_down_count == 1
     assert stages == [
         "windows",
         "results",
         "classification",
         "pinning",
-        "validation",
         "scatter",
     ]
     for obj in objects:
@@ -1818,7 +1824,7 @@ def test_rank0_windowed_remote_resolver_uses_cached_slab_context(monkeypatch):
 
 def test_rank0_windowed_cached_context_validation_failure_rolls_back(monkeypatch):
     keys = [[_make_key(), replace(_make_key(), chunk_hash=0x601)]]
-    root_allocator = TensorMemoryAllocator(torch.empty(4096, dtype=torch.uint8))
+    root_allocator = TensorMemoryAllocator(torch.empty(8192, dtype=torch.uint8))
     valid = root_allocator.allocate(
         torch.Size([8]),
         torch.float16,
@@ -1831,7 +1837,12 @@ def test_rank0_windowed_cached_context_validation_failure_rolls_back(monkeypatch
     )
     assert valid is not None and invalid is not None
     objects = [valid, invalid]
-    monitor = SimpleNamespace(on_pin=lambda _obj: None, on_unpin=lambda _obj: None)
+    batch_pins = []
+    monitor = SimpleNamespace(
+        on_pin=lambda _obj: None,
+        on_pin_many=lambda objs: batch_pins.append(tuple(objs)),
+        on_unpin=lambda _obj: None,
+    )
     monkeypatch.setattr(PinMonitor, "GetOrCreate", lambda _config=None: monitor)
     engine = object.__new__(LMCacheEngine)
     engine.storage_manager = SimpleNamespace(
@@ -1865,6 +1876,7 @@ def test_rank0_windowed_cached_context_validation_failure_rolls_back(monkeypatch
         )
 
     assert all(not obj.is_pinned and not obj.is_valid() for obj in objects)
+    assert batch_pins == []
     assert stages[-1] == "rollback"
 
 
@@ -1892,6 +1904,37 @@ def test_rank0_windowed_failed_pin_rolls_back_all_objects():
 
     assert all(not obj.is_pinned for obj in objects)
     assert all(obj.ref_count_down_count == 1 for obj in objects)
+
+
+def test_rank0_windowed_fallback_verifies_successful_pin():
+    class _NoopPinMemoryObj(_FakeResolvableMemoryObj):
+        def pin(self):
+            return True
+
+    memory_obj = _NoopPinMemoryObj()
+    engine = object.__new__(LMCacheEngine)
+    engine.storage_manager = SimpleNamespace(
+        batched_get=lambda _keys, location=None: [memory_obj]
+    )
+    engine._is_rank0_shared_mem_obj = lambda _obj: True
+
+    def validate(mem_obj, *_args, _require_pinned=True, **_kwargs):
+        if _require_pinned and not mem_obj.is_pinned:
+            raise ValueError("must be pinned")
+
+    engine._validate_rank0_shared_mem_obj = validate
+
+    with pytest.raises(ValueError, match="must be pinned"):
+        engine._resolve_shared_rank0_remote_layers_windowed(
+            req_id="req-1",
+            phase="sparse_decode_bootstrap",
+            kv_group=0,
+            keys_layer_major=[[_make_key()]],
+            layers_per_batch=1,
+        )
+
+    assert not memory_obj.is_pinned
+    assert memory_obj.ref_count_down_count == 1
 
 
 def test_rank0_resolver_releases_prefetched_hits_on_alignment_error():

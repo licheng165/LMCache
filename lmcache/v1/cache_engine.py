@@ -1914,6 +1914,7 @@ class LMCacheEngine:
         chunk_index: int,
         _context: Optional[_SharedRank0ObjectContext] = None,
         _metadata: Optional[MemoryObjMetadata] = None,
+        _require_pinned: bool = True,
     ) -> None:
         context = _context or self._shared_rank0_object_context(kv_group)
         if context is None:
@@ -1960,11 +1961,16 @@ class LMCacheEngine:
         physical_size = int(metadata.phy_size)
         logical_size = int(mem_obj.get_size())
         if (
-            offset < 0
-            or physical_size <= 0
-            or logical_size <= 0
+            logical_size <= 0
             or logical_size > physical_size
-            or offset + physical_size > context.slab_size
+            or (
+                _metadata is None
+                and (
+                    offset < 0
+                    or physical_size <= 0
+                    or offset + physical_size > context.slab_size
+                )
+            )
         ):
             raise ValueError(
                 "Shared CPU cache object has invalid slab bounds: "
@@ -1973,7 +1979,7 @@ class LMCacheEngine:
                 f"offset={offset}, logical_size={logical_size}, "
                 f"physical_size={physical_size}, slab_size={context.slab_size}"
             )
-        if metadata.pin_count <= 0:
+        if _require_pinned and metadata.pin_count <= 0:
             raise ValueError(
                 "Shared CPU cache object must be pinned before handle publication: "
                 f"request_id={req_id}, phase={phase}, layer_id={layer_id}, "
@@ -2350,25 +2356,6 @@ class LMCacheEngine:
                                 )
 
                         acquired.append(mem_obj)
-                        window_objects.append(
-                            (layer_id, chunk_index, mem_obj, metadata)
-                        )
-                    finish_stage("classification", started)
-
-                    started = start_stage()
-                    for layer_id, chunk_index, mem_obj, _metadata in window_objects:
-                        if mem_obj.pin() is False:
-                            raise ValueError(
-                                "Shared CPU cache failed to pin a resolved object: "
-                                f"request_id={req_id}, phase={phase}, "
-                                f"layer_id={layer_id}, kv_group={kv_group}, "
-                                f"chunk_index={chunk_index}"
-                            )
-                        pinned.append(mem_obj)
-                    finish_stage("pinning", started)
-
-                    started = start_stage()
-                    for layer_id, chunk_index, mem_obj, metadata in window_objects:
                         self._validate_rank0_shared_mem_obj(
                             mem_obj,
                             req_id=req_id,
@@ -2378,8 +2365,42 @@ class LMCacheEngine:
                             chunk_index=chunk_index,
                             _context=context,
                             _metadata=metadata,
+                            _require_pinned=False,
                         )
-                    finish_stage("validation", started)
+                        window_objects.append(
+                            (layer_id, chunk_index, mem_obj, metadata)
+                        )
+                    finish_stage("classification", started)
+
+                    started = start_stage()
+                    window_mem_objs = [item[2] for item in window_objects]
+                    if all(
+                        type(mem_obj) is TensorMemoryObj
+                        for mem_obj in window_mem_objs
+                    ):
+                        TensorMemoryObj.pin_many(window_mem_objs)
+                        pinned.extend(window_mem_objs)
+                    else:
+                        for layer_id, chunk_index, mem_obj, metadata in window_objects:
+                            if mem_obj.pin() is False:
+                                raise ValueError(
+                                    "Shared CPU cache failed to pin a resolved object: "
+                                    f"request_id={req_id}, phase={phase}, "
+                                    f"layer_id={layer_id}, kv_group={kv_group}, "
+                                    f"chunk_index={chunk_index}"
+                                )
+                            pinned.append(mem_obj)
+                            self._validate_rank0_shared_mem_obj(
+                                mem_obj,
+                                req_id=req_id,
+                                phase=phase,
+                                layer_id=layer_id,
+                                kv_group=kv_group,
+                                chunk_index=chunk_index,
+                                _context=context,
+                                _metadata=metadata,
+                            )
+                    finish_stage("pinning", started)
 
                     started = start_stage()
                     for layer_id, _chunk_index, mem_obj, _metadata in window_objects:

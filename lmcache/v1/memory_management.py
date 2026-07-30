@@ -620,6 +620,39 @@ class TensorMemoryObj(MemoryObj):
             pin_monitor.on_pin(self)
             return True
 
+    @classmethod
+    def pin_many(cls, memory_objs: list["TensorMemoryObj"]) -> bool:
+        """Pin a homogeneous batch with one monitor update."""
+        if not memory_objs:
+            return True
+
+        unique = sorted({id(obj): obj for obj in memory_objs}.values(), key=id)
+        locked: list[TensorMemoryObj] = []
+        newly_pinned = 0
+        stats_updated = False
+        try:
+            for obj in unique:
+                obj.lock.acquire()
+                locked.append(obj)
+            newly_pinned = sum(obj.meta.pin_count == 0 for obj in unique)
+            for obj in memory_objs:
+                obj.meta.pin_count += 1
+            try:
+                if newly_pinned:
+                    cls.monitor.update_pinned_memory_objs_count(newly_pinned)
+                    stats_updated = True
+                PinMonitor.GetOrCreate().on_pin_many(unique)
+            except Exception:
+                for obj in memory_objs:
+                    obj.meta.pin_count -= 1
+                if stats_updated:
+                    cls.monitor.update_pinned_memory_objs_count(-newly_pinned)
+                raise
+            return True
+        finally:
+            for obj in reversed(locked):
+                obj.lock.release()
+
     def unpin(self) -> bool:
         with self.lock:
             self.meta.pin_count -= 1
