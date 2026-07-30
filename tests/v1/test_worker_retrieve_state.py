@@ -162,6 +162,59 @@ class TestWorkerRetrieveState:
         assert state.cached_memory_objs_indexer == []
         assert set(state.prepared_sparse_sources) == {0}
 
+    def test_dense_prefix_seed_trims_partial_tail_for_sparse(self) -> None:
+        class MemoryObj:
+            def __init__(self):
+                self.released = 0
+
+            def is_valid(self):
+                return self.released == 0
+
+            def ref_count_down(self):
+                self.released += 1
+
+        impl = _make_impl()
+        impl.config = SimpleNamespace(dsa_two_groups=True)
+        impl.lmcache_engine = _make_shared_engine(rank0=False)
+        latent = [[MemoryObj(), MemoryObj()]]
+        indexer = [[MemoryObj(), MemoryObj()]]
+        latent_tail = latent[0][1]
+        indexer_tail = indexer[0][1]
+        state = WorkerRetrieveState(
+            req_id="req-1",
+            cached_keys=[["lk0", "lk1"]],
+            cached_starts=[0, 256],
+            cached_ends=[256, 300],
+            cached_memory_objs=latent,
+            cached_shared_handles=[["lh0", "lh1"]],
+            cached_keys_indexer=[["ik0", "ik1"]],
+            cached_starts_indexer=[0, 256],
+            cached_ends_indexer=[256, 300],
+            cached_memory_objs_indexer=indexer,
+            cached_shared_handles_indexer=[["ih0", "ih1"]],
+            dense_prefix_seed=True,
+            metadata_warm=True,
+            token_count=300,
+        )
+        impl.lmcache_engine.register_shared_cpu_sparse_request(
+            state.req_id,
+            owned_groups={0: latent, 1: indexer},
+        )
+
+        assert impl._trim_dense_prefix_seed_for_sparse(state, 256)
+        assert state.token_count == 256
+        assert state.cached_ends == [256]
+        assert state.cached_ends_indexer == [256]
+        assert state.cached_shared_handles == [["lh0"]]
+        assert state.cached_shared_handles_indexer == [["ih0"]]
+        assert latent[0][0].released == 0
+        assert indexer[0][0].released == 0
+        assert latent_tail.released == 1
+        assert indexer_tail.released == 1
+        assert impl.lmcache_engine._shared_cpu_request_leases[
+            "req-1"
+        ].object_ids() == {id(latent[0][0]), id(indexer[0][0])}
+
     def test_deep_retrieve_state_requires_both_gates_and_is_bounded_once(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:

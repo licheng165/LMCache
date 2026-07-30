@@ -97,6 +97,7 @@ LayerwiseRetrieveSegment = Tuple[
     List[int],
     List[List[CacheEngineKey]],
 ]
+_SHARED_CPU_CHUNK_PLAN_KEY = "_shared_cpu_chunk_hash_plan"
 
 
 @dataclass
@@ -2562,6 +2563,117 @@ class LMCacheEngine:
             if mem_obj.is_valid():
                 mem_obj.ref_count_down()
 
+    def _dense_retrieve_token_results(
+        self,
+        tokens: Union[torch.Tensor, list[int]],
+        mask: Optional[torch.Tensor],
+        request_configs: Optional[dict],
+        kv_group: int,
+        kwargs: dict[str, Any],
+    ) -> Iterable[tuple[int, int, CacheEngineKey]]:
+        """Reuse group-0 prefix hashes when constructing group-1 keys."""
+        state = kwargs.get("shared_cpu_request_preflight_state")
+        plan = (
+            state.get(_SHARED_CPU_CHUNK_PLAN_KEY)
+            if kv_group == 1 and isinstance(state, dict)
+            else None
+        )
+        if plan is not None:
+            generated = self.token_database.process_tokens(
+                hashes=[entry[2] for entry in plan],
+                offsets=[entry[1] - entry[0] for entry in plan],
+                request_configs=request_configs,
+                kv_group=kv_group,
+            )
+            return (
+                (start, end, key)
+                for (start, end, _), (_, _, key) in zip(
+                    plan, generated, strict=True
+                )
+            )
+
+        results = self.token_database.process_tokens(
+            tokens=tokens,
+            mask=mask,
+            request_configs=request_configs,
+            kv_group=kv_group,
+        )
+        if kv_group != 0 or not isinstance(state, dict):
+            return results
+
+        def record_plan():
+            plan = []
+            for start, end, key in results:
+                plan.append((start, end, key.chunk_hash))
+                yield start, end, key
+            state[_SHARED_CPU_CHUNK_PLAN_KEY] = tuple(plan)
+
+        return record_plan()
+
+    def _adopt_dense_shared_retrieve_cache(
+        self,
+        *,
+        req_id: str,
+        starts: list[int],
+        ends: list[int],
+        keys_layer_major: list[list[CacheEngineKey]],
+        memory_objs: list[list[MemoryObj]],
+        handles: list[list[SharedChunkHandle]],
+        kv_group: int,
+        kwargs: dict[str, Any],
+    ) -> bool:
+        """Move a completed dense retrieve directly into sparse request state."""
+        if not req_id or not kwargs.get("_retain_shared_dense_cache"):
+            return False
+        caches = {
+            name: kwargs.get(name)
+            for name in (
+                "cached_keys",
+                "cached_starts",
+                "cached_ends",
+                "cached_memory_objs",
+                "cached_shared_handles",
+            )
+        }
+        if any(value is None for value in caches.values()):
+            raise ValueError("Dense shared cache retention requires mutable caches.")
+        if (
+            caches["cached_starts"]
+            or caches["cached_ends"]
+            or any(caches["cached_keys"])
+            or any(caches["cached_memory_objs"])
+            or any(caches["cached_shared_handles"])
+        ):
+            raise ValueError("Dense shared cache retention target is not empty.")
+        chunks = len(starts)
+        layers = (keys_layer_major, memory_objs, handles)
+        if (
+            len(ends) != chunks
+            or any(len(values) != self.num_layers for values in layers)
+            or any(len(layer) != chunks for values in layers for layer in values)
+        ):
+            return False
+
+        try:
+            caches["cached_starts"][:] = starts
+            caches["cached_ends"][:] = ends
+            caches["cached_keys"][:] = [list(layer) for layer in keys_layer_major]
+            caches["cached_memory_objs"][:] = [
+                list(layer) for layer in memory_objs
+            ]
+            caches["cached_shared_handles"][:] = [
+                list(layer) for layer in handles
+            ]
+            self.register_shared_cpu_sparse_request(
+                req_id,
+                owned_groups={kv_group: memory_objs},
+            )
+        except Exception:
+            for cache in caches.values():
+                cache.clear()
+            raise
+        return True
+
     def _retrieve_layer_shared_rank0(
         self,
         *,
@@ -2607,6 +2719,8 @@ class LMCacheEngine:
         next(mem_obj_consumer)
 
         to_release: list[MemoryObj] = []
+        resolved_layers: list[list[MemoryObj]] = []
+        handles_by_layer: list[list[SharedChunkHandle]] = []
         page_first_remote = (
             location == "RemoteBackend"
             and mooncake_page_layout_enabled(getattr(self, "config", None))
@@ -2663,6 +2777,7 @@ class LMCacheEngine:
                     raise
                 if pre_resolved_layers is None:
                     to_release.extend(mem_objs_layer)
+                resolved_layers.append(mem_objs_layer)
 
                 handles = self._make_shared_handles_for_layer(
                     req_id=req_id,
@@ -2673,6 +2788,7 @@ class LMCacheEngine:
                     kv_group=kv_group,
                     validate_memory_objs=False,
                 )
+                handles_by_layer.append(handles)
                 self._broadcast_shared_envelope(
                     SharedHandleEnvelope(
                         request_id=req_id,
@@ -2696,6 +2812,17 @@ class LMCacheEngine:
             next(mem_obj_consumer)
             self._close_shared_retrieve_consumer(mem_obj_consumer)
             mem_obj_consumer = None
+            if self._adopt_dense_shared_retrieve_cache(
+                req_id=req_id,
+                starts=starts,
+                ends=ends,
+                keys_layer_major=keys_layer_major,
+                memory_objs=resolved_layers,
+                handles=handles_by_layer,
+                kv_group=kv_group,
+                kwargs=kwargs,
+            ):
+                to_release.clear()
             retrieved_tokens = torch.sum(ret_mask)
             self.stats_monitor.on_retrieve_finished(
                 monitor_req_id,
@@ -2742,6 +2869,8 @@ class LMCacheEngine:
         assert_layerwise_gpu_connector(self.gpu_connector)
         mem_obj_consumer = None
         to_release: list[MemoryObj] = []
+        resolved_layers: list[list[MemoryObj]] = []
+        handles_by_layer: list[list[SharedChunkHandle]] = []
         expected_handle_count: Optional[int] = None
 
         try:
@@ -2811,6 +2940,8 @@ class LMCacheEngine:
                     )
                     mem_objs_layer.append(mem_obj)
                     to_release.append(mem_obj)
+                resolved_layers.append(mem_objs_layer)
+                handles_by_layer.append(envelope.handles)
 
                 if layer_id == 0:
                     yield torch.sum(ret_mask)
@@ -2824,6 +2955,17 @@ class LMCacheEngine:
                 next(mem_obj_consumer)
                 self._close_shared_retrieve_consumer(mem_obj_consumer)
                 mem_obj_consumer = None
+            if resolved_layers and self._adopt_dense_shared_retrieve_cache(
+                req_id=req_id,
+                starts=starts,
+                ends=ends,
+                keys_layer_major=keys_layer_major,
+                memory_objs=resolved_layers,
+                handles=handles_by_layer,
+                kv_group=kv_group,
+                kwargs=kwargs,
+            ):
+                to_release.clear()
 
             retrieved_tokens = torch.sum(ret_mask)
             self.stats_monitor.on_retrieve_finished(monitor_req_id, retrieved_tokens)
@@ -3747,11 +3889,12 @@ class LMCacheEngine:
             assert isinstance(request_configs, dict)
 
         if shared_layerwise_retrieve and self._is_passive():
-            for start, end, key in self.token_database.process_tokens(
-                tokens=tokens,
-                mask=mask,
-                request_configs=request_configs,
-                kv_group=kv_group,
+            for start, end, key in self._dense_retrieve_token_results(
+                tokens,
+                mask,
+                request_configs,
+                kv_group,
+                kwargs,
             ):
                 assert isinstance(key, CacheEngineKey)
                 starts.append(start)
@@ -3778,11 +3921,12 @@ class LMCacheEngine:
             missing_shared_chunks: list[dict[str, Any]] = []
             phase = kwargs.get("shared_cpu_phase", "dense_prefix")
             request_ordinal = int(kwargs.get("shared_cpu_request_ordinal", 0))
-            for start, end, key in self.token_database.process_tokens(
-                tokens=tokens,
-                mask=mask,
-                request_configs=request_configs,
-                kv_group=kv_group,
+            for start, end, key in self._dense_retrieve_token_results(
+                tokens,
+                mask,
+                request_configs,
+                kv_group,
+                kwargs,
             ):
                 assert isinstance(key, CacheEngineKey)
 
@@ -3879,11 +4023,12 @@ class LMCacheEngine:
                 kwargs=kwargs,
             )
             return
-        for start, end, key in self.token_database.process_tokens(
-            tokens=tokens,
-            mask=mask,
-            request_configs=request_configs,
-            kv_group=kv_group,
+        for start, end, key in self._dense_retrieve_token_results(
+            tokens,
+            mask,
+            request_configs,
+            kv_group,
+            kwargs,
         ):
             assert isinstance(key, CacheEngineKey)
 
