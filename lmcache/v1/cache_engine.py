@@ -2836,6 +2836,8 @@ class LMCacheEngine:
         )
         pre_resolved_layers: Optional[list[list[MemoryObj]]] = None
         compact_batch: Optional[SharedHandleBatch] = None
+        perf_enabled = cold_start_perf_enabled()
+        consume_started = consumer_send_s = consumer_finish_s = 0.0
         try:
             for layer_id in range(self.num_layers):
                 try:
@@ -2935,16 +2937,24 @@ class LMCacheEngine:
                         )
                     )
 
+                if perf_enabled and not consume_started:
+                    consume_started = cold_start_perf_now()
                 if layer_id == 0:
                     yield torch.sum(ret_mask)
                 else:
                     yield None
 
+                send_started = cold_start_perf_now() if perf_enabled else 0.0
                 mem_obj_consumer.send(mem_objs_layer)
+                if send_started:
+                    consumer_send_s += cold_start_perf_now() - send_started
 
+            finish_started = cold_start_perf_now() if perf_enabled else 0.0
             next(mem_obj_consumer)
             self._close_shared_retrieve_consumer(mem_obj_consumer)
             mem_obj_consumer = None
+            if finish_started:
+                consumer_finish_s += cold_start_perf_now() - finish_started
             if self._adopt_dense_shared_retrieve_cache(
                 req_id=req_id,
                 starts=starts,
@@ -2967,6 +2977,32 @@ class LMCacheEngine:
                 kv_group,
                 retrieved_tokens,
             )
+            if consume_started:
+                elapsed_s = cold_start_perf_now() - consume_started
+                cold_start_perf_log(
+                    logger,
+                    "dense_shared_consume",
+                    started=consume_started,
+                    req_id=req_id,
+                    phase=phase,
+                    kv_group=kv_group,
+                    rank=self.metadata.worker_id,
+                    role="rank0",
+                    layers=len(resolved_layers),
+                    objects=sum(map(len, resolved_layers)),
+                    compact=compact_batch is not None,
+                    view_build_ms=0.0,
+                    consumer_send_ms=round(consumer_send_s * 1000, 3),
+                    consumer_final_wait_ms=round(consumer_finish_s * 1000, 3),
+                    suspended_or_other_ms=round(
+                        max(
+                            elapsed_s - consumer_send_s - consumer_finish_s,
+                            0.0,
+                        )
+                        * 1000,
+                        3,
+                    ),
+                )
             yield None
             # Keep request-owned shared objects through the final layer wait,
             # but release them before the result yield can remain suspended.
@@ -3006,12 +3042,16 @@ class LMCacheEngine:
         handles_by_layer: list[list[Any]] = []
         expected_handle_count: Optional[int] = None
         compact_batch: Optional[SharedHandleBatch] = None
+        perf_enabled = cold_start_perf_enabled()
+        consume_started = view_build_s = consumer_send_s = consumer_finish_s = 0.0
 
         try:
             for layer_id in range(self.num_layers):
                 envelope = None
                 if compact_batch is None:
                     envelope = self._receive_shared_envelope()
+                    if perf_enabled and not consume_started:
+                        consume_started = cold_start_perf_now()
                     self._validate_shared_layerwise_envelope(
                         envelope,
                         req_id=req_id,
@@ -3086,6 +3126,7 @@ class LMCacheEngine:
                     if compact_batch is not None
                     else envelope.handles  # type: ignore[union-attr]
                 )
+                view_started = cold_start_perf_now() if perf_enabled else 0.0
                 for chunk_index, handle in enumerate(layer_handles):
                     expected_shape, expected_dtype, expected_fmt = (
                         self._expected_shared_cpu_chunk_metadata(
@@ -3127,6 +3168,8 @@ class LMCacheEngine:
                     )
                     mem_objs_layer.append(mem_obj)
                     to_release.append(mem_obj)
+                if view_started:
+                    view_build_s += cold_start_perf_now() - view_started
                 resolved_layers.append(mem_objs_layer)
                 handles_by_layer.append(layer_handles)
 
@@ -3136,12 +3179,18 @@ class LMCacheEngine:
                     yield None
 
                 assert mem_obj_consumer is not None
+                send_started = cold_start_perf_now() if perf_enabled else 0.0
                 mem_obj_consumer.send(mem_objs_layer)
+                if send_started:
+                    consumer_send_s += cold_start_perf_now() - send_started
 
             if mem_obj_consumer is not None:
+                finish_started = cold_start_perf_now() if perf_enabled else 0.0
                 next(mem_obj_consumer)
                 self._close_shared_retrieve_consumer(mem_obj_consumer)
                 mem_obj_consumer = None
+                if finish_started:
+                    consumer_finish_s += cold_start_perf_now() - finish_started
             if resolved_layers and self._adopt_dense_shared_retrieve_cache(
                 req_id=req_id,
                 starts=starts,
@@ -3162,6 +3211,29 @@ class LMCacheEngine:
                 kv_group,
                 retrieved_tokens,
             )
+            if consume_started and resolved_layers:
+                elapsed_s = cold_start_perf_now() - consume_started
+                active_s = view_build_s + consumer_send_s + consumer_finish_s
+                cold_start_perf_log(
+                    logger,
+                    "dense_shared_consume",
+                    started=consume_started,
+                    req_id=req_id,
+                    phase=phase,
+                    kv_group=kv_group,
+                    rank=self.metadata.worker_id,
+                    role="passive",
+                    layers=len(resolved_layers),
+                    objects=sum(map(len, resolved_layers)),
+                    compact=compact_batch is not None,
+                    view_build_ms=round(view_build_s * 1000, 3),
+                    consumer_send_ms=round(consumer_send_s * 1000, 3),
+                    consumer_final_wait_ms=round(consumer_finish_s * 1000, 3),
+                    suspended_or_other_ms=round(
+                        max(elapsed_s - active_s, 0.0) * 1000,
+                        3,
+                    ),
+                )
             yield None
             # Keep request-owned shared objects through the final layer wait,
             # but release them before the result yield can remain suspended.
