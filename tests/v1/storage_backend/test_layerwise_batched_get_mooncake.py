@@ -513,7 +513,7 @@ class TestMooncakeConnectorBatchedContains:
         conn.config = SimpleNamespace(experimental_sampled_layerwise_lookup=False)
         assert not conn.support_batched_contains()
 
-        conn.config.experimental_sampled_layerwise_lookup = True
+        conn._sampled_layerwise_lookup = True
         assert conn.support_batched_contains()
         assert conn.batched_contains(keys) == 2
         assert conn.store.keys == [key.to_string() for key in keys]

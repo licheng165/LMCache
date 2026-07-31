@@ -332,6 +332,111 @@ def test_dense_retrieve_reuses_group0_chunk_plan_for_group1():
     )
 
 
+def test_shared_page_first_uniform_location_uses_one_batched_probe():
+    engine = object.__new__(LMCacheEngine)
+    engine.config = SimpleNamespace(
+        extra_config={"mooncake_page_first_multi_buffer": True}
+    )
+    engine.retrieve_locations = None
+    engine._shared_local_cpu_backend = lambda: SimpleNamespace(
+        cpu_lock=nullcontext(),
+        hot_cache={},
+    )
+    calls = []
+
+    def batched_contains(keys, search_range):
+        calls.append((list(keys), search_range))
+        return len(keys), {"RemoteBackend": list(keys)}
+
+    remote = SimpleNamespace(
+        connection=SimpleNamespace(support_batched_contains=lambda: True)
+    )
+    engine.storage_manager = SimpleNamespace(
+        get_active_storage_backends=lambda search_range=None: iter(
+            [("RemoteBackend", remote)]
+        ),
+        batched_contains=batched_contains,
+    )
+    keys_by_chunk = [
+        replace(_make_key(), chunk_hash=chunk).split_layers(2)
+        for chunk in (1, 2)
+    ]
+
+    assert (
+        engine._shared_page_first_uniform_location(keys_by_chunk)
+        == "RemoteBackend"
+    )
+    assert calls == [
+        ([key for chunk in keys_by_chunk for key in chunk], ["RemoteBackend"])
+    ]
+    flat_keys = calls[0][0]
+    engine._shared_local_cpu_backend = lambda: SimpleNamespace(
+        cpu_lock=nullcontext(),
+        hot_cache=dict.fromkeys(flat_keys),
+    )
+    assert (
+        engine._shared_page_first_uniform_location(keys_by_chunk)
+        == "LocalCPUBackend"
+    )
+    assert len(calls) == 1
+
+
+@pytest.mark.parametrize(
+    "local_hit,remote_hits,retrieval_backends,supports_batch",
+    [
+        (True, 4, ["RemoteBackend"], True),
+        (False, 3, ["RemoteBackend"], True),
+        (False, 4, ["LocalCPUBackend"], True),
+        (False, 4, ["RemoteBackend", "LocalDiskBackend"], True),
+        (False, 4, ["RemoteBackend"], False),
+    ],
+)
+def test_shared_page_first_uniform_location_falls_back(
+    local_hit, remote_hits, retrieval_backends, supports_batch
+):
+    engine = object.__new__(LMCacheEngine)
+    engine.config = SimpleNamespace(
+        extra_config={"mooncake_page_first_multi_buffer": True}
+    )
+    engine.retrieve_locations = retrieval_backends
+    keys_by_chunk = [
+        replace(_make_key(), chunk_hash=chunk).split_layers(2)
+        for chunk in (1, 2)
+    ]
+    flat_keys = [key for chunk in keys_by_chunk for key in chunk]
+    engine._shared_local_cpu_backend = lambda: SimpleNamespace(
+        cpu_lock=nullcontext(),
+        hot_cache={flat_keys[-1]: object()} if local_hit else {},
+    )
+    calls = []
+
+    def batched_contains(keys, search_range):
+        calls.append((list(keys), search_range))
+        return remote_hits, {"RemoteBackend": list(keys[:remote_hits])}
+
+    remote = SimpleNamespace(
+        connection=SimpleNamespace(
+            support_batched_contains=lambda: supports_batch
+        )
+    )
+    active = [("RemoteBackend", remote)]
+    if "LocalDiskBackend" in retrieval_backends:
+        active.append(("LocalDiskBackend", object()))
+    engine.storage_manager = SimpleNamespace(
+        get_active_storage_backends=lambda search_range=None: iter(active),
+        batched_contains=batched_contains,
+    )
+
+    assert engine._shared_page_first_uniform_location(keys_by_chunk) is None
+    assert len(calls) == (
+        1
+        if not local_hit
+        and supports_batch
+        and retrieval_backends == ["RemoteBackend"]
+        else 0
+    )
+
+
 def test_dense_shared_cache_adoption_transfers_ownership():
     engine = object.__new__(LMCacheEngine)
     engine.num_layers = 2

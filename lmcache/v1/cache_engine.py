@@ -2115,6 +2115,49 @@ class LMCacheEngine:
             return "LocalCPUBackend"
         return self.storage_manager.contains(key, self.retrieve_locations)
 
+    def _shared_page_first_uniform_location(
+        self,
+        keys_by_chunk: list[list[CacheEngineKey]],
+    ) -> Optional[str]:
+        """Batch-prove one location before the mixed per-object fallback."""
+        if not keys_by_chunk or not mooncake_page_layout_enabled(self.config):
+            return None
+        flat_keys = [key for chunk in keys_by_chunk for key in chunk]
+        local = self._shared_local_cpu_backend()
+        lock = getattr(local, "cpu_lock", None)
+        hot_cache = getattr(local, "hot_cache", None)
+        if lock is None or hot_cache is None:
+            return None
+        with lock:
+            local_hits = sum(key in hot_cache for key in flat_keys)
+        if local_hits:
+            return "LocalCPUBackend" if local_hits == len(flat_keys) else None
+        search_range = self.retrieve_locations
+        if search_range is not None and "RemoteBackend" not in search_range:
+            return None
+        active = dict(
+            self.storage_manager.get_active_storage_backends(
+                search_range=search_range
+            )
+        )
+        if set(active) - {"LocalCPUBackend", "RemoteBackend"}:
+            return None
+        remote = active.get("RemoteBackend")
+        supports = getattr(
+            getattr(remote, "connection", None),
+            "support_batched_contains",
+            None,
+        )
+        if not callable(supports) or not supports():
+            return None
+        hits, mapping = self.storage_manager.batched_contains(
+            flat_keys,
+            ["RemoteBackend"],
+        )
+        if hits == len(flat_keys) and set(mapping) == {"RemoteBackend"}:
+            return "RemoteBackend"
+        return None
+
     def _resolve_shared_rank0_layer_mem_objs(
         self,
         *,
@@ -4060,45 +4103,54 @@ class LMCacheEngine:
             return
 
         if shared_layerwise_retrieve:
+            plan_started = (
+                cold_start_perf_now() if cold_start_perf_enabled() else None
+            )
             location = None
             chunk_locations: list[list[str]] = []
             missing_shared_chunks: list[dict[str, Any]] = []
             phase = kwargs.get("shared_cpu_phase", "dense_prefix")
             request_ordinal = int(kwargs.get("shared_cpu_request_ordinal", 0))
-            for start, end, key in self._dense_retrieve_token_results(
-                tokens,
-                mask,
-                request_configs,
-                kv_group,
-                kwargs,
-            ):
-                assert isinstance(key, CacheEngineKey)
-
-                keys_multi_layer = key.split_layers(self.num_layers)
-                locations_multi_layer: list[str] = []
+            token_results = self._dense_retrieve_token_results(
+                tokens, mask, request_configs, kv_group, kwargs
+            )
+            candidates: Iterable[tuple[int, int, list[CacheEngineKey]]] = (
+                (start, end, key.split_layers(self.num_layers))
+                for start, end, key in token_results
+            )
+            batch_location = None
+            if mooncake_page_layout_enabled(self.config):
+                candidates = list(candidates)
+                batch_location = self._shared_page_first_uniform_location(
+                    [item[2] for item in candidates]
+                )
+            for start, end, keys_multi_layer in candidates:
                 missing_layer = False
-                for layer_idx, layer_key in enumerate(keys_multi_layer):
-                    current_location = self._find_shared_rank0_chunk_location(
-                        layer_key
-                    )
-                    if current_location is None:
-                        # A missing layer0 is the normal dense-prefix miss
-                        # boundary. If layer0 exists but a later layer is
-                        # absent, the selected chunk is inconsistent and must
-                        # fail before handle publication in strict mode.
-                        if layer_idx != 0:
-                            missing_shared_chunks.append(
-                                {
-                                    "chunk_index": len(keys),
-                                    "layer_id": layer_idx,
-                                    "start": int(start),
-                                    "end": int(end),
-                                    "key": repr(layer_key),
-                                }
-                            )
-                        missing_layer = True
-                        break
-                    locations_multi_layer.append(current_location)
+                locations_multi_layer: list[str] = (
+                    [batch_location] * len(keys_multi_layer)
+                    if batch_location is not None
+                    else []
+                )
+                if batch_location is None:
+                    for layer_idx, layer_key in enumerate(keys_multi_layer):
+                        current_location = self._find_shared_rank0_chunk_location(
+                            layer_key
+                        )
+                        if current_location is None:
+                            # A missing layer0 is the normal prefix boundary.
+                            if layer_idx != 0:
+                                missing_shared_chunks.append(
+                                    {
+                                        "chunk_index": len(keys),
+                                        "layer_id": layer_idx,
+                                        "start": int(start),
+                                        "end": int(end),
+                                        "key": repr(layer_key),
+                                    }
+                                )
+                            missing_layer = True
+                            break
+                        locations_multi_layer.append(current_location)
                 if missing_layer:
                     break
 
@@ -4129,6 +4181,23 @@ class LMCacheEngine:
                 else "mixed"
                 if unique_locations
                 else None
+            )
+            cold_start_perf_log(
+                logger,
+                "shared_location_plan",
+                started=plan_started,
+                req_id=req_id,
+                phase=phase,
+                kv_group=kv_group,
+                chunks=len(keys),
+                objects=sum(map(len, keys)),
+                mode=(
+                    "page_batch"
+                    if batch_location == "RemoteBackend"
+                    else "local_batch"
+                    if batch_location == "LocalCPUBackend"
+                    else "per_object"
+                ),
             )
             if missing_shared_chunks and self.shared_cpu_cache_strict:
                 message = (
