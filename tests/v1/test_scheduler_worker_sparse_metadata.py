@@ -34,8 +34,47 @@ class StubCachedRequestData:
 class StubSchedulerOutput:
     finished_req_ids: set[str]
     scheduled_new_reqs: list
-    scheduled_cached_reqs: StubCachedRequestData
+    scheduled_cached_reqs: object
     num_scheduled_tokens: dict[str, int]
+    dsa_routes: dict[str, object] | None = None
+
+
+def _make_dsa_route(
+    route_state: str,
+    must_persist: bool,
+    *,
+    remap_end: int = 0,
+    source_active: bool = False,
+    request_id: str = "decode-window",
+) -> SimpleNamespace:
+    source_generation = "generation-1" if source_active else None
+    request_key = SimpleNamespace(
+        process_instance_id="scheduler-1",
+        request_id=request_id,
+        scope_id=1,
+    )
+    return SimpleNamespace(
+        request_key=request_key,
+        execution_seq=1,
+        route_epoch=1,
+        route_state=SimpleNamespace(value=route_state),
+        transfer_plan=SimpleNamespace(
+            must_persist_decode_windows=must_persist,
+        ),
+        remap_end=remap_end,
+        active_source_generation_id=source_generation,
+        active_source_receipt_bundle_id=("receipt-1" if source_active else None),
+        source_lease=(
+            SimpleNamespace(
+                request_key=request_key,
+                execution_seq=1,
+                route_epoch=1,
+                source_generation_id=source_generation,
+            )
+            if source_active
+            else None
+        ),
+    )
 
 
 def _make_scheduler_impl() -> LMCacheConnectorV1Impl:
@@ -364,6 +403,11 @@ class TestDisaggSpecOwnership:
                 new_block_ids=[],
             ),
             num_scheduled_tokens={req_id: 1},
+            dsa_routes={
+                req_id: _make_dsa_route(
+                    "resident", False, request_id=req_id
+                )
+            },
         )
 
         impl.build_connector_meta(scheduler_output)
@@ -371,6 +415,113 @@ class TestDisaggSpecOwnership:
         tracker = impl._request_trackers[req_id]
         assert tracker.disagg_spec is not None
         assert tracker.disagg_spec.receiver_id == "decode-host9000"
+        assert tracker.dsa_route_state == "resident"
+        assert tracker.dsa_must_persist_decode_windows is False
+
+    def test_legacy_cached_request_list_applies_each_dsa_route(self) -> None:
+        impl = _make_scheduler_impl()
+        req_ids = ["resident", "promoting"]
+        for req_id in req_ids:
+            impl._request_trackers[req_id] = RequestTracker(
+                req_id=req_id,
+                prompt_len=2,
+                token_ids=[0, 1],
+                allocated_block_ids=[0],
+                num_saved_tokens=2,
+            )
+        cached_reqs = [
+            SimpleNamespace(
+                req_id=req_id,
+                new_token_ids=[2],
+                new_block_ids=[],
+                resumed_from_preemption=False,
+            )
+            for req_id in req_ids
+        ]
+        scheduler_output = StubSchedulerOutput(
+            finished_req_ids=set(),
+            scheduled_new_reqs=[],
+            scheduled_cached_reqs=cached_reqs,
+            num_scheduled_tokens={req_id: 1 for req_id in req_ids},
+            dsa_routes={
+                "resident": _make_dsa_route(
+                    "resident", False, request_id="resident"
+                ),
+                "promoting": _make_dsa_route(
+                    "promoting", True, request_id="promoting"
+                ),
+            },
+        )
+
+        impl.build_connector_meta(scheduler_output)
+
+        resident = impl._request_trackers["resident"]
+        promoting = impl._request_trackers["promoting"]
+        assert resident.dsa_route_state == "resident"
+        assert resident.dsa_must_persist_decode_windows is False
+        assert promoting.dsa_route_state == "promoting"
+        assert promoting.dsa_must_persist_decode_windows is True
+
+    def test_missing_route_revokes_positive_threshold_authority(self) -> None:
+        impl = _make_scheduler_impl()
+        tracker = RequestTracker(
+            req_id="route-required",
+            prompt_len=2,
+            token_ids=[0, 1],
+            allocated_block_ids=[0],
+        )
+        impl._apply_dsa_route_snapshot(
+            SimpleNamespace(
+                dsa_routes={
+                    tracker.req_id: _make_dsa_route(
+                        "resident", False, request_id=tracker.req_id
+                    )
+                }
+            ),
+            tracker,
+        )
+
+        impl._apply_dsa_route_snapshot(
+            SimpleNamespace(dsa_routes=None),
+            tracker,
+        )
+
+        assert tracker.dsa_route_state == "unknown"
+        with pytest.raises(RuntimeError, match="authoritative DSA route"):
+            impl._require_valid_dsa_route(tracker)
+
+    def test_stale_request_key_cannot_replace_route_authority(self) -> None:
+        impl = _make_scheduler_impl()
+        req_id = "route-stale"
+        tracker = RequestTracker(
+            req_id=req_id,
+            prompt_len=2,
+            token_ids=[0, 1],
+            allocated_block_ids=[0],
+        )
+        current_route = _make_dsa_route(
+            "resident", False, request_id=req_id
+        )
+        impl._apply_dsa_route_snapshot(
+            SimpleNamespace(dsa_routes={req_id: current_route}),
+            tracker,
+        )
+        stale_route = _make_dsa_route(
+            "resident", False, request_id=req_id
+        )
+        stale_route.request_key.scope_id = 0
+
+        impl._apply_dsa_route_snapshot(
+            SimpleNamespace(dsa_routes={req_id: stale_route}),
+            tracker,
+        )
+
+        assert tracker.dsa_request_key == current_route.request_key
+        assert tracker.dsa_route_state == "unknown"
+        with pytest.raises(RuntimeError, match="authoritative DSA route"):
+            impl._require_valid_dsa_route(tracker)
+
+
 class TestBuildConnectorMetaSparseSyntheticLoadSpec:
     def test_first_decode_step_keeps_short_prompt_resident(self) -> None:
         impl = _make_scheduler_impl()
@@ -701,6 +852,165 @@ class TestBuildConnectorMetaSparseSyntheticLoadSpec:
             impl.update_connector_output(
                 SimpleNamespace(completed_decode_window_saves={req_id: 999})
             )
+
+    @pytest.mark.parametrize("route_state", ["resident", "promoting"])
+    def test_nonpersist_route_defers_decode_window_release(
+        self, route_state: str
+    ) -> None:
+        impl = _make_scheduler_impl()
+        impl._decode_window_save_window_size = 256
+        req_id = f"{route_state}-window"
+        tracker = RequestTracker(
+            req_id=req_id,
+            prompt_len=256,
+            token_ids=list(range(600)),
+            allocated_block_ids=list(range(40)),
+            num_saved_tokens=256,
+        )
+        tracker.dsa_route_state = route_state
+        tracker.decode_window_save_anchor = 256
+        tracker.decode_window_save_next_start = 512
+        tracker.decode_window_save_inflight_end = 512
+        tracker.decode_window_save_committed_end = 256
+        impl._request_trackers[req_id] = tracker
+        output = SimpleNamespace(completed_decode_window_saves={req_id: 512})
+
+        impl.update_connector_output(output)
+
+        assert output.completed_decode_window_saves == {}
+        assert tracker.decode_window_save_committed_end == 512
+        assert tracker.decode_window_save_inflight_end is None
+        pending_key, pending_frontiers = (
+            impl._dsa_pending_decode_window_releases[req_id]
+        )
+        assert pending_key == tracker.dsa_request_key
+        assert list(pending_frontiers) == [512]
+
+    def test_explicit_legacy_route_preserves_decode_window_completion(self) -> None:
+        impl = _make_scheduler_impl()
+        impl._decode_window_save_window_size = 256
+        req_id = "legacy-window"
+        tracker = RequestTracker(
+            req_id=req_id,
+            prompt_len=256,
+            token_ids=list(range(600)),
+            allocated_block_ids=list(range(40)),
+            num_saved_tokens=256,
+        )
+        tracker.dsa_route_state = "legacy"
+        tracker.decode_window_save_anchor = 256
+        tracker.decode_window_save_next_start = 512
+        tracker.decode_window_save_inflight_end = 512
+        tracker.decode_window_save_committed_end = 256
+        impl._request_trackers[req_id] = tracker
+        output = SimpleNamespace(completed_decode_window_saves={req_id: 512})
+
+        impl.update_connector_output(output)
+
+        assert output.completed_decode_window_saves == {req_id: 512}
+        assert tracker.decode_window_save_committed_end == 512
+        assert tracker.decode_window_save_inflight_end is None
+
+    def test_sparse_persist_route_preserves_decode_window_completion(self) -> None:
+        impl = _make_scheduler_impl()
+        impl._decode_window_save_window_size = 256
+        req_id = "sparse-window"
+        tracker = RequestTracker(
+            req_id=req_id,
+            prompt_len=256,
+            token_ids=list(range(600)),
+            allocated_block_ids=list(range(40)),
+            num_saved_tokens=256,
+        )
+        impl._apply_dsa_route_snapshot(
+            SimpleNamespace(
+                dsa_routes={
+                    req_id: _make_dsa_route(
+                        "sparse",
+                        True,
+                        remap_end=512,
+                        source_active=True,
+                        request_id=req_id,
+                    )
+                }
+            ),
+            tracker,
+        )
+        tracker.decode_window_save_anchor = 256
+        tracker.decode_window_save_next_start = 512
+        tracker.decode_window_save_inflight_end = 512
+        tracker.decode_window_save_committed_end = 256
+        impl._request_trackers[req_id] = tracker
+        output = SimpleNamespace(completed_decode_window_saves={req_id: 512})
+
+        impl.update_connector_output(output)
+
+        assert output.completed_decode_window_saves == {req_id: 512}
+        assert tracker.decode_window_save_committed_end == 512
+        assert tracker.decode_window_save_inflight_end is None
+
+    def test_pending_release_keeps_lower_frontier_until_remap_catches_up(
+        self,
+    ) -> None:
+        impl = _make_scheduler_impl()
+        impl._decode_window_save_window_size = 256
+        req_id = "ordered-window"
+        tracker = RequestTracker(
+            req_id=req_id,
+            prompt_len=256,
+            token_ids=list(range(1024)),
+            allocated_block_ids=list(range(64)),
+            num_saved_tokens=256,
+        )
+        impl._apply_dsa_route_snapshot(
+            SimpleNamespace(
+                dsa_routes={
+                    req_id: _make_dsa_route(
+                        "promoting", True, request_id=req_id
+                    )
+                }
+            ),
+            tracker,
+        )
+        tracker.decode_window_save_anchor = 256
+        tracker.decode_window_save_committed_end = 256
+        impl._request_trackers[req_id] = tracker
+
+        for release_end in (512, 768):
+            tracker.decode_window_save_next_start = release_end
+            tracker.decode_window_save_inflight_end = release_end
+            output = SimpleNamespace(
+                completed_decode_window_saves={req_id: release_end}
+            )
+            impl.update_connector_output(output)
+            assert output.completed_decode_window_saves == {}
+
+        pending_key, pending_frontiers = (
+            impl._dsa_pending_decode_window_releases[req_id]
+        )
+        assert pending_key == tracker.dsa_request_key
+        assert list(pending_frontiers) == [512, 768]
+
+        impl._apply_dsa_route_snapshot(
+            SimpleNamespace(
+                dsa_routes={
+                    req_id: _make_dsa_route(
+                        "sparse",
+                        True,
+                        remap_end=512,
+                        source_active=True,
+                        request_id=req_id,
+                    )
+                }
+            ),
+            tracker,
+        )
+        output = SimpleNamespace(completed_decode_window_saves={})
+        impl.update_connector_output(output)
+
+        assert output.completed_decode_window_saves == {req_id: 512}
+        _, pending_frontiers = impl._dsa_pending_decode_window_releases[req_id]
+        assert list(pending_frontiers) == [768]
 
     def test_decode_window_completion_ignored_before_save_frontier_exists(self) -> None:
         impl = _make_scheduler_impl()
@@ -1163,6 +1473,80 @@ class TestDecodeWindowSaveMetadata:
         assert tracker.num_saved_tokens == 256
         assert tracker.decode_window_save_next_start == 512
         assert tracker.decode_window_save_committed_end == 256
+
+    @pytest.mark.parametrize("route_state", ["resident", "promoting"])
+    def test_nonpersist_route_blocks_decode_window_save(
+        self, route_state: str
+    ) -> None:
+        impl, tracker, scheduler_output = self._build_decode_window_case(
+            shared_cpu=False,
+            indexer_blocks=False,
+        )
+        scheduler_output.dsa_routes = {
+            tracker.req_id: _make_dsa_route(route_state, False)
+        }
+
+        meta = impl.build_connector_meta(scheduler_output)
+
+        assert tracker.dsa_route_state == route_state
+        assert tracker.dsa_must_persist_decode_windows is False
+        assert not any(request.is_decode_window_save for request in meta.requests)
+        assert tracker.decode_window_save_next_start is None
+
+    def test_persist_plan_overrides_disaggregated_window_guard(self) -> None:
+        impl, tracker, scheduler_output = self._build_decode_window_case(
+            shared_cpu=False,
+            indexer_blocks=False,
+        )
+        tracker.disagg_spec = SimpleNamespace()
+        scheduler_output.dsa_routes = {
+            tracker.req_id: _make_dsa_route("promoting", True)
+        }
+
+        meta = impl.build_connector_meta(scheduler_output)
+
+        window_meta = next(
+            request for request in meta.requests if request.is_decode_window_save
+        )
+        assert window_meta.decode_window_start == 256
+        assert window_meta.decode_window_end == 512
+        assert tracker.dsa_route_state == "promoting"
+        assert tracker.dsa_must_persist_decode_windows is True
+
+        output = SimpleNamespace(
+            completed_decode_window_saves={tracker.req_id: 512}
+        )
+        impl.update_connector_output(output)
+
+        assert output.completed_decode_window_saves == {}
+        assert tracker.decode_window_save_committed_end == 512
+        assert tracker.decode_window_save_inflight_end is None
+        pending_key, pending_frontiers = (
+            impl._dsa_pending_decode_window_releases[tracker.req_id]
+        )
+        assert pending_key == tracker.dsa_request_key
+        assert list(pending_frontiers) == [512]
+
+        impl._apply_dsa_route_snapshot(
+            SimpleNamespace(
+                dsa_routes={
+                    tracker.req_id: _make_dsa_route(
+                        "sparse",
+                        True,
+                        remap_end=512,
+                        source_active=True,
+                    )
+                }
+            ),
+            tracker,
+        )
+        later_output = SimpleNamespace(completed_decode_window_saves={})
+        impl.update_connector_output(later_output)
+
+        assert later_output.completed_decode_window_saves == {
+            tracker.req_id: 512
+        }
+        assert impl._dsa_pending_decode_window_releases == {}
 
     def test_decode_window_save_waits_until_boundary(self) -> None:
         impl = _make_scheduler_impl()

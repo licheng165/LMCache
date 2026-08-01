@@ -575,6 +575,12 @@ class RequestTracker:
     # authoritative per-request NPU execution mode.
     dsa_must_persist_decode_windows: bool = field(default=False, repr=False)
     dsa_route_state: Optional[str] = field(default=None, repr=False)
+    dsa_request_key: Optional[Any] = field(default=None, repr=False)
+    dsa_route_authoritative: bool = field(default=False, repr=False)
+    dsa_route_epoch: int = field(default=-1, repr=False)
+    dsa_execution_seq: int = field(default=-1, repr=False)
+    dsa_remap_end: int = field(default=0, repr=False)
+    dsa_sparse_release_authorized: bool = field(default=False, repr=False)
 
     @_lmcache_nvtx_annotate
     @staticmethod
@@ -3335,7 +3341,7 @@ class LMCacheConnectorV1Impl:
 
     def update_connector_output(self, connector_output: Any) -> None:
         completed = getattr(connector_output, "completed_decode_window_saves", None)
-        if not completed:
+        if completed is None:
             return
         published: dict[str, int] = {}
         for req_id, window_end in completed.items():
@@ -3446,7 +3452,36 @@ class LMCacheConnectorV1Impl:
             tracker.decode_window_save_committed_end = max(
                 committed_before, publish_end
             )
-            published[req_id] = publish_end
+            if self._dsa_decode_window_release_authorized(tracker, publish_end):
+                published[req_id] = publish_end
+            else:
+                pending_releases = getattr(
+                    self, "_dsa_pending_decode_window_releases", None
+                )
+                if pending_releases is None:
+                    pending_releases = {}
+                    self._dsa_pending_decode_window_releases = pending_releases
+                pending_key, pending_frontiers = pending_releases.get(
+                    req_id,
+                    (tracker.dsa_request_key, deque()),
+                )
+                if pending_key != tracker.dsa_request_key:
+                    pending_frontiers = deque()
+                if not pending_frontiers or pending_frontiers[-1] < publish_end:
+                    pending_frontiers.append(publish_end)
+                pending_releases[req_id] = (
+                    tracker.dsa_request_key,
+                    pending_frontiers,
+                )
+                logger.warning(
+                    "Deferring decode-window release until DSA sparse-source "
+                    "activation: req_id=%s route_state=%s committed_end=%d "
+                    "remap_end=%d",
+                    req_id,
+                    tracker.dsa_route_state,
+                    publish_end,
+                    tracker.dsa_remap_end,
+                )
             _mtp_dw_event(
                 "commit",
                 req=req_id,
@@ -3471,6 +3506,32 @@ class LMCacheConnectorV1Impl:
                     committed_before=committed_before,
                     committed_after=tracker.decode_window_save_committed_end,
                 )
+        pending_releases = getattr(
+            self, "_dsa_pending_decode_window_releases", None
+        )
+        if pending_releases:
+            for req_id, (request_key, release_frontiers) in list(
+                pending_releases.items()
+            ):
+                tracker = self._request_trackers.get(req_id)
+                if tracker is None or tracker.dsa_request_key != request_key:
+                    pending_releases.pop(req_id, None)
+                    continue
+                authorized = [
+                    release_end
+                    for release_end in release_frontiers
+                    if self._dsa_decode_window_release_authorized(
+                        tracker, release_end
+                    )
+                ]
+                if not authorized:
+                    continue
+                release_end = max(authorized)
+                published[req_id] = max(published.get(req_id, 0), release_end)
+                while release_frontiers and release_frontiers[0] <= release_end:
+                    release_frontiers.popleft()
+                if not release_frontiers:
+                    pending_releases.pop(req_id, None)
         # The vLLM scheduler consumes this same mapping after this callback to
         # release local blocks. Replacing raw completions with delayed
         # frontiers keeps release and split_boundary on the same commit point.
@@ -7427,19 +7488,174 @@ class LMCacheConnectorV1Impl:
 
         self.load_specs[request.request_id].can_load = True
 
+    def _apply_dsa_route_snapshot(
+        self,
+        scheduler_output: SchedulerOutput,
+        tracker: RequestTracker,
+    ) -> Optional[Any]:
+        routes = getattr(scheduler_output, "dsa_routes", None)
+        if not routes:
+            # Old vLLM and cached LEGACY steps do not publish route snapshots.
+            # A previously non-LEGACY tracker, however, must not retain stale
+            # sparse authority when an expected snapshot disappears.
+            if tracker.dsa_route_authoritative:
+                tracker.dsa_must_persist_decode_windows = False
+                tracker.dsa_route_state = "unknown"
+                tracker.dsa_remap_end = 0
+                tracker.dsa_sparse_release_authorized = False
+            return None
+
+        route = routes.get(tracker.req_id)
+        if route is None:
+            tracker.dsa_must_persist_decode_windows = False
+            tracker.dsa_route_state = "unknown"
+            tracker.dsa_route_authoritative = True
+            tracker.dsa_remap_end = 0
+            tracker.dsa_sparse_release_authorized = False
+            return None
+
+        route_state = getattr(route, "route_state", None)
+        route_state = getattr(route_state, "value", route_state)
+        route_state = (
+            route_state.lower() if isinstance(route_state, str) else "unknown"
+        )
+        route_key = getattr(route, "request_key", None)
+        try:
+            route_epoch = int(route.route_epoch)
+            execution_seq = int(route.execution_seq)
+        except (TypeError, ValueError, AttributeError):
+            route_state = "unknown"
+            route_epoch = -1
+            execution_seq = -1
+        executable_states = {
+            "resident",
+            "promoting",
+            "sparse",
+            "fallback_resident",
+        }
+        invalid_identity = route_state != "legacy" and (
+            route_state not in executable_states
+            or route_key is None
+            or getattr(route_key, "request_id", None) != tracker.req_id
+            or (
+                tracker.dsa_request_key is not None
+                and route_key != tracker.dsa_request_key
+            )
+            or route_epoch < tracker.dsa_route_epoch
+            or execution_seq < tracker.dsa_execution_seq
+        )
+        if invalid_identity:
+            tracker.dsa_must_persist_decode_windows = False
+            tracker.dsa_route_state = "unknown"
+            tracker.dsa_route_authoritative = True
+            tracker.dsa_remap_end = 0
+            tracker.dsa_sparse_release_authorized = False
+            return route
+
+        plan = getattr(route, "transfer_plan", None)
+        tracker.dsa_must_persist_decode_windows = bool(
+            getattr(plan, "must_persist_decode_windows", False)
+        )
+        tracker.dsa_route_state = route_state
+        if tracker.dsa_route_authoritative and tracker.dsa_route_state == "legacy":
+            tracker.dsa_must_persist_decode_windows = False
+            tracker.dsa_route_state = "unknown"
+        elif tracker.dsa_route_state != "legacy":
+            tracker.dsa_route_authoritative = True
+            tracker.dsa_request_key = route_key
+            tracker.dsa_route_epoch = route_epoch
+            tracker.dsa_execution_seq = execution_seq
+        tracker.dsa_remap_end = int(getattr(route, "remap_end", 0) or 0)
+        source_lease = getattr(route, "source_lease", None)
+        active_generation = getattr(route, "active_source_generation_id", None)
+        lease_generation = getattr(source_lease, "source_generation_id", None)
+        tracker.dsa_sparse_release_authorized = bool(
+            tracker.dsa_route_state == "sparse"
+            and active_generation
+            and getattr(route, "active_source_receipt_bundle_id", None)
+            and source_lease is not None
+            and tracker.dsa_request_key is not None
+            and getattr(source_lease, "request_key", None)
+            == tracker.dsa_request_key
+            and getattr(source_lease, "execution_seq", None)
+            == getattr(route, "execution_seq", None)
+            and getattr(source_lease, "route_epoch", None)
+            == getattr(route, "route_epoch", None)
+            and lease_generation == active_generation
+        )
+        return route
+
+    @staticmethod
+    def _reset_dsa_route_authority(tracker: RequestTracker) -> None:
+        tracker.dsa_must_persist_decode_windows = False
+        tracker.dsa_route_state = None
+        tracker.dsa_request_key = None
+        tracker.dsa_route_authoritative = False
+        tracker.dsa_route_epoch = -1
+        tracker.dsa_execution_seq = -1
+        tracker.dsa_remap_end = 0
+        tracker.dsa_sparse_release_authorized = False
+
+    def _clear_dsa_pending_decode_window_releases(self, req_id: str) -> None:
+        pending_releases = getattr(
+            self, "_dsa_pending_decode_window_releases", None
+        )
+        if pending_releases is not None:
+            pending_releases.pop(req_id, None)
+
+    @staticmethod
+    def _require_valid_dsa_route(tracker: RequestTracker) -> None:
+        invalid_route = tracker.dsa_route_state == "unknown" or (
+            tracker.dsa_route_state == "sparse"
+            and (
+                not tracker.dsa_sparse_release_authorized
+                or not tracker.dsa_must_persist_decode_windows
+            )
+        )
+        if tracker.dsa_route_authoritative and invalid_route:
+            raise RuntimeError(
+                "Missing or invalid authoritative DSA route for request "
+                f"{tracker.req_id}."
+            )
+
+    @staticmethod
+    def _dsa_decode_window_persistence_authorized(
+        tracker: RequestTracker,
+    ) -> bool:
+        if tracker.dsa_route_state in (None, "legacy"):
+            return True
+        return tracker.dsa_must_persist_decode_windows
+
+    @staticmethod
+    def _dsa_decode_window_release_authorized(
+        tracker: RequestTracker,
+        release_end: int,
+    ) -> bool:
+        if tracker.dsa_route_state in (None, "legacy"):
+            return True
+        return (
+            tracker.dsa_sparse_release_authorized
+            and tracker.dsa_must_persist_decode_windows
+            and 0 < release_end <= tracker.dsa_remap_end
+        )
+
     def _should_decode_window_save(self, tracker: RequestTracker) -> bool:
         window_size = getattr(self, "_decode_window_save_window_size", 0)
         if window_size <= 0:
             return False
         if self.kv_role == "kv_consumer":
             return False
+        if not self._dsa_decode_window_persistence_authorized(tracker):
+            return False
         # Authoritative transfer obligation from the Scheduler's route snapshot
         # (design section 10.5). When must_persist_decode_windows is set, the
         # decode window save MUST run even for PD Decoder requests that carry a
         # disagg_spec -- otherwise exactly the PD Decoder long request's window
         # save gets disabled by the legacy disagg guard.
-        must_persist = bool(getattr(tracker, "dsa_must_persist_decode_windows", False))
-        if tracker.disagg_spec is not None and not must_persist:
+        if (
+            tracker.disagg_spec is not None
+            and tracker.dsa_route_state in (None, "legacy")
+        ):
             return False
         if tracker.skip_save:
             return False
@@ -7456,7 +7672,12 @@ class LMCacheConnectorV1Impl:
             return "window_disabled"
         if self.kv_role == "kv_consumer":
             return "kv_consumer"
-        if tracker.disagg_spec is not None:
+        if not self._dsa_decode_window_persistence_authorized(tracker):
+            return "dsa_persistence_not_authorized"
+        if (
+            tracker.disagg_spec is not None
+            and tracker.dsa_route_state in (None, "legacy")
+        ):
             return "disaggregated_request"
         if tracker.skip_save:
             return "tracker_skip_save"
@@ -7806,6 +8027,11 @@ class LMCacheConnectorV1Impl:
                 }
                 self._mtp_dw_deep_window_group_wait_seen = waits_copy
             self._unfinished_requests.pop(finished_req_id, None)
+            pending_releases = getattr(
+                self, "_dsa_pending_decode_window_releases", None
+            )
+            if pending_releases is not None:
+                pending_releases.pop(finished_req_id, None)
 
         # We should load KV for:
         # 1. new requests
@@ -7846,6 +8072,9 @@ class LMCacheConnectorV1Impl:
                     load_spec.dsa_committed_end
                 )
             self._request_trackers[request.req_id] = request_tracker
+            self._clear_dsa_pending_decode_window_releases(request.req_id)
+            self._apply_dsa_route_snapshot(scheduler_output, request_tracker)
+            self._require_valid_dsa_route(request_tracker)
 
             req_meta = self._build_request_meta(request_tracker, load_spec)
             if req_meta is not None:
@@ -7871,6 +8100,8 @@ class LMCacheConnectorV1Impl:
                 # token_ids correctly for chunk key computation
                 all_token_ids = None
                 if req.resumed_from_preemption:
+                    self._clear_dsa_pending_decode_window_releases(req.req_id)
+                    self._reset_dsa_route_authority(request_tracker)
                     vllm_request = self._unfinished_requests.get(req.req_id)
                     assert vllm_request is not None, (
                         f"Preempted request {req.req_id} not found "
@@ -7886,24 +8117,9 @@ class LMCacheConnectorV1Impl:
                     vllm_cached_tokens=vllm_cached_tokens,
                     all_token_ids=all_token_ids,
                 )
-
-            self._add_decode_window_save_metas(meta, request_tracker)
-            # Populate the authoritative transfer obligation from the route
-            # snapshot so _should_decode_window_save honors must_persist even
-            # for PD Decoder requests carrying a disagg_spec (design 10.5).
-            _dsa_routes_map = getattr(scheduler_output, "dsa_routes", None)
-            _dsa_route = _dsa_routes_map.get(req_id) if _dsa_routes_map else None
-            if _dsa_route is not None:
-                _plan = getattr(_dsa_route, "transfer_plan", None)
-                request_tracker.dsa_must_persist_decode_windows = bool(
-                    getattr(_plan, "must_persist_decode_windows", False)
-                )
-                request_tracker.dsa_route_state = (
-                    getattr(getattr(_dsa_route, "route_state", None), "value", None)
-                )
-            else:
-                request_tracker.dsa_must_persist_decode_windows = False
-                request_tracker.dsa_route_state = None
+                self._apply_dsa_route_snapshot(scheduler_output, request_tracker)
+                self._require_valid_dsa_route(request_tracker)
+                self._add_decode_window_save_metas(meta, request_tracker)
                 req_meta = self._build_request_meta(request_tracker, load_spec)
                 if req_meta is not None:
                     req_meta.resumed_from_preemption = req.resumed_from_preemption
@@ -7953,6 +8169,8 @@ class LMCacheConnectorV1Impl:
                     f"This might be due to an unsupported vLLM version."
                 )
             if preempted:
+                self._clear_dsa_pending_decode_window_releases(req_id)
+                self._reset_dsa_route_authority(request_tracker)
                 published = getattr(
                     self, "_initial_sparse_release_published", None
                 )
@@ -7987,6 +8205,7 @@ class LMCacheConnectorV1Impl:
             # reset request.num_computed_tokens, this will lead to
             # request_tracker.token_ids being not matched with vllm
             if num_current_tokens < len(request_tracker.token_ids):
+                self._clear_dsa_pending_decode_window_releases(req_id)
                 logger.warning(
                     "Request %s rolled back from %d to %d tokens; "
                     "truncating tracker state.",
@@ -8035,6 +8254,10 @@ class LMCacheConnectorV1Impl:
                 all_token_ids=all_token_ids,
             )
 
+            dsa_route = self._apply_dsa_route_snapshot(
+                scheduler_output, request_tracker
+            )
+            self._require_valid_dsa_route(request_tracker)
             self._add_decode_window_save_metas(meta, request_tracker)
             # DSA threshold routing: the Scheduler publishes an authoritative
             # per-request route snapshot in scheduler_output.dsa_routes.  When
@@ -8043,14 +8266,7 @@ class LMCacheConnectorV1Impl:
             # comes from snapshot.remap_end (design section 10.1 / 10.4).  When
             # absent or LEGACY (threshold=0), fall back to the legacy local
             # classification so the compatibility path is unchanged.
-            dsa_route = None
-            dsa_routes_map = getattr(scheduler_output, "dsa_routes", None)
-            if dsa_routes_map:
-                dsa_route = dsa_routes_map.get(req_id)
-            route_state_str = None
-            if dsa_route is not None:
-                rs = getattr(dsa_route, "route_state", None)
-                route_state_str = getattr(rs, "value", None) if rs is not None else None
+            route_state_str = request_tracker.dsa_route_state
 
             if route_state_str is not None and route_state_str != "legacy":
                 is_sparse_decode = route_state_str == "sparse"
