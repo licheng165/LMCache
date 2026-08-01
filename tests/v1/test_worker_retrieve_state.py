@@ -3539,6 +3539,68 @@ class TestWorkerRetrieveState:
         assert state.request_scope_token == "req-1:5:512"
         assert state.shared_validation_signature is None
 
+    def test_store_merge_does_not_publish_suffix_only_pointer_cache(self):
+        starts = [0]
+        ends = [256]
+        memory_objs = [["prefix"]]
+        chunk_ptrs = []
+
+        merged = LMCacheConnectorV1Impl._merge_cache_group_by_ranges(
+            dst_starts=starts,
+            dst_ends=ends,
+            dst_keys=[["prefix-key"]],
+            dst_memory_objs=memory_objs,
+            dst_tensors=[],
+            dst_chunk_dev_ptrs=[],
+            dst_chunk_ptrs_npu=chunk_ptrs,
+            dst_shared_handles=[[]],
+            src_starts=[256],
+            src_ends=[512],
+            src_keys=[["suffix-key"]],
+            src_memory_objs=[["suffix"]],
+            src_tensors=[],
+            src_chunk_dev_ptrs=[[222]],
+            src_chunk_ptrs_npu=[torch.tensor([222], dtype=torch.long)],
+            src_shared_handles=[],
+        )
+
+        assert merged == 1
+        assert starts == [0, 256]
+        assert ends == [256, 512]
+        assert memory_objs == [["prefix", "suffix"]]
+        assert chunk_ptrs == [None]
+
+    def test_store_merge_replaces_partial_tail_with_complete_pointer_cache(self):
+        starts = [0, 256]
+        ends = [256, 300]
+        memory_objs = [["full-prefix", "partial-tail"]]
+        chunk_ptrs = [torch.tensor([111, 222], dtype=torch.long)]
+
+        merged = LMCacheConnectorV1Impl._merge_cache_group_by_ranges(
+            dst_starts=starts,
+            dst_ends=ends,
+            dst_keys=[["prefix-key", "partial-key"]],
+            dst_memory_objs=memory_objs,
+            dst_tensors=[],
+            dst_chunk_dev_ptrs=[[111, 222]],
+            dst_chunk_ptrs_npu=chunk_ptrs,
+            dst_shared_handles=[[]],
+            src_starts=[256],
+            src_ends=[512],
+            src_keys=[["full-tail-key"]],
+            src_memory_objs=[["full-tail"]],
+            src_tensors=[],
+            src_chunk_dev_ptrs=[[333]],
+            src_chunk_ptrs_npu=[torch.tensor([333], dtype=torch.long)],
+            src_shared_handles=[],
+        )
+
+        assert merged == 1
+        assert starts == [0, 256]
+        assert ends == [256, 512]
+        assert memory_objs == [["full-prefix", "full-tail"]]
+        assert chunk_ptrs[0].tolist() == [111, 333]
+
     def test_decode_window_save_tail_only_does_not_seed_warm_state(self):
         impl = _make_impl()
         impl.config = SimpleNamespace(dsa_two_groups=False)

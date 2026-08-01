@@ -4579,6 +4579,8 @@ class LMCacheConnectorV1Impl:
                     break
             if replace_at is not None:
                 break
+        existing_chunks = len(dst_starts)
+        cached_prefix_chunks = existing_chunks if replace_at is None else replace_at
 
         existing_ranges = set(
             zip(
@@ -4641,22 +4643,31 @@ class LMCacheConnectorV1Impl:
         )
 
         def can_append_layer_ptr_tensors() -> bool:
-            if selected_ptrs_by_layer is None:
-                return False
             if (
-                require_pointer_cache
-                and len(selected_ptrs_by_layer) < source_layer_count
+                selected_ptrs_by_layer is None
+                or len(selected_ptrs_by_layer) != source_layer_count
             ):
                 return False
             for layer_id in range(len(selected_ptrs_by_layer)):
-                if layer_id >= len(dst_chunk_ptrs_npu):
-                    continue
-                existing = dst_chunk_ptrs_npu[layer_id]
-                if existing is not None and not isinstance(existing, torch.Tensor):
+                existing = (
+                    dst_chunk_ptrs_npu[layer_id]
+                    if layer_id < len(dst_chunk_ptrs_npu)
+                    else None
+                )
+                if existing_chunks and (
+                    not isinstance(existing, torch.Tensor)
+                    or int(existing.numel()) != existing_chunks
+                ):
+                    return False
+                if not existing_chunks and existing is not None and (
+                    not isinstance(existing, torch.Tensor)
+                    or int(existing.numel()) != 0
+                ):
                     return False
             return True
 
-        if require_pointer_cache and not can_append_layer_ptr_tensors():
+        can_append_ptrs = can_append_layer_ptr_tensors()
+        if require_pointer_cache and not can_append_ptrs:
             return 0
 
         if replace_at is not None:
@@ -4680,7 +4691,7 @@ class LMCacheConnectorV1Impl:
                 if isinstance(ptrs, torch.Tensor):
                     dst_chunk_ptrs_npu[layer_id] = ptrs[:replace_at]
 
-        cached_prefix_chunks = len(dst_starts)
+        assert len(dst_starts) == cached_prefix_chunks
         for chunk_idx in append_indices:
             dst_starts.append(src_starts[chunk_idx])
             dst_ends.append(src_ends[chunk_idx])
@@ -4722,7 +4733,7 @@ class LMCacheConnectorV1Impl:
         append_layer_values(dst_shared_handles, src_shared_handles)
 
         def append_layer_ptr_tensors() -> bool:
-            if not can_append_layer_ptr_tensors():
+            if not can_append_ptrs:
                 return False
             if not dst_chunk_ptrs_npu:
                 dst_chunk_ptrs_npu.extend(
