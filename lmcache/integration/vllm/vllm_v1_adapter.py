@@ -5517,18 +5517,20 @@ class LMCacheConnectorV1Impl:
             if state.prepared_sparse_sources.get(0) is None:
                 raise RuntimeError("Cold compact latent source was not sealed")
             return state
-        except BaseException:
+        except BaseException as exc:
             try:
                 self._synchronize_dsa_cold_dense_load()
             except BaseException:
+                setattr(exc, "_lmcache_dsa_cold_state", state)
                 logger.exception(
                     "Cold compact cleanup could not synchronize the dense "
                     "load stream; scheduler blocks must remain retained"
                 )
-            self._release_unadopted_shared_request_objects(state, request)
-            self._release_shared_worker_retrieve_state(
-                state, self.lmcache_engine
-            )
+            else:
+                self._release_unadopted_shared_request_objects(state, request)
+                self._release_shared_worker_retrieve_state(
+                    state, self.lmcache_engine
+                )
             raise
 
     @_lmcache_nvtx_annotate
@@ -7610,6 +7612,7 @@ class LMCacheConnectorV1Impl:
             generation, future, request, indexer_block_ids, submitted_at = entry
             if not future.done():
                 continue
+            state = None
             aborted_ids = getattr(self, "_dsa_cold_aborted_req_ids", None)
             was_aborted = bool(aborted_ids is not None and req_id in aborted_ids)
             try:
@@ -7654,7 +7657,7 @@ class LMCacheConnectorV1Impl:
                     len(indexer_block_ids),
                     (time.monotonic() - submitted_at) * 1000,
                 )
-            except BaseException:
+            except BaseException as exc:
                 try:
                     self._synchronize_dsa_cold_dense_load()
                 except BaseException:
@@ -7665,6 +7668,22 @@ class LMCacheConnectorV1Impl:
                         exc_info=True,
                     )
                     continue
+                failed_state = getattr(exc, "_lmcache_dsa_cold_state", None)
+                states = getattr(self, "_worker_retrieve_state", {})
+                if (
+                    failed_state is None
+                    and state is not None
+                    and state.req_id is not None
+                    and states.get(req_id) is not state
+                ):
+                    failed_state = state
+                if failed_state is not None:
+                    self._release_unadopted_shared_request_objects(
+                        failed_state, request
+                    )
+                    self._release_shared_worker_retrieve_state(
+                        failed_state, self.lmcache_engine
+                    )
                 self._invalid_block_ids.update(indexer_block_ids)
                 if was_aborted:
                     self._release_request_lookup_pins(req_id)
@@ -7906,6 +7925,8 @@ class LMCacheConnectorV1Impl:
             and num_computed_tokens == 0
             and num_external_hit_tokens == request.num_tokens
             and need_to_allocate > 0
+            and cdiv(num_external_hit_tokens, self._block_size)
+            == cdiv(need_to_allocate, self._block_size)
         )
         below_min_retrieve = (
             not dsa_prefix_hit

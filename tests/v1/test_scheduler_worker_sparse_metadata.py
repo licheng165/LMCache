@@ -135,13 +135,21 @@ def test_dsa_cold_compact_async_requires_complete_prompt_hit() -> None:
         == 7936
     )
 
-    lookup_client.lookup_cache.return_value = 8193
-    unaligned = SimpleNamespace(request_id="cold-unaligned", num_tokens=8193)
-    assert impl.get_num_new_matched_tokens(unaligned, 0) == 8192
+    lookup_client.lookup_cache.return_value = 8194
+    unaligned = SimpleNamespace(request_id="cold-unaligned", num_tokens=8194)
+    assert impl.get_num_new_matched_tokens(unaligned, 0) == 8193
     assert impl.load_specs[unaligned.request_id].dsa_committed_end == 8192
     assert (
         getattr(impl.load_specs[unaligned.request_id], "dsa_release_frontier")
         == 8192
+    )
+
+    lookup_client.lookup_cache.return_value = 8193
+    new_block = SimpleNamespace(request_id="cold-new-block", num_tokens=8193)
+    assert impl.get_num_new_matched_tokens(new_block, 0) == 8192
+    assert not impl.should_load_kv_async(new_block.request_id)
+    assert not hasattr(
+        impl.load_specs[new_block.request_id], "dsa_cold_compact_load"
     )
 
     lookup_client.lookup_cache.return_value = 4096
@@ -247,6 +255,39 @@ def test_dsa_cold_compact_worker_restores_submitted_npu_device(
     fake_npu.set_device.assert_called_once_with(6)
 
 
+def test_dsa_cold_compact_worker_retains_sources_when_stream_sync_fails() -> None:
+    impl = LMCacheConnectorV1Impl.__new__(LMCacheConnectorV1Impl)
+    impl.num_layers = 1
+    impl._num_layers_for_group = lambda _kv_group: 1
+    impl._kvcaches_for_group = lambda _kv_group: []
+    impl._sparse_retrieve_kwargs = MagicMock(return_value=({}, None, None))
+    impl._synchronize_dsa_cold_dense_load = MagicMock(
+        side_effect=RuntimeError("sync failed")
+    )
+    impl._release_unadopted_shared_request_objects = MagicMock()
+    impl._release_shared_worker_retrieve_state = MagicMock()
+    impl.lmcache_engine = SimpleNamespace(
+        retrieve_layer_head_token_wise=MagicMock(
+            side_effect=ValueError("retrieve failed")
+        )
+    )
+    request = SimpleNamespace(
+        req_id="cold-sync-failed",
+        load_spec=SimpleNamespace(lmcache_cached_tokens=1),
+        token_ids=[1],
+    )
+
+    with pytest.raises(ValueError, match="retrieve failed") as raised:
+        impl._run_dsa_cold_compact_load(request, None)
+
+    assert isinstance(
+        getattr(raised.value, "_lmcache_dsa_cold_state"),
+        WorkerRetrieveState,
+    )
+    impl._release_unadopted_shared_request_objects.assert_not_called()
+    impl._release_shared_worker_retrieve_state.assert_not_called()
+
+
 def test_dsa_cold_compact_finished_signal_waits_for_future() -> None:
     impl = LMCacheConnectorV1Impl.__new__(LMCacheConnectorV1Impl)
     future = Future()
@@ -271,6 +312,73 @@ def test_dsa_cold_compact_finished_signal_waits_for_future() -> None:
     assert impl._drain_dsa_cold_load_futures() == {"cold-future"}
     impl._publish_worker_retrieve_state.assert_called_once()
     assert getattr(state, "_dsa_cold_prune_protected")
+
+
+def test_dsa_cold_compact_generation_mismatch_releases_returned_state() -> None:
+    impl = LMCacheConnectorV1Impl.__new__(LMCacheConnectorV1Impl)
+    future = Future()
+    request = SimpleNamespace(
+        load_spec=SimpleNamespace(dsa_cold_load_generation=2)
+    )
+    state = WorkerRetrieveState(req_id="cold-stale-generation")
+    future.set_result(state)
+    impl._dsa_cold_load_futures = {
+        "cold-stale-generation": (1, future, request, {100}, 0.0)
+    }
+    impl._worker_retrieve_state = {}
+    impl._synchronize_dsa_cold_dense_load = MagicMock()
+    impl._release_unadopted_shared_request_objects = MagicMock()
+    impl._release_shared_worker_retrieve_state = MagicMock()
+    impl._publish_worker_retrieve_state = MagicMock()
+    impl._invalid_block_ids = set()
+    impl.lmcache_engine = object()
+
+    assert impl._drain_dsa_cold_load_futures() == {
+        "cold-stale-generation"
+    }
+    impl._publish_worker_retrieve_state.assert_not_called()
+    impl._release_unadopted_shared_request_objects.assert_called_once_with(
+        state, request
+    )
+    impl._release_shared_worker_retrieve_state.assert_called_once_with(
+        state, impl.lmcache_engine
+    )
+    assert impl._invalid_block_ids == {100}
+
+
+def test_dsa_cold_compact_failed_state_releases_after_sync_retry() -> None:
+    impl = LMCacheConnectorV1Impl.__new__(LMCacheConnectorV1Impl)
+    future = Future()
+    request = SimpleNamespace(
+        load_spec=SimpleNamespace(dsa_cold_load_generation=1)
+    )
+    state = WorkerRetrieveState(req_id="cold-sync-retry")
+    error = RuntimeError("load failed")
+    setattr(error, "_lmcache_dsa_cold_state", state)
+    future.set_exception(error)
+    impl._dsa_cold_load_futures = {
+        "cold-sync-retry": (1, future, request, {100, 101}, 0.0)
+    }
+    impl._synchronize_dsa_cold_dense_load = MagicMock(
+        side_effect=[RuntimeError("still active"), None]
+    )
+    impl._release_unadopted_shared_request_objects = MagicMock()
+    impl._release_shared_worker_retrieve_state = MagicMock()
+    impl._invalid_block_ids = set()
+    impl.lmcache_engine = object()
+
+    assert impl._drain_dsa_cold_load_futures() is None
+    assert "cold-sync-retry" in impl._dsa_cold_load_futures
+    impl._release_shared_worker_retrieve_state.assert_not_called()
+
+    assert impl._drain_dsa_cold_load_futures() == {"cold-sync-retry"}
+    impl._release_unadopted_shared_request_objects.assert_called_once_with(
+        state, request
+    )
+    impl._release_shared_worker_retrieve_state.assert_called_once_with(
+        state, impl.lmcache_engine
+    )
+    assert impl._invalid_block_ids == {100, 101}
 
 
 def test_dsa_cold_ready_state_survives_cross_rank_completion_gap() -> None:
