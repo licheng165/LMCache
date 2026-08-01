@@ -20,6 +20,7 @@ from lmcache.integration.vllm.vllm_v1_adapter import (
     RequestTracker,
     SaveSpec,
     WorkerRetrieveState,
+    _requires_complete_sparse_load,
 )
 from lmcache.v1.cache_engine import LayerwiseStoreResult, LMCacheEngine
 from lmcache.v1.gpu_connector.sparse import PreparedSparseSource
@@ -40,6 +41,15 @@ def _make_impl() -> LMCacheConnectorV1Impl:
     impl.kv_role = "kv_both"
     impl._late_finished_sending = set()
     return impl
+
+
+def test_complete_sparse_retrieve_requirement_is_boundary_scoped():
+    active = frozenset({"active"})
+
+    assert _requires_complete_sparse_load(active, "active")
+    assert not _requires_complete_sparse_load(active, "resident")
+    assert _requires_complete_sparse_load(True, "resident")
+    assert not _requires_complete_sparse_load(False, "active")
 
 
 def test_complete_sparse_retrieve_validation_accepts_requested_mask():

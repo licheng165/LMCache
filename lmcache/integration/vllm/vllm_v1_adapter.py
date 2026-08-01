@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # Standard
 from collections import deque
-from collections.abc import Iterable
+from collections.abc import Collection, Iterable
 from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass, field
 import json
@@ -389,6 +389,16 @@ def _sparse_payload_value(value: Any):
     return value
 
 
+def _requires_complete_sparse_load(
+    requirement: bool | Collection[str],
+    req_id: str,
+) -> bool:
+    """Return whether this request has a nonzero remap boundary."""
+    if isinstance(requirement, bool):
+        return requirement
+    return req_id in requirement
+
+
 def _flatten_block_ids(block_ids) -> list[int]:
     if block_ids is None:
         return []
@@ -423,7 +433,8 @@ class LoadSpec:
     lmcache_cached_tokens: int
     # Whether the scheduler allow us to load the tokens
     can_load: bool
-    # Block-aligned frontier that sparse decode may remap from LMCache.
+    # Block-aligned prefix committed in LMCache. Consumers derive their
+    # effective remap boundary separately.
     dsa_committed_end: Optional[int] = None
     # Fixed resident prefix capacity used by DSA MTP union scratch.
     dsa_scratch_capacity: Optional[int] = None
@@ -5958,7 +5969,7 @@ class LMCacheConnectorV1Impl:
         target_slot_mapping=None,
         payload_event=None,
         selected_token_counts=None,
-        require_complete_sparse_load: bool = False,
+        require_complete_sparse_load: bool | Collection[str] = False,
     ) -> None:
         """Blocking until the KV for a specific layer is loaded into vLLM's
         paged buffer.
@@ -6267,8 +6278,14 @@ class LMCacheConnectorV1Impl:
                             sparse_indexer_sent_layers.add(indexer_sent_key)
                             if ret_token_mask is None:
                                 ret_token_mask = indexer_ret_mask
+                    require_complete_for_request = (
+                        _requires_complete_sparse_load(
+                            require_complete_sparse_load,
+                            request.req_id,
+                        )
+                    )
                     if (
-                        require_complete_sparse_load
+                        require_complete_for_request
                         and wait_group == 0
                         and self.current_layer == 0
                     ):
@@ -7914,11 +7931,6 @@ class LMCacheConnectorV1Impl:
                     // self._lmcache_chunk_size
                     * self._lmcache_chunk_size
                 )
-                dsa_committed_end = (
-                    committed_end
-                    if committed_end > self._dsa_scratch_capacity
-                    else 0
-                )
                 if self.kv_role == "kv_consumer":
                     # Include the final partial prompt chunk in worker metadata;
                     # the release/remap frontier remains LMCache-chunk aligned below.
@@ -7937,7 +7949,7 @@ class LMCacheConnectorV1Impl:
                     vllm_cached_tokens=0,
                     lmcache_cached_tokens=lmcache_cached_for_sparse,
                     can_load=lmcache_cached_for_sparse > 0,
-                    dsa_committed_end=dsa_committed_end,
+                    dsa_committed_end=committed_end,
                     dsa_scratch_capacity=self._dsa_scratch_capacity,
                 )
 

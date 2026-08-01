@@ -648,7 +648,7 @@ class TestBuildConnectorMetaSparseSyntheticLoadSpec:
         assert req_meta.load_spec is not None
         assert req_meta.load_spec.can_load is True
         assert req_meta.load_spec.lmcache_cached_tokens == 256
-        assert req_meta.load_spec.dsa_committed_end == 0
+        assert req_meta.load_spec.dsa_committed_end == 256
         assert req_meta.token_ids == all_tokens[:256]
         assert tracker.sparse_token_ids == all_tokens[:256]
         assert req_meta.slot_mapping[0].numel() == 256
