@@ -3761,7 +3761,7 @@ def test_shared_dense_rank0_retriever_releases_before_result_tail(
         on_retrieve_finished=lambda monitor_req_id, tokens: None
     )
     mem_objs = [_FakeResolvableMemoryObj(), _FakeResolvableMemoryObj()]
-    resolver_calls = {"layer": 0, "remote_layers": 0}
+    resolver_calls = {"layer": 0, "page_first": 0}
 
     def resolve_layer(**kwargs):
         resolver_calls["layer"] += 1
@@ -3773,13 +3773,13 @@ def test_shared_dense_rank0_retriever_releases_before_result_tail(
 
     engine._resolve_shared_rank0_layer_mem_objs = resolve_layer
 
-    def resolve_remote_layers(**kwargs):
-        resolver_calls["remote_layers"] += 1
+    def resolve_page_first(**kwargs):
+        resolver_calls["page_first"] += 1
         for mem_obj in mem_objs:
             mem_obj.pin()
         return [[mem_obj] for mem_obj in mem_objs]
 
-    engine._resolve_shared_rank0_remote_layers_windowed = resolve_remote_layers
+    engine._resolve_shared_rank0_page_first_layers = resolve_page_first
     engine._make_shared_handles_for_layer = lambda **kwargs: [object()]
     broadcasts = []
     engine._broadcast_shared_envelope = lambda envelope: broadcasts.append(envelope)
@@ -3803,9 +3803,9 @@ def test_shared_dense_rank0_retriever_releases_before_result_tail(
     yielded = [next(retriever) for _ in range(engine.num_layers + 1)]
 
     assert resolver_calls == (
-        {"layer": 0, "remote_layers": 1}
+        {"layer": 0, "page_first": 1}
         if page_first
-        else {"layer": 2, "remote_layers": 0}
+        else {"layer": 2, "page_first": 0}
     )
     assert yielded[0].item() == 4
     assert yielded[1] is None
