@@ -3737,8 +3737,9 @@ def test_shared_dense_page_first_publishes_one_compact_batch(monkeypatch):
 
 
 @pytest.mark.parametrize("kv_group", [0, 1])
+@pytest.mark.parametrize("page_first", [False, True])
 def test_shared_dense_rank0_retriever_releases_before_result_tail(
-    monkeypatch, kv_group
+    monkeypatch, kv_group, page_first
 ):
     import lmcache.v1.cache_engine as cache_engine_module
 
@@ -3748,6 +3749,9 @@ def test_shared_dense_rank0_retriever_releases_before_result_tail(
         lambda _connector: None,
     )
     engine = object.__new__(LMCacheEngine)
+    engine.config = SimpleNamespace(
+        extra_config={"mooncake_page_first_multi_buffer": page_first}
+    )
     engine.storage_manager = SimpleNamespace()
     engine.gpu_connector = _FakeLayerwiseGPUConnector()
     engine.num_layers = 2
@@ -3757,21 +3761,38 @@ def test_shared_dense_rank0_retriever_releases_before_result_tail(
         on_retrieve_finished=lambda monitor_req_id, tokens: None
     )
     mem_objs = [_FakeResolvableMemoryObj(), _FakeResolvableMemoryObj()]
-    engine._resolve_shared_rank0_layer_mem_objs = (
-        lambda **kwargs: [mem_objs[kwargs["layer_id"]]]
-    )
+    resolver_calls = {"layer": 0, "remote_layers": 0}
+
+    def resolve_layer(**kwargs):
+        resolver_calls["layer"] += 1
+        mem_obj = mem_objs[kwargs["layer_id"]]
+        # Match _resolve_shared_rank0_layer_mem_objs(), which returns an
+        # ownership pin that the retriever releases after publication.
+        mem_obj.pin()
+        return [mem_obj]
+
+    engine._resolve_shared_rank0_layer_mem_objs = resolve_layer
+
+    def resolve_remote_layers(**kwargs):
+        resolver_calls["remote_layers"] += 1
+        for mem_obj in mem_objs:
+            mem_obj.pin()
+        return [[mem_obj] for mem_obj in mem_objs]
+
+    engine._resolve_shared_rank0_remote_layers_windowed = resolve_remote_layers
     engine._make_shared_handles_for_layer = lambda **kwargs: [object()]
     broadcasts = []
     engine._broadcast_shared_envelope = lambda envelope: broadcasts.append(envelope)
     ret_mask = torch.ones(4, dtype=torch.bool)
     keys_by_layer = [[_make_key()], [_make_key()]]
+    chunk_location = "RemoteBackend" if page_first else "LocalCPUBackend"
 
     retriever = engine._retrieve_layer_shared_rank0(
         starts=[0],
         ends=[4],
         keys_layer_major=keys_by_layer,
-        chunk_locations_layer_major=[["LocalCPUBackend"], ["LocalCPUBackend"]],
-        location="LocalCPUBackend",
+        chunk_locations_layer_major=[[chunk_location], [chunk_location]],
+        location=chunk_location,
         ret_mask=ret_mask,
         monitor_req_id=123,
         req_id="req-1",
@@ -3781,6 +3802,11 @@ def test_shared_dense_rank0_retriever_releases_before_result_tail(
 
     yielded = [next(retriever) for _ in range(engine.num_layers + 1)]
 
+    assert resolver_calls == (
+        {"layer": 0, "remote_layers": 1}
+        if page_first
+        else {"layer": 2, "remote_layers": 0}
+    )
     assert yielded[0].item() == 4
     assert yielded[1] is None
     assert yielded[2] is None
