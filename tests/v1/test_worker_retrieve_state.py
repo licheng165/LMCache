@@ -3570,6 +3570,77 @@ class TestWorkerRetrieveState:
         assert memory_objs == [["prefix", "suffix"]]
         assert chunk_ptrs == [None]
 
+    def test_store_merge_extends_complete_32_chunk_prefix(self):
+        prefix_chunks = 32
+        suffix_chunks = 16
+        starts = [chunk * 256 for chunk in range(prefix_chunks)]
+        ends = [start + 256 for start in starts]
+        memory_objs = [[f"m{chunk}" for chunk in range(prefix_chunks)]]
+        chunk_ptrs = [torch.arange(prefix_chunks, dtype=torch.long)]
+        suffix_starts = [
+            (prefix_chunks + chunk) * 256 for chunk in range(suffix_chunks)
+        ]
+
+        merged = LMCacheConnectorV1Impl._merge_cache_group_by_ranges(
+            dst_starts=starts,
+            dst_ends=ends,
+            dst_keys=[[f"k{chunk}" for chunk in range(prefix_chunks)]],
+            dst_memory_objs=memory_objs,
+            dst_tensors=[],
+            dst_chunk_dev_ptrs=[list(range(prefix_chunks))],
+            dst_chunk_ptrs_npu=chunk_ptrs,
+            dst_shared_handles=[[]],
+            src_starts=suffix_starts,
+            src_ends=[start + 256 for start in suffix_starts],
+            src_keys=[
+                [f"k{prefix_chunks + chunk}" for chunk in range(suffix_chunks)]
+            ],
+            src_memory_objs=[
+                [f"m{prefix_chunks + chunk}" for chunk in range(suffix_chunks)]
+            ],
+            src_tensors=[],
+            src_chunk_dev_ptrs=[list(range(prefix_chunks, 48))],
+            src_chunk_ptrs_npu=[
+                torch.arange(prefix_chunks, 48, dtype=torch.long)
+            ],
+            src_shared_handles=[],
+            require_pointer_cache=True,
+        )
+
+        assert merged == suffix_chunks
+        assert len(starts) == 48
+        assert len(memory_objs[0]) == 48
+        assert chunk_ptrs[0].tolist() == list(range(48))
+
+    def test_store_merge_rejects_suffix_without_prefix_owners(self):
+        starts = [chunk * 256 for chunk in range(32)]
+        ends = [start + 256 for start in starts]
+        keys = [[f"k{chunk}" for chunk in range(32)]]
+
+        merged = LMCacheConnectorV1Impl._merge_cache_group_by_ranges(
+            dst_starts=starts,
+            dst_ends=ends,
+            dst_keys=keys,
+            dst_memory_objs=[],
+            dst_tensors=[[f"t{chunk}" for chunk in range(32)]],
+            dst_chunk_dev_ptrs=[],
+            dst_chunk_ptrs_npu=[],
+            dst_shared_handles=[],
+            src_starts=[8192],
+            src_ends=[8448],
+            src_keys=[["suffix-key"]],
+            src_memory_objs=[["suffix-owner"]],
+            src_tensors=[],
+            src_chunk_dev_ptrs=[[1]],
+            src_chunk_ptrs_npu=[torch.tensor([1], dtype=torch.long)],
+            src_shared_handles=[],
+        )
+
+        assert merged == 0
+        assert len(starts) == 32
+        assert len(ends) == 32
+        assert len(keys[0]) == 32
+
     def test_store_merge_replaces_partial_tail_with_complete_pointer_cache(self):
         starts = [0, 256]
         ends = [256, 300]

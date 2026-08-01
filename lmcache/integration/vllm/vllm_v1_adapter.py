@@ -4780,6 +4780,17 @@ class LMCacheConnectorV1Impl:
             len(src_tensors or []),
             len(src_keys or []),
         )
+        if cached_prefix_chunks and (
+            len(dst_memory_objs) != source_layer_count
+            or any(len(layer) != existing_chunks for layer in dst_memory_objs)
+        ):
+            logger.warning(
+                "Skipping suffix cache promotion without complete prefix "
+                "owners: prefix_chunks=%d, layers=%d",
+                cached_prefix_chunks,
+                source_layer_count,
+            )
+            return 0
 
         def can_append_layer_ptr_tensors() -> bool:
             if (
