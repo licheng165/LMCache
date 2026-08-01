@@ -662,6 +662,7 @@ class RequestTracker:
             self.allocated_block_ids_indexer = new_indexer_block_ids
             # reset the number of saved tokens
             self.num_saved_tokens = lmcache_cached_tokens
+            self.num_lmcache_cached_tokens = lmcache_cached_tokens
             self.decode_window_save_committed_end = lmcache_cached_tokens
             self.decode_window_save_next_start = None
             self.decode_window_save_anchor = None
@@ -1651,6 +1652,7 @@ class LMCacheConnectorV1Impl:
             self._late_finished_sending: set[str] = set()
             self._completed_decode_window_saves: dict[str, int] = {}
             self._decode_window_save_completed_groups: set[LayerwiseSaveKey] = set()
+            self._prefill_save_completed_groups: dict[LayerwiseSaveKey, int] = {}
             self._decode_window_save_expected_start: dict[str, int] = {}
             self._warn_mla_per_rank_lookup_config(config)
 
@@ -3006,6 +3008,13 @@ class LMCacheConnectorV1Impl:
         if expected is not None:
             expected.pop(req_id, None)
 
+    def _clear_prefill_save_groups_for_req(self, req_id: str) -> None:
+        completed = getattr(self, "_prefill_save_completed_groups", None)
+        if completed is not None:
+            for group_key in list(completed):
+                if group_key[0] == req_id:
+                    completed.pop(group_key, None)
+
     def _clear_decode_window_save_groups_for_window(
         self,
         request: ReqMeta,
@@ -3164,6 +3173,7 @@ class LMCacheConnectorV1Impl:
                 self._layerwise_save_storers.pop(storer_key, None)
             )
         self._clear_decode_window_save_groups_for_req(req_id)
+        self._clear_prefill_save_groups_for_req(req_id)
 
         for pending_key in list(self._deferred_latent_pending):
             if pending_key[0] == req_id:
@@ -3290,7 +3300,46 @@ class LMCacheConnectorV1Impl:
             )
         self._clear_decode_window_save_groups_for_window(request)
 
-    def _mark_prefill_committed(self, request: ReqMeta) -> None:
+    def _prefill_save_required_groups(self, request: ReqMeta) -> set[int]:
+        save_spec = request.save_spec
+        if save_spec is None:
+            return {0} if self.kv_role == "kv_producer" else set()
+        if not save_spec.can_save and self.kv_role != "kv_producer":
+            return set()
+        if not getattr(self.config, "dsa_two_groups", False):
+            return {0}
+        required = set()
+        if save_spec.can_save_latent:
+            required.add(0)
+        if save_spec.can_save_indexer:
+            required.add(1)
+        return required
+
+    def _record_prefill_save_group_completed(
+        self,
+        request: ReqMeta,
+        kv_group: int,
+        result: Optional[LayerwiseStoreResult],
+    ) -> None:
+        if (
+            result is None
+            or result.committed_end <= 0
+            or not request.is_last_prefill
+            or request.is_sparse_decode
+            or self._is_decode_window_save_request(request)
+        ):
+            return
+        completed = getattr(self, "_prefill_save_completed_groups", None)
+        if completed is not None:
+            completed[self._layerwise_save_storer_key(request, kv_group)] = (
+                result.committed_end
+            )
+
+    def _mark_prefill_committed(
+        self,
+        request: ReqMeta,
+        committed_end: Optional[int] = None,
+    ) -> None:
         """Publish the full-chunk prefill frontier after its save completes."""
         if (
             not request.is_last_prefill
@@ -3298,8 +3347,22 @@ class LMCacheConnectorV1Impl:
             or self._is_decode_window_save_request(request)
         ):
             return
+        engine = getattr(self, "lmcache_engine", None)
+        is_passive = getattr(engine, "_is_passive", None)
+        if callable(is_passive) and is_passive():
+            return
+        if committed_end is None:
+            required = self._prefill_save_required_groups(request)
+            groups = getattr(self, "_prefill_save_completed_groups", {})
+            keys = [
+                self._layerwise_save_storer_key(request, kv_group)
+                for kv_group in required
+            ]
+            if not keys or not all(key in groups for key in keys):
+                return
+            committed_end = min(groups.pop(key) for key in keys)
         committed_end = (
-            len(request.token_ids)
+            min(int(committed_end), len(request.token_ids))
             // self._lmcache_chunk_size
             * self._lmcache_chunk_size
         )
@@ -3406,6 +3469,23 @@ class LMCacheConnectorV1Impl:
                     f"LMCache committed_end={committed_end} exceeds request "
                     f"frontier={len(tracker.token_ids)} for request {req_id}."
                 )
+            initial_cached_end = (
+                tracker.num_lmcache_cached_tokens
+                // self._lmcache_chunk_size
+                * self._lmcache_chunk_size
+            )
+            if (
+                window_size > 0
+                and initial_cached_end > 0
+                and committed_end == initial_cached_end
+                and tracker.decode_window_save_next_start is not None
+                and committed_end < int(tracker.decode_window_save_next_start)
+            ):
+                # The first sparse step confirms that the externally loaded
+                # prefix can be released. It may arrive after decode-window
+                # tracking has already advanced to the full appended prompt.
+                published[req_id] = committed_end
+                continue
             if (
                 tracker.decode_window_save_next_start is not None
                 and committed_end
@@ -3525,11 +3605,21 @@ class LMCacheConnectorV1Impl:
         self._worker_retrieve_state[req_id] = state
         self._mark_worker_retrieve_registry_changed()
 
-    def _prune_worker_retrieve_state(self, active_req_ids: set[str]) -> None:
+    def _prune_worker_retrieve_state(
+        self,
+        active_req_ids: set[str],
+        resumed_req_ids: set[str] | None = None,
+    ) -> None:
         if hasattr(self, "_pd_partial_restored_req_ids"):
             self._pd_partial_restored_req_ids.intersection_update(active_req_ids)
         if hasattr(self, "_initial_sparse_release_published"):
             self._initial_sparse_release_published.intersection_update(active_req_ids)
+            if resumed_req_ids:
+                self._initial_sparse_release_published.difference_update(
+                    resumed_req_ids
+                )
+        for req_id in resumed_req_ids or ():
+            self._clear_prefill_save_groups_for_req(req_id)
         if not hasattr(self, "_worker_retrieve_state"):
             return
         active_key = frozenset(active_req_ids)
@@ -5600,6 +5690,7 @@ class LMCacheConnectorV1Impl:
             self._init_kv_caches_from_forward_context(forward_context)
 
         active_req_ids: set[str] = set()
+        resumed_req_ids: set[str] = set()
         loadable_requests: list[tuple[int, ReqMeta]] = []
         vllm_hit_tokens = 0
         prompt_tokens = 0
@@ -5608,6 +5699,8 @@ class LMCacheConnectorV1Impl:
         for idx, request in enumerate(metadata.requests):
             if not self._is_decode_window_save_request(request):
                 active_req_ids.add(request.req_id)
+            if request.resumed_from_preemption:
+                resumed_req_ids.add(request.req_id)
             load_spec = request.load_spec
             if load_spec is None:
                 continue
@@ -5622,7 +5715,7 @@ class LMCacheConnectorV1Impl:
             if self.use_layerwise and not request.is_sparse_decode:
                 staged_load_count += 1
 
-        self._prune_worker_retrieve_state(active_req_ids)
+        self._prune_worker_retrieve_state(active_req_ids, resumed_req_ids)
 
         assert len(self.kv_caches) > 0
         if not self._kvcaches_list:
@@ -6949,7 +7042,13 @@ class LMCacheConnectorV1Impl:
                 "Layerwise store result group mismatch: "
                 f"expected={kv_group}, got={result.kv_group}"
             )
+        if result is not None and result.request_id != request.req_id:
+            raise RuntimeError(
+                "Layerwise store result request mismatch: "
+                f"expected={request.req_id}, got={result.request_id}"
+            )
         self._promote_layerwise_store_result(request, result)
+        self._record_prefill_save_group_completed(request, kv_group, result)
         self._record_decode_window_save_group_completed(
             request,
             kv_group,
@@ -7590,7 +7689,7 @@ class LMCacheConnectorV1Impl:
                     save_context.setdefault("decode_window_saves", []).append(
                         request
                     )
-                self._mark_prefill_committed(request)
+                self._mark_prefill_committed(request, len(token_ids))
 
                 if get_pp_group().is_last_rank:
                     save_spec.skip_leading_tokens = len(token_ids)
@@ -8685,11 +8784,6 @@ class LMCacheConnectorV1Impl:
                     f"This might be due to an unsupported vLLM version."
                 )
             if preempted:
-                published = getattr(
-                    self, "_initial_sparse_release_published", None
-                )
-                if published is not None:
-                    published.discard(req_id)
                 assert load_spec is not None, (
                     f"Request {req_id} is preempted but was not given a load spec"
                 )

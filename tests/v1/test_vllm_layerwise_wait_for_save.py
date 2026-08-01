@@ -18,6 +18,7 @@ from lmcache.integration.vllm.vllm_v1_adapter import (
     RequestTracker,
     SaveSpec,
 )
+from lmcache.v1.cache_engine import LayerwiseStoreResult
 
 
 class _FakeParent:
@@ -34,6 +35,7 @@ class _FakeEngine:
         self.store_steps: dict[str, int] = {}
         self.store_calls: list[str] = []
         self.store_kwargs: list[dict] = []
+        self.store_results: dict[str, LayerwiseStoreResult | None] = {}
         self.passive = False
 
     def lookup_unpin(self, req_id: str) -> None:
@@ -47,9 +49,11 @@ class _FakeEngine:
         num_layers = max(1, len(kwargs.get("kvcaches", []) or []))
 
         def _storer():
-            for _ in range(num_layers + 1):
+            for _ in range(num_layers):
                 self.store_steps[req_id] += 1
                 yield None
+            self.store_steps[req_id] += 1
+            yield self.store_results.get(req_id)
 
         return _storer()
 
@@ -108,6 +112,7 @@ def _make_connector(requests):
     connector._late_finished_sending = set()
     connector._completed_decode_window_saves = {}
     connector._decode_window_save_completed_groups = set()
+    connector._prefill_save_completed_groups = {}
     connector._decode_window_save_expected_start = {}
     return connector, metadata, engine
 
@@ -662,6 +667,80 @@ def test_layerwise_save_skips_requests_that_cannot_save() -> None:
     connector.save_kv_layer("layer0", torch.zeros(1), None)
     assert engine.store_calls == []
     assert connector._layerwise_save_storers == {}
+
+
+def test_layerwise_prefill_does_not_publish_without_a_verified_store() -> None:
+    request = _make_req("req-1", can_save=False)
+    request.is_last_prefill = True
+    request.token_ids = list(range(16))
+    request.slot_mapping = [torch.arange(16)]
+    connector, _, _ = _make_connector([request])
+    connector.kv_role = "kv_both"
+
+    connector.save_kv_layer("layer0", torch.zeros(1), None)
+    connector.wait_for_save()
+
+    assert connector.get_completed_decode_window_saves() == {}
+
+
+def test_layerwise_prefill_publishes_verified_store_frontier() -> None:
+    request = _make_req("req-1")
+    request.is_last_prefill = True
+    request.token_ids = list(range(18))
+    request.slot_mapping = [torch.arange(18)]
+    connector, _, engine = _make_connector([request])
+    engine.store_results[request.req_id] = LayerwiseStoreResult(
+        request_id=request.req_id,
+        committed_end=18,
+    )
+
+    connector.save_kv_layer("layer0", torch.zeros(1), None)
+    connector.wait_for_save()
+
+    assert connector.get_completed_decode_window_saves() == {"req-1": 16}
+
+
+def test_layerwise_prefill_does_not_publish_incomplete_store() -> None:
+    request = _make_req("req-1")
+    request.is_last_prefill = True
+    request.token_ids = list(range(16))
+    request.slot_mapping = [torch.arange(16)]
+    connector, _, engine = _make_connector([request])
+    engine.store_results[request.req_id] = LayerwiseStoreResult(
+        request_id=request.req_id
+    )
+
+    connector.save_kv_layer("layer0", torch.zeros(1), None)
+    connector.wait_for_save()
+
+    assert connector.get_completed_decode_window_saves() == {}
+
+
+def test_layerwise_prefill_waits_for_both_kv_groups() -> None:
+    request = _make_req("req-1")
+    request.is_last_prefill = True
+    request.token_ids = list(range(16))
+    request.save_spec.can_save_indexer = True
+    connector, _, _ = _make_connector([request])
+    connector.config.dsa_two_groups = True
+    latent = LayerwiseStoreResult(
+        request_id=request.req_id,
+        kv_group=0,
+        committed_end=16,
+    )
+    indexer = LayerwiseStoreResult(
+        request_id=request.req_id,
+        kv_group=1,
+        committed_end=16,
+    )
+
+    connector._consume_completed_layerwise_store(request, 0, True, latent)
+    connector._mark_prefill_committed(request)
+    assert connector.get_completed_decode_window_saves() == {}
+
+    connector._consume_completed_layerwise_store(request, 1, True, indexer)
+    connector._mark_prefill_committed(request)
+    assert connector.get_completed_decode_window_saves() == {"req-1": 16}
 
 
 def test_layerwise_save_kv_producer_ignores_can_save_flag() -> None:

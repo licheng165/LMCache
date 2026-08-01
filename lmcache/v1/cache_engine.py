@@ -120,6 +120,10 @@ class LayerwiseStoreResult:
     tensors: List[List[torch.Tensor]] = field(default_factory=list)
     chunk_dev_ptrs: List[List[int]] = field(default_factory=list)
     chunk_ptrs: List[Optional[torch.Tensor]] = field(default_factory=list)
+    # Highest token boundary whose requested chunks were all present or
+    # successfully stored for every layer. Zero means the store was skipped or
+    # incomplete and must not be used to release serving-engine KV blocks.
+    committed_end: int = 0
 
     def has_cache(self) -> bool:
         """Return whether the completed store produced reusable cache data."""
@@ -3968,6 +3972,8 @@ class LMCacheEngine:
         keys = []
         memory_objs = []
         tot_token_num = 0
+        requested_end = 0
+        store_complete = True
         request_configs = kwargs.get("request_configs")
         if request_configs is not None and len(request_configs) != 0:
             assert isinstance(request_configs, dict)
@@ -3981,6 +3987,7 @@ class LMCacheEngine:
             kv_group=kv_group,
         ):
             assert isinstance(key, CacheEngineKey)
+            requested_end = end
 
             keys_multi_layer = key.split_layers(self.num_layers)
             if self._layerwise_chunk_fully_stored(
@@ -4021,6 +4028,7 @@ class LMCacheEngine:
                     "Local cpu memory under pressure so"
                     " choosing to not store the KV cache."
                 )
+                store_complete = False
                 break
 
             starts.append(start)
@@ -4126,6 +4134,8 @@ class LMCacheEngine:
                 yield
 
         self.stats_monitor.on_store_finished(monitor_req_id, tot_token_num)
+        if store_complete:
+            store_result.committed_end = requested_end
         yield store_result
 
     @_lmcache_nvtx_annotate

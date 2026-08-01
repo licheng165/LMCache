@@ -4523,6 +4523,23 @@ class TestWorkerRetrieveState:
 
         assert impl._worker_retrieve_state is pruned_states
 
+    def test_prune_reopens_initial_release_after_preemption(self):
+        impl = _make_impl()
+        impl._initial_sparse_release_published = {"req-1", "req-2"}
+        impl._prefill_save_completed_groups = {
+            ("req-1", "normal_save", 0, 0, 256): 256,
+            ("req-2", "normal_save", 0, 0, 256): 256,
+        }
+
+        impl._prune_worker_retrieve_state(
+            {"req-1", "req-2"}, resumed_req_ids={"req-1"}
+        )
+
+        assert impl._initial_sparse_release_published == {"req-2"}
+        assert set(impl._prefill_save_completed_groups) == {
+            ("req-2", "normal_save", 0, 0, 256)
+        }
+
     def test_registry_change_invalidates_prune_key(self):
         impl = _make_impl()
         impl._worker_retrieve_state = {

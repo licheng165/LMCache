@@ -679,9 +679,11 @@ def test_prefill_completion_publishes_only_chunk_aligned_frontier() -> None:
         is_decode_window_save=False,
     )
 
-    impl._mark_prefill_committed(request)
+    impl._mark_prefill_committed(request, len(request.token_ids))
 
     assert impl._completed_decode_window_saves == {"prefill-partial": 256}
+
+
 class TestRequestTrackerPhase:
     def test_one_token_prefill_boundary_remains_prefill(self) -> None:
         tracker = RequestTracker(
@@ -1126,6 +1128,38 @@ class TestBuildConnectorMetaSparseSyntheticLoadSpec:
         with pytest.raises(RuntimeError, match="exceeds request frontier"):
             impl.update_connector_output(
                 SimpleNamespace(completed_decode_window_saves={req_id: 999})
+            )
+
+    def test_initial_cached_prefix_release_precedes_appended_prompt_window(
+        self,
+    ) -> None:
+        impl = _make_scheduler_impl()
+        impl._decode_window_save_window_size = 256
+        req_id = "appended-prompt"
+        tracker = RequestTracker(
+            req_id=req_id,
+            prompt_len=1024,
+            token_ids=list(range(1025)),
+            allocated_block_ids=list(range(65)),
+            num_saved_tokens=512,
+            num_lmcache_cached_tokens=512,
+            decode_window_save_committed_end=1024,
+        )
+        tracker.is_decode_phase = True
+        tracker.decode_window_save_anchor = 1024
+        tracker.decode_window_save_next_start = 1024
+        impl._request_trackers[req_id] = tracker
+        output = SimpleNamespace(completed_decode_window_saves={req_id: 512})
+
+        impl.update_connector_output(output)
+
+        assert output.completed_decode_window_saves == {req_id: 512}
+        assert tracker.decode_window_save_committed_end == 1024
+        assert tracker.decode_window_save_next_start == 1024
+
+        with pytest.raises(RuntimeError, match="unexpected frontier"):
+            impl.update_connector_output(
+                SimpleNamespace(completed_decode_window_saves={req_id: 768})
             )
 
     def test_decode_window_completion_ignored_before_save_frontier_exists(self) -> None:
@@ -1660,6 +1694,7 @@ class TestDecodeWindowSaveMetadata:
 
         assert tracker.decode_window_save_next_start is None
         assert tracker.decode_window_save_committed_end == 256
+        assert tracker.num_lmcache_cached_tokens == 256
         assert list(tracker.decode_window_save_pending_commits) == []
         assert tracker.sparse_meta_frontier is None
 
