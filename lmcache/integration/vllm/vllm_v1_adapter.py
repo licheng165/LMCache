@@ -4446,6 +4446,116 @@ class LMCacheConnectorV1Impl:
         mem = state.cached_memory_objs
         return bool(mem and len(mem) == num_layers and any(mem))
 
+    def _worker_state_store_merge_issues(
+        self,
+        state: WorkerRetrieveState,
+        result: LayerwiseStoreResult,
+    ) -> dict[int, dict[str, Any]]:
+        """Return state groups that cannot safely accept a range-based merge."""
+
+        def layer_counts(values: list) -> tuple[int, ...]:
+            return tuple(
+                len(layer_values)
+                if isinstance(layer_values, (list, tuple))
+                else -1
+                for layer_values in (values or [])
+            )
+
+        def pointer_counts(values: list) -> tuple[int, ...]:
+            return tuple(
+                int(layer_ptrs.numel())
+                if isinstance(layer_ptrs, torch.Tensor)
+                else (0 if layer_ptrs is None else -1)
+                for layer_ptrs in (values or [])
+            )
+
+        def is_present(counts: tuple[int, ...]) -> bool:
+            return any(count != 0 for count in counts)
+
+        dsa_two_groups = self._is_dsa_two_groups()
+        group_ids = (0, 1) if dsa_two_groups else (0,)
+        issues: dict[int, dict[str, Any]] = {}
+        for kv_group in group_ids:
+            cache = state.cache_kwargs(kv_group, dsa_two_groups)
+            starts = cache["cached_starts"]
+            ends = cache["cached_ends"]
+            if not starts and not ends:
+                continue
+
+            range_count = len(starts)
+            key_counts = layer_counts(cache["cached_keys"])
+            memory_counts = layer_counts(cache["cached_memory_objs"])
+            tensor_counts = layer_counts(cache["cached_tensors"])
+            device_pointer_counts = layer_counts(cache["cached_chunk_dev_ptrs"])
+            pointer_table_counts = pointer_counts(
+                cache["cached_chunk_ptrs_npu"]
+            )
+            expected_layers = max(
+                self._num_layers_for_group(kv_group),
+                len(key_counts),
+                len(memory_counts),
+                len(tensor_counts),
+                len(device_pointer_counts),
+                len(pointer_table_counts),
+            )
+            field_counts = {
+                "keys": key_counts,
+                "memory_objs": memory_counts,
+                "tensors": tensor_counts,
+                "device_ptrs": device_pointer_counts,
+                "pointer_tables": pointer_table_counts,
+            }
+            malformed = (
+                range_count != len(ends)
+                or expected_layers <= 0
+                or len(key_counts) != expected_layers
+                or any(count != range_count for count in key_counts)
+                or any(
+                    is_present(counts)
+                    and (
+                        len(counts) != expected_layers
+                        or any(count != range_count for count in counts)
+                    )
+                    for counts in (
+                        memory_counts,
+                        tensor_counts,
+                        device_pointer_counts,
+                        pointer_table_counts,
+                    )
+                )
+            )
+            if malformed:
+                issues[kv_group] = {
+                    "kind": "partial",
+                    "ranges": range_count,
+                    "fields": field_counts,
+                }
+                continue
+
+            memory_present = is_present(memory_counts)
+            tensors_present = is_present(tensor_counts)
+            if not memory_present and not tensors_present:
+                issues[kv_group] = {
+                    "kind": "metadata_only",
+                    "ranges": range_count,
+                    "fields": field_counts,
+                }
+                continue
+
+            if (
+                kv_group == result.kv_group
+                and (
+                    memory_present != is_present(layer_counts(result.memory_objs))
+                    or tensors_present != is_present(layer_counts(result.tensors))
+                )
+            ):
+                issues[kv_group] = {
+                    "kind": "representation_mismatch",
+                    "ranges": range_count,
+                    "fields": field_counts,
+                }
+        return issues
+
     def _resolve_store_retrieve_location(
         self, state: WorkerRetrieveState
     ) -> Optional[str]:
@@ -4815,6 +4925,38 @@ class LMCacheConnectorV1Impl:
         state_is_warm = state is not None and (
             state.metadata_warm or state.has_cache()
         )
+        if state is not None:
+            merge_issues = self._worker_state_store_merge_issues(state, result)
+            if merge_issues:
+                # Dense prefix retrieval retains metadata but releases its CPU
+                # objects after scattering to NPU. A following suffix-only
+                # store cannot be merged into that range list without shifting
+                # sparse chunk indices. The completed store already lives in
+                # LMCache, so let the first sparse bootstrap fetch the complete
+                # prefix instead of publishing a poisoned hot state.
+                if any(
+                    issue["kind"] == "partial"
+                    for issue in merge_issues.values()
+                ):
+                    logger.warning(
+                        "Dropping partial worker retrieve state before "
+                        "layerwise store-result promotion: req_id=%s "
+                        "result_group=%d groups=%s",
+                        request.req_id,
+                        result.kv_group,
+                        merge_issues,
+                    )
+                    self._drop_worker_retrieve_state(request.req_id)
+                else:
+                    logger.debug(
+                        "Skipping layerwise store-result promotion into an "
+                        "unaligned prefix state: req_id=%s result_group=%d "
+                        "groups=%s",
+                        request.req_id,
+                        result.kv_group,
+                        merge_issues,
+                    )
+                return
         if (
             state_is_warm
             and self._is_decode_window_save_request(request)
@@ -4829,7 +4971,6 @@ class LMCacheConnectorV1Impl:
             return
         if (
             not state_is_warm
-            and self._is_decode_window_save_request(request)
             and not self._cached_ranges_cover_prefix(
                 result.starts,
                 result.ends,
@@ -4837,7 +4978,7 @@ class LMCacheConnectorV1Impl:
             )
         ):
             logger.debug(
-                "Skipping decode-window store result without full-prefix "
+                "Skipping layerwise store result without full-prefix "
                 "coverage: req_id=%s ranges=%s token_count=%d",
                 request.req_id,
                 list(zip(result.starts, result.ends, strict=False)),

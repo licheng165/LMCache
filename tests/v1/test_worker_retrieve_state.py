@@ -3341,6 +3341,166 @@ class TestWorkerRetrieveState:
         assert state.cached_tensors == [["t0", "t1"]]
         assert state.token_count == 8192
 
+    def test_common_prefix_suffix_store_does_not_poison_two_group_state(self):
+        impl = _make_impl()
+        impl.config = SimpleNamespace(dsa_two_groups=True)
+        impl._latent_kvcaches = [object()]
+        impl._indexer_kvcaches = [object()]
+
+        prefix_chunks = 32
+        suffix_chunks = 16
+        chunk_size = 256
+        prefix_end = prefix_chunks * chunk_size
+        total_tokens = (prefix_chunks + suffix_chunks) * chunk_size
+        prefix_starts = [index * chunk_size for index in range(prefix_chunks)]
+        prefix_ends = [start + chunk_size for start in prefix_starts]
+        state = WorkerRetrieveState(
+            req_id="req-long",
+            cached_keys=[[f"latent-prefix-{i}" for i in range(prefix_chunks)]],
+            cached_starts=list(prefix_starts),
+            cached_ends=list(prefix_ends),
+            cached_keys_indexer=[
+                [f"index-prefix-{i}" for i in range(prefix_chunks)]
+            ],
+            cached_starts_indexer=list(prefix_starts),
+            cached_ends_indexer=list(prefix_ends),
+            metadata_warm=True,
+            token_count=prefix_end,
+        )
+        impl._worker_retrieve_state[state.req_id] = state
+        request = ReqMeta(
+            req_id=state.req_id,
+            token_ids=[0] * total_tokens,
+            is_sparse_decode=False,
+        )
+        suffix_starts = [
+            prefix_end + index * chunk_size for index in range(suffix_chunks)
+        ]
+        suffix_ends = [start + chunk_size for start in suffix_starts]
+
+        def suffix_result(kv_group: int) -> LayerwiseStoreResult:
+            label = "index" if kv_group == 1 else "latent"
+            return LayerwiseStoreResult(
+                request_id=request.req_id,
+                kv_group=kv_group,
+                starts=list(suffix_starts),
+                ends=list(suffix_ends),
+                keys=[[f"{label}-suffix-{i}" for i in range(suffix_chunks)]],
+                memory_objs=[[f"{label}-mem-{i}" for i in range(suffix_chunks)]],
+                tensors=[[f"{label}-tensor-{i}" for i in range(suffix_chunks)]],
+                chunk_ptrs=[torch.arange(suffix_chunks, dtype=torch.long)],
+            )
+
+        # TP two-group Prefill completes index first, then flushes deferred
+        # latent. Neither suffix-local result can extend metadata-only ranges.
+        impl._promote_layerwise_store_result(request, suffix_result(1))
+        impl._promote_layerwise_store_result(request, suffix_result(0))
+
+        assert state.cached_starts == prefix_starts
+        assert state.cached_ends == prefix_ends
+        assert state.cached_tensors == []
+        assert state.cached_chunk_ptrs_npu == []
+        assert state.cached_starts_indexer == prefix_starts
+        assert state.cached_ends_indexer == prefix_ends
+        assert state.cached_tensors_indexer == []
+        assert state.cached_chunk_ptrs_npu_indexer == []
+        assert state.token_count == prefix_end
+        assert state.prepared_sparse_sources == {}
+
+    def test_partial_two_group_state_does_not_reseed_from_suffix_results(self):
+        impl = _make_impl()
+        impl.config = SimpleNamespace(dsa_two_groups=True)
+        impl._latent_kvcaches = [object()]
+        impl._indexer_kvcaches = [object()]
+        range_count = 48
+        materialized_count = 16
+        starts = [i * 256 for i in range(range_count)]
+        ends = [(i + 1) * 256 for i in range(range_count)]
+        state = WorkerRetrieveState(
+            req_id="req-long",
+            cached_keys=[[f"key-{i}" for i in range(range_count)]],
+            cached_starts=list(starts),
+            cached_ends=list(ends),
+            cached_memory_objs=[
+                [f"mem-{i}" for i in range(materialized_count)]
+            ],
+            cached_tensors=[
+                [f"tensor-{i}" for i in range(materialized_count)]
+            ],
+            cached_chunk_ptrs_npu=[
+                torch.arange(materialized_count, dtype=torch.long)
+            ],
+            cached_keys_indexer=[
+                [f"index-key-{i}" for i in range(range_count)]
+            ],
+            cached_starts_indexer=list(starts),
+            cached_ends_indexer=list(ends),
+            metadata_warm=True,
+            token_count=range_count * 256,
+        )
+        impl._worker_retrieve_state[state.req_id] = state
+        request = ReqMeta(
+            req_id=state.req_id,
+            token_ids=[0] * ((range_count + 1) * 256),
+        )
+
+        def suffix_result(kv_group: int) -> LayerwiseStoreResult:
+            return LayerwiseStoreResult(
+                request_id=state.req_id or request.req_id,
+                kv_group=kv_group,
+                starts=[range_count * 256],
+                ends=[(range_count + 1) * 256],
+                keys=[[f"suffix-key-{kv_group}"]],
+                memory_objs=[[f"suffix-mem-{kv_group}"]],
+                tensors=[[f"suffix-tensor-{kv_group}"]],
+            )
+
+        # Production TP ordering promotes index first, then deferred latent.
+        # The first result drops the old 48/16 state; the second must not seed
+        # a new suffix-only state after that drop.
+        impl._promote_layerwise_store_result(request, suffix_result(1))
+
+        assert state.req_id is None
+        assert state.cached_memory_objs == []
+        assert state.cached_tensors == []
+        assert state.cached_chunk_ptrs_npu == []
+        assert "req-long" not in impl._worker_retrieve_state
+
+        impl._promote_layerwise_store_result(request, suffix_result(0))
+
+        assert "req-long" not in impl._worker_retrieve_state
+
+    def test_memory_only_store_seed_can_merge_memory_only_suffix(self):
+        impl = _make_impl()
+        impl.config = SimpleNamespace(dsa_two_groups=False)
+        impl._latent_kvcaches = [object()]
+        state = WorkerRetrieveState(
+            req_id="req-1",
+            cached_keys=[["k0"]],
+            cached_starts=[0],
+            cached_ends=[256],
+            cached_memory_objs=[["m0"]],
+            metadata_warm=True,
+            token_count=256,
+        )
+        impl._worker_retrieve_state[state.req_id] = state
+        request = ReqMeta(req_id=state.req_id, token_ids=[0] * 512)
+        result = LayerwiseStoreResult(
+            request_id=state.req_id,
+            starts=[256],
+            ends=[512],
+            keys=[["k1"]],
+            memory_objs=[["m1"]],
+        )
+
+        impl._promote_layerwise_store_result(request, result)
+
+        assert state.cached_starts == [0, 256]
+        assert state.cached_ends == [256, 512]
+        assert state.cached_memory_objs == [["m0", "m1"]]
+        assert state.cached_tensors == []
+        assert state.token_count == 512
+
     def test_store_seed_full_chunk_replaces_partial_at_same_start(self):
         impl = _make_impl()
         impl.config = SimpleNamespace(dsa_two_groups=False)
