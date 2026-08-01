@@ -332,7 +332,7 @@ def test_dense_retrieve_reuses_group0_chunk_plan_for_group1():
     )
 
 
-def test_shared_page_first_uniform_location_uses_one_batched_probe():
+def test_shared_page_first_uniform_location_uses_local_then_one_remote_probe():
     engine = object.__new__(LMCacheEngine)
     engine.config = SimpleNamespace(
         extra_config={"mooncake_page_first_multi_buffer": True}
@@ -379,12 +379,29 @@ def test_shared_page_first_uniform_location_uses_one_batched_probe():
         == "LocalCPUBackend"
     )
     assert len(calls) == 1
+    engine._shared_local_cpu_backend = lambda: SimpleNamespace(
+        cpu_lock=nullcontext(),
+        hot_cache={flat_keys[0]: object()},
+    )
+    assert (
+        engine._shared_page_first_uniform_location(keys_by_chunk)
+        == "RemoteBackend"
+    )
+    # A page-first probe must include every layer from the shortest common
+    # LocalCPU prefix, even when another layer already has that object locally.
+    assert calls[-1] == (flat_keys, ["RemoteBackend"])
+    engine._shared_local_cpu_backend = lambda: SimpleNamespace(
+        cpu_lock=nullcontext(),
+        hot_cache={flat_keys[-1]: object()},
+    )
+    assert engine._shared_page_first_uniform_location(keys_by_chunk) is None
+    assert len(calls) == 2
 
 
 @pytest.mark.parametrize(
     "local_hit,remote_hits,retrieval_backends,supports_batch",
     [
-        (True, 4, ["RemoteBackend"], True),
+        (True, 2, ["RemoteBackend"], True),
         (False, 3, ["RemoteBackend"], True),
         (False, 4, ["LocalCPUBackend"], True),
         (False, 4, ["RemoteBackend", "LocalDiskBackend"], True),
@@ -434,6 +451,24 @@ def test_shared_page_first_uniform_location_falls_back(
         and supports_batch
         and retrieval_backends == ["RemoteBackend"]
         else 0
+    )
+
+
+def test_page_first_plan_uses_shortest_local_layer_prefix():
+    locations = [
+        ["LocalCPUBackend", "LocalCPUBackend", "RemoteBackend"],
+        ["LocalCPUBackend", "RemoteBackend", "RemoteBackend"],
+    ]
+
+    assert LMCacheEngine._shared_page_first_common_prefix_plan(locations) == [
+        ["LocalCPUBackend", "RemoteBackend", "RemoteBackend"],
+        ["LocalCPUBackend", "RemoteBackend", "RemoteBackend"],
+    ]
+    assert (
+        LMCacheEngine._shared_page_first_common_prefix_plan(
+            [["RemoteBackend", "LocalCPUBackend"]]
+        )
+        is None
     )
 
 
@@ -795,21 +830,37 @@ def _make_dsa_lookup_engine(present):
 
 
 class _RecordingRemoteSampleStorageManager:
-    def __init__(self, present):
+    def __init__(self, present, local_present=(), pin_present=None):
         self.present = set(present)
+        self.pin_present = set(present if pin_present is None else pin_present)
+        self.local_present = set(local_present)
         self.calls = []
+        self.local_calls = []
         self.unpinned = []
         self.storage_backends = {"RemoteBackend": self}
 
+    def contains(self, key, search_range=None, pin=False):
+        self.local_calls.append((key, search_range, pin))
+        if key in self.local_present and search_range == ["LocalCPUBackend"]:
+            return "LocalCPUBackend"
+        return None
+
     def batched_contains(self, keys, search_range=None, pin=False):
         keys = list(keys)
-        self.calls.append((keys, search_range, pin))
+        local = search_range == ["LocalCPUBackend"]
+        (self.local_calls if local else self.calls).append(
+            (keys, search_range, pin)
+        )
         hit = 0
+        present = self.local_present if local else (
+            self.pin_present if pin else self.present
+        )
         for key in keys:
-            if key not in self.present:
+            if key not in present:
                 break
             hit += 1
-        mapping = {"RemoteBackend": keys[:hit]} if hit else {}
+        location = "LocalCPUBackend" if local else "RemoteBackend"
+        mapping = {location: keys[:hit]} if hit else {}
         return hit, mapping
 
     def batched_unpin(self, keys, locations=None):
@@ -819,11 +870,12 @@ class _RecordingRemoteSampleStorageManager:
         return None
 
     def get_active_storage_backends(self, location=None, search_range=None):
-        if location and location != "RemoteBackend":
-            return
-        if search_range and "RemoteBackend" not in search_range:
-            return
-        yield "RemoteBackend", self
+        for backend in ("LocalCPUBackend", "RemoteBackend"):
+            if location and location != backend:
+                continue
+            if search_range and backend not in search_range:
+                continue
+            yield backend, self
 
 
 def _sampled_keys_for_chunk(token_db, chunk_index, num_layers=4):
@@ -838,17 +890,26 @@ def _sampled_keys_for_chunk(token_db, chunk_index, num_layers=4):
     return sampled
 
 
-def _make_sampled_lookup_engine(present):
+def _layer_keys_for_chunk(token_db, chunk_index, kv_group, num_layers=4):
+    return token_db._make_key_by_hash(
+        0x100 + chunk_index,
+        kv_group=kv_group,
+    ).split_layers(num_layers)
+
+
+def _make_sampled_lookup_engine(present, local_present=(), pin_present=None):
     engine = _make_dsa_lookup_engine([])
     engine.token_database = _FakeMultiChunkLookupTokenDatabase()
-    engine.storage_manager = _RecordingRemoteSampleStorageManager(present)
-    engine.retrieve_locations = ["LocalCPUBackend"]
+    engine.storage_manager = _RecordingRemoteSampleStorageManager(
+        present, local_present, pin_present
+    )
+    engine.retrieve_locations = ["LocalCPUBackend", "RemoteBackend"]
     engine.num_layers = 4
     engine.config.experimental_sampled_layerwise_lookup = True
     return engine
 
 
-def test_sampled_lookup_uses_remote_first_and_reverse_tail_probes() -> None:
+def test_sampled_lookup_uses_local_first_and_reverse_tail_probes() -> None:
     token_db = _FakeMultiChunkLookupTokenDatabase()
     first_keys = _sampled_keys_for_chunk(token_db, 0)
     winner_keys = _sampled_keys_for_chunk(token_db, 2)
@@ -863,14 +924,94 @@ def test_sampled_lookup_uses_remote_first_and_reverse_tail_probes() -> None:
         _sampled_keys_for_chunk(token_db, 2),
     ]
     assert all(call[1] == ["RemoteBackend"] for call in calls)
-    assert calls[-1] == (
-        [*first_keys, *winner_keys],
-        ["RemoteBackend"],
-        True,
+    assert engine.lookup_pins["req"]["RemoteBackend"] == []
+
+
+def test_sampled_lookup_combines_local_and_remote_keys() -> None:
+    token_db = _FakeMultiChunkLookupTokenDatabase()
+    local_keys = [
+        key
+        for chunk in range(3)
+        for key in _layer_keys_for_chunk(token_db, chunk, 0)
+    ]
+    remote_keys = [
+        *_sampled_keys_for_chunk(token_db, 0)[2:],
+        *_sampled_keys_for_chunk(token_db, 2)[2:],
+    ]
+    engine = _make_sampled_lookup_engine(remote_keys, local_keys)
+
+    assert engine.lookup(list(range(14)), lookup_id="req", pin=True) == 12
+
+    assert engine.lookup_pins["req"]["LocalCPUBackend"] == local_keys
+    assert engine.lookup_pins["req"]["RemoteBackend"] == []
+
+
+def test_sampled_lookup_avoids_remote_when_samples_are_local() -> None:
+    token_db = _FakeMultiChunkLookupTokenDatabase()
+    local_keys = [
+        key
+        for chunk in range(4)
+        for group in (0, 1)
+        for key in _layer_keys_for_chunk(token_db, chunk, group)
+    ]
+    engine = _make_sampled_lookup_engine([], local_keys)
+
+    assert engine.lookup(list(range(14)), lookup_id="req", pin=True) == 14
+
+    assert engine.storage_manager.calls == []
+    assert engine.lookup_pins["req"]["LocalCPUBackend"] == local_keys
+
+
+def test_sampled_lookup_does_not_trust_partial_local_layers() -> None:
+    token_db = _FakeMultiChunkLookupTokenDatabase()
+    sampled = _sampled_keys_for_chunk(token_db, 0)
+    engine = _make_sampled_lookup_engine([], sampled)
+
+    assert engine.lookup(list(range(14)), lookup_id="req", pin=True) == 0
+    assert engine.lookup_pins["req"] == {}
+
+
+def test_sampled_lookup_rejects_local_prefix_holes() -> None:
+    token_db = _FakeMultiChunkLookupTokenDatabase()
+    first = [
+        key
+        for group in (0, 1)
+        for key in _layer_keys_for_chunk(token_db, 0, group)
+    ]
+    tail = [
+        key
+        for group in (0, 1)
+        for key in _layer_keys_for_chunk(token_db, 3, group)
+    ]
+    engine = _make_sampled_lookup_engine([], [*first, *tail])
+
+    assert engine.lookup(list(range(14)), lookup_id="req", pin=True) == 0
+    assert engine.lookup_pins["req"] == {}
+    assert engine.storage_manager.unpinned == [
+        (first, ["LocalCPUBackend"]),
+    ]
+
+
+def test_sampled_lookup_rolls_back_local_pins_on_remote_race() -> None:
+    token_db = _FakeMultiChunkLookupTokenDatabase()
+    pinned_local_keys = _layer_keys_for_chunk(token_db, 0, 0)
+    partial_local = _layer_keys_for_chunk(token_db, 1, 0)[:1]
+    remote_keys = [
+        *_sampled_keys_for_chunk(token_db, 0)[2:],
+        *_sampled_keys_for_chunk(token_db, 2),
+    ]
+    partial_remote = _sampled_keys_for_chunk(token_db, 1)[:2]
+    engine = _make_sampled_lookup_engine(
+        remote_keys,
+        [*pinned_local_keys, *partial_local],
+        pin_present=partial_remote[:1],
     )
-    assert engine.lookup_pins["req"]["RemoteBackend"] == [
-        *first_keys,
-        *winner_keys,
+
+    assert engine.lookup(list(range(14)), lookup_id="req", pin=True) == 0
+    assert engine.lookup_pins["req"] == {}
+    assert engine.storage_manager.unpinned == [
+        (partial_local, ["LocalCPUBackend"]),
+        (pinned_local_keys, ["LocalCPUBackend"]),
     ]
 
 
@@ -881,6 +1022,35 @@ def test_sampled_lookup_returns_zero_after_first_chunk_miss() -> None:
 
     assert len(engine.storage_manager.calls) == 1
     assert engine.storage_manager.calls[0][1] == ["RemoteBackend"]
+
+
+def test_sampled_lookup_uses_active_backends_when_range_is_unset() -> None:
+    token_db = _FakeMultiChunkLookupTokenDatabase()
+    first_keys = _sampled_keys_for_chunk(token_db, 0)
+    tail_keys = _sampled_keys_for_chunk(token_db, 3)
+    engine = _make_sampled_lookup_engine([*first_keys, *tail_keys])
+    engine.retrieve_locations = None
+
+    assert engine.lookup(list(range(14)), pin=False) == 14
+    assert engine.storage_manager.calls == [
+        (first_keys, ["RemoteBackend"], False),
+        (tail_keys, ["RemoteBackend"], False),
+    ]
+
+
+def test_sampled_lookup_respects_explicit_local_search_range() -> None:
+    token_db = _FakeMultiChunkLookupTokenDatabase()
+    engine = _make_sampled_lookup_engine(_sampled_keys_for_chunk(token_db, 0))
+
+    assert (
+        engine.lookup(
+            list(range(14)),
+            search_range=["LocalCPUBackend"],
+            pin=False,
+        )
+        == 0
+    )
+    assert engine.storage_manager.calls == []
 
 
 def test_sampled_lookup_can_select_partial_tail_chunk() -> None:
@@ -1977,6 +2147,92 @@ def test_rank0_resolver_reuses_remote_object_already_in_shared_slab():
     assert resolved == remote_objects
     assert all(obj.is_pinned for obj in resolved)
     assert all(obj.ref_count_down_count == 0 for obj in resolved)
+
+
+def test_page_first_resolver_joins_common_local_prefix_and_remote_suffix():
+    keys = [
+        [replace(_make_key(), chunk_hash=layer * 10 + chunk) for chunk in range(3)]
+        for layer in range(2)
+    ]
+    local = [
+        [_FakeResolvableMemoryObj(), _FakeResolvableMemoryObj()],
+        [_FakeResolvableMemoryObj()],
+    ]
+    remote = [
+        [_FakeResolvableMemoryObj(), _FakeResolvableMemoryObj()],
+        [_FakeResolvableMemoryObj(), _FakeResolvableMemoryObj()],
+    ]
+    prefixes = [
+        LocalCPUPrefixGetResult(
+            list(layer),
+            list(range(len(layer), 3)),
+            keys[layer_id][len(layer) :],
+        )
+        for layer_id, layer in enumerate(local)
+    ]
+    engine = object.__new__(LMCacheEngine)
+    engine.num_layers = 2
+    engine.storage_manager = object()
+    engine._shared_local_cpu_backend = lambda: object()
+    engine._is_rank0_shared_mem_obj = lambda _obj: True
+    engine._validate_rank0_shared_mem_obj = lambda *_args, **_kwargs: None
+    remote_calls = []
+
+    def resolve_remote(**kwargs):
+        remote_calls.append(kwargs)
+        return remote
+
+    engine._resolve_shared_rank0_remote_layers_windowed = resolve_remote
+
+    resolved = engine._resolve_shared_rank0_page_first_layers(
+        req_id="req-mixed",
+        phase="sparse_decode_bootstrap",
+        kv_group=0,
+        keys_layer_major=keys,
+        local_prefix_layers=prefixes,
+    )
+
+    assert resolved == [
+        [local[0][0], *remote[0]],
+        [local[1][0], *remote[1]],
+    ]
+    assert local[0][1].ref_count_down_count == 1
+    assert remote_calls[0]["keys_layer_major"] == [layer[1:] for layer in keys]
+    assert remote_calls[0]["layers_per_batch"] == 2
+    assert all(obj.is_pinned for obj in (local[0][0], local[1][0]))
+
+
+def test_page_first_resolver_rolls_back_local_prefix_on_remote_failure():
+    keys = [
+        [replace(_make_key(), chunk_hash=layer * 10 + chunk) for chunk in range(2)]
+        for layer in range(2)
+    ]
+    local = [[_FakeResolvableMemoryObj()] for _ in range(2)]
+    prefixes = [
+        LocalCPUPrefixGetResult(list(layer), [1], keys[layer_id][1:])
+        for layer_id, layer in enumerate(local)
+    ]
+    engine = object.__new__(LMCacheEngine)
+    engine.num_layers = 2
+    engine.storage_manager = object()
+    engine._shared_local_cpu_backend = lambda: object()
+    engine._is_rank0_shared_mem_obj = lambda _obj: True
+    engine._validate_rank0_shared_mem_obj = lambda *_args, **_kwargs: None
+    engine._resolve_shared_rank0_remote_layers_windowed = lambda **_kwargs: (
+        _ for _ in ()
+    ).throw(RuntimeError("remote failed"))
+
+    with pytest.raises(RuntimeError, match="remote failed"):
+        engine._resolve_shared_rank0_page_first_layers(
+            req_id="req-mixed",
+            phase="sparse_decode_bootstrap",
+            kv_group=0,
+            keys_layer_major=keys,
+            local_prefix_layers=prefixes,
+        )
+
+    assert all(not obj.is_pinned for layer in local for obj in layer)
+    assert all(obj.ref_count_down_count == 1 for layer in local for obj in layer)
 
 
 def test_rank0_windowed_remote_resolver_batches_layers_and_preserves_order():
@@ -3324,7 +3580,17 @@ def test_dense_prefix_zero_hit_broadcasts_skipped_not_miss():
     assert broadcasts[-1] == {"stats": 0}
 
 
-def test_shared_dense_page_first_remote_uses_all_layer_window(monkeypatch):
+@pytest.mark.parametrize(
+    ("locations", "location", "page_first"),
+    [
+        ([["RemoteBackend"] * 2] * 2, "RemoteBackend", True),
+        ([["LocalCPUBackend", "RemoteBackend"]] * 2, "mixed", True),
+        ([["RemoteBackend", "LocalCPUBackend"]] * 2, "mixed", False),
+    ],
+)
+def test_shared_dense_page_first_selects_safe_resolver(
+    monkeypatch, locations, location, page_first
+):
     import lmcache.v1.cache_engine as cache_engine_module
 
     monkeypatch.setattr(
@@ -3349,21 +3615,24 @@ def test_shared_dense_page_first_remote_uses_all_layer_window(monkeypatch):
     ]
     keys_by_layer = [list(row) for row in zip(*chunk_keys, strict=True)]
     mem_objs = [
-        [_FakeResolvableMemoryObj() for _ in range(2)]
-        for _ in range(engine.num_layers)
+        [_FakeResolvableMemoryObj() for _ in range(2)] for _ in range(engine.num_layers)
     ]
     for mem_obj in (obj for layer in mem_objs for obj in layer):
         mem_obj.pin()
-    windowed_calls = []
+    page_calls = []
 
-    def resolve_windowed(**kwargs):
-        windowed_calls.append(kwargs)
+    def resolve_page_first(**kwargs):
+        page_calls.append(kwargs)
         return mem_objs
 
-    engine._resolve_shared_rank0_remote_layers_windowed = resolve_windowed
-    engine._resolve_shared_rank0_layer_mem_objs = lambda **_kwargs: (
-        _ for _ in ()
-    ).throw(AssertionError("page-first remote reads must not fetch one layer"))
+    layer_calls = []
+
+    def resolve_layer(**kwargs):
+        layer_calls.append(kwargs)
+        return mem_objs[kwargs["layer_id"]]
+
+    engine._resolve_shared_rank0_page_first_layers = resolve_page_first
+    engine._resolve_shared_rank0_layer_mem_objs = resolve_layer
     engine._make_shared_handles_for_layer = lambda **kwargs: [
         object() for _ in kwargs["mem_objs_layer"]
     ]
@@ -3374,11 +3643,8 @@ def test_shared_dense_page_first_remote_uses_all_layer_window(monkeypatch):
             starts=[0, 4],
             ends=[4, 8],
             keys_layer_major=keys_by_layer,
-            chunk_locations_layer_major=[
-                ["RemoteBackend", "RemoteBackend"]
-                for _ in range(engine.num_layers)
-            ],
-            location="RemoteBackend",
+            chunk_locations_layer_major=locations,
+            location=location,
             ret_mask=torch.ones(8, dtype=torch.bool),
             monitor_req_id=123,
             req_id="req-page-first",
@@ -3387,9 +3653,10 @@ def test_shared_dense_page_first_remote_uses_all_layer_window(monkeypatch):
         )
     )
 
-    assert len(windowed_calls) == 1
-    assert windowed_calls[0]["keys_layer_major"] == keys_by_layer
-    assert windowed_calls[0]["layers_per_batch"] == engine.num_layers
+    assert len(page_calls) == int(page_first)
+    assert len(layer_calls) == (0 if page_first else engine.num_layers)
+    if page_first:
+        assert page_calls[0]["keys_layer_major"] == keys_by_layer
     assert engine.gpu_connector.sent == mem_objs
     assert all(
         obj.ref_count_down_count == 1 and not obj.is_pinned
@@ -3432,7 +3699,7 @@ def test_shared_dense_page_first_publishes_one_compact_batch(monkeypatch):
     ]
     for obj in (obj for layer in mem_objs for obj in layer):
         obj.pin()
-    engine._resolve_shared_rank0_remote_layers_windowed = lambda **_kwargs: mem_objs
+    engine._resolve_shared_rank0_page_first_layers = lambda **_kwargs: mem_objs
     engine._make_shared_handles_for_layer = lambda **_kwargs: (
         _ for _ in ()
     ).throw(AssertionError("compact page-first path must not build handles"))

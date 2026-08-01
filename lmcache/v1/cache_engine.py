@@ -1414,22 +1414,6 @@ class LMCacheEngine:
             self._sampled_lookup_local_fallback_logged = True
         return False
 
-    def _sampled_scheduler_keys(
-        self,
-        base_key: CacheEngineKey,
-        *,
-        request_configs: Optional[dict],
-    ) -> list[CacheEngineKey]:
-        group_keys = [
-            self._lookup_key_for_kv_group(
-                base_key,
-                kv_group=kv_group,
-                request_configs=request_configs,
-            )
-            for kv_group in self._layerwise_lookup_kv_groups()
-        ]
-        return first_last_layer_keys(group_keys, self.num_layers)
-
     def _sampled_scheduler_lookup(
         self,
         chunks: list[tuple[int, CacheEngineKey]],
@@ -1442,21 +1426,117 @@ class LMCacheEngine:
             return 0
         assert self.storage_manager is not None
 
-        def remote_exists(keys: list[CacheEngineKey]) -> bool:
-            if not keys:
-                return False
-            hits, _ = self.storage_manager.batched_contains(
-                keys, ["RemoteBackend"], False
-            )
-            return hits == len(keys)
+        def tiered_locations(
+            base_keys: list[CacheEngineKey],
+            *,
+            pin: bool = False,
+            local_through: Optional[set[int]] = None,
+        ) -> Optional[dict[str, list[CacheEngineKey]]]:
+            if not base_keys:
+                return None
+            mapping: dict[str, list[CacheEngineKey]] = defaultdict(list)
+            remote_keys: list[CacheEngineKey] = []
+            kv_groups = self._layerwise_lookup_kv_groups()
+            remote_groups: set[int] = set()
+            required_local = local_through or set()
+
+            def rollback() -> None:
+                if pin:
+                    for location, location_keys in mapping.items():
+                        if location_keys:
+                            self.storage_manager.batched_unpin(
+                                location_keys, [location]
+                            )
+
+            try:
+                for base_key in base_keys:
+                    for kv_group in kv_groups:
+                        if pin and kv_group in remote_groups:
+                            continue
+                        group_key = self._lookup_key_for_kv_group(
+                            base_key,
+                            kv_group=kv_group,
+                            request_configs=request_configs,
+                        )
+                        sampled = first_last_layer_keys(
+                            [group_key], self.num_layers
+                        )
+                        if self.storage_manager.contains(
+                            sampled[0], ["LocalCPUBackend"], False
+                        ) is None:
+                            if pin and kv_group in required_local:
+                                rollback()
+                                return None
+                            if pin:
+                                # Sampling already proved the remote prefix;
+                                # remote pin/unpin are no-ops. Keep only the
+                                # location marker needed by retrieval routing.
+                                mapping.setdefault("RemoteBackend", [])
+                                remote_groups.add(kv_group)
+                            else:
+                                remote_keys.extend(sampled)
+                            continue
+                        layer_keys = group_key.split_layers(self.num_layers)
+                        if pin:
+                            hits, pinned = self.storage_manager.batched_contains(
+                                layer_keys,
+                                ["LocalCPUBackend"],
+                                True,
+                            )
+                            if hits == self.num_layers:
+                                for location, keys in pinned.items():
+                                    mapping[location].extend(keys)
+                                continue
+                            for location, keys in pinned.items():
+                                self.storage_manager.batched_unpin(keys, [location])
+                            if kv_group in required_local:
+                                rollback()
+                                return None
+                            remote_keys.extend(sampled)
+                            remote_groups.add(kv_group)
+                            continue
+                        hits, _ = self.storage_manager.batched_contains(
+                            layer_keys,
+                            ["LocalCPUBackend"],
+                            False,
+                        )
+                        if hits != self.num_layers:
+                            remote_keys.extend(sampled)
+                            continue
+                        mapping["LocalCPUBackend"].extend(layer_keys)
+                    if pin and len(remote_groups) == len(kv_groups):
+                        break
+
+                if remote_keys:
+                    hits, remote = self.storage_manager.batched_contains(
+                        remote_keys,
+                        ["RemoteBackend"],
+                        pin,
+                    )
+                    for location, keys in remote.items():
+                        if pin and location == "RemoteBackend":
+                            mapping.setdefault(location, [])
+                        else:
+                            mapping[location].extend(keys)
+                    if hits != len(remote_keys):
+                        rollback()
+                        return None
+            except Exception:
+                rollback()
+                raise
+            return mapping
+
+        local_groups_by_chunk: dict[int, set[int]] = {}
 
         def chunk_exists(index: int) -> bool:
-            return remote_exists(
-                self._sampled_scheduler_keys(
-                    chunks[index][1],
-                    request_configs=request_configs,
-                )
-            )
+            locations = tiered_locations([chunks[index][1]])
+            if locations is None:
+                return False
+            local_groups_by_chunk[index] = {
+                key.kv_group
+                for key in locations.get("LocalCPUBackend", [])
+            }
+            return True
 
         winner_index = find_last_sampled_hit(
             len(chunks),
@@ -1467,26 +1547,13 @@ class LMCacheEngine:
 
         if pin:
             assert lookup_id is not None, "lookup_id is required when pin is True"
-            first_keys = self._sampled_scheduler_keys(
-                chunks[0][1],
-                request_configs=request_configs,
+            pin_chunks = [key for _, key in chunks[: winner_index + 1]]
+            block_mapping = tiered_locations(
+                pin_chunks,
+                pin=True,
+                local_through=local_groups_by_chunk[winner_index],
             )
-            winner_keys = self._sampled_scheduler_keys(
-                chunks[winner_index][1],
-                request_configs=request_configs,
-            )
-            pin_keys = list(dict.fromkeys([*first_keys, *winner_keys]))
-            hits, block_mapping = self.storage_manager.batched_contains(
-                pin_keys,
-                ["RemoteBackend"],
-                True,
-            )
-            if hits != len(pin_keys):
-                for location, location_keys in block_mapping.items():
-                    self.storage_manager.batched_unpin(
-                        location_keys,
-                        [location],
-                    )
+            if block_mapping is None:
                 return 0
             for location, location_keys in block_mapping.items():
                 self.lookup_pins[lookup_id][location].extend(location_keys)
@@ -2119,19 +2186,27 @@ class LMCacheEngine:
         self,
         keys_by_chunk: list[list[CacheEngineKey]],
     ) -> Optional[str]:
-        """Batch-prove one location before the mixed per-object fallback."""
+        """Prefer LocalCPU and prove Mooncake covers every remaining key."""
         if not keys_by_chunk or not mooncake_page_layout_enabled(self.config):
             return None
-        flat_keys = [key for chunk in keys_by_chunk for key in chunk]
         local = self._shared_local_cpu_backend()
         lock = getattr(local, "cpu_lock", None)
         hot_cache = getattr(local, "hot_cache", None)
         if lock is None or hot_cache is None:
             return None
+        local_chunks = len(keys_by_chunk)
+        missed_layers: set[int] = set()
         with lock:
-            local_hits = sum(key in hot_cache for key in flat_keys)
-        if local_hits:
-            return "LocalCPUBackend" if local_hits == len(flat_keys) else None
+            for chunk_index, chunk in enumerate(keys_by_chunk):
+                for layer_id, key in enumerate(chunk):
+                    if key in hot_cache:
+                        if layer_id in missed_layers:
+                            return None
+                    else:
+                        missed_layers.add(layer_id)
+                        local_chunks = min(local_chunks, chunk_index)
+        if local_chunks == len(keys_by_chunk):
+            return "LocalCPUBackend"
         search_range = self.retrieve_locations
         if search_range is not None and "RemoteBackend" not in search_range:
             return None
@@ -2150,13 +2225,53 @@ class LMCacheEngine:
         )
         if not callable(supports) or not supports():
             return None
+        remote_keys = [
+            key for chunk in keys_by_chunk[local_chunks:] for key in chunk
+        ]
         hits, mapping = self.storage_manager.batched_contains(
-            flat_keys,
+            remote_keys,
             ["RemoteBackend"],
         )
-        if hits == len(flat_keys) and set(mapping) == {"RemoteBackend"}:
+        if hits == len(remote_keys) and set(mapping) == {"RemoteBackend"}:
             return "RemoteBackend"
         return None
+
+    @staticmethod
+    def _is_shared_page_first_location_plan(
+        locations_layer_major: list[list[str]],
+    ) -> bool:
+        """Accept only a LocalCPU prefix followed by a Remote suffix per layer."""
+        if not locations_layer_major or not locations_layer_major[0]:
+            return False
+        chunks = len(locations_layer_major[0])
+        if any(len(locations) != chunks for locations in locations_layer_major):
+            return False
+        for locations in locations_layer_major:
+            remote = False
+            for location in locations:
+                if location == "RemoteBackend":
+                    remote = True
+                elif location != "LocalCPUBackend" or remote:
+                    return False
+        return True
+
+    @classmethod
+    def _shared_page_first_common_prefix_plan(
+        cls,
+        locations_layer_major: list[list[str]],
+    ) -> Optional[list[list[str]]]:
+        """Normalize layer prefixes to the all-layer page boundary."""
+        if not cls._is_shared_page_first_location_plan(locations_layer_major):
+            return None
+        local_chunks = min(
+            locations.count("LocalCPUBackend")
+            for locations in locations_layer_major
+        )
+        return [
+            ["LocalCPUBackend"] * local_chunks
+            + ["RemoteBackend"] * (len(locations) - local_chunks)
+            for locations in locations_layer_major
+        ]
 
     def _resolve_shared_rank0_layer_mem_objs(
         self,
@@ -2369,6 +2484,88 @@ class LMCacheEngine:
                 mem_obj.ref_count_down()
             if local_prefix is not None:
                 local_prefix.release()
+            raise
+
+    def _resolve_shared_rank0_page_first_layers(
+        self,
+        *,
+        req_id: str,
+        phase: str,
+        kv_group: int,
+        keys_layer_major: list[list[CacheEngineKey]],
+        local_prefix_layers: Optional[list[LocalCPUPrefixGetResult]] = None,
+    ) -> list[list[MemoryObj]]:
+        """Join the common LocalCPU prefix with one all-layer remote suffix.
+
+        Supplied prefix results are consumed on both success and failure.
+        """
+        if len(keys_layer_major) != self.num_layers or not keys_layer_major:
+            raise ValueError("Page-first retrieval requires every model layer")
+        chunks = len(keys_layer_major[0])
+        if any(len(keys) != chunks for keys in keys_layer_major):
+            raise ValueError("Page-first retrieval requires equal layer chunk counts")
+
+        prefixes = (
+            local_prefix_layers
+            if local_prefix_layers is not None
+            else self._shared_local_cpu_backend().batched_get_prefixes_with_misses(
+                keys_layer_major
+            )
+        )
+        if len(prefixes) != self.num_layers:
+            for prefix in prefixes:
+                prefix.release()
+            raise ValueError("LocalCPU prefix lookup returned the wrong layer count")
+
+        resolved: list[list[MemoryObj]] = [[] for _ in keys_layer_major]
+        owned: list[MemoryObj] = []
+        try:
+            for prefix, keys in zip(prefixes, keys_layer_major, strict=True):
+                prefix.validate(keys)
+            local_chunks = min(len(prefix.local_memory_objs) for prefix in prefixes)
+
+            if local_chunks:
+                for layer_id, (prefix, keys) in enumerate(
+                    zip(prefixes, keys_layer_major, strict=True)
+                ):
+                    local_objs = [prefix.take_local(i) for i in range(local_chunks)]
+                    prefix.release()
+                    local = self._resolve_shared_rank0_layer_mem_objs(
+                        req_id=req_id,
+                        phase=phase,
+                        layer_id=layer_id,
+                        kv_group=kv_group,
+                        keys_layer=keys[:local_chunks],
+                        local_prefix=LocalCPUPrefixGetResult(local_objs, [], []),
+                    )
+                    resolved[layer_id].extend(local)
+                    owned.extend(local)
+            else:
+                for prefix in prefixes:
+                    prefix.release()
+
+            if local_chunks < chunks:
+                remote = self._resolve_shared_rank0_remote_layers_windowed(
+                    req_id=req_id,
+                    phase=phase,
+                    kv_group=kv_group,
+                    keys_layer_major=[keys[local_chunks:] for keys in keys_layer_major],
+                    layers_per_batch=self.num_layers,
+                )
+                owned.extend(obj for layer in remote for obj in layer)
+                if len(remote) != self.num_layers or any(
+                    len(layer) != chunks - local_chunks for layer in remote
+                ):
+                    raise ValueError(
+                        "Page-first remote suffix returned the wrong shape"
+                    )
+                for layer, suffix in zip(resolved, remote, strict=True):
+                    layer.extend(suffix)
+            return resolved
+        except Exception:
+            for prefix in prefixes:
+                prefix.release()
+            self._release_shared_retrieve_objs(owned, unpin=True)
             raise
 
     def _resolve_shared_rank0_remote_layers_windowed(
@@ -2830,9 +3027,14 @@ class LMCacheEngine:
         to_release: list[MemoryObj] = []
         resolved_layers: list[list[MemoryObj]] = []
         handles_by_layer: list[list[Any]] = []
-        page_first_remote = (
-            location == "RemoteBackend"
-            and mooncake_page_layout_enabled(getattr(self, "config", None))
+        page_first_resolve = (
+            mooncake_page_layout_enabled(getattr(self, "config", None))
+            and (
+                location in {"LocalCPUBackend", "RemoteBackend"}
+                or self._is_shared_page_first_location_plan(
+                    chunk_locations_layer_major
+                )
+            )
         )
         pre_resolved_layers: Optional[list[list[MemoryObj]]] = None
         compact_batch: Optional[SharedHandleBatch] = None
@@ -2841,15 +3043,14 @@ class LMCacheEngine:
         try:
             for layer_id in range(self.num_layers):
                 try:
-                    if page_first_remote:
+                    if page_first_resolve:
                         if pre_resolved_layers is None:
                             pre_resolved_layers = (
-                                self._resolve_shared_rank0_remote_layers_windowed(
+                                self._resolve_shared_rank0_page_first_layers(
                                     req_id=req_id,
                                     phase=phase,
                                     kv_group=kv_group,
                                     keys_layer_major=keys_layer_major,
-                                    layers_per_batch=self.num_layers,
                                 )
                             )
                             to_release.extend(
@@ -4490,7 +4691,20 @@ class LMCacheEngine:
 
             # TODO: support batched_contains when layerwise is enabled
             if self.use_layerwise:
-                if self._use_sampled_scheduler_lookup():
+                sampled_range = (
+                    set(search_range)
+                    if search_range is not None
+                    else {
+                        name
+                        for name, _ in (
+                            self.storage_manager.get_active_storage_backends()
+                        )
+                    }
+                )
+                if (
+                    sampled_range == {"LocalCPUBackend", "RemoteBackend"}
+                    and self._use_sampled_scheduler_lookup()
+                ):
                     sampled_chunks: list[tuple[int, CacheEngineKey]] = []
                     for _, end, key in chunk_info_iterator:
                         assert isinstance(key, CacheEngineKey)
@@ -4702,10 +4916,6 @@ class LMCacheEngine:
         if self.use_layerwise:
             experimental_lookup_enabled = self._sampled_scheduler_lookup_requested()
             if experimental_lookup_enabled:
-                use_remote_sampling = self._use_sampled_scheduler_lookup()
-                lookup_search_range = (
-                    ["RemoteBackend"] if use_remote_sampling else search_range
-                )
                 async_lookup_server = getattr(
                     self.storage_manager,
                     "async_lookup_server",
@@ -4725,7 +4935,7 @@ class LMCacheEngine:
                             tokens=tokens,
                             hashes=hashes,
                             offsets=offsets,
-                            search_range=lookup_search_range,
+                            search_range=search_range,
                             lookup_id=lookup_id,
                             pin=pin,
                             request_configs=request_configs,
