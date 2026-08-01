@@ -2783,6 +2783,144 @@ def test_shared_dense_rank0_retriever_releases_before_result_tail(
     assert [mem.ref_count_down_count for mem in mem_objs] == [1, 1]
 
 
+def test_shared_dense_rank0_page_first_fetches_complete_layer_pages(monkeypatch):
+    import lmcache.v1.cache_engine as cache_engine_module
+
+    monkeypatch.setattr(
+        cache_engine_module,
+        "assert_layerwise_gpu_connector",
+        lambda _connector: None,
+    )
+    engine = object.__new__(LMCacheEngine)
+    engine.config = SimpleNamespace(extra_config={})
+    engine.storage_manager = SimpleNamespace(
+        uses_remote_page_first_layout=lambda: True,
+        contains_remote_page=lambda _key: True,
+    )
+    engine.gpu_connector = _FakeLayerwiseGPUConnector()
+    engine.num_layers = 2
+    engine.shared_cpu_cache_generation = 9
+    engine.metadata = SimpleNamespace(first_rank=0, worker_id=0)
+    engine.stats_monitor = SimpleNamespace(
+        on_retrieve_finished=lambda monitor_req_id, tokens: None
+    )
+
+    chunk_keys = [
+        replace(_make_key(), chunk_hash=0x500 + chunk_index) for chunk_index in range(4)
+    ]
+    keys_layer_major = [
+        list(layer_keys)
+        for layer_keys in zip(
+            *(key.split_layers(engine.num_layers) for key in chunk_keys),
+            strict=True,
+        )
+    ]
+    page_objs = [
+        [_FakeResolvableMemoryObj() for _ in range(3)] for _ in range(engine.num_layers)
+    ]
+    non_page_objs = {
+        (layer_id, chunk_index): _FakeResolvableMemoryObj()
+        for layer_id, chunk_index in ((0, 0), (1, 0))
+    }
+    prefetch_calls = []
+    events = []
+
+    def prefetch_pages(**kwargs):
+        assert events == ["local-0", "local-1"]
+        events.append("page-prefetch")
+        prefetch_calls.append(kwargs)
+        for layer_objs in page_objs:
+            for mem_obj in layer_objs:
+                mem_obj.pin()
+        return page_objs
+
+    engine._resolve_shared_rank0_remote_layers_windowed = prefetch_pages
+
+    def resolve_non_page(**kwargs):
+        layer_id = kwargs["layer_id"]
+        columns = [
+            keys_layer_major[layer_id].index(key) for key in kwargs["keys_layer"]
+        ]
+        source = (
+            "local"
+            if kwargs["chunk_locations"]
+            and all(item == "LocalCPUBackend" for item in kwargs["chunk_locations"])
+            else "remote"
+        )
+        events.append(f"{source}-{layer_id}")
+        resolved = [non_page_objs[(layer_id, index)] for index in columns]
+        for mem_obj in resolved:
+            mem_obj.pin()
+        return resolved
+
+    engine._resolve_shared_rank0_layer_mem_objs = resolve_non_page
+    engine._make_shared_handles_for_layer = lambda **kwargs: [
+        object(),
+        object(),
+        object(),
+        object(),
+    ]
+    broadcasts = []
+    engine._broadcast_shared_envelope = lambda envelope: broadcasts.append(envelope)
+    ret_mask = torch.ones(16, dtype=torch.bool)
+
+    retriever = engine._retrieve_layer_shared_rank0(
+        starts=[0, 4, 8, 12],
+        ends=[4, 8, 12, 16],
+        keys_layer_major=keys_layer_major,
+        chunk_locations_layer_major=[
+            [
+                "LocalCPUBackend",
+                "RemoteBackend",
+                "RemoteBackend",
+                "LocalCPUBackend",
+            ],
+            [
+                "LocalCPUBackend",
+                "RemoteBackend",
+                "RemoteBackend",
+                "RemoteBackend",
+            ],
+        ],
+        location="mixed",
+        ret_mask=ret_mask,
+        monitor_req_id=123,
+        req_id="req-page-first",
+        kv_group=0,
+        kwargs={"shared_cpu_phase": "dense_prefix"},
+    )
+
+    yielded = [next(retriever) for _ in range(engine.num_layers + 1)]
+    assert yielded[0].item() == 16
+    assert yielded[1:] == [None, None]
+    assert events == ["local-0", "local-1", "page-prefetch"]
+    assert len(prefetch_calls) == 1
+    assert prefetch_calls[0]["keys_layer_major"] == [
+        layer_keys[1:] for layer_keys in keys_layer_major
+    ]
+    assert prefetch_calls[0]["layers_per_batch"] == engine.num_layers
+    assert engine.gpu_connector.sent == [
+        [
+            non_page_objs[(layer_id, 0)],
+            *page_objs[layer_id],
+        ]
+        for layer_id in range(engine.num_layers)
+    ]
+    assert [item.layer_id for item in broadcasts] == [0, 1]
+
+    assert torch.equal(next(retriever), ret_mask)
+    assert all(
+        mem_obj.ref_count_down_count == 1 and not mem_obj.is_pinned
+        for mem_obj in [
+            *page_objs[0],
+            *page_objs[1],
+            *non_page_objs.values(),
+        ]
+    )
+    with pytest.raises(StopIteration):
+        next(retriever)
+
+
 @pytest.mark.parametrize("kv_group", [0, 1])
 def test_shared_dense_passive_retriever_releases_before_result_tail(
     monkeypatch, kv_group

@@ -57,6 +57,7 @@ from lmcache.v1.memory_management import (  # noqa: E501
     TensorMemoryObj,
 )
 from lmcache.v1.metadata import LMCacheMetadata
+from lmcache.v1.mooncake_layout import mooncake_page_layout_enabled
 from lmcache.v1.pin_monitor import PinMonitor
 from lmcache.v1.sampled_lookup import (
     find_last_sampled_hit,
@@ -2344,16 +2345,195 @@ class LMCacheEngine:
 
         to_release: list[MemoryObj] = []
         try:
+            page_remote_columns: list[int] = []
+            prefetched_page_layers: Optional[list[list[MemoryObj]]] = None
+            resolved_non_page_layers: Optional[list[dict[int, MemoryObj]]] = None
+            remote_page_layout = bool(
+                getattr(
+                    self.storage_manager,
+                    "uses_remote_page_first_layout",
+                    lambda: False,
+                )()
+            )
+            if remote_page_layout or mooncake_page_layout_enabled(
+                getattr(self, "config", None)
+            ):
+                contains_remote_page = getattr(
+                    self.storage_manager,
+                    "contains_remote_page",
+                    lambda _key: False,
+                )
+                try:
+                    for chunk_index in range(len(starts)):
+                        remote_layer_id = next(
+                            (
+                                layer_id
+                                for layer_id in range(self.num_layers)
+                                if chunk_locations_layer_major[layer_id][chunk_index]
+                                == "RemoteBackend"
+                            ),
+                            None,
+                        )
+                        if remote_layer_id is not None and contains_remote_page(
+                            keys_layer_major[remote_layer_id][chunk_index]
+                        ):
+                            page_remote_columns.append(chunk_index)
+                except Exception as exc:
+                    message = (
+                        "Shared CPU cache rank0 page lookup failed before "
+                        "handle publication."
+                    )
+                    self._broadcast_shared_envelope(
+                        self._shared_layerwise_error_envelope(
+                            req_id=req_id,
+                            phase=phase,
+                            request_ordinal=request_ordinal,
+                            layer_id=0,
+                            kv_group=kv_group,
+                            message=message,
+                            details={"error": str(exc), "location": location},
+                        )
+                    )
+                    raise
+                if page_remote_columns:
+                    page_remote_column_set = set(page_remote_columns)
+                    resolved_non_page_layers = [{} for _ in range(self.num_layers)]
+
+                    # Hold every non-page local object before remote receive
+                    # allocation can evict it. Page-backed columns use the
+                    # complete remote page without retaining duplicate layers.
+                    for local_only in (True, False):
+                        for layer_id in range(self.num_layers):
+                            columns = [
+                                index
+                                for index in range(len(starts))
+                                if index not in page_remote_column_set
+                                and (
+                                    chunk_locations_layer_major[layer_id][index]
+                                    == "LocalCPUBackend"
+                                )
+                                is local_only
+                            ]
+                            if not columns:
+                                continue
+                            try:
+                                resolved = self._resolve_shared_rank0_layer_mem_objs(
+                                    req_id=req_id,
+                                    phase=phase,
+                                    layer_id=layer_id,
+                                    kv_group=kv_group,
+                                    keys_layer=[
+                                        keys_layer_major[layer_id][index]
+                                        for index in columns
+                                    ],
+                                    chunk_locations=[
+                                        chunk_locations_layer_major[layer_id][index]
+                                        for index in columns
+                                    ],
+                                )
+                            except Exception as exc:
+                                message = (
+                                    "Shared CPU cache rank0 materialization "
+                                    "failed before handle publication."
+                                )
+                                self._broadcast_shared_envelope(
+                                    self._shared_layerwise_error_envelope(
+                                        req_id=req_id,
+                                        phase=phase,
+                                        request_ordinal=request_ordinal,
+                                        layer_id=0,
+                                        kv_group=kv_group,
+                                        message=message,
+                                        details={
+                                            "error": str(exc),
+                                            "location": location,
+                                            "failed_layer_id": layer_id,
+                                        },
+                                    )
+                                )
+                                raise
+                            to_release.extend(resolved)
+                            resolved_non_page_layers[layer_id].update(
+                                zip(columns, resolved, strict=True)
+                            )
+
+                    page_keys_layer_major = [
+                        [layer_keys[index] for index in page_remote_columns]
+                        for layer_keys in keys_layer_major
+                    ]
+                    try:
+                        # Page-first Mooncake objects contain every model layer.
+                        # Fetch complete chunk columns so the connector can use
+                        # the page key instead of falling back to absent legacy
+                        # one-layer keys.
+                        prefetched_page_layers = (
+                            self._resolve_shared_rank0_remote_layers_windowed(
+                                req_id=req_id,
+                                phase=phase,
+                                kv_group=kv_group,
+                                keys_layer_major=page_keys_layer_major,
+                                layers_per_batch=self.num_layers,
+                            )
+                        )
+                        for layer_objs in prefetched_page_layers:
+                            to_release.extend(layer_objs)
+                        if len(prefetched_page_layers) != self.num_layers or any(
+                            len(layer_objs) != len(page_remote_columns)
+                            for layer_objs in prefetched_page_layers
+                        ):
+                            raise ValueError(
+                                "Shared CPU page-first prefetch returned an "
+                                "invalid layer/chunk matrix: "
+                                f"layers={len(prefetched_page_layers)}, "
+                                f"expected_layers={self.num_layers}, "
+                                f"remote_columns={len(page_remote_columns)}"
+                            )
+                    except Exception as exc:
+                        message = (
+                            "Shared CPU cache rank0 page-first materialization "
+                            "failed before handle publication."
+                        )
+                        self._broadcast_shared_envelope(
+                            self._shared_layerwise_error_envelope(
+                                req_id=req_id,
+                                phase=phase,
+                                request_ordinal=request_ordinal,
+                                layer_id=0,
+                                kv_group=kv_group,
+                                message=message,
+                                details={
+                                    "error": str(exc),
+                                    "location": location,
+                                    "remote_columns": page_remote_columns,
+                                },
+                            )
+                        )
+                        raise
+
+            page_column_offsets = {
+                chunk_index: offset
+                for offset, chunk_index in enumerate(page_remote_columns)
+            }
             for layer_id in range(self.num_layers):
                 try:
-                    mem_objs_layer = self._resolve_shared_rank0_layer_mem_objs(
-                        req_id=req_id,
-                        phase=phase,
-                        layer_id=layer_id,
-                        kv_group=kv_group,
-                        keys_layer=keys_layer_major[layer_id],
-                        chunk_locations=chunk_locations_layer_major[layer_id],
-                    )
+                    if prefetched_page_layers is None:
+                        mem_objs_layer = self._resolve_shared_rank0_layer_mem_objs(
+                            req_id=req_id,
+                            phase=phase,
+                            layer_id=layer_id,
+                            kv_group=kv_group,
+                            keys_layer=keys_layer_major[layer_id],
+                            chunk_locations=chunk_locations_layer_major[layer_id],
+                        )
+                        to_release.extend(mem_objs_layer)
+                    else:
+                        assert resolved_non_page_layers is not None
+                        mem_objs_layer = [
+                            prefetched_page_layers[layer_id][page_column_offsets[index]]
+                            if index in page_column_offsets
+                            else resolved_non_page_layers[layer_id][index]
+                            for index in range(len(starts))
+                        ]
                 except Exception as exc:
                     message = (
                         "Shared CPU cache rank0 materialization failed before "
@@ -2374,7 +2554,6 @@ class LMCacheEngine:
                         )
                     )
                     raise
-                to_release.extend(mem_objs_layer)
 
                 handles = self._make_shared_handles_for_layer(
                     req_id=req_id,

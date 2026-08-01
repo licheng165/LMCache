@@ -100,6 +100,12 @@ class InstrumentedRemoteConnector(RemoteConnector):
     def support_batched_get(self) -> bool:
         return self._connector.support_batched_get()
 
+    def uses_page_first_layout(self) -> bool:
+        return self._connector.uses_page_first_layout()
+
+    def exists_page_sync(self, key: CacheEngineKey) -> bool:
+        return self._connector.exists_page_sync(key)
+
     def support_batched_async_contains(self) -> bool:
         return self._connector.support_batched_async_contains()
 

@@ -110,6 +110,12 @@ class AuditBackend(StorageBackendInterface):
     def requires_put_completion(self) -> bool:
         return self.real_backend.requires_put_completion()
 
+    def uses_page_first_layout(self) -> bool:
+        return self.real_backend.uses_page_first_layout()
+
+    def contains_page(self, key: CacheEngineKey) -> bool:
+        return self.real_backend.contains_page(key)
+
     def batched_submit_put_task(
         self,
         keys: Sequence[CacheEngineKey],

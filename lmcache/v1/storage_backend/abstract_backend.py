@@ -69,6 +69,14 @@ class StorageBackendInterface(metaclass=abc.ABCMeta):
         """Whether callers must wait for this backend's put futures."""
         return False
 
+    def uses_page_first_layout(self) -> bool:
+        """Whether one backend object stores every layer of a token page."""
+        return False
+
+    def contains_page(self, key: CacheEngineKey) -> bool:
+        """Whether the key is currently backed by an all-layer page object."""
+        return False
+
     # NOTE (Jiayi): Using batched interface allows the underlying implementation
     # have more flexibility to do optimizations.
     @abc.abstractmethod

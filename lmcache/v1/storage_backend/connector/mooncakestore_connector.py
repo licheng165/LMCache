@@ -267,6 +267,7 @@ class MooncakestoreConnector(RemoteConnector):
         self.local_cpu_backend = local_cpu_backend
         self.registered_buffer_ptr = None
         self._inflight_put_tasks: set[asyncio.Task[Any]] = set()
+        self._inflight_get_tasks: set[asyncio.Task[Any]] = set()
 
         # Initialize ReplicateConfig
         self.replica_config = ReplicateConfig()
@@ -652,6 +653,13 @@ class MooncakestoreConnector(RemoteConnector):
         """
         return True
 
+    def uses_page_first_layout(self) -> bool:
+        return bool(getattr(self, "_page_first_multi_buffer", False))
+
+    def exists_page_sync(self, key: CacheEngineKey) -> bool:
+        page_key = self._page_key_for(key)
+        return page_key is not None and self._key_exists(page_key)
+
     def support_batched_contains(self) -> bool:
         return bool(
             getattr(self.config, "experimental_sampled_layerwise_lookup", False)
@@ -685,6 +693,12 @@ class MooncakestoreConnector(RemoteConnector):
         """
         return False
 
+    def _key_exists(self, key: str) -> bool:
+        status = self.store.is_exist(key)
+        if status not in (0, 1):
+            logger.warning("Mooncake is_exist failed with status=%s", status)
+        return status == 1
+
     async def batched_get_non_blocking(
         self,
         lookup_id: str,
@@ -713,17 +727,15 @@ class MooncakestoreConnector(RemoteConnector):
 
     async def exists(self, key: CacheEngineKey) -> bool:
         page_key = self._page_key_for(key)
-        return bool(
-            (page_key is not None and self.store.is_exist(page_key))
-            or self.store.is_exist(key.to_string())
-        )
+        if page_key is not None and self._key_exists(page_key):
+            return True
+        return self._key_exists(key.to_string())
 
     def exists_sync(self, key: CacheEngineKey) -> bool:
         page_key = self._page_key_for(key)
-        return bool(
-            (page_key is not None and self.store.is_exist(page_key))
-            or self.store.is_exist(key.to_string())
-        )
+        if page_key is not None and self._key_exists(page_key):
+            return True
+        return self._key_exists(key.to_string())
 
     async def batched_get(
         self, keys: List[CacheEngineKey]
@@ -756,7 +768,7 @@ class MooncakestoreConnector(RemoteConnector):
             return self.batched_contains(keys)
         num_hit_counts = 0
         for key in keys:
-            if not self.store.is_exist(key.to_string()):
+            if not self._key_exists(key.to_string()):
                 break
             num_hit_counts += 1
         return num_hit_counts
@@ -795,11 +807,18 @@ class MooncakestoreConnector(RemoteConnector):
         try:
             if not submitted_groups:
                 return loaded
-            statuses = await asyncio.to_thread(
+            statuses = await self._run_blocking_get(
                 self.store.batch_get_into_multi_buffers,
-                [page_key for page_key, _ in submitted_groups],
-                all_buffer_ptrs,
-                all_buffer_sizes,
+                (
+                    [page_key for page_key, _ in submitted_groups],
+                    all_buffer_ptrs,
+                    all_buffer_sizes,
+                ),
+                [
+                    memory_obj
+                    for memory_obj in object_by_index.values()
+                    if memory_obj is not None
+                ],
             )
             for group_index, (page_key, indices) in enumerate(submitted_groups):
                 if group_index >= len(statuses):
@@ -922,8 +941,10 @@ class MooncakestoreConnector(RemoteConnector):
         try:
             # Single RPC call for multiple chunks
             logger.debug(f"Calling batch_get_into with {len(key_strs)} keys")
-            bytes_read_list = await asyncio.to_thread(
-                self.store.batch_get_into, key_strs, buffer_ptrs, buffer_sizes
+            bytes_read_list = await self._run_blocking_get(
+                self.store.batch_get_into,
+                (key_strs, buffer_ptrs, buffer_sizes),
+                [memory_objs[index] for index in valid_idx],  # type: ignore
             )
             logger.debug(f"batch_get_into returned: {bytes_read_list}")
 
@@ -953,6 +974,10 @@ class MooncakestoreConnector(RemoteConnector):
 
             return results
 
+        except asyncio.CancelledError:
+            for i in valid_idx:
+                memory_objs[i].ref_count_down()  # type: ignore
+            raise
         except Exception as exc:
             logger.error(f"batch_get_into threw exception: {str(exc)}")
             # Release any buffers we successfully allocated
@@ -1058,6 +1083,32 @@ class MooncakestoreConnector(RemoteConnector):
 
     def requires_put_completion(self) -> bool:
         return True
+
+    async def _run_blocking_get(
+        self,
+        func: Callable[..., Any],
+        args: tuple[Any, ...],
+        memory_objs: List[MemoryObj],
+    ) -> Any:
+        """Keep receive buffers alive until a native Mooncake get exits."""
+        for memory_obj in memory_objs:
+            memory_obj.ref_count_up()
+
+        task = asyncio.create_task(asyncio.to_thread(func, *args))
+        inflight = getattr(self, "_inflight_get_tasks", None)
+        if inflight is None:
+            inflight = self._inflight_get_tasks = set()
+        inflight.add(task)
+
+        def release_buffers(done: asyncio.Task[Any]) -> None:
+            inflight.discard(done)
+            for memory_obj in memory_objs:
+                memory_obj.ref_count_down()
+            if not done.cancelled():
+                done.exception()
+
+        task.add_done_callback(release_buffers)
+        return await asyncio.shield(task)
 
     async def _run_blocking_put(
         self,
@@ -1286,13 +1337,27 @@ class MooncakestoreConnector(RemoteConnector):
         pass
 
     async def close(self):
-        if self._inflight_put_tasks:
-            await asyncio.gather(
-                *tuple(self._inflight_put_tasks), return_exceptions=True
+        inflight_tasks = (
+            *self._inflight_put_tasks,
+            *self._inflight_get_tasks,
+        )
+        close_cancelled = False
+        if inflight_tasks:
+            waiter = asyncio.gather(
+                *(asyncio.shield(task) for task in inflight_tasks),
+                return_exceptions=True,
             )
+            while not waiter.done():
+                try:
+                    await asyncio.shield(waiter)
+                except asyncio.CancelledError:
+                    close_cancelled = True
+            waiter.result()
 
         # Unregister buffer before closing the store
         self._unregister_cpu_buffer()
 
         self.store.close()
         logger.info("Closed the mooncake store connection")
+        if close_cancelled:
+            raise asyncio.CancelledError

@@ -254,6 +254,14 @@ class RemoteConnector(metaclass=abc.ABCMeta):
         """
         return False
 
+    def uses_page_first_layout(self) -> bool:
+        """Whether one remote object stores every layer of a token page."""
+        return False
+
+    def exists_page_sync(self, key: CacheEngineKey) -> bool:
+        """Whether the key is currently backed by an all-layer page object."""
+        return False
+
     async def batched_get(
         self, keys: List[CacheEngineKey]
     ) -> List[Optional[MemoryObj]]:

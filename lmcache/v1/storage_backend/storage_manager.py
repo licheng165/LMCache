@@ -571,7 +571,10 @@ class StorageManager:
         if connection is None:
             return False
 
-        if connection.support_batched_get() and not connection.support_batched_get_non_blocking():
+        if (
+            connection.support_batched_get()
+            and not connection.support_batched_get_non_blocking()
+        ):
             return True
         return False
 
@@ -970,6 +973,16 @@ class StorageManager:
             List[str]: List of all backend names
         """
         return list(self.storage_backends.keys())
+
+    def uses_remote_page_first_layout(self) -> bool:
+        """Whether the active remote backend stores all-layer token pages."""
+        backend = self.storage_backends.get("RemoteBackend")
+        return backend is not None and backend.uses_page_first_layout()
+
+    def contains_remote_page(self, key: CacheEngineKey) -> bool:
+        """Whether the active remote backend has an all-layer page for key."""
+        backend = self.storage_backends.get("RemoteBackend")
+        return backend is not None and backend.contains_page(key)
 
     def contains(
         self,

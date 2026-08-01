@@ -212,6 +212,16 @@ class RemoteBackend(StorageBackendInterface):
             and self.connection.requires_put_completion()
         )
 
+    def uses_page_first_layout(self) -> bool:
+        return self.connection is not None and self.connection.uses_page_first_layout()
+
+    def contains_page(self, key: CacheEngineKey) -> bool:
+        if self.connection is None:
+            return False
+        if self._mla_worker_id_as0_mode:
+            key = key.with_new_worker_id(0)
+        return self.connection.exists_page_sync(key)
+
     def put_callback(self, future: Future, key: CacheEngineKey):
         with self.lock:
             self.put_tasks.discard(key)
