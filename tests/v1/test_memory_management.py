@@ -14,6 +14,7 @@ from lmcache.v1.memory_management import (
     BytesBufferMemoryObj,
     GPUMemoryAllocator,
     HostMemoryAllocator,
+    LayerPageMemoryObj,
     MemoryFormat,
     MemoryObjMetadata,
     MixedMemoryAllocator,
@@ -261,6 +262,58 @@ def test_tensor_address_backed_batch_preserves_tensor_access() -> None:
 
     allocator.batched_free(objects)
     assert allocator.memcheck()
+
+
+def test_layer_page_batch_owns_one_object_per_chunk() -> None:
+    shape = torch.Size([8, 4])
+    layer_bytes = shape.numel() * torch.bfloat16.itemsize
+    buffer = torch.zeros(layer_bytes * 3 * 2 + 8192, dtype=torch.uint8)
+    allocator = TensorMemoryAllocator(buffer)
+    pages = allocator.batched_allocate_layer_pages(
+        shape,
+        torch.bfloat16,
+        batch_size=2,
+        num_layers=3,
+        fmt=MemoryFormat.KV_MLA_LATENT_FMT,
+    )
+
+    assert pages is not None and len(pages) == 2
+    assert all(isinstance(page, LayerPageMemoryObj) for page in pages)
+    assert all(
+        page.num_layers == 3 and page.layer_size == layer_bytes for page in pages
+    )
+    for page in pages:
+        tensors = [page.layer_tensor(layer) for layer in range(3)]
+        assert all(tensor.shape == shape for tensor in tensors)
+        assert [tensor.data_ptr() for tensor in tensors] == [
+            page.data_ptr + layer * layer_bytes for layer in range(3)
+        ]
+        for layer, tensor in enumerate(tensors):
+            tensor.fill_(layer + 1)
+        assert [int(tensor.flatten()[0]) for tensor in tensors] == [1, 2, 3]
+
+    allocator.batched_free(pages)
+    assert allocator.memcheck()
+
+
+def test_layer_page_rejects_pointer_access_after_release() -> None:
+    allocator = TensorMemoryAllocator(torch.zeros(4096, dtype=torch.uint8))
+    pages = allocator.batched_allocate_layer_pages(
+        torch.Size([8]),
+        torch.float16,
+        batch_size=1,
+        num_layers=2,
+        fmt=MemoryFormat.KV_MLA_LATENT_FMT,
+    )
+    assert pages is not None
+    page = pages[0]
+
+    page.ref_count_down()
+
+    with pytest.raises(RuntimeError, match="no longer valid"):
+        page.layer_data_ptr(0)
+    with pytest.raises(RuntimeError, match="no longer valid"):
+        page.layer_tensor(0)
 
 
 def test_mixed_address_backed_batch_preserves_format_validation() -> None:

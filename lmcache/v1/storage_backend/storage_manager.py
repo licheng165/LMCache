@@ -27,6 +27,7 @@ from lmcache.logging import init_logger
 from lmcache.observability import PrometheusLogger
 from lmcache.utils import (
     CacheEngineKey,
+    LayerCacheEngineKey,
     _lmcache_nvtx_annotate,
     start_loop_in_thread_with_exceptions,
 )
@@ -571,7 +572,10 @@ class StorageManager:
         if connection is None:
             return False
 
-        if connection.support_batched_get() and not connection.support_batched_get_non_blocking():
+        if (
+            connection.support_batched_get()
+            and not connection.support_batched_get_non_blocking()
+        ):
             return True
         return False
 
@@ -1043,6 +1047,38 @@ class StorageManager:
 
         return total_hit_chunks, block_mapping
 
+    def batched_contains_layer_pages(
+        self,
+        keys: List[LayerCacheEngineKey],
+        search_range: Optional[List[str]] = None,
+        pin: bool = False,
+    ) -> tuple[int, dict]:
+        """Prefix lookup using one physical page key per logical chunk."""
+        total = 0
+        mapping = {}
+        remaining: List[LayerCacheEngineKey] = keys
+        for name, backend in self.get_active_storage_backends(
+            search_range=search_range
+        ):
+            backend_keys: list[CacheEngineKey]
+            if name == "LocalCPUBackend":
+                backend_keys = [key.without_layer() for key in remaining]
+                hits = backend.batched_contains_layer_pages(remaining, pin)
+            else:
+                contains = getattr(backend, "batched_contains_layer_pages", None)
+                if not callable(contains):
+                    continue
+                backend_keys = list(remaining)
+                hits = contains(backend_keys, pin)
+            if not hits:
+                continue
+            mapping[name] = backend_keys[:hits]
+            total += hits
+            if total == len(keys):
+                break
+            remaining = remaining[hits:]
+        return total, mapping
+
     def get_block_mapping(
         self, chunk_infos: List[Tuple[CacheEngineKey, int, int]]
     ) -> Dict[str, List[Tuple[CacheEngineKey, int, int]]]:
@@ -1149,8 +1185,12 @@ class StorageManager:
         """
         for backend_name, backend in self.storage_backends.items():
             if locations is None or backend_name in locations:
-                for key in keys:
-                    backend.unpin(key)
+                batched = getattr(backend, "batched_unpin", None)
+                if callable(batched):
+                    batched(keys)
+                else:
+                    for key in keys:
+                        backend.unpin(key)
 
     def clear(
         self,

@@ -594,6 +594,31 @@ class LayerCacheEngineKey(CacheEngineKey):
             )
         return keys
 
+    def without_layer(self) -> CacheEngineKey:
+        """Return the chunk identity shared by every layer of this key."""
+        return CacheEngineKey(
+            model_name=self.model_name,
+            world_size=self.world_size,
+            worker_id=self.worker_id,
+            chunk_hash=self.chunk_hash,
+            dtype=self.dtype,
+            request_configs=self.request_configs,
+            kv_group=self.kv_group,
+        )
+
+    def with_new_worker_id(self, new_worker_id: int) -> "LayerCacheEngineKey":
+        """Return the same layer key for another worker."""
+        return LayerCacheEngineKey(
+            model_name=self.model_name,
+            world_size=self.world_size,
+            worker_id=new_worker_id,
+            chunk_hash=self.chunk_hash,
+            dtype=self.dtype,
+            request_configs=self.request_configs,
+            layer_id=self.layer_id,
+            kv_group=self.kv_group,
+        )
+
     @staticmethod
     def from_string(s):
         parts = s.split("@")

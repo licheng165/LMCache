@@ -13,6 +13,7 @@ import torch
 from lmcache.utils import CacheEngineKey
 from lmcache.v1.cache_engine import LMCacheEngine, LMCacheEngineBuilder
 from lmcache.v1.memory_management import (
+    LayerPageMemoryObj,
     MemoryFormat,
     MemoryObjMetadata,
     PagedTensorMemoryAllocator,
@@ -332,7 +333,7 @@ def test_dense_retrieve_reuses_group0_chunk_plan_for_group1():
     )
 
 
-def test_shared_page_first_uniform_location_uses_local_then_one_remote_probe():
+def test_shared_page_first_location_plan_uses_local_then_one_remote_probe():
     engine = object.__new__(LMCacheEngine)
     engine.config = SimpleNamespace(
         extra_config={"mooncake_page_first_multi_buffer": True}
@@ -363,8 +364,8 @@ def test_shared_page_first_uniform_location_uses_local_then_one_remote_probe():
     ]
 
     assert (
-        engine._shared_page_first_uniform_location(keys_by_chunk)
-        == "RemoteBackend"
+        engine._shared_page_first_location_plan(keys_by_chunk)
+        == ["RemoteBackend", "RemoteBackend"]
     )
     assert calls == [
         ([key for chunk in keys_by_chunk for key in chunk], ["RemoteBackend"])
@@ -375,8 +376,8 @@ def test_shared_page_first_uniform_location_uses_local_then_one_remote_probe():
         hot_cache=dict.fromkeys(flat_keys),
     )
     assert (
-        engine._shared_page_first_uniform_location(keys_by_chunk)
-        == "LocalCPUBackend"
+        engine._shared_page_first_location_plan(keys_by_chunk)
+        == ["LocalCPUBackend", "LocalCPUBackend"]
     )
     assert len(calls) == 1
     engine._shared_local_cpu_backend = lambda: SimpleNamespace(
@@ -384,8 +385,8 @@ def test_shared_page_first_uniform_location_uses_local_then_one_remote_probe():
         hot_cache={flat_keys[0]: object()},
     )
     assert (
-        engine._shared_page_first_uniform_location(keys_by_chunk)
-        == "RemoteBackend"
+        engine._shared_page_first_location_plan(keys_by_chunk)
+        == ["RemoteBackend", "RemoteBackend"]
     )
     # A page-first probe must include every layer from the shortest common
     # LocalCPU prefix, even when another layer already has that object locally.
@@ -394,8 +395,122 @@ def test_shared_page_first_uniform_location_uses_local_then_one_remote_probe():
         cpu_lock=nullcontext(),
         hot_cache={flat_keys[-1]: object()},
     )
-    assert engine._shared_page_first_uniform_location(keys_by_chunk) is None
+    assert engine._shared_page_first_location_plan(keys_by_chunk) is None
     assert len(calls) == 2
+
+
+def test_layer_page_location_plan_probes_one_remote_key_per_chunk():
+    engine = object.__new__(LMCacheEngine)
+    engine.config = SimpleNamespace(
+        enable_shared_cpu_cache=True,
+        use_layerwise=True,
+        remote_url="mooncakestore://metadata/",
+        extra_config={
+            "mooncake_page_first_multi_buffer": True,
+            "mooncake_layer_merged_page_objects": True,
+            "save_only_first_rank": True,
+        },
+    )
+    engine.retrieve_locations = None
+    keys_by_chunk = [
+        replace(_make_key(), chunk_hash=chunk).split_layers(2)
+        for chunk in (1, 2, 3)
+    ]
+    allocator = TensorMemoryAllocator(torch.zeros(128, dtype=torch.uint8))
+    pages = allocator.batched_allocate_layer_pages(
+        torch.Size([4]),
+        torch.float16,
+        batch_size=1,
+        num_layers=2,
+        fmt=MemoryFormat.KV_MLA_LATENT_FMT,
+    )
+    assert pages is not None
+    engine._shared_local_cpu_backend = lambda: SimpleNamespace(
+        cpu_lock=nullcontext(),
+        hot_cache={keys_by_chunk[0][0].without_layer(): pages[0]},
+    )
+    calls = []
+
+    def batched_contains_layer_pages(keys, search_range):
+        calls.append((list(keys), search_range))
+        return len(keys), {"RemoteBackend": list(keys)}
+
+    remote = SimpleNamespace(
+        connection=SimpleNamespace(
+            batched_contains_layer_pages=lambda _keys: len(_keys),
+            # Layer pages have their own batched API and must not depend on
+            # the generic sampled-lookup gate.
+            support_batched_contains=lambda: False,
+        )
+    )
+    engine.storage_manager = SimpleNamespace(
+        get_active_storage_backends=lambda search_range=None: iter(
+            [("RemoteBackend", remote)]
+        ),
+        batched_contains_layer_pages=batched_contains_layer_pages,
+        batched_contains=lambda *_: pytest.fail("expanded layer lookup used"),
+    )
+
+    assert (
+        engine._shared_page_first_location_plan(keys_by_chunk)
+        == ["LocalCPUBackend", "RemoteBackend", "RemoteBackend"]
+    )
+    assert calls == [
+        ([keys_by_chunk[1][0], keys_by_chunk[2][0]], ["RemoteBackend"])
+    ]
+    pages[0].ref_count_down()
+
+
+def test_layer_page_batch_plan_keeps_partial_tail_on_legacy_lookup():
+    engine = object.__new__(LMCacheEngine)
+    engine.config = SimpleNamespace(
+        chunk_size=4,
+        enable_shared_cpu_cache=True,
+        use_layerwise=True,
+        remote_url="mooncakestore://metadata/",
+        extra_config={
+            "mooncake_page_first_multi_buffer": True,
+            "mooncake_layer_merged_page_objects": True,
+            "save_only_first_rank": True,
+        },
+    )
+    engine.num_layers = 2
+    engine.storage_manager = object()
+    engine.gpu_connector = object()
+    engine.shared_cpu_cache_strict = False
+    engine.stats_monitor = SimpleNamespace(on_retrieve_request=lambda _tokens: 1)
+    engine.is_healthy = lambda: True
+    engine._should_use_shared_layerwise_retrieve = lambda _group: True
+    engine._is_passive = lambda: False
+    keys = [replace(_make_key(), chunk_hash=chunk) for chunk in (1, 2, 3)]
+    engine._dense_retrieve_token_results = lambda *_args: iter(
+        [(0, 4, keys[0]), (4, 8, keys[1]), (8, 10, keys[2])]
+    )
+    planned = []
+    engine._shared_page_first_location_plan = lambda chunks: (
+        planned.extend(chunks) or ["RemoteBackend"] * len(chunks)
+    )
+    tail_probes = []
+    engine._find_shared_rank0_chunk_location = lambda key: (
+        tail_probes.append(key) or "RemoteBackend"
+    )
+    resolved = {}
+
+    def retrieve(**kwargs):
+        resolved.update(kwargs)
+        yield kwargs["ret_mask"]
+
+    engine._retrieve_layer_shared_rank0 = retrieve
+
+    list(engine.retrieve_layer(list(range(10)), req_id="req-partial"))
+
+    assert len(planned) == 2
+    assert len(tail_probes) == engine.num_layers
+    assert resolved["starts"] == [0, 4, 8]
+    assert resolved["chunk_locations_layer_major"] == [
+        ["RemoteBackend"] * 3,
+        ["RemoteBackend"] * 3,
+    ]
 
 
 @pytest.mark.parametrize(
@@ -408,7 +523,7 @@ def test_shared_page_first_uniform_location_uses_local_then_one_remote_probe():
         (False, 4, ["RemoteBackend"], False),
     ],
 )
-def test_shared_page_first_uniform_location_falls_back(
+def test_shared_page_first_location_plan_falls_back(
     local_hit, remote_hits, retrieval_backends, supports_batch
 ):
     engine = object.__new__(LMCacheEngine)
@@ -444,31 +559,13 @@ def test_shared_page_first_uniform_location_falls_back(
         batched_contains=batched_contains,
     )
 
-    assert engine._shared_page_first_uniform_location(keys_by_chunk) is None
+    assert engine._shared_page_first_location_plan(keys_by_chunk) is None
     assert len(calls) == (
         1
         if not local_hit
         and supports_batch
         and retrieval_backends == ["RemoteBackend"]
         else 0
-    )
-
-
-def test_page_first_plan_uses_shortest_local_layer_prefix():
-    locations = [
-        ["LocalCPUBackend", "LocalCPUBackend", "RemoteBackend"],
-        ["LocalCPUBackend", "RemoteBackend", "RemoteBackend"],
-    ]
-
-    assert LMCacheEngine._shared_page_first_common_prefix_plan(locations) == [
-        ["LocalCPUBackend", "RemoteBackend", "RemoteBackend"],
-        ["LocalCPUBackend", "RemoteBackend", "RemoteBackend"],
-    ]
-    assert (
-        LMCacheEngine._shared_page_first_common_prefix_plan(
-            [["RemoteBackend", "LocalCPUBackend"]]
-        )
-        is None
     )
 
 
@@ -925,6 +1022,28 @@ def test_sampled_lookup_uses_local_first_and_reverse_tail_probes() -> None:
     ]
     assert all(call[1] == ["RemoteBackend"] for call in calls)
     assert engine.lookup_pins["req"]["RemoteBackend"] == []
+
+
+def test_sampled_lookup_recognizes_remote_pages_without_local_page_objects():
+    engine = _make_sampled_lookup_engine([])
+    engine.config.extra_config = {"mooncake_page_first_multi_buffer": True}
+    page_calls = []
+
+    def batched_contains_layer_pages(keys, search_range=None, pin=False):
+        page_calls.append((list(keys), search_range, pin))
+        return len(keys), {"RemoteBackend": list(keys)}
+
+    engine.storage_manager.batched_contains_layer_pages = (
+        batched_contains_layer_pages
+    )
+
+    assert engine.lookup(list(range(14)), pin=False) == 14
+    assert engine.storage_manager.calls == []
+    assert page_calls
+    assert all(
+        len(keys) == 1 and search_range == ["RemoteBackend"]
+        for keys, search_range, _ in page_calls
+    )
 
 
 def test_sampled_lookup_combines_local_and_remote_keys() -> None:
@@ -1741,6 +1860,33 @@ def test_engine_contract_requires_broadcast_object_fn_for_shared_tp():
         engine._validate_shared_cpu_cache_contract()
 
 
+def test_engine_contract_rejects_unsupported_layer_page_consumers():
+    engine = _make_engine_for_contract(
+        use_layerwise=True,
+        sparse=False,
+        shared=True,
+    )
+    engine.config.remote_url = "mooncakestore://metadata/"
+    engine.config.enable_shared_cpu_cache = True
+    engine.config.extra_config = {
+        "mooncake_page_first_multi_buffer": True,
+        "mooncake_layer_merged_page_objects": True,
+        "save_only_first_rank": True,
+    }
+    engine.gpu_connector = SimpleNamespace()
+
+    with pytest.raises(ValueError, match="supports LayerPageSource"):
+        engine._validate_shared_cpu_cache_contract()
+
+    engine.gpu_connector.supports_layer_page_source = True
+    engine.broadcast_object_fn = lambda obj, src=0: obj
+    engine._validate_shared_cpu_cache_contract()
+
+    engine.metadata.use_mla = False
+    with pytest.raises(ValueError, match="requires MLA"):
+        engine._validate_shared_cpu_cache_contract()
+
+
 def test_engine_contract_requires_index_materialization_for_strict_sparse():
     engine = _make_engine_for_contract(
         use_layerwise=True,
@@ -1909,6 +2055,49 @@ def test_runtime_capacity_details_exclude_required_hot_chunks_from_evictable():
     assert details["non_shm_hot_chunk_count"] == 0
     assert details["active_sparse_requests"] == 2
     assert details["fits"] is True
+
+
+def test_runtime_capacity_recognizes_one_layer_page_for_all_layers():
+    engine = _make_engine_for_sparse_capacity(max_local_cpu_size=1)
+    allocator = TensorMemoryAllocator(torch.zeros(4096, dtype=torch.uint8))
+    pages = allocator.batched_allocate_layer_pages(
+        torch.Size([8]),
+        torch.float16,
+        batch_size=1,
+        num_layers=2,
+        fmt=MemoryFormat.KV_MLA_LATENT_FMT,
+    )
+    assert pages is not None
+    layer_keys = _make_key().split_layers(2)
+    page_key = layer_keys[0].without_layer()
+    backend = _FakeLocalCPUBackend(
+        free_bytes=0,
+        hot_cache={page_key: pages[0]},
+    )
+    engine._shared_local_cpu_backend = lambda: backend
+    engine._is_rank0_shared_mem_obj = lambda obj: obj is pages[0]
+    engine.config.chunk_size = 4
+
+    details = engine._shared_cpu_runtime_capacity_details(
+        req_id="req-page",
+        phase="dense_prefix",
+        kv_group=0,
+        keys_layer_major=[[layer_keys[0]], [layer_keys[1]]],
+        chunk_locations_layer_major=[
+            ["LocalCPUBackend"],
+            ["LocalCPUBackend"],
+        ],
+        token_count=4,
+        chunk_token_lengths=[4],
+    )
+
+    assert details["missing_chunk_count"] == 0
+    assert details["required_bytes"] == 0
+    assert details["hot_chunk_count"] == 1
+    assert details["non_shm_hot_chunk_count"] == 0
+    assert details["protected_hot_bytes"] == pages[0].metadata.phy_size
+    assert details["fits"] is True
+    pages[0].ref_count_down()
 
 
 def test_capacity_snapshot_reads_nested_pin_allocator_free_space():
@@ -2233,6 +2422,279 @@ def test_page_first_resolver_rolls_back_local_prefix_on_remote_failure():
 
     assert all(not obj.is_pinned for layer in local for obj in layer)
     assert all(obj.ref_count_down_count == 1 for layer in local for obj in layer)
+
+
+def test_layer_page_resolver_preserves_legacy_local_suffix():
+    allocator = TensorMemoryAllocator(torch.zeros(4096, dtype=torch.uint8))
+    pages = allocator.batched_allocate_layer_pages(
+        torch.Size([8]),
+        torch.float16,
+        batch_size=1,
+        num_layers=2,
+        fmt=MemoryFormat.KV_MLA_LATENT_FMT,
+    )
+    assert pages is not None
+    keys = [
+        replace(_make_key(), chunk_hash=0x380 + chunk).split_layers(2)
+        for chunk in range(2)
+    ]
+    keys_by_layer = [list(row) for row in zip(*keys, strict=True)]
+    suffix = [[_FakeResolvableMemoryObj()] for _ in range(2)]
+
+    class _Local:
+        @staticmethod
+        def batched_get_layer_page_prefix(_keys):
+            return list(pages), 1
+
+        @staticmethod
+        def contains_any_exact(_keys):
+            return True
+
+    engine = object.__new__(LMCacheEngine)
+    engine.num_layers = 2
+    engine.config = SimpleNamespace(chunk_size=8)
+    engine._shared_local_cpu_backend = lambda: _Local()
+    engine._expected_shared_cpu_chunk_metadata = lambda **_kwargs: (
+        pages[0].get_shape(),
+        torch.float16,
+        MemoryFormat.KV_MLA_LATENT_FMT,
+    )
+    engine._validate_rank0_shared_mem_obj = lambda *_args, **_kwargs: None
+    calls = []
+
+    def resolve_suffix(**kwargs):
+        calls.append(kwargs["keys_layer_major"])
+        for layer in suffix:
+            layer[0].pin()
+        return suffix
+
+    engine._resolve_shared_rank0_page_first_layers = resolve_suffix
+    resolved, page_chunks = engine._resolve_shared_rank0_layer_pages(
+        req_id="req-mixed",
+        phase="dense_prefix",
+        kv_group=0,
+        keys_layer_major=keys_by_layer,
+        page_chunks=2,
+    )
+
+    assert page_chunks == 1
+    assert resolved == [[pages[0], suffix[0][0]], [pages[0], suffix[1][0]]]
+    assert calls == [[layer[1:] for layer in keys_by_layer]]
+    pages[0].unpin()
+    pages[0].ref_count_down()
+
+
+def test_layer_page_resolver_falls_back_for_legacy_remote_suffix():
+    allocator = TensorMemoryAllocator(torch.zeros(4096, dtype=torch.uint8))
+    pages = allocator.batched_allocate_layer_pages(
+        torch.Size([8]),
+        torch.float16,
+        batch_size=1,
+        num_layers=2,
+        fmt=MemoryFormat.KV_MLA_LATENT_FMT,
+    )
+    assert pages is not None
+    keys = [
+        replace(_make_key(), chunk_hash=0x388 + chunk).split_layers(2)
+        for chunk in range(2)
+    ]
+    keys_by_layer = [list(row) for row in zip(*keys, strict=True)]
+    suffix = [[_FakeResolvableMemoryObj()] for _ in range(2)]
+    page_probes = []
+
+    class _Local:
+        @staticmethod
+        def batched_get_layer_page_prefix(_keys):
+            return list(pages), 1
+
+        @staticmethod
+        def contains_any_exact(_keys):
+            return False
+
+    class _Remote:
+        @staticmethod
+        def batched_contains_layer_pages(probe_keys):
+            page_probes.append(list(probe_keys))
+            return 0
+
+        @staticmethod
+        def batched_get_layer_pages(_keys):
+            pytest.fail("missing page suffix was fetched as a page")
+
+    engine = object.__new__(LMCacheEngine)
+    engine.num_layers = 2
+    engine.config = SimpleNamespace(chunk_size=8)
+    engine.storage_manager = SimpleNamespace(
+        storage_backends={"RemoteBackend": _Remote()}
+    )
+    engine._shared_local_cpu_backend = lambda: _Local()
+    engine._expected_shared_cpu_chunk_metadata = lambda **_kwargs: (
+        pages[0].get_shape(),
+        torch.float16,
+        MemoryFormat.KV_MLA_LATENT_FMT,
+    )
+    engine._validate_rank0_shared_mem_obj = lambda *_args, **_kwargs: None
+
+    def resolve_suffix(**_kwargs):
+        for layer in suffix:
+            layer[0].pin()
+        return suffix
+
+    engine._resolve_shared_rank0_page_first_layers = resolve_suffix
+    resolved, page_chunks = engine._resolve_shared_rank0_layer_pages(
+        req_id="req-legacy-remote",
+        phase="dense_prefix",
+        kv_group=0,
+        keys_layer_major=keys_by_layer,
+        page_chunks=2,
+    )
+
+    assert page_chunks == 1
+    assert page_probes == [[keys_by_layer[0][1]]]
+    assert resolved == [[pages[0], suffix[0][0]], [pages[0], suffix[1][0]]]
+    pages[0].unpin()
+    pages[0].ref_count_down()
+    for layer in suffix:
+        layer[0].unpin()
+
+
+def test_layer_page_resolver_keeps_remote_page_prefix_before_legacy_suffix():
+    allocator = TensorMemoryAllocator(torch.zeros(8192, dtype=torch.uint8))
+    pages = allocator.batched_allocate_layer_pages(
+        torch.Size([8]),
+        torch.float16,
+        batch_size=2,
+        num_layers=2,
+        fmt=MemoryFormat.KV_MLA_LATENT_FMT,
+    )
+    assert pages is not None
+    keys = [
+        replace(_make_key(), chunk_hash=0x38C + chunk).split_layers(2)
+        for chunk in range(3)
+    ]
+    keys_by_layer = [list(row) for row in zip(*keys, strict=True)]
+    suffix = [[_FakeResolvableMemoryObj()] for _ in range(2)]
+    fetched_keys = []
+    suffix_keys = []
+
+    class _Local:
+        @staticmethod
+        def batched_get_layer_page_prefix(_keys):
+            return [pages[0]], 1
+
+        @staticmethod
+        def contains_any_exact(_keys):
+            return False
+
+    class _Remote:
+        @staticmethod
+        def batched_contains_layer_pages(_keys):
+            return 1
+
+        @staticmethod
+        def batched_get_layer_pages(fetch_keys):
+            fetched_keys.extend(fetch_keys)
+            return [pages[1]]
+
+    engine = object.__new__(LMCacheEngine)
+    engine.num_layers = 2
+    engine.config = SimpleNamespace(chunk_size=8)
+    engine.storage_manager = SimpleNamespace(
+        storage_backends={"RemoteBackend": _Remote()}
+    )
+    engine._shared_local_cpu_backend = lambda: _Local()
+    engine._expected_shared_cpu_chunk_metadata = lambda **_kwargs: (
+        pages[0].get_shape(),
+        torch.float16,
+        MemoryFormat.KV_MLA_LATENT_FMT,
+    )
+    engine._validate_rank0_shared_mem_obj = lambda *_args, **_kwargs: None
+
+    def resolve_suffix(**kwargs):
+        suffix_keys.extend(kwargs["keys_layer_major"])
+        for layer in suffix:
+            layer[0].pin()
+        return suffix
+
+    engine._resolve_shared_rank0_page_first_layers = resolve_suffix
+    resolved, page_chunks = engine._resolve_shared_rank0_layer_pages(
+        req_id="req-page-then-legacy",
+        phase="dense_prefix",
+        kv_group=0,
+        keys_layer_major=keys_by_layer,
+        page_chunks=3,
+    )
+
+    assert page_chunks == 2
+    assert fetched_keys == [keys_by_layer[0][1]]
+    assert suffix_keys == [layer[2:] for layer in keys_by_layer]
+    assert resolved == [
+        [pages[0], pages[1], suffix[layer_id][0]] for layer_id in range(2)
+    ]
+    for page in pages:
+        page.unpin()
+        page.ref_count_down()
+    for layer in suffix:
+        layer[0].unpin()
+
+
+def test_layer_page_resolver_rolls_back_pinned_legacy_suffix():
+    allocator = TensorMemoryAllocator(torch.zeros(4096, dtype=torch.uint8))
+    pages = allocator.batched_allocate_layer_pages(
+        torch.Size([8]),
+        torch.float16,
+        batch_size=1,
+        num_layers=2,
+        fmt=MemoryFormat.KV_MLA_LATENT_FMT,
+    )
+    assert pages is not None
+    keys = [
+        replace(_make_key(), chunk_hash=0x390 + chunk).split_layers(2)
+        for chunk in range(2)
+    ]
+    keys_by_layer = [list(row) for row in zip(*keys, strict=True)]
+    suffix = [[_FakeResolvableMemoryObj()] for _ in range(2)]
+
+    class _Local:
+        @staticmethod
+        def batched_get_layer_page_prefix(_keys):
+            return list(pages), 1
+
+        @staticmethod
+        def contains_any_exact(_keys):
+            return True
+
+    engine = object.__new__(LMCacheEngine)
+    engine.num_layers = 2
+    engine.config = SimpleNamespace(chunk_size=8)
+    engine._shared_local_cpu_backend = lambda: _Local()
+    engine._expected_shared_cpu_chunk_metadata = lambda **_kwargs: (
+        pages[0].get_shape(),
+        torch.float16,
+        MemoryFormat.KV_MLA_LATENT_FMT,
+    )
+
+    def resolve_suffix(**_kwargs):
+        for layer in suffix:
+            layer[0].pin()
+        return suffix
+
+    engine._resolve_shared_rank0_page_first_layers = resolve_suffix
+    engine._validate_rank0_shared_mem_obj = lambda *_args, **_kwargs: (
+        _ for _ in ()
+    ).throw(RuntimeError("page validation failed"))
+
+    with pytest.raises(RuntimeError, match="page validation failed"):
+        engine._resolve_shared_rank0_layer_pages(
+            req_id="req-mixed",
+            phase="dense_prefix",
+            kv_group=0,
+            keys_layer_major=keys_by_layer,
+            page_chunks=2,
+        )
+
+    assert all(not layer[0].is_pinned for layer in suffix)
+    assert all(layer[0].ref_count_down_count == 1 for layer in suffix)
 
 
 def test_rank0_windowed_remote_resolver_batches_layers_and_preserves_order():
@@ -3475,6 +3937,71 @@ def test_compact_shared_handle_batch_round_trip_and_view():
             expected_num_chunks=2,
             expected_chunk_hashes=batch.chunk_hashes,
             slab_size=256,
+        )
+
+
+def test_compact_shared_handle_batch_preserves_layer_pages_and_tail():
+    batch = SharedHandleBatch(
+        shm_name="/lmcache-test",
+        producer_rank=0,
+        num_layers=2,
+        num_chunks=2,
+        physical_sizes=[16, 32],
+        chunk_hashes=[11, 22],
+        offsets=[128, 192],
+        page_offsets=[0],
+        page_physical_sizes=[64],
+    )
+    decoded = SharedHandleBatch.from_dict(batch.to_dict())
+    assert decoded == batch
+    validate_shared_handle_batch(
+        decoded,
+        expected_shm_name=batch.shm_name,
+        expected_producer_rank=0,
+        expected_num_layers=2,
+        expected_num_chunks=2,
+        expected_chunk_hashes=batch.chunk_hashes,
+        slab_size=256,
+    )
+
+    allocator = PassiveSharedViewAllocator(
+        slab_tensor=torch.arange(256, dtype=torch.uint8),
+        shm_name=batch.shm_name,
+        generation=9,
+    )
+    page = allocator.create_page_view(
+        batch,
+        chunk_index=0,
+        shape=torch.Size([8]),
+        dtype=torch.float16,
+        fmt=MemoryFormat.KV_MLA_LATENT_FMT,
+        cached_positions=range(8),
+    )
+    assert isinstance(page, LayerPageMemoryObj)
+    assert "raw_data" not in page.__dict__
+    assert page.layer_data_ptr(1) == allocator.slab_tensor.data_ptr() + 16
+    assert "raw_data" not in page.__dict__
+    assert page.layer_tensor(0).data_ptr() == allocator.slab_tensor.data_ptr()
+    assert page.layer_tensor(1).data_ptr() == allocator.slab_tensor.data_ptr() + 16
+    tail = allocator.create_batch_view(
+        batch,
+        layer_id=1,
+        chunk_index=1,
+        shape=torch.Size([4]),
+        dtype=torch.float16,
+        fmt=MemoryFormat.KV_MLA_LATENT_FMT,
+        cached_positions=range(4),
+    )
+    assert tail.metadata.address == 192
+    with pytest.raises(SharedCPUCacheValidationError, match="create_page_view"):
+        allocator.create_batch_view(
+            batch,
+            layer_id=0,
+            chunk_index=0,
+            shape=torch.Size([8]),
+            dtype=torch.float16,
+            fmt=MemoryFormat.KV_MLA_LATENT_FMT,
+            cached_positions=range(8),
         )
 
 

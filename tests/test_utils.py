@@ -521,6 +521,15 @@ class TestLayerCacheEngineKey:
         for i, lk in enumerate(layers):
             assert lk.layer_id == i
 
+    def test_layer_identity_conversions(self, layer_key):
+        base = layer_key.without_layer()
+        moved = layer_key.with_new_worker_id(7)
+
+        assert type(base) is CacheEngineKey
+        assert base.chunk_hash == layer_key.chunk_hash
+        assert isinstance(moved, LayerCacheEngineKey)
+        assert moved.worker_id == 7 and moved.layer_id == layer_key.layer_id
+
 
 # ============================================================
 # parse_cache_key

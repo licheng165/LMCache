@@ -38,6 +38,7 @@ from lmcache.usage_context import InitializeUsageContext
 from lmcache.utils import (
     CacheEngineKey,
     CacheStoreEvent,
+    LayerCacheEngineKey,
     _lmcache_nvtx_annotate,
     compress_slot_mapping,
     convert_tokens_to_list,
@@ -54,6 +55,8 @@ from lmcache.v1.gpu_connector.utils import assert_layerwise_gpu_connector
 from lmcache.v1.memory_management import CuFileMemoryAllocator  # noqa: E501
 from lmcache.v1.memory_management import (  # noqa: E501
     MemoryAllocatorInterface,
+    LayerPageMemoryObj,
+    LayerPageSource,
     MemoryFormat,
     MemoryObj,
     MemoryObjMetadata,
@@ -62,7 +65,10 @@ from lmcache.v1.memory_management import (  # noqa: E501
     TensorMemoryObj,
 )
 from lmcache.v1.metadata import LMCacheMetadata
-from lmcache.v1.mooncake_layout import mooncake_page_layout_enabled
+from lmcache.v1.mooncake_layout import (
+    mooncake_layer_pages_enabled,
+    mooncake_page_layout_enabled,
+)
 from lmcache.v1.pin_monitor import PinMonitor
 from lmcache.v1.sampled_lookup import (
     find_last_sampled_hit,
@@ -375,7 +381,12 @@ class LMCacheEngine:
         )
 
     def _validate_shared_cpu_cache_contract(self) -> None:
+        layer_pages = mooncake_layer_pages_enabled(self.config)
         if not self.metadata.use_mla:
+            if layer_pages:
+                raise ValueError(
+                    "mooncake_layer_merged_page_objects currently requires MLA."
+                )
             return
 
         tp_gt_one = self.metadata.world_size > 1
@@ -409,6 +420,19 @@ class LMCacheEngine:
 
         if not self.enable_shared_cpu_cache:
             return
+
+        if (
+            layer_pages
+            and self.gpu_connector is not None
+            and not getattr(
+                self.gpu_connector, "supports_layer_page_source", False
+            )
+        ):
+            raise ValueError(
+                "mooncake_layer_merged_page_objects requires a GPU connector "
+                "that supports LayerPageSource."
+                + context
+            )
 
         if (
             self.metadata.world_size > 1
@@ -1196,22 +1220,38 @@ class LMCacheEngine:
         ):
             return None
         chunks = len(memory_objs[0])
-        flat = [obj for layer in memory_objs for obj in layer]
         if (
             any(len(layer) != chunks for layer in memory_objs)
             or len(keys_layer_major) != self.num_layers
             or any(len(layer) != chunks for layer in keys_layer_major)
-            or any(type(obj) is not TensorMemoryObj for obj in flat)
         ):
             return None
+        page_chunks = 0
+        for chunk in range(chunks):
+            page = memory_objs[0][chunk]
+            if not isinstance(page, LayerPageMemoryObj):
+                break
+            if page.num_layers != self.num_layers or any(
+                layer[chunk] is not page for layer in memory_objs
+            ):
+                return None
+            page_chunks += 1
+        tail = [obj for layer in memory_objs for obj in layer[page_chunks:]]
+        if any(type(obj) is not TensorMemoryObj for obj in tail):
+            return None
         physical_sizes = [
-            int(memory_objs[0][chunk].meta.phy_size) for chunk in range(chunks)
+            (
+                memory_objs[0][chunk].layer_size
+                if chunk < page_chunks
+                else int(memory_objs[0][chunk].meta.phy_size)
+            )
+            for chunk in range(chunks)
         ]
         if any(
             int(obj.meta.phy_size) != physical_sizes[chunk]
             or obj.get_size() > physical_sizes[chunk]
             for layer in memory_objs
-            for chunk, obj in enumerate(layer)
+            for chunk, obj in enumerate(layer[page_chunks:], page_chunks)
         ):
             return None
         batch = SharedHandleBatch(
@@ -1223,7 +1263,15 @@ class LMCacheEngine:
             chunk_hashes=[
                 int(key.chunk_hash) for key in keys_layer_major[0][:chunks]
             ],
-            offsets=[int(obj.meta.address) for obj in flat],
+            offsets=[int(obj.meta.address) for obj in tail],
+            page_offsets=[
+                int(memory_objs[0][chunk].meta.address)
+                for chunk in range(page_chunks)
+            ],
+            page_physical_sizes=[
+                int(memory_objs[0][chunk].meta.phy_size)
+                for chunk in range(page_chunks)
+            ],
         )
         cold_start_perf_log(
             logger,
@@ -1232,6 +1280,7 @@ class LMCacheEngine:
             layers=self.num_layers,
             chunks=chunks,
             offsets=len(batch.offsets),
+            pages=page_chunks,
             rank=self.metadata.worker_id,
         )
         return batch
@@ -1248,6 +1297,19 @@ class LMCacheEngine:
     ) -> Optional[str]:
         """Return the backend location only when all layers already exist."""
         assert self.storage_manager is not None
+        if (
+            end - start == self.config.chunk_size
+            and keys_multi_layer
+            and isinstance(keys_multi_layer[0], LayerCacheEngineKey)
+            and mooncake_layer_pages_enabled(self.config)
+        ):
+            page_hits, page_mapping = (
+                self.storage_manager.batched_contains_layer_pages(
+                    [keys_multi_layer[0]], self.retrieve_locations
+                )
+            )
+            if page_hits == 1 and len(page_mapping) == 1:
+                return next(iter(page_mapping))
         hit_layers, block_mapping = self.storage_manager.batched_contains(
             keys_multi_layer,
             self.retrieve_locations,
@@ -1440,7 +1502,10 @@ class LMCacheEngine:
                 return None
             mapping: dict[str, list[CacheEngineKey]] = defaultdict(list)
             remote_keys: list[CacheEngineKey] = []
+            remote_pages: list[tuple[LayerCacheEngineKey, list[CacheEngineKey]]] = []
             kv_groups = self._layerwise_lookup_kv_groups()
+            local_page_lookup = mooncake_layer_pages_enabled(self.config)
+            remote_page_lookup = mooncake_page_layout_enabled(self.config)
             remote_groups: set[int] = set()
             required_local = local_through or set()
 
@@ -1465,6 +1530,17 @@ class LMCacheEngine:
                         sampled = first_last_layer_keys(
                             [group_key], self.num_layers
                         )
+                        page_key = group_key.split_layers(1)[0]
+                        if local_page_lookup:
+                            hits, local_pages = (
+                                self.storage_manager.batched_contains_layer_pages(
+                                    [page_key], ["LocalCPUBackend"], pin
+                                )
+                            )
+                            if hits == 1:
+                                for location, keys in local_pages.items():
+                                    mapping[location].extend(keys)
+                                continue
                         if self.storage_manager.contains(
                             sampled[0], ["LocalCPUBackend"], False
                         ) is None:
@@ -1477,6 +1553,8 @@ class LMCacheEngine:
                                 # location marker needed by retrieval routing.
                                 mapping.setdefault("RemoteBackend", [])
                                 remote_groups.add(kv_group)
+                            elif remote_page_lookup:
+                                remote_pages.append((page_key, sampled))
                             else:
                                 remote_keys.extend(sampled)
                             continue
@@ -1496,7 +1574,10 @@ class LMCacheEngine:
                             if kv_group in required_local:
                                 rollback()
                                 return None
-                            remote_keys.extend(sampled)
+                            if remote_page_lookup:
+                                remote_pages.append((page_key, sampled))
+                            else:
+                                remote_keys.extend(sampled)
                             remote_groups.add(kv_group)
                             continue
                         hits, _ = self.storage_manager.batched_contains(
@@ -1505,12 +1586,26 @@ class LMCacheEngine:
                             False,
                         )
                         if hits != self.num_layers:
-                            remote_keys.extend(sampled)
+                            if remote_page_lookup:
+                                remote_pages.append((page_key, sampled))
+                            else:
+                                remote_keys.extend(sampled)
                             continue
                         mapping["LocalCPUBackend"].extend(layer_keys)
                     if pin and len(remote_groups) == len(kv_groups):
                         break
 
+                if remote_pages:
+                    for page_key, sampled in remote_pages:
+                        page_hits, _ = (
+                            self.storage_manager.batched_contains_layer_pages(
+                                [page_key], ["RemoteBackend"], False
+                            )
+                        )
+                        if page_hits:
+                            mapping.setdefault("RemoteBackend", [])
+                        else:
+                            remote_keys.extend(sampled)
                 if remote_keys:
                     hits, remote = self.storage_manager.batched_contains(
                         remote_keys,
@@ -1818,6 +1913,20 @@ class LMCacheEngine:
             for key, location in zip(layer_keys, layer_locations, strict=False)
             if location == "LocalCPUBackend"
         }
+        required_page_keys = {
+            key.without_layer()
+            for key, location in zip(
+                keys_layer_major[0] if keys_layer_major else [],
+                (
+                    chunk_locations_layer_major[0]
+                    if chunk_locations_layer_major
+                    else []
+                ),
+                strict=False,
+            )
+            if location == "LocalCPUBackend"
+            and isinstance(key, LayerCacheEngineKey)
+        }
         hot_cache = getattr(local_cpu_backend, "hot_cache", {})
         cpu_lock = getattr(local_cpu_backend, "cpu_lock", None)
         lock_cm = cpu_lock if cpu_lock is not None else None
@@ -1827,12 +1936,29 @@ class LMCacheEngine:
             required_local_items = [
                 (key, hot_cache.get(key)) for key in required_local_keys
             ]
+            required_page_items = [
+                (key, hot_cache.get(key)) for key in required_page_keys
+            ]
         else:
             with lock_cm:
                 required_local_items = [
                     (key, hot_cache.get(key)) for key in required_local_keys
                 ]
+                required_page_items = [
+                    (key, hot_cache.get(key)) for key in required_page_keys
+                ]
+        rank0_shared_hot_keys.update(
+            key
+            for key, mem_obj in required_page_items
+            if isinstance(mem_obj, LayerPageMemoryObj)
+            and self._is_rank0_shared_mem_obj(mem_obj)
+        )
         for key, mem_obj in required_local_items:
+            if (
+                isinstance(key, LayerCacheEngineKey)
+                and key.without_layer() in rank0_shared_hot_keys
+            ):
+                continue
             if mem_obj is not None and self._is_rank0_shared_mem_obj(mem_obj):
                 rank0_shared_hot_keys.add(key)
             else:
@@ -1858,7 +1984,13 @@ class LMCacheEngine:
                     continue
                 if (
                     location == "LocalCPUBackend"
-                    and key in rank0_shared_hot_keys
+                    and (
+                        key in rank0_shared_hot_keys
+                        or (
+                            isinstance(key, LayerCacheEngineKey)
+                            and key.without_layer() in rank0_shared_hot_keys
+                        )
+                    )
                 ):
                     continue
                 missing_chunk_count += 1
@@ -2181,15 +2313,23 @@ class LMCacheEngine:
         key: CacheEngineKey,
     ) -> Optional[str]:
         assert self.storage_manager is not None
+        if isinstance(key, LayerCacheEngineKey) and mooncake_layer_pages_enabled(
+            self.config
+        ):
+            hits, mapping = self.storage_manager.batched_contains_layer_pages(
+                [key], self.retrieve_locations
+            )
+            if hits == 1 and len(mapping) == 1:
+                return next(iter(mapping))
         local_cpu_backend = self._shared_local_cpu_backend()
         if local_cpu_backend.contains(key):
             return "LocalCPUBackend"
         return self.storage_manager.contains(key, self.retrieve_locations)
 
-    def _shared_page_first_uniform_location(
+    def _shared_page_first_location_plan(
         self,
         keys_by_chunk: list[list[CacheEngineKey]],
-    ) -> Optional[str]:
+    ) -> Optional[list[str]]:
         """Prefer LocalCPU and prove Mooncake covers every remaining key."""
         if not keys_by_chunk or not mooncake_page_layout_enabled(self.config):
             return None
@@ -2199,18 +2339,58 @@ class LMCacheEngine:
         if lock is None or hot_cache is None:
             return None
         local_chunks = len(keys_by_chunk)
-        missed_layers: set[int] = set()
+        layer_pages = mooncake_layer_pages_enabled(self.config)
+        page_keys: list[LayerCacheEngineKey] = []
         with lock:
-            for chunk_index, chunk in enumerate(keys_by_chunk):
-                for layer_id, key in enumerate(chunk):
-                    if key in hot_cache:
-                        if layer_id in missed_layers:
+            if layer_pages and all(
+                chunk and isinstance(chunk[0], LayerCacheEngineKey)
+                for chunk in keys_by_chunk
+            ):
+                local_chunks = next(
+                    (
+                        index
+                        for index, chunk in enumerate(keys_by_chunk)
+                        if not isinstance(
+                            hot_cache.get(chunk[0].without_layer()),
+                            LayerPageMemoryObj,
+                        )
+                    ),
+                    len(keys_by_chunk),
+                )
+                if local_chunks == len(keys_by_chunk):
+                    return ["LocalCPUBackend"] * local_chunks
+                # A legacy per-layer suffix still needs the general planner.
+                if not any(key in hot_cache for key in keys_by_chunk[local_chunks]):
+                    page_keys = [
+                        key
+                        for chunk in keys_by_chunk[local_chunks:]
+                        for key in chunk[:1]
+                        if isinstance(key, LayerCacheEngineKey)
+                    ]
+            if not page_keys:
+                missed_layers: set[int] = set()
+                local_chunks = len(keys_by_chunk)
+                for chunk_index, chunk in enumerate(keys_by_chunk):
+                    if (
+                        layer_pages
+                        and isinstance(chunk[0], LayerCacheEngineKey)
+                        and isinstance(
+                            hot_cache.get(chunk[0].without_layer()),
+                            LayerPageMemoryObj,
+                        )
+                    ):
+                        if missed_layers:
                             return None
-                    else:
-                        missed_layers.add(layer_id)
-                        local_chunks = min(local_chunks, chunk_index)
+                        continue
+                    for layer_id, key in enumerate(chunk):
+                        if key in hot_cache:
+                            if layer_id in missed_layers:
+                                return None
+                        else:
+                            missed_layers.add(layer_id)
+                            local_chunks = min(local_chunks, chunk_index)
         if local_chunks == len(keys_by_chunk):
-            return "LocalCPUBackend"
+            return ["LocalCPUBackend"] * local_chunks
         search_range = self.retrieve_locations
         if search_range is not None and "RemoteBackend" not in search_range:
             return None
@@ -2222,6 +2402,26 @@ class LMCacheEngine:
         if set(active) - {"LocalCPUBackend", "RemoteBackend"}:
             return None
         remote = active.get("RemoteBackend")
+        if page_keys:
+            page_contains = getattr(
+                getattr(remote, "connection", None),
+                "batched_contains_layer_pages",
+                None,
+            )
+            if not callable(page_contains):
+                return None
+            hits, mapping = self.storage_manager.batched_contains_layer_pages(
+                page_keys, ["RemoteBackend"]
+            )
+            remote_complete = (
+                hits == len(page_keys) and set(mapping) == {"RemoteBackend"}
+            )
+            return (
+                ["LocalCPUBackend"] * local_chunks
+                + ["RemoteBackend"] * (len(keys_by_chunk) - local_chunks)
+                if remote_complete
+                else None
+            )
         supports = getattr(
             getattr(remote, "connection", None),
             "support_batched_contains",
@@ -2237,7 +2437,9 @@ class LMCacheEngine:
             ["RemoteBackend"],
         )
         if hits == len(remote_keys) and set(mapping) == {"RemoteBackend"}:
-            return "RemoteBackend"
+            return ["LocalCPUBackend"] * local_chunks + ["RemoteBackend"] * (
+                len(keys_by_chunk) - local_chunks
+            )
         return None
 
     @staticmethod
@@ -2258,24 +2460,6 @@ class LMCacheEngine:
                 elif location != "LocalCPUBackend" or remote:
                     return False
         return True
-
-    @classmethod
-    def _shared_page_first_common_prefix_plan(
-        cls,
-        locations_layer_major: list[list[str]],
-    ) -> Optional[list[list[str]]]:
-        """Normalize layer prefixes to the all-layer page boundary."""
-        if not cls._is_shared_page_first_location_plan(locations_layer_major):
-            return None
-        local_chunks = min(
-            locations.count("LocalCPUBackend")
-            for locations in locations_layer_major
-        )
-        return [
-            ["LocalCPUBackend"] * local_chunks
-            + ["RemoteBackend"] * (len(locations) - local_chunks)
-            for locations in locations_layer_major
-        ]
 
     def _resolve_shared_rank0_layer_mem_objs(
         self,
@@ -2570,6 +2754,108 @@ class LMCacheEngine:
             for prefix in prefixes:
                 prefix.release()
             self._release_shared_retrieve_objs(owned, unpin=True)
+            raise
+
+    def _resolve_shared_rank0_layer_pages(
+        self,
+        *,
+        req_id: str,
+        phase: str,
+        kv_group: int,
+        keys_layer_major: list[list[CacheEngineKey]],
+        page_chunks: int,
+    ) -> tuple[list[list[MemoryObj]], int]:
+        """Resolve full chunks as layer pages and retain the legacy tail path."""
+        if not 0 < page_chunks <= len(keys_layer_major[0]):
+            raise ValueError("Layer-page retrieval requires at least one full chunk")
+        page_keys = [
+            key
+            for key in keys_layer_major[0][:page_chunks]
+            if isinstance(key, LayerCacheEngineKey)
+        ]
+        if len(page_keys) != page_chunks:
+            raise ValueError("Layer-page retrieval requires layer cache keys")
+
+        local = self._shared_local_cpu_backend()
+        base_keys = [key.without_layer() for key in page_keys]
+        pages, local_count = local.batched_get_layer_page_prefix(base_keys)
+        owned: list[MemoryObj] = list(pages)
+        pinned: list[MemoryObj] = []
+        try:
+            legacy_suffix = local_count < page_chunks and local.contains_any_exact(
+                [layer[local_count] for layer in keys_layer_major]
+            )
+            if legacy_suffix:
+                tail_start = local_count
+            elif local_count < page_chunks:
+                remote = self.storage_manager.storage_backends.get("RemoteBackend")
+                contains = getattr(remote, "batched_contains_layer_pages", None)
+                retrieve = getattr(remote, "batched_get_layer_pages", None)
+                if not callable(contains) or not callable(retrieve):
+                    raise RuntimeError("RemoteBackend does not support layer pages")
+                remote_page_keys = page_keys[local_count:page_chunks]
+                remote_count = contains(remote_page_keys)
+                if not 0 <= remote_count <= len(remote_page_keys):
+                    raise ValueError("Remote layer-page lookup returned invalid count")
+                if remote_count:
+                    fetched = retrieve(remote_page_keys[:remote_count])
+                    if len(fetched) != remote_count:
+                        raise ValueError(
+                            "Remote layer-page result count is inconsistent"
+                        )
+                    pages.extend(fetched)
+                    owned.extend(fetched)
+                tail_start = local_count + remote_count
+                legacy_suffix = tail_start < page_chunks
+            else:
+                tail_start = page_chunks
+            tail = (
+                self._resolve_shared_rank0_page_first_layers(
+                    req_id=req_id,
+                    phase=phase,
+                    kv_group=kv_group,
+                    keys_layer_major=[layer[tail_start:] for layer in keys_layer_major],
+                )
+                if tail_start < len(keys_layer_major[0])
+                else [[] for _ in keys_layer_major]
+            )
+            tail_objects = [obj for layer in tail for obj in layer]
+            owned.extend(tail_objects)
+            # The legacy resolver returns request-pinned objects. Track them
+            # alongside pages so failures after tail resolution undo both.
+            pinned.extend(tail_objects)
+            expected_pages = tail_start
+            if len(pages) != expected_pages:
+                raise ValueError(
+                    f"Layer-page result count {len(pages)} != {expected_pages}"
+                )
+
+            expected_shape, _, _ = self._expected_shared_cpu_chunk_metadata(
+                kv_group=kv_group,
+                num_tokens=self.config.chunk_size,
+            )
+            if any(
+                page.num_layers != self.num_layers
+                or page.get_shape() != expected_shape
+                for page in pages
+            ) or not LayerPageMemoryObj.pin_many(pages):
+                raise ValueError("Invalid or unpinnable layer-page object")
+            pinned.extend(pages)
+            for chunk_index, page in enumerate(pages):
+                self._validate_rank0_shared_mem_obj(
+                    page,
+                    req_id=req_id,
+                    phase=phase,
+                    layer_id=0,
+                    kv_group=kv_group,
+                    chunk_index=chunk_index,
+                )
+
+            return [list(pages) + layer for layer in tail], expected_pages
+        except Exception:
+            for page in reversed(pinned):
+                page.unpin()
+            self._release_shared_retrieve_objs(owned, unpin=False)
             raise
 
     def _resolve_shared_rank0_remote_layers_windowed(
@@ -3041,6 +3327,8 @@ class LMCacheEngine:
             )
         )
         pre_resolved_layers: Optional[list[list[MemoryObj]]] = None
+        layer_page_chunks = 0
+        layer_pages: tuple[LayerPageMemoryObj, ...] = ()
         compact_batch: Optional[SharedHandleBatch] = None
         perf_enabled = cold_start_perf_enabled()
         consume_started = consumer_send_s = consumer_finish_s = 0.0
@@ -3049,23 +3337,59 @@ class LMCacheEngine:
                 try:
                     if page_first_resolve:
                         if pre_resolved_layers is None:
-                            pre_resolved_layers = (
-                                self._resolve_shared_rank0_page_first_layers(
-                                    req_id=req_id,
-                                    phase=phase,
-                                    kv_group=kv_group,
-                                    keys_layer_major=keys_layer_major,
-                                )
+                            full_chunks = next(
+                                (
+                                    index
+                                    for index, (start, end) in enumerate(
+                                        zip(starts, ends, strict=True)
+                                    )
+                                    if end - start != self.config.chunk_size
+                                ),
+                                len(starts),
                             )
-                            to_release.extend(
-                                mem_obj
+                            if (
+                                mooncake_layer_pages_enabled(self.config)
+                                and full_chunks
+                            ):
+                                pre_resolved_layers, layer_page_chunks = (
+                                    self._resolve_shared_rank0_layer_pages(
+                                        req_id=req_id,
+                                        phase=phase,
+                                        kv_group=kv_group,
+                                        keys_layer_major=keys_layer_major,
+                                        page_chunks=full_chunks,
+                                    )
+                                )
+                                layer_pages = tuple(
+                                    page
+                                    for page in pre_resolved_layers[0][
+                                        :layer_page_chunks
+                                    ]
+                                    if isinstance(page, LayerPageMemoryObj)
+                                )
+                            else:
+                                pre_resolved_layers = (
+                                    self._resolve_shared_rank0_page_first_layers(
+                                        req_id=req_id,
+                                        phase=phase,
+                                        kv_group=kv_group,
+                                        keys_layer_major=keys_layer_major,
+                                    )
+                                )
+                            unique = {
+                                id(mem_obj): mem_obj
                                 for layer in pre_resolved_layers
                                 for mem_obj in layer
-                            )
+                            }
+                            to_release.extend(unique.values())
                             compact_batch = self._make_shared_handle_batch(
                                 pre_resolved_layers,
                                 keys_layer_major,
                             )
+                            if layer_page_chunks and compact_batch is None:
+                                raise ValueError(
+                                    "Layer pages require compact shared publication"
+                                )
                             if compact_batch is not None:
                                 self._broadcast_shared_envelope(
                                     SharedHandleEnvelope(
@@ -3150,7 +3474,15 @@ class LMCacheEngine:
                     yield None
 
                 send_started = cold_start_perf_now() if perf_enabled else 0.0
-                mem_obj_consumer.send(mem_objs_layer)
+                mem_obj_consumer.send(
+                    LayerPageSource(
+                        layer_pages,
+                        layer_id,
+                        tuple(mem_objs_layer[layer_page_chunks:]),
+                    )
+                    if layer_page_chunks
+                    else mem_objs_layer
+                )
                 if send_started:
                     consumer_send_s += cold_start_perf_now() - send_started
 
@@ -3195,6 +3527,9 @@ class LMCacheEngine:
                     role="rank0",
                     layers=len(resolved_layers),
                     objects=sum(map(len, resolved_layers)),
+                    unique_objects=len(
+                        {id(obj) for layer in resolved_layers for obj in layer}
+                    ),
                     compact=compact_batch is not None,
                     view_build_ms=0.0,
                     consumer_send_ms=round(consumer_send_s * 1000, 3),
@@ -3247,6 +3582,8 @@ class LMCacheEngine:
         handles_by_layer: list[list[Any]] = []
         expected_handle_count: Optional[int] = None
         compact_batch: Optional[SharedHandleBatch] = None
+        passive_pages: list[LayerPageMemoryObj] = []
+        passive_page_tuple: tuple[LayerPageMemoryObj, ...] = ()
         perf_enabled = cold_start_perf_enabled()
         consume_started = view_build_s = consumer_send_s = consumer_finish_s = 0.0
 
@@ -3314,6 +3651,39 @@ class LMCacheEngine:
                         **kwargs,
                     )
                     next(mem_obj_consumer)
+                    if compact_batch is not None:
+                        page_view_started = (
+                            cold_start_perf_now() if perf_enabled else 0.0
+                        )
+                        for chunk_index in range(len(compact_batch.page_offsets)):
+                            shape, dtype, fmt = (
+                                self._expected_shared_cpu_chunk_metadata(
+                                    kv_group=kv_group,
+                                    num_tokens=int(
+                                        ends_all[chunk_index]
+                                        - starts_all[chunk_index]
+                                    ),
+                                )
+                            )
+                            passive_pages.append(
+                                self.shared_cpu_cache_passive_allocator.create_page_view(
+                                    compact_batch,
+                                    chunk_index=chunk_index,
+                                    shape=shape,
+                                    dtype=dtype,
+                                    fmt=fmt,
+                                    cached_positions=range(
+                                        int(starts_all[chunk_index]),
+                                        int(ends_all[chunk_index]),
+                                    ),
+                                )
+                            )
+                        to_release.extend(passive_pages)
+                        passive_page_tuple = tuple(passive_pages)
+                        if page_view_started:
+                            view_build_s += (
+                                cold_start_perf_now() - page_view_started
+                            )
                 elif (
                     compact_batch is None
                     and envelope is not None
@@ -3325,14 +3695,16 @@ class LMCacheEngine:
                         f"{expected_handle_count}"
                     )
 
-                mem_objs_layer: list[MemoryObj] = []
+                mem_objs_layer: list[MemoryObj] = list(passive_pages)
                 layer_handles = (
                     [None] * expected_handle_count
                     if compact_batch is not None
                     else envelope.handles  # type: ignore[union-attr]
                 )
                 view_started = cold_start_perf_now() if perf_enabled else 0.0
-                for chunk_index, handle in enumerate(layer_handles):
+                page_chunks = len(passive_pages)
+                for chunk_index in range(page_chunks, expected_handle_count):
+                    handle = layer_handles[chunk_index]
                     expected_shape, expected_dtype, expected_fmt = (
                         self._expected_shared_cpu_chunk_metadata(
                             kv_group=kv_group,
@@ -3385,7 +3757,15 @@ class LMCacheEngine:
 
                 assert mem_obj_consumer is not None
                 send_started = cold_start_perf_now() if perf_enabled else 0.0
-                mem_obj_consumer.send(mem_objs_layer)
+                mem_obj_consumer.send(
+                    LayerPageSource(
+                        passive_page_tuple,
+                        layer_id,
+                        tuple(mem_objs_layer[page_chunks:]),
+                    )
+                    if passive_pages
+                    else mem_objs_layer
+                )
                 if send_started:
                     consumer_send_s += cold_start_perf_now() - send_started
 
@@ -3430,6 +3810,9 @@ class LMCacheEngine:
                     role="passive",
                     layers=len(resolved_layers),
                     objects=sum(map(len, resolved_layers)),
+                    unique_objects=len(
+                        {id(obj) for layer in resolved_layers for obj in layer}
+                    ),
                     compact=compact_batch is not None,
                     view_build_ms=round(view_build_s * 1000, 3),
                     consumer_send_ms=round(consumer_send_s * 1000, 3),
@@ -4401,20 +4784,36 @@ class LMCacheEngine:
                 (start, end, key.split_layers(self.num_layers))
                 for start, end, key in token_results
             )
-            batch_location = None
+            batch_plan = None
             if mooncake_page_layout_enabled(self.config):
                 candidates = list(candidates)
-                batch_location = self._shared_page_first_uniform_location(
-                    [item[2] for item in candidates]
+                page_candidates = (
+                    candidates[
+                        : next(
+                            (
+                                index
+                                for index, (start, end, _) in enumerate(candidates)
+                                if end - start != self.config.chunk_size
+                            ),
+                            len(candidates),
+                        )
+                    ]
+                    if mooncake_layer_pages_enabled(self.config)
+                    else candidates
                 )
+                if page_candidates:
+                    batch_plan = self._shared_page_first_location_plan(
+                        [item[2] for item in page_candidates]
+                    )
             for start, end, keys_multi_layer in candidates:
                 missing_layer = False
+                planned = batch_plan is not None and len(keys) < len(batch_plan)
                 locations_multi_layer: list[str] = (
-                    [batch_location] * len(keys_multi_layer)
-                    if batch_location is not None
+                    [batch_plan[len(keys)]] * len(keys_multi_layer)
+                    if planned
                     else []
                 )
-                if batch_location is None:
+                if not planned:
                     for layer_idx, layer_key in enumerate(keys_multi_layer):
                         current_location = self._find_shared_rank0_chunk_location(
                             layer_key
@@ -4476,9 +4875,9 @@ class LMCacheEngine:
                 objects=sum(map(len, keys)),
                 mode=(
                     "page_batch"
-                    if batch_location == "RemoteBackend"
+                    if batch_plan is not None and "RemoteBackend" in batch_plan
                     else "local_batch"
-                    if batch_location == "LocalCPUBackend"
+                    if batch_plan is not None
                     else "per_object"
                 ),
             )
@@ -4728,32 +5127,50 @@ class LMCacheEngine:
                     return res
 
                 lookup_kv_groups = self._layerwise_lookup_kv_groups()
+                page_lookup = mooncake_layer_pages_enabled(self.config)
+                def contains_group(
+                    keys: list[CacheEngineKey], page: bool, do_pin: bool
+                ) -> tuple[int, dict]:
+                    if page:
+                        return self.storage_manager.batched_contains_layer_pages(
+                            keys,  # type: ignore[arg-type]
+                            search_range,
+                            do_pin,
+                        )
+                    return self.storage_manager.batched_contains(
+                        keys, search_range, do_pin
+                    )
+
                 for start, end, key in chunk_info_iterator:
                     assert isinstance(key, CacheEngineKey)
-
-                    chunk_group_layers: list[list[CacheEngineKey]] = []
+                    chunk_groups: list[tuple[list[CacheEngineKey], bool]] = []
                     for kv_group in lookup_kv_groups:
                         group_key = self._lookup_key_for_kv_group(
                             key,
                             kv_group=kv_group,
                             request_configs=request_configs,
                         )
-                        key_all_layers = group_key.split_layers(self.num_layers)
-                        hit_chunks, block_mapping = (
-                            self.storage_manager.batched_contains(
-                                key_all_layers,  # type: ignore
-                                search_range,
-                                False,
-                            )
+                        page = page_lookup and end - start == self.config.chunk_size
+                        group_keys: list[CacheEngineKey] = group_key.split_layers(
+                            1 if page else self.num_layers
                         )
+                        hit_chunks, block_mapping = contains_group(
+                            group_keys, page, False
+                        )
+                        if page and (hit_chunks != 1 or len(block_mapping) != 1):
+                            page = False
+                            group_keys = group_key.split_layers(self.num_layers)
+                            hit_chunks, block_mapping = contains_group(
+                                group_keys, page, False
+                            )
                         # Only all layers are hit and hit in one location,
                         # we consider this group complete for the chunk.
                         if (
-                            hit_chunks != self.num_layers
+                            hit_chunks != len(group_keys)
                             or len(block_mapping) != 1
                         ):
                             return res
-                        chunk_group_layers.append(key_all_layers)
+                        chunk_groups.append((group_keys, page))
 
                     if pin:
                         assert lookup_id is not None, (
@@ -4761,16 +5178,12 @@ class LMCacheEngine:
                         )
                         pinned_mappings: list[tuple[str, list[CacheEngineKey]]] = []
                         try:
-                            for key_all_layers in chunk_group_layers:
-                                hit_chunks, block_mapping = (
-                                    self.storage_manager.batched_contains(
-                                        key_all_layers,  # type: ignore
-                                        search_range,
-                                        True,
-                                    )
+                            for group_keys, page in chunk_groups:
+                                hit_chunks, block_mapping = contains_group(
+                                    group_keys, page, True
                                 )
                                 if (
-                                    hit_chunks != self.num_layers
+                                    hit_chunks != len(group_keys)
                                     or len(block_mapping) != 1
                                 ):
                                     for location, pinned_keys in block_mapping.items():

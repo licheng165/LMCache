@@ -18,6 +18,7 @@ import torch
 from lmcache.logging import init_logger
 from lmcache.utils import CacheEngineKey
 from lmcache.v1.memory_management import (
+    LayerPageMemoryObj,
     MemoryAllocatorInterface,
     MemoryFormat,
     MemoryObj,
@@ -644,6 +645,8 @@ class SharedHandleBatch:
     physical_sizes: list[int]
     chunk_hashes: list[int]
     offsets: list[int]
+    page_offsets: list[int] = field(default_factory=list)
+    page_physical_sizes: list[int] = field(default_factory=list)
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -654,6 +657,8 @@ class SharedHandleBatch:
             "physical_sizes": self.physical_sizes,
             "chunk_hashes": self.chunk_hashes,
             "offsets": self.offsets,
+            "page_offsets": self.page_offsets,
+            "page_physical_sizes": self.page_physical_sizes,
         }
 
     @classmethod
@@ -679,6 +684,9 @@ class SharedHandleBatch:
         if not all(
             isinstance(data[field], list)
             for field in ("physical_sizes", "chunk_hashes", "offsets")
+        ) or not all(
+            isinstance(data.get(field, []), list)
+            for field in ("page_offsets", "page_physical_sizes")
         ):
             raise SharedCPUCacheValidationError(
                 "SharedHandleBatch sizes, hashes, and offsets must be lists"
@@ -691,6 +699,10 @@ class SharedHandleBatch:
             physical_sizes=[int(size) for size in data["physical_sizes"]],
             chunk_hashes=[int(value) for value in data["chunk_hashes"]],
             offsets=[int(offset) for offset in data["offsets"]],
+            page_offsets=[int(offset) for offset in data.get("page_offsets", [])],
+            page_physical_sizes=[
+                int(size) for size in data.get("page_physical_sizes", [])
+            ],
         )
 
 
@@ -861,20 +873,33 @@ def validate_shared_handle_batch(
     )
     if not sizes_valid:
         failures.append("physical sizes must contain one positive size per chunk")
-    expected_offsets = expected_num_layers * expected_num_chunks
+    page_count = len(batch.page_offsets)
+    if page_count > expected_num_chunks or len(batch.page_physical_sizes) != page_count:
+        failures.append("page offsets and physical sizes must match valid chunks")
+    tail_chunks = max(expected_num_chunks - page_count, 0)
+    expected_offsets = expected_num_layers * tail_chunks
     if len(batch.offsets) != expected_offsets:
         failures.append(
             f"offsets={len(batch.offsets)}, expected={expected_offsets}"
         )
     if any(offset < 0 for offset in batch.offsets) or (
         sizes_valid
-        and expected_num_chunks > 0
+        and tail_chunks > 0
         and any(
-            offset + batch.physical_sizes[index % expected_num_chunks] > slab_size
+            offset
+            + batch.physical_sizes[page_count + index % tail_chunks]
+            > slab_size
             for index, offset in enumerate(batch.offsets)
         )
     ):
         failures.append("one or more offsets exceed shared slab bounds")
+    if any(size <= 0 for size in batch.page_physical_sizes) or any(
+        offset < 0 or offset + size > slab_size
+        for offset, size in zip(
+            batch.page_offsets, batch.page_physical_sizes, strict=False
+        )
+    ):
+        failures.append("one or more page offsets exceed shared slab bounds")
     if failures:
         raise SharedCPUCacheValidationError(
             "Invalid shared CPU cache batch before passive view creation: "
@@ -897,6 +922,7 @@ class PassiveSharedViewAllocator(MemoryAllocatorInterface):
         generation: int,
     ) -> None:
         self.slab_tensor = slab_tensor.view(torch.uint8).flatten()
+        self.buffer = self.slab_tensor
         self.shm_name = shm_name
         self.generation = int(generation)
 
@@ -974,7 +1000,12 @@ class PassiveSharedViewAllocator(MemoryAllocatorInterface):
         fmt: MemoryFormat,
         cached_positions: Iterable[int],
     ) -> TensorMemoryObj:
-        offset = batch.offsets[layer_id * batch.num_chunks + chunk_index]
+        page_count = len(batch.page_offsets)
+        if chunk_index < page_count:
+            raise SharedCPUCacheValidationError("Page chunks require create_page_view")
+        tail_chunks = batch.num_chunks - page_count
+        tail_index = chunk_index - page_count
+        offset = batch.offsets[layer_id * tail_chunks + tail_index]
         physical_size = batch.physical_sizes[chunk_index]
         logical_size = shape.numel() * dtype.itemsize
         if logical_size <= 0 or logical_size > physical_size:
@@ -998,6 +1029,53 @@ class PassiveSharedViewAllocator(MemoryAllocatorInterface):
                 dtypes=[dtype],
             ),
             parent_allocator=self,
+        )
+
+    def create_page_view(
+        self,
+        batch: SharedHandleBatch,
+        *,
+        chunk_index: int,
+        shape: torch.Size,
+        dtype: torch.dtype,
+        fmt: MemoryFormat,
+        cached_positions: Iterable[int],
+    ) -> LayerPageMemoryObj:
+        """Create one passive all-layer view from a compact page descriptor."""
+        if not 0 <= chunk_index < len(batch.page_offsets):
+            raise SharedCPUCacheValidationError("Invalid compact page chunk index")
+        offset = batch.page_offsets[chunk_index]
+        physical_size = batch.page_physical_sizes[chunk_index]
+        layer_size = shape.numel() * dtype.itemsize
+        logical_size = layer_size * batch.num_layers
+        if (
+            layer_size != batch.physical_sizes[chunk_index]
+            or logical_size <= 0
+            or logical_size > physical_size
+        ):
+            raise SharedCPUCacheValidationError(
+                "Invalid compact page logical size: "
+                f"logical_size={logical_size}, physical_size={physical_size}"
+            )
+        return LayerPageMemoryObj(
+            raw_data=None,
+            metadata=MemoryObjMetadata(
+                shape=shape,
+                dtype=dtype,
+                address=offset,
+                phy_size=physical_size,
+                ref_count=1,
+                pin_count=0,
+                fmt=fmt,
+                cached_positions=torch.tensor(
+                    list(cached_positions), dtype=torch.int64
+                ),
+                shapes=[shape] * batch.num_layers,
+                dtypes=[dtype] * batch.num_layers,
+            ),
+            parent_allocator=self,
+            num_layers=batch.num_layers,
+            raw_view_size=logical_size,
         )
 
     def allocate(

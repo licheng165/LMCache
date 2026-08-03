@@ -920,6 +920,72 @@ class TensorMemoryObj(MemoryObj):
         return self.parent_allocator
 
 
+class LayerPageMemoryObj(TensorMemoryObj):
+    """One allocator-owned chunk containing the same layout for every layer."""
+
+    def __init__(
+        self,
+        raw_data: Optional[torch.Tensor],
+        metadata: MemoryObjMetadata,
+        parent_allocator: Optional["MemoryAllocatorInterface"],
+        *,
+        num_layers: int,
+        group_prefix_sum: Optional[tuple[int, ...]] = None,
+        raw_view_size: Optional[int] = None,
+    ) -> None:
+        super().__init__(
+            raw_data,
+            metadata,
+            parent_allocator,
+            group_prefix_sum,
+            raw_view_size,
+        )
+        if num_layers < 1 or len(self.group_prefix_sum) != num_layers + 1:
+            raise ValueError("Layer page requires one tensor group per layer")
+        sizes = {
+            right - left
+            for left, right in zip(
+                self.group_prefix_sum, self.group_prefix_sum[1:], strict=True
+            )
+        }
+        if len(sizes) != 1:
+            raise ValueError("Layer page requires a homogeneous layer layout")
+        self.num_layers = num_layers
+        self.layer_size = sizes.pop()
+        self._base_data_ptr = self.data_ptr
+
+    @property
+    def tensor(self) -> Optional[torch.Tensor]:
+        raise RuntimeError("Layer page requires layer_tensor(layer_id)")
+
+    def layer_tensor(self, layer_id: int) -> torch.Tensor:
+        """Return the typed tensor view for one layer."""
+        if not self.valid:
+            raise RuntimeError("Layer page storage is no longer valid")
+        if not 0 <= layer_id < self.num_layers:
+            raise IndexError(f"Invalid layer page index: {layer_id}")
+        tensor = self.get_tensor(layer_id)
+        assert tensor is not None
+        return tensor
+
+    def layer_data_ptr(self, layer_id: int) -> int:
+        """Return the host address of one layer without constructing a view."""
+        if not self.valid:
+            raise RuntimeError("Layer page storage is no longer valid")
+        if not 0 <= layer_id < self.num_layers:
+            raise IndexError(f"Invalid layer page index: {layer_id}")
+        return self._base_data_ptr + self.group_prefix_sum[layer_id]
+
+
+@dataclass(frozen=True, slots=True)
+class LayerPageSource:
+    """Layer selection over request-owned page objects."""
+
+    pages: tuple[LayerPageMemoryObj, ...]
+    layer_id: int
+    suffix: tuple[MemoryObj, ...] = ()
+
+
 class BytesBufferMemoryObj(MemoryObj):
     """
     Wraps a raw flat tensor with some metadata
@@ -1611,6 +1677,29 @@ class TensorMemoryAllocator(MemoryAllocatorInterface):
             shapes, dtypes, batch_size, fmt, materialize_views=False
         )
 
+    def batched_allocate_layer_pages(
+        self,
+        shapes: Union[torch.Size, list[torch.Size]],
+        dtypes: Union[torch.dtype, list[torch.dtype]],
+        batch_size: int,
+        num_layers: int,
+        fmt: MemoryFormat,
+    ) -> Optional[List[LayerPageMemoryObj]]:
+        """Allocate one homogeneous all-layer object per token chunk."""
+        if num_layers < 1:
+            raise ValueError("num_layers must be positive")
+        shapes, dtypes = self._adapt_shapes_and_dtypes(shapes, dtypes)
+        if len(shapes) != 1 or len(dtypes) != 1:
+            return None
+        return self._batched_allocate(
+            shapes * num_layers,
+            dtypes * num_layers,
+            batch_size,
+            fmt,
+            materialize_views=False,
+            page_layers=num_layers,
+        )  # type: ignore[return-value]
+
     def _batched_allocate(
         self,
         shapes: Union[torch.Size, list[torch.Size]],
@@ -1619,6 +1708,7 @@ class TensorMemoryAllocator(MemoryAllocatorInterface):
         fmt: MemoryFormat,
         *,
         materialize_views: bool,
+        page_layers: int = 0,
     ) -> Optional[List[TensorMemoryObj]]:
         shapes, dtypes = self._adapt_shapes_and_dtypes(shapes, dtypes)
 
@@ -1665,8 +1755,9 @@ class TensorMemoryAllocator(MemoryAllocatorInterface):
         group_prefix_sum = _group_prefix_sums(shapes, dtypes, unit_raw_size)
         tensor_mem_objs = []
         for raw_data, address in zip(raw_datas, addresses, strict=True):
+            cls = LayerPageMemoryObj if page_layers else TensorMemoryObj
             tensor_mem_objs.append(
-                TensorMemoryObj(
+                cls(
                     raw_data=raw_data,
                     metadata=MemoryObjMetadata(
                         shapes[0],
@@ -1682,6 +1773,7 @@ class TensorMemoryAllocator(MemoryAllocatorInterface):
                     parent_allocator=self,
                     group_prefix_sum=group_prefix_sum,
                     raw_view_size=unit_aligned_size,
+                    **({"num_layers": page_layers} if page_layers else {}),
                 )
             )
 
@@ -2462,6 +2554,21 @@ class MixedMemoryAllocator(MemoryAllocatorInterface):
             return self.batched_allocate(shapes, dtypes, batch_size, fmt)
         with self.host_mem_lock:
             return allocate(shapes, dtypes, batch_size, fmt, str(self))
+
+    def batched_allocate_layer_pages(
+        self,
+        shapes: Union[torch.Size, list[torch.Size]],
+        dtypes: Union[torch.dtype, list[torch.dtype]],
+        batch_size: int,
+        num_layers: int,
+        fmt: MemoryFormat,
+    ) -> Optional[List[LayerPageMemoryObj]]:
+        """Allocate layer pages from the pinned allocator."""
+        allocate = getattr(self.pin_allocator, "batched_allocate_layer_pages", None)
+        if not callable(allocate):
+            return None
+        with self.host_mem_lock:
+            return allocate(shapes, dtypes, batch_size, num_layers, fmt)
 
     @_lmcache_nvtx_annotate
     def free(self, memory_obj: MemoryObj, allocator_type: Optional[str] = None):

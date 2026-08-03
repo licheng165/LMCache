@@ -9,10 +9,15 @@ import torch
 
 # First Party
 from lmcache.observability import LMCStatsMonitor
-from lmcache.utils import CacheEngineKey
+from lmcache.utils import CacheEngineKey, LayerCacheEngineKey
 from lmcache.v1.cache_controller.message import BatchedKVOperationMsg, OpType
 from lmcache.v1.config import LMCacheEngineConfig
-from lmcache.v1.memory_management import MemoryFormat, MemoryObj, MixedMemoryAllocator
+from lmcache.v1.memory_management import (
+    MemoryFormat,
+    MemoryObj,
+    MixedMemoryAllocator,
+    TensorMemoryAllocator,
+)
 from lmcache.v1.metadata import LMCacheMetadata
 from lmcache.v1.pin_monitor import PinMonitor
 from lmcache.v1.storage_backend.local_cpu_backend import LocalCPUBackend
@@ -67,7 +72,7 @@ def create_test_key(key_id: str = "test_key") -> CacheEngineKey:
     )
 
 
-def create_test_metadata() -> LMCacheMetadata:
+def create_test_metadata(*, use_mla: bool = False) -> LMCacheMetadata:
     return LMCacheMetadata(
         model_name="test_model",
         world_size=1,
@@ -76,6 +81,7 @@ def create_test_metadata() -> LMCacheMetadata:
         local_worker_id=0,
         kv_dtype=torch.bfloat16,
         kv_shape=(4, 2, 256, 8, 128),
+        use_mla=use_mla,
     )
 
 
@@ -117,6 +123,57 @@ class TestLocalCPUBackend:
     def teardown_method(self, method):
         LMCStatsMonitor.unregister_all_metrics()
         LMCStatsMonitor.DestroyInstance()
+        PinMonitor.DestroyInstance()
+
+    def test_layer_page_uses_explicit_page_key(self):
+        config = create_test_config(use_layerwise=True)
+        config.enable_shared_cpu_cache = True
+        config.remote_url = "mooncakestore://127.0.0.1:50051/"
+        config.extra_config = {
+            "mooncake_page_first_multi_buffer": True,
+            "mooncake_layer_merged_page_objects": True,
+            "save_only_first_rank": True,
+        }
+        metadata = create_test_metadata(use_mla=True)
+        PinMonitor.GetOrCreate(config)
+        allocator = TensorMemoryAllocator(torch.zeros(16384, dtype=torch.uint8))
+        backend = LocalCPUBackend(config, metadata, memory_allocator=allocator)
+        assert backend.layer_page_objects
+        pages = backend.batched_allocate_layer_pages(
+            [torch.Size([8])],
+            [torch.float16],
+            batch_size=1,
+            num_layers=4,
+            fmt=MemoryFormat.KV_MLA_LATENT_FMT,
+        )
+        assert pages is not None
+        key = LayerCacheEngineKey(
+            "test_model", metadata.world_size, 0, 1, torch.float16, layer_id=0
+        )
+        page_key = key.without_layer()
+        layer_keys = key.split_layers(4)
+        other_page_key = LayerCacheEngineKey(
+            "test_model", metadata.world_size, 0, 2, torch.float16, layer_id=0
+        ).without_layer()
+        with pytest.raises(ValueError, match="one unique key per page"):
+            backend.batched_submit_layer_pages(
+                [page_key, other_page_key], [pages[0], pages[0]]
+            )
+        backend.batched_submit_layer_pages([page_key], pages)
+
+        assert backend.batched_contains(layer_keys, pin=True) == 0
+        assert backend.get_blocking(layer_keys[0]) is None
+        assert not backend.remove(layer_keys[0])
+        assert backend.batched_contains_layer_pages(layer_keys[:1], pin=True) == 1
+        assert pages[0].metadata.pin_count == 1
+        backend.batched_unpin([page_key])
+        assert pages[0].metadata.pin_count == 0
+        retained, count = backend.batched_get_layer_page_prefix([page_key])
+        assert retained == pages and count == 1
+
+        retained[0].ref_count_down()
+        backend.remove(page_key)
+        pages[0].ref_count_down()
 
     def test_init(self, memory_allocator):
         """Test LocalCPUBackend initialization."""
