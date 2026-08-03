@@ -7,6 +7,7 @@ from types import SimpleNamespace
 import asyncio
 import os
 import sys
+import threading
 
 import pytest
 import torch
@@ -416,8 +417,47 @@ def test_shared_page_first_location_plan_uses_local_then_one_remote_probe():
         cpu_lock=nullcontext(),
         hot_cache={flat_keys[-1]: object()},
     )
-    assert engine._shared_page_first_location_plan(keys_by_chunk) is None
-    assert len(calls) == 2
+    assert (
+        engine._shared_page_first_location_plan(keys_by_chunk)
+        == ["RemoteBackend", "RemoteBackend"]
+    )
+    assert calls[-1] == (flat_keys, ["RemoteBackend"])
+    assert len(calls) == 3
+    engine._shared_local_cpu_backend = lambda: SimpleNamespace(
+        cpu_lock=nullcontext(),
+        hot_cache=dict.fromkeys([*keys_by_chunk[0], keys_by_chunk[1][-1]]),
+    )
+    assert (
+        engine._shared_page_first_location_plan(keys_by_chunk)
+        == ["LocalCPUBackend", "RemoteBackend"]
+    )
+    assert calls[-1] == (keys_by_chunk[1], ["RemoteBackend"])
+    assert len(calls) == 4
+
+
+def test_shared_rank0_location_checks_page_without_merged_local_pages():
+    engine = object.__new__(LMCacheEngine)
+    engine.config = SimpleNamespace(
+        extra_config={"mooncake_page_first_multi_buffer": True}
+    )
+    engine.retrieve_locations = None
+    key = _make_key().get_first_layer()
+    engine._shared_local_cpu_backend = lambda: SimpleNamespace(
+        contains=lambda _key: False,
+    )
+    calls = []
+
+    def batched_contains_layer_pages(keys, search_range):
+        calls.append((list(keys), search_range))
+        return len(keys), {"RemoteBackend": list(keys)}
+
+    engine.storage_manager = SimpleNamespace(
+        batched_contains_layer_pages=batched_contains_layer_pages,
+        contains=lambda *_args: pytest.fail("raw legacy lookup used"),
+    )
+
+    assert engine._find_shared_rank0_chunk_location(key) == "RemoteBackend"
+    assert calls == [([key], None)]
 
 
 def test_shared_page_first_common_prefix_plan_keeps_ascend_contract():
@@ -500,8 +540,12 @@ def test_layer_page_location_plan_probes_one_remote_key_per_chunk():
     pages[0].ref_count_down()
 
 
-@pytest.mark.parametrize("tail_complete", [True, False])
-def test_layer_page_batch_plan_keeps_partial_tail_on_legacy_lookup(
+@pytest.mark.parametrize(
+    ("merged_pages", "tail_complete"),
+    [(True, True), (True, False), (False, True)],
+)
+def test_page_first_batch_plan_handles_partial_tail(
+    merged_pages,
     tail_complete,
 ):
     engine = object.__new__(LMCacheEngine)
@@ -512,11 +556,13 @@ def test_layer_page_batch_plan_keeps_partial_tail_on_legacy_lookup(
         remote_url="mooncakestore://metadata/",
         extra_config={
             "mooncake_page_first_multi_buffer": True,
-            "mooncake_layer_merged_page_objects": True,
             "save_only_first_rank": True,
+            **({"mooncake_layer_merged_page_objects": True} if merged_pages else {}),
         },
     )
     engine.num_layers = 2
+    engine.retrieve_locations = None
+    engine.metadata = SimpleNamespace(worker_id=0)
     engine.storage_manager = SimpleNamespace()
     engine.gpu_connector = object()
     engine.shared_cpu_cache_strict = False
@@ -555,10 +601,17 @@ def test_layer_page_batch_plan_keeps_partial_tail_on_legacy_lookup(
 
     list(engine.retrieve_layer(list(range(10)), req_id="req-partial"))
 
-    assert len(planned) == 2
-    assert len(tail_batches) == 1
-    assert len(tail_batches[0][0]) == engine.num_layers
-    assert len(tail_probes) == (0 if tail_complete else engine.num_layers)
+    if merged_pages:
+        assert len(planned) == 2
+        assert all(len(chunk) == 1 for chunk in planned)
+        assert len(tail_batches) == 1
+        assert len(tail_batches[0][0]) == engine.num_layers
+        assert len(tail_probes) == (0 if tail_complete else engine.num_layers)
+    else:
+        assert len(planned) == 3
+        assert all(len(chunk) == engine.num_layers for chunk in planned)
+        assert tail_batches == []
+        assert tail_probes == []
     assert resolved["starts"] == [0, 4, 8]
     assert resolved["chunk_locations_layer_major"] == [
         ["RemoteBackend"] * 3,
@@ -614,11 +667,7 @@ def test_shared_page_first_location_plan_falls_back(
 
     assert engine._shared_page_first_location_plan(keys_by_chunk) is None
     assert len(calls) == (
-        1
-        if not local_hit
-        and supports_batch
-        and retrieval_backends == ["RemoteBackend"]
-        else 0
+        1 if supports_batch and retrieval_backends == ["RemoteBackend"] else 0
     )
 
 
@@ -4145,6 +4194,96 @@ def test_receive_shared_envelope_reports_corrupt_payload():
 
     with pytest.raises(ValueError, match="corrupt envelope"):
         engine._receive_shared_envelope()
+
+
+def test_receive_shared_envelope_demultiplexes_concurrent_requests():
+    engine = object.__new__(LMCacheEngine)
+    engine.metadata = SimpleNamespace(first_rank=0)
+    engine.shared_cpu_cache_generation = 9
+    cold_envelope = SharedHandleEnvelope(
+        request_id="cold-req",
+        phase="dsa_cold_compact_latent",
+        request_ordinal=0,
+        layer_id=25,
+        kv_group=0,
+        status="skipped",
+        generation=9,
+        handles=[],
+    ).to_dict()
+    decode_envelope = SharedHandleEnvelope(
+        request_id="decode-req",
+        phase="sparse_decode_bootstrap",
+        request_ordinal=1,
+        layer_id=0,
+        kv_group=1,
+        status="skipped",
+        generation=9,
+        handles=[],
+    ).to_dict()
+    incoming = [cold_envelope]
+    incoming_condition = threading.Condition()
+    cold_received = threading.Event()
+    receive_count = 0
+
+    def receive(_obj, _rank):
+        nonlocal receive_count
+        with incoming_condition:
+            assert incoming_condition.wait_for(lambda: bool(incoming), timeout=2)
+            receive_count += 1
+            envelope = incoming.pop(0)
+        if envelope is cold_envelope:
+            cold_received.set()
+        return envelope
+
+    engine.broadcast_object_fn = receive
+    results = {}
+    errors = []
+
+    def receive_decode():
+        try:
+            results["decode"] = engine._receive_matching_shared_envelope(
+                req_id="decode-req",
+                phase="sparse_decode_bootstrap",
+                request_ordinal=1,
+                layer_id=0,
+                kv_group=1,
+            )
+        except BaseException as exc:
+            errors.append(exc)
+
+    def receive_cold():
+        try:
+            results["cold"] = engine._receive_matching_shared_envelope(
+                req_id="cold-req",
+                phase="dsa_cold_compact_latent",
+                request_ordinal=0,
+                layer_id=25,
+                kv_group=0,
+            )
+        except BaseException as exc:
+            errors.append(exc)
+
+    decode_thread = threading.Thread(target=receive_decode)
+    decode_thread.start()
+    assert cold_received.wait(timeout=2)
+
+    cold_thread = threading.Thread(target=receive_cold)
+    cold_thread.start()
+    cold_thread.join(timeout=2)
+    assert not cold_thread.is_alive()
+    assert results["cold"].request_id == "cold-req"
+
+    with incoming_condition:
+        incoming.append(decode_envelope)
+        incoming_condition.notify_all()
+    decode_thread.join(timeout=2)
+
+    assert not decode_thread.is_alive()
+    assert not errors
+    assert results["decode"].request_id == "decode-req"
+    assert receive_count == 2
+    assert engine._pending_shared_envelopes == {}
+    assert engine._shared_envelope_waiters == {}
 
 
 def test_skipped_index_envelope_round_trips_without_handles():

@@ -2391,7 +2391,7 @@ class TestWorkerRetrieveState:
         assert torch.equal(target_payload, target_slot_mapping[0])
         assert impl.current_layer == 1
 
-    def test_dense_prefix_two_group_wait_advances_after_both_groups(self):
+    def test_dense_prefix_two_group_wait_supports_staged_graph_order(self):
         req = ReqMeta(
             req_id="req-1",
             token_ids=[1, 2, 3, 4],
@@ -2421,14 +2421,117 @@ class TestWorkerRetrieveState:
             (_retriever("latent"), _retriever("indexer"))
         ]
 
+        # Staged SFA bootstraps the current indexer before the first graph
+        # island, then the eager split advances latent followed by the next
+        # indexer group between islands.
+        impl.wait_for_layer_load("model.layers.0.self_attn.indexer.k_cache")
+
+        assert captured == ["indexer"]
+        assert impl.current_layer == 0
+
         impl.wait_for_layer_load("model.layers.0.self_attn.attn")
 
-        assert captured == ["latent"]
-        assert impl.current_layer == 0
+        assert captured == ["indexer", "latent"]
+        assert impl.current_layer == 1
+
+        impl.wait_for_layer_load("model.layers.1.self_attn.indexer.k_cache")
+
+        assert captured == ["indexer", "latent", "indexer"]
+        assert impl.current_layer == 1
+
+    def test_mixed_dense_sparse_wait_supports_staged_graph_order(self):
+        dense = ReqMeta(
+            req_id="dense",
+            token_ids=[1, 2, 3, 4],
+            load_spec=LoadSpec(
+                vllm_cached_tokens=0,
+                lmcache_cached_tokens=4,
+                can_load=True,
+            ),
+            is_sparse_decode=False,
+        )
+        sparse = make_sparse_req_meta("sparse", token_count=4)
+        impl, _, _ = make_worker_connector(
+            [dense, sparse],
+            use_layerwise=True,
+        )
+        impl.config.dsa_two_groups = True
+        impl._indexer_layer_names = [
+            "model.layers.0.self_attn.indexer.k_cache",
+            "model.layers.1.self_attn.indexer.k_cache",
+        ]
+        impl.current_layer = 0
+        impl.num_layers = 2
+        impl._layerwise_requests = [dense, sparse]
+        impl._layerwise_retriever_is_sparse = [False, True]
+        impl._layerwise_sparse_req_ids = ["sparse"]
+
+        captured = []
+
+        def dense_retriever(label):
+            while True:
+                captured.append((label, None))
+                yield torch.ones(4, dtype=torch.bool)
+
+        def sparse_retriever(label):
+            payload = yield None
+            while True:
+                captured.append((label, payload))
+                payload = yield torch.ones(4, dtype=torch.bool)
+
+        sparse_latent = sparse_retriever("sparse-latent")
+        sparse_indexer = sparse_retriever("sparse-indexer")
+        next(sparse_latent)
+        next(sparse_indexer)
+        impl.layerwise_retrievers = [
+            (
+                dense_retriever("dense-latent"),
+                dense_retriever("dense-indexer"),
+            ),
+            (sparse_latent, sparse_indexer),
+        ]
 
         impl.wait_for_layer_load("model.layers.0.self_attn.indexer.k_cache")
 
-        assert captured == ["latent", "indexer"]
+        assert [label for label, _ in captured] == [
+            "dense-indexer",
+            "sparse-indexer",
+        ]
+        assert impl.current_layer == 0
+
+        selected_tokens = torch.tensor(
+            [[10, 11, 12, 13], [20, 21, 22, 23]],
+            dtype=torch.int32,
+        )
+        target_slot_mapping = torch.tensor(
+            [[100, 101, 102, 103], [200, 201, 202, 203]],
+            dtype=torch.long,
+        )
+        impl.wait_for_layer_load(
+            "model.layers.0.self_attn.attn",
+            selected_tokens=selected_tokens,
+            request_ids=["dense", "sparse"],
+            target_slot_mapping=target_slot_mapping,
+        )
+
+        assert [label for label, _ in captured] == [
+            "dense-indexer",
+            "sparse-indexer",
+            "dense-latent",
+            "sparse-latent",
+        ]
+        sparse_payload = captured[-1][1]
+        assert sparse_payload[1] is None
+        assert torch.equal(sparse_payload[0], selected_tokens[1])
+        assert torch.equal(sparse_payload[2], target_slot_mapping[1])
+        assert impl.current_layer == 1
+
+        impl.wait_for_layer_load("model.layers.1.self_attn.indexer.k_cache")
+
+        assert [label for label, _ in captured[-2:]] == [
+            "dense-indexer",
+            "sparse-indexer",
+        ]
         assert impl.current_layer == 1
 
     def test_bind_keeps_scheduler_metadata_payload_free(self):

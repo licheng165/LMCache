@@ -59,6 +59,10 @@ def _make_scheduler_impl() -> LMCacheConnectorV1Impl:
     impl._decode_window_save_window_size = 0
     impl._decode_window_save_commit_delay_windows = 0
     impl._dsa_scratch_capacity = 4096
+    impl._dsa_kv_policy_threshold = 0
+    impl._dsa_kv_policy_log = False
+    impl._dsa_kv_policy_states = {}
+    impl._cold_perf_lookup_started = {}
     impl._discard_partial_chunks = True
     impl._request_trackers = {}
     impl._unfinished_requests = {}
@@ -82,6 +86,45 @@ def _make_vllm_request(
         num_computed_tokens=num_computed,
         all_token_ids=prompt + [decode_token],
     )
+
+
+def test_dsa_kv_policy_log_uses_storage_semantics(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    impl = _make_scheduler_impl()
+    impl._dsa_kv_policy_log = True
+    log = MagicMock()
+    monkeypatch.setattr(adapter_module, "logger", log)
+
+    impl._log_dsa_kv_policy("req-1", False, 1024, 1025)
+    impl._log_dsa_kv_policy("req-1", False, 1024, 1026)
+    impl._log_dsa_kv_policy("req-1", True, 1024, 1027)
+
+    assert log.info.call_count == 2
+    first = log.info.call_args_list[0].args
+    assert first[:4] == (
+        "[DSA_KV_POLICY] req=%s kv_policy=%s%s prompt_len=%d computed=%d threshold=%d",
+        "req-1",
+        "full_resident",
+        " (first)",
+    )
+    second = log.info.call_args_list[1].args
+    assert second[2:4] == (
+        "sparse_managed",
+        " (switched from full_resident)",
+    )
+    assert "path=dense" not in first[0]
+
+
+def test_shutdown_clears_dsa_kv_policy_state() -> None:
+    impl = LMCacheConnectorV1Impl.__new__(LMCacheConnectorV1Impl)
+    impl._dsa_kv_policy_states = {"finished": "full_resident"}
+    impl._manager = SimpleNamespace(stop_services=MagicMock())
+
+    impl.shutdown()
+
+    assert impl._dsa_kv_policy_states == {}
+    impl._manager.stop_services.assert_called_once_with()
 
 
 @pytest.mark.parametrize("kv_role", ["kv_consumer", "kv_both"])
@@ -127,13 +170,11 @@ def test_dsa_cold_compact_async_requires_complete_prompt_hit() -> None:
 
     assert impl.get_num_new_matched_tokens(request, 0) == 8191
     assert impl.should_load_kv_async(request.request_id)
-    assert getattr(
-        impl.load_specs[request.request_id], "dsa_cold_compact_load"
-    )
+    assert impl.load_specs[request.request_id].dsa_cold_compact_load
     assert impl.load_specs[request.request_id].dsa_committed_end == 8192
     assert impl.load_specs[request.request_id].dsa_remap_frontier == 8191
     assert (
-        getattr(impl.load_specs[request.request_id], "dsa_release_frontier")
+        impl.load_specs[request.request_id].dsa_release_frontier
         == 7936
     )
 
@@ -143,7 +184,7 @@ def test_dsa_cold_compact_async_requires_complete_prompt_hit() -> None:
     assert impl.load_specs[unaligned.request_id].dsa_committed_end == 8194
     assert impl.load_specs[unaligned.request_id].dsa_remap_frontier == 8193
     assert (
-        getattr(impl.load_specs[unaligned.request_id], "dsa_release_frontier")
+        impl.load_specs[unaligned.request_id].dsa_release_frontier
         == 8192
     )
 
@@ -161,7 +202,244 @@ def test_dsa_cold_compact_async_requires_complete_prompt_hit() -> None:
     assert not impl.should_load_kv_async(partial.request_id)
     partial_spec = impl.load_specs[partial.request_id]
     assert not hasattr(partial_spec, "dsa_cold_compact_load")
-    assert not hasattr(partial_spec, "dsa_release_frontier")
+    assert partial_spec.dsa_release_frontier is None
+
+
+def test_dsa_cold_compact_is_skipped_when_frontier_below_scratch_capacity() -> None:
+    """Regression: 0804-4. Cold compact materializes the prefix in indexer
+    blocks that only the SFA compact-scratch remap can read, and the remap
+    requires a frontier of zero or >= scratch_capacity. A short prompt would
+    resume with the raw unclamped frontier (hit_tokens - 1, e.g. 49), which
+    the staged-SFA route rejects as FATAL frontier_too_short. Prompts whose
+    cold-compact frontier would land below scratch_capacity must fall back to
+    the normal dense-prefix load path instead."""
+    impl = _make_scheduler_impl()
+    impl.config.enable_dsa_cold_compact_load = True
+    impl.config.dsa_two_groups = True
+    impl.config.enable_shared_cpu_cache = True
+    impl.config.min_retrieve_tokens = 0
+    lookup_client = MagicMock()
+    lookup_client.lookup_cache.return_value = 50
+    impl._manager = SimpleNamespace(lookup_client=lookup_client)
+    request = SimpleNamespace(request_id="short-prompt", num_tokens=50)
+
+    assert impl.get_num_new_matched_tokens(request, 0) == 49
+    assert not impl.should_load_kv_async(request.request_id)
+    load_spec = impl.load_specs[request.request_id]
+    assert not hasattr(load_spec, "dsa_cold_compact_load")
+    assert load_spec.dsa_release_frontier is None
+    assert load_spec.dsa_committed_end == 0
+    assert load_spec.dsa_scratch_capacity == 4096
+
+    # The band between zero and scratch_capacity must also skip cold compact:
+    # the raw frontier (2999) is below the scratch capacity (4096).
+    lookup_client.lookup_cache.return_value = 3000
+    mid = SimpleNamespace(request_id="mid-prompt", num_tokens=3000)
+    assert impl.get_num_new_matched_tokens(mid, 0) == 2999
+    assert not impl.should_load_kv_async(mid.request_id)
+    assert not hasattr(impl.load_specs[mid.request_id], "dsa_cold_compact_load")
+    assert impl.load_specs[mid.request_id].dsa_committed_end == 2999 // 256 * 256
+
+    # A long prompt whose frontier reaches scratch_capacity still engages the
+    # compact load (see test_dsa_cold_compact_async_requires_complete_prompt_hit).
+    lookup_client.lookup_cache.return_value = 8192
+    long = SimpleNamespace(request_id="long-prompt", num_tokens=8192)
+    assert impl.get_num_new_matched_tokens(long, 0) == 8191
+    assert impl.should_load_kv_async(long.request_id)
+    assert impl.load_specs[long.request_id].dsa_cold_compact_load
+
+
+def test_dsa_cold_compact_is_skipped_within_kv_policy_threshold() -> None:
+    """Regression: 0808-2 (方案 A threshold gate). A prompt within the KV-policy
+    threshold uses resident main blocks, so cold compact (compact KV
+    materialized in indexer blocks) is pure overhead. Such prompts take the
+    normal dense-prefix load path; only prompts beyond the threshold keep the
+    compact load."""
+    impl = _make_scheduler_impl()
+    impl.config.enable_dsa_cold_compact_load = True
+    impl.config.dsa_two_groups = True
+    impl.config.enable_shared_cpu_cache = True
+    impl.config.min_retrieve_tokens = 0
+    impl._dsa_kv_policy_threshold = 10000
+    lookup_client = MagicMock()
+    impl._manager = SimpleNamespace(lookup_client=lookup_client)
+
+    # Within threshold, with a cold-compact frontier that would satisfy the
+    # scratch-capacity gate: the threshold gate must skip cold compact.
+    lookup_client.lookup_cache.return_value = 8378
+    short = SimpleNamespace(
+        request_id="short-within-threshold", num_tokens=8378
+    )
+    assert impl.get_num_new_matched_tokens(short, 0) == 8377
+    assert not impl.should_load_kv_async(short.request_id)
+    short_spec = impl.load_specs[short.request_id]
+    assert not hasattr(short_spec, "dsa_cold_compact_load")
+    assert short_spec.dsa_release_frontier is None
+    assert short_spec.dsa_committed_end == 8378 // 256 * 256
+
+    # Beyond threshold: the compact load still engages.
+    lookup_client.lookup_cache.return_value = 12000
+    long = SimpleNamespace(
+        request_id="long-beyond-threshold", num_tokens=12000
+    )
+    assert impl.get_num_new_matched_tokens(long, 0) == 11999
+    assert impl.should_load_kv_async(long.request_id)
+    assert impl.load_specs[long.request_id].dsa_cold_compact_load
+
+    # Threshold disabled (0): the same prompt engages the compact load again
+    # (baseline behavior preserved when the dense fast-path is off).
+    impl._dsa_kv_policy_threshold = 0
+    lookup_client.lookup_cache.return_value = 8378
+    control = SimpleNamespace(
+        request_id="threshold-disabled", num_tokens=8378
+    )
+    assert impl.get_num_new_matched_tokens(control, 0) == 8377
+    assert impl.should_load_kv_async(control.request_id)
+    assert impl.load_specs[control.request_id].dsa_cold_compact_load
+
+
+@pytest.mark.parametrize(
+    (
+        "prompt_len",
+        "expect_cold_compact",
+        "expected_committed",
+        "expected_remap",
+        "expected_release",
+    ),
+    [
+        (10_000, False, 9_984, None, None),
+        (10_001, True, 10_001, 10_000, 9_984),
+        (10_240, True, 10_240, 10_239, 9_984),
+        (10_241, False, 10_240, None, None),
+    ],
+)
+def test_dsa_cold_compact_threshold_alignment_boundaries(
+    prompt_len: int,
+    expect_cold_compact: bool,
+    expected_committed: int,
+    expected_remap: int | None,
+    expected_release: int | None,
+) -> None:
+    """The compact-load gate and its raw/aligned frontiers are independent."""
+    impl = _make_scheduler_impl()
+    impl.config.enable_dsa_cold_compact_load = True
+    impl.config.dsa_two_groups = True
+    impl.config.enable_shared_cpu_cache = True
+    impl.config.min_retrieve_tokens = 0
+    impl._block_size = 128
+    impl._dsa_kv_policy_threshold = 10_000
+    lookup_client = MagicMock()
+    lookup_client.lookup_cache.return_value = prompt_len
+    impl._manager = SimpleNamespace(lookup_client=lookup_client)
+    request = SimpleNamespace(
+        request_id=f"threshold-{prompt_len}",
+        num_tokens=prompt_len,
+    )
+
+    assert impl.get_num_new_matched_tokens(request, 0) == prompt_len - 1
+    load_spec = impl.load_specs[request.request_id]
+    assert (
+        getattr(load_spec, "dsa_cold_compact_load", False)
+        is expect_cold_compact
+    )
+    assert load_spec.dsa_committed_end == expected_committed
+    assert load_spec.dsa_remap_frontier == expected_remap
+    assert load_spec.dsa_release_frontier == expected_release
+
+
+@pytest.mark.parametrize("prompt_len", [10_001, 10_240, 16_457])
+def test_cold_compact_nonresident_frontier_survives_threshold_rollback(
+    prompt_len: int,
+) -> None:
+    """Cold compact omits main latent KV even before any block release."""
+    impl = _make_scheduler_impl()
+    impl.config.dsa_two_groups = True
+    impl._dsa_kv_policy_threshold = 10_000
+    req_id = f"cold-rollback-{prompt_len}"
+    remap_frontier = prompt_len - 1
+    release = (
+        remap_frontier
+        // impl._lmcache_chunk_size
+        * impl._lmcache_chunk_size
+    )
+    num_blocks = (prompt_len + impl._block_size - 1) // impl._block_size
+    latent_blocks = list(range(num_blocks))
+    indexer_blocks = list(range(10_000, 10_000 + num_blocks))
+    prompt_tokens = list(range(prompt_len))
+    decode_token = prompt_len + 100
+    vllm_request = _make_vllm_request(
+        req_id,
+        prompt_len,
+        prompt_len - 1,
+        decode_token,
+    )
+    impl._unfinished_requests[req_id] = vllm_request
+    load_spec = LoadSpec(
+        vllm_cached_tokens=prompt_len - 1,
+        lmcache_cached_tokens=prompt_len,
+        can_load=True,
+        dsa_committed_end=prompt_len,
+        dsa_remap_frontier=remap_frontier,
+        dsa_scratch_capacity=impl._dsa_scratch_capacity,
+        dsa_release_frontier=release,
+        dsa_current_released_frontier=0,
+    )
+    load_spec.dsa_cold_compact_load = True
+    impl.load_specs[req_id] = load_spec
+    impl._dsa_cold_loaded_req_ids = {req_id}
+
+    # vLLM invokes this callback again when an asynchronous cold load resumes,
+    # with zero new external tokens because the lookup already completed.
+    impl._manager = SimpleNamespace(lookup_client=MagicMock())
+    impl.update_state_after_alloc(vllm_request, 0)
+    assert load_spec.can_load
+
+    new_request = SimpleNamespace(
+        req_id=req_id,
+        prompt_token_ids=prompt_tokens,
+        block_ids=[latent_blocks, indexer_blocks],
+        num_computed_tokens=prompt_len - 1,
+        sampling_params=SimpleNamespace(extra_args=None),
+    )
+    new_output = StubSchedulerOutput(
+        finished_req_ids=set(),
+        scheduled_new_reqs=[new_request],
+        scheduled_cached_reqs=StubCachedRequestData([], [], []),
+        num_scheduled_tokens={req_id: 1},
+    )
+
+    first_meta = impl.build_connector_meta(new_output).requests[0]
+    tracker = impl._request_trackers[req_id]
+    assert tracker.dsa_nonresident_frontier == remap_frontier
+    assert tracker.dsa_current_released_frontier == 0
+    assert first_meta.is_sparse_decode
+    assert first_meta.dsa_nonresident_frontier == remap_frontier
+    assert first_meta.dsa_current_released_frontier == 0
+
+    # Simulate invalid-block recovery rolling logical progress back into the
+    # dense-threshold range before any scheduler release was acknowledged.
+    vllm_request.num_computed_tokens = 9_984
+    rollback_output = StubSchedulerOutput(
+        finished_req_ids=set(),
+        scheduled_new_reqs=[],
+        scheduled_cached_reqs=StubCachedRequestData(
+            req_ids=[req_id],
+            new_token_ids=[[vllm_request.all_token_ids[9_984]]],
+            new_block_ids=[[]],
+        ),
+        num_scheduled_tokens={req_id: 1},
+    )
+
+    rollback_meta = impl.build_connector_meta(rollback_output).requests[0]
+    assert len(tracker.token_ids) <= impl._dsa_kv_policy_threshold
+    assert tracker.dsa_nonresident_frontier == remap_frontier
+    assert tracker.dsa_current_released_frontier == 0
+    assert rollback_meta.is_sparse_decode
+    assert rollback_meta.dsa_nonresident_frontier == remap_frontier
+    assert rollback_meta.load_spec is not None
+    assert rollback_meta.load_spec.can_load
+    assert rollback_meta.load_spec.dsa_committed_end >= remap_frontier
+    assert rollback_meta.load_spec.lmcache_cached_tokens >= remap_frontier
 
 
 def test_dsa_cold_compact_is_disabled_with_vllm_prefix_caching() -> None:
@@ -191,8 +469,10 @@ def test_dsa_cold_compact_alloc_metadata_has_only_indexer_slots() -> None:
         vllm_cached_tokens=0,
         lmcache_cached_tokens=8192,
         can_load=False,
+        dsa_committed_end=8192,
+        dsa_remap_frontier=8191,
     )
-    setattr(impl.load_specs[req_id], "dsa_cold_compact_load", True)
+    impl.load_specs[req_id].dsa_cold_compact_load = True
     request = SimpleNamespace(
         request_id=req_id,
         num_tokens=8192,
@@ -212,7 +492,9 @@ def test_dsa_cold_compact_alloc_metadata_has_only_indexer_slots() -> None:
     req_meta = impl._pending_dsa_cold_load_metas[req_id]
     assert req_meta.slot_mapping == []
     assert len(req_meta.indexer_slot_mapping[0]) == 8192
-    assert getattr(req_meta.load_spec, "dsa_cold_load_generation") == 1
+    assert req_meta.dsa_current_released_frontier == 0
+    assert req_meta.dsa_nonresident_frontier == 8191
+    assert req_meta.load_spec.dsa_cold_load_generation == 1
 
 
 def test_dsa_cold_compact_submit_captures_current_npu_device(
@@ -239,6 +521,65 @@ def test_dsa_cold_compact_submit_captures_current_npu_device(
         request,
         5,
     )
+
+
+def test_staged_sfa_native_barrier_waits_for_cold_compact_loads() -> None:
+    impl = LMCacheConnectorV1Impl.__new__(LMCacheConnectorV1Impl)
+    first = MagicMock(done=MagicMock(return_value=False))
+    second = MagicMock(done=MagicMock(return_value=True))
+    impl._dsa_cold_load_futures = {
+        "cold-pending": (1, first, object(), set(), 0.0),
+        "cold-complete": (1, second, object(), set(), 0.0),
+    }
+
+    impl.synchronize_staged_sfa_capture_unsafe_loads()
+
+    first.result.assert_called_once_with()
+    second.result.assert_called_once_with()
+    assert set(impl._dsa_cold_load_futures) == {
+        "cold-pending",
+        "cold-complete",
+    }
+
+
+def test_staged_sfa_native_barrier_defers_cold_load_failure() -> None:
+    impl = LMCacheConnectorV1Impl.__new__(LMCacheConnectorV1Impl)
+    failed = Future()
+    failed.set_exception(RuntimeError("cold load failed"))
+    request = SimpleNamespace(
+        load_spec=SimpleNamespace(dsa_cold_load_generation=1)
+    )
+    impl._dsa_cold_load_futures = {
+        "cold-failed": (1, failed, request, {100}, 0.0),
+    }
+    impl._synchronize_dsa_cold_dense_load = MagicMock()
+    impl._release_unadopted_shared_request_objects = MagicMock()
+    impl._release_shared_worker_retrieve_state = MagicMock()
+    impl._invalid_block_ids = set()
+    impl.lmcache_engine = object()
+
+    impl.synchronize_staged_sfa_capture_unsafe_loads()
+
+    impl._synchronize_dsa_cold_dense_load.assert_called_once_with()
+    assert "cold-failed" in impl._dsa_cold_load_futures
+    assert impl._drain_dsa_cold_load_futures() == {"cold-failed"}
+    assert impl._invalid_block_ids == {100}
+    assert not hasattr(impl, "_dsa_cold_load_futures")
+
+
+def test_staged_sfa_native_barrier_rejects_active_failed_stream() -> None:
+    impl = LMCacheConnectorV1Impl.__new__(LMCacheConnectorV1Impl)
+    failed = Future()
+    failed.set_exception(RuntimeError("cold load failed"))
+    impl._dsa_cold_load_futures = {
+        "cold-failed": (1, failed, object(), set(), 0.0),
+    }
+    impl._synchronize_dsa_cold_dense_load = MagicMock(
+        side_effect=RuntimeError("stream still active")
+    )
+
+    with pytest.raises(RuntimeError, match="stream still active"):
+        impl.synchronize_staged_sfa_capture_unsafe_loads()
 
 
 def test_dsa_cold_compact_worker_restores_submitted_npu_device(
@@ -284,7 +625,7 @@ def test_dsa_cold_compact_worker_retains_sources_when_stream_sync_fails() -> Non
         impl._run_dsa_cold_compact_load(request, None)
 
     assert isinstance(
-        getattr(raised.value, "_lmcache_dsa_cold_state"),
+        raised.value._lmcache_dsa_cold_state,
         WorkerRetrieveState,
     )
     impl._release_unadopted_shared_request_objects.assert_not_called()
@@ -324,7 +665,7 @@ def test_dsa_cold_compact_finished_signal_waits_for_future(
     future.set_result(state)
     assert impl._drain_dsa_cold_load_futures() == {"cold-future"}
     impl._publish_worker_retrieve_state.assert_called_once()
-    assert getattr(state, "_dsa_cold_prune_protected")
+    assert state._dsa_cold_prune_protected
     event, fields = events[-1]
     assert event == "worker_load_complete"
     assert fields["mode"] == "dsa_cold_compact"
@@ -355,6 +696,8 @@ def test_dsa_cold_compact_generation_mismatch_releases_returned_state() -> None:
         "cold-stale-generation"
     }
     impl._publish_worker_retrieve_state.assert_not_called()
+    # The completed future owns a concrete state even when its generation is
+    # stale, so the rejected result must be released rather than leaked.
     impl._release_unadopted_shared_request_objects.assert_called_once_with(
         state, request
     )
@@ -372,7 +715,7 @@ def test_dsa_cold_compact_failed_state_releases_after_sync_retry() -> None:
     )
     state = WorkerRetrieveState(req_id="cold-sync-retry")
     error = RuntimeError("load failed")
-    setattr(error, "_lmcache_dsa_cold_state", state)
+    error._lmcache_dsa_cold_state = state
     future.set_exception(error)
     impl._dsa_cold_load_futures = {
         "cold-sync-retry": (1, future, request, {100, 101}, 0.0)
@@ -410,7 +753,7 @@ def test_dsa_cold_ready_state_survives_cross_rank_completion_gap() -> None:
         shared_index_status="present",
         indexer_npu_resident=True,
     )
-    setattr(state, "_dsa_cold_prune_protected", True)
+    state._dsa_cold_prune_protected = True
     impl._worker_retrieve_state = {"cold-ready-gap": state}
     impl._worker_retrieve_registry_version = 1
     impl._release_shared_worker_retrieve_state = MagicMock()
@@ -476,7 +819,7 @@ def test_dsa_cold_compact_failure_does_not_mark_request_ready() -> None:
             lmcache_cached_tokens=8192,
             can_load=True,
         )
-        setattr(impl.load_specs[req_id], "dsa_cold_compact_load", True)
+        impl.load_specs[req_id].dsa_cold_compact_load = True
 
     impl.update_connector_output(
         SimpleNamespace(
@@ -496,7 +839,14 @@ def test_first_sparse_step_publishes_initial_release_frontier_once() -> None:
     request = SimpleNamespace(
         req_id="initial-sparse-release",
         is_sparse_decode=True,
-        load_spec=SimpleNamespace(dsa_committed_end=8192),
+        resumed_from_preemption=False,
+        dsa_current_released_frontier=0,
+        dsa_nonresident_frontier=0,
+        load_spec=SimpleNamespace(
+            dsa_committed_end=8192,
+            dsa_release_frontier=8192,
+            dsa_current_released_frontier=0,
+        ),
     )
 
     impl._mark_initial_sparse_release_ready(request)
@@ -508,6 +858,12 @@ def test_first_sparse_step_publishes_initial_release_frontier_once() -> None:
     # initial frontier again after the completion output has been drained.
     impl._mark_initial_sparse_release_ready(request)
     assert impl.get_completed_decode_window_saves() == {}
+
+    request.resumed_from_preemption = True
+    impl._mark_initial_sparse_release_ready(request)
+    assert impl.get_completed_decode_window_saves() == {
+        "initial-sparse-release": 8192
+    }
 
 
 def test_chunk_size_must_be_integer_multiple_of_block_size() -> None:
@@ -755,6 +1111,8 @@ class TestDisaggSpecOwnership:
         tracker = impl._request_trackers[req_id]
         assert tracker.disagg_spec is not None
         assert tracker.disagg_spec.receiver_id == "decode-host9000"
+
+
 class TestBuildConnectorMetaSparseSyntheticLoadSpec:
     def test_cold_compact_resume_marker_is_one_shot(self) -> None:
         impl = _make_scheduler_impl()
@@ -767,14 +1125,21 @@ class TestBuildConnectorMetaSparseSyntheticLoadSpec:
             num_computed_tokens=prompt_len - 1,
             sampling_params=SimpleNamespace(extra_args=None),
         )
+        impl._unfinished_requests[req_id] = _make_vllm_request(
+            req_id,
+            prompt_len,
+            prompt_len - 1,
+            prompt_len,
+        )
         impl._dsa_cold_loaded_req_ids = {req_id}
         impl.load_specs[req_id] = LoadSpec(
             vllm_cached_tokens=0,
             lmcache_cached_tokens=prompt_len,
             can_load=True,
-            dsa_committed_end=prompt_len - 1,
+            dsa_committed_end=prompt_len,
+            dsa_remap_frontier=prompt_len - 1,
         )
-        setattr(impl.load_specs[req_id], "dsa_cold_compact_load", True)
+        impl.load_specs[req_id].dsa_cold_compact_load = True
 
         first = impl.build_connector_meta(
             StubSchedulerOutput(
@@ -786,7 +1151,9 @@ class TestBuildConnectorMetaSparseSyntheticLoadSpec:
         ).requests[0]
 
         assert first.is_sparse_decode
-        assert first.load_spec.dsa_committed_end == prompt_len - 1
+        assert first.load_spec.dsa_committed_end == prompt_len
+        assert first.load_spec.dsa_remap_frontier == prompt_len - 1
+        assert first.dsa_nonresident_frontier == prompt_len - 1
         assert first.load_spec.dsa_cold_compact_resume is True
         assert not hasattr(first.load_spec, "dsa_cold_compact_load")
 
@@ -801,6 +1168,188 @@ class TestBuildConnectorMetaSparseSyntheticLoadSpec:
             )
         ).requests[0]
         assert not hasattr(second.load_spec, "dsa_cold_compact_resume")
+
+    def test_default_zero_threshold_keeps_sparse_decode(
+        self,
+    ) -> None:
+        """方案 A: with the default threshold 0 (unset or '0') the dense
+        fast-path is disabled, so even short prompts keep sparse decode."""
+        impl = _make_scheduler_impl()
+        impl._dsa_kv_policy_threshold = 0
+        req_id = "zero-threshold"
+        prompt_len = 300
+        decode_token = 999
+        vllm_req = _make_vllm_request(
+            req_id, prompt_len, prompt_len, decode_token
+        )
+
+        impl._unfinished_requests[req_id] = vllm_req
+        impl._request_trackers[req_id] = RequestTracker(
+            req_id=req_id,
+            prompt_len=prompt_len,
+            token_ids=list(range(prompt_len)),
+            allocated_block_ids=list(range(19)),
+            num_saved_tokens=prompt_len,
+        )
+        scheduler_output = StubSchedulerOutput(
+            finished_req_ids=set(),
+            scheduled_new_reqs=[],
+            scheduled_cached_reqs=StubCachedRequestData(
+                req_ids=[req_id],
+                new_token_ids=[[decode_token]],
+                new_block_ids=[[]],
+            ),
+            num_scheduled_tokens={req_id: 1},
+        )
+
+        meta = impl.build_connector_meta(scheduler_output)
+
+        assert len(meta.requests) == 1
+        req_meta = meta.requests[0]
+        assert req_meta.is_sparse_decode
+        assert req_meta.load_spec is not None
+
+    def test_short_prompt_within_kv_policy_threshold_is_full_resident(
+        self,
+    ) -> None:
+        """方案 A: requests within the KV-policy threshold use the
+        full-resident policy (is_sparse_decode=False).
+
+        Regression: 0806-4. The FIRST compute step (token_ids == prompt_len,
+        is_decode_phase still False, e.g. right after a cold-compact load) must
+        also stay in the connector metadata (is_sparse_decode=False,
+        load_spec=None). Otherwise the step classifies as
+        MISSING_CONNECTOR_METADATA, falls back to the eager path, and the
+        torch_npu fx compiler captures ACL graphs at serving time — which is
+        illegal to overlap with the async cold-compact load thread's
+        synchronized device copies (device error 507057). Keeping every
+        full-resident step staged prevents serving-time graph capture."""
+        impl = _make_scheduler_impl()
+        impl._dsa_kv_policy_threshold = 2048
+        req_id = "short-prompt"
+        prompt_len = 300
+        decode_token = 999
+        vllm_req = _make_vllm_request(
+            req_id, prompt_len, prompt_len, decode_token
+        )
+
+        impl._unfinished_requests[req_id] = vllm_req
+        impl._request_trackers[req_id] = RequestTracker(
+            req_id=req_id,
+            prompt_len=prompt_len,
+            token_ids=list(range(prompt_len)),
+            allocated_block_ids=list(range(19)),
+            num_saved_tokens=prompt_len,
+            is_decode_phase=False,
+        )
+        scheduler_output = StubSchedulerOutput(
+            finished_req_ids=set(),
+            scheduled_new_reqs=[],
+            scheduled_cached_reqs=StubCachedRequestData(
+                req_ids=[req_id],
+                new_token_ids=[[decode_token]],
+                new_block_ids=[[]],
+            ),
+            num_scheduled_tokens={req_id: 1},
+        )
+
+        meta = impl.build_connector_meta(scheduler_output)
+
+        assert len(meta.requests) == 1
+        req_meta = meta.requests[0]
+        assert not req_meta.is_sparse_decode
+        assert req_meta.load_spec is None
+        assert req_meta.save_spec is not None
+        assert not req_meta.save_spec.can_save
+
+    def test_long_prompt_beyond_kv_policy_threshold_is_sparse_managed(
+        self,
+    ) -> None:
+        """方案 A: requests beyond the KV-policy threshold keep the
+        sparse-managed behavior."""
+        impl = _make_scheduler_impl()
+        impl._dsa_kv_policy_threshold = 2048
+        req_id = "long-prompt"
+        prompt_len = 4096
+        decode_token = 999
+        vllm_req = _make_vllm_request(
+            req_id, prompt_len, prompt_len, decode_token
+        )
+        impl._unfinished_requests[req_id] = vllm_req
+        impl._request_trackers[req_id] = RequestTracker(
+            req_id=req_id,
+            prompt_len=prompt_len,
+            token_ids=list(range(prompt_len)),
+            allocated_block_ids=list(range(256)),
+            num_saved_tokens=prompt_len,
+        )
+        scheduler_output = StubSchedulerOutput(
+            finished_req_ids=set(),
+            scheduled_new_reqs=[],
+            scheduled_cached_reqs=StubCachedRequestData(
+                req_ids=[req_id],
+                new_token_ids=[[decode_token]],
+                new_block_ids=[[]],
+            ),
+            num_scheduled_tokens={req_id: 1},
+        )
+
+        meta = impl.build_connector_meta(scheduler_output)
+
+        assert len(meta.requests) == 1
+        req_meta = meta.requests[0]
+        assert req_meta.is_sparse_decode
+        assert req_meta.load_spec is not None
+        assert req_meta.load_spec.lmcache_cached_tokens == prompt_len
+
+    def test_short_prompt_growing_past_threshold_switches_to_sparse(
+        self,
+    ) -> None:
+        """方案 A: the KV-policy decision follows the CURRENT context length. A
+        short prompt that grows past the threshold switches from full-resident
+        to sparse-managed loading/release behavior."""
+        impl = _make_scheduler_impl()
+        impl._dsa_kv_policy_threshold = 2048
+        impl._decode_window_save_window_size = 256
+        req_id = "grown-prompt"
+        prompt_len = 300
+        context_len = 5000
+        decode_token = 999
+        vllm_req = _make_vllm_request(
+            req_id, prompt_len, context_len, decode_token
+        )
+
+        impl._unfinished_requests[req_id] = vllm_req
+        impl._request_trackers[req_id] = RequestTracker(
+            req_id=req_id,
+            prompt_len=prompt_len,
+            token_ids=list(range(context_len)),
+            allocated_block_ids=list(range(313)),
+            num_saved_tokens=prompt_len,
+        )
+        scheduler_output = StubSchedulerOutput(
+            finished_req_ids=set(),
+            scheduled_new_reqs=[],
+            scheduled_cached_reqs=StubCachedRequestData(
+                req_ids=[req_id],
+                new_token_ids=[[decode_token]],
+                new_block_ids=[[]],
+            ),
+            num_scheduled_tokens={req_id: 1},
+        )
+
+        meta = impl.build_connector_meta(scheduler_output)
+
+        assert len(meta.requests) >= 1
+        req_meta = next(
+            request
+            for request in meta.requests
+            if not getattr(request, "is_decode_window_save", False)
+        )
+        assert req_meta.is_sparse_decode
+        assert req_meta.load_spec is not None
+        assert not req_meta.load_spec.can_load
+        assert req_meta.load_spec.dsa_committed_end == 0
 
     def test_first_decode_step_keeps_short_prompt_resident(self) -> None:
         impl = _make_scheduler_impl()
@@ -846,7 +1395,6 @@ class TestBuildConnectorMetaSparseSyntheticLoadSpec:
         req_id = "sparse-req"
         prompt_len = 256
         vllm_req = _make_vllm_request(req_id, prompt_len, prompt_len + 1, 999)
-
         impl._unfinished_requests[req_id] = vllm_req
         tracker = RequestTracker(
             req_id=req_id,
@@ -1003,7 +1551,7 @@ class TestBuildConnectorMetaSparseSyntheticLoadSpec:
         tracker.is_decode_phase = True
         tracker.sparse_token_ids = list(range(prompt_len))
         tracker.sparse_meta_frontier = prompt_len
-        setattr(tracker, "sparse_remap_frontier", prompt_len - 1)
+        tracker.sparse_remap_frontier = prompt_len - 1
         impl._request_trackers[req_id] = tracker
 
         scheduler_output = StubSchedulerOutput(
@@ -1022,10 +1570,10 @@ class TestBuildConnectorMetaSparseSyntheticLoadSpec:
 
         assert req_meta.load_spec is not None
         assert req_meta.load_spec.lmcache_cached_tokens == prompt_len
-        assert req_meta.load_spec.dsa_committed_end == release_frontier
+        assert req_meta.load_spec.dsa_committed_end == prompt_len - 1
         assert req_meta.load_spec.dsa_remap_frontier == prompt_len - 1
         assert (
-            getattr(req_meta.load_spec, "dsa_release_frontier")
+            req_meta.load_spec.dsa_release_frontier
             == release_frontier
         )
         assert req_meta.sparse_warm_ref
@@ -1218,7 +1766,8 @@ class TestBuildConnectorMetaSparseSyntheticLoadSpec:
 
         impl.update_connector_output(output)
 
-        assert output.completed_decode_window_saves == {req_id: 512}
+        assert output.completed_decode_window_saves == {}
+        assert tracker.dsa_nonresident_frontier == 0
         assert tracker.decode_window_save_committed_end == 1024
         assert tracker.decode_window_save_next_start == 1024
 
@@ -1356,7 +1905,7 @@ class TestBuildConnectorMetaSparseSyntheticLoadSpec:
         assert tracker.decode_window_save_inflight_end is None
         assert tracker.decode_window_save_committed_end == 512
         assert list(tracker.decode_window_save_pending_commits) == [768]
-        assert second_output.completed_decode_window_saves == {req_id: 512}
+        assert second_output.completed_decode_window_saves == {}
 
     def test_decode_window_commit_delay_two(self) -> None:
         impl = _make_scheduler_impl()
@@ -1385,7 +1934,7 @@ class TestBuildConnectorMetaSparseSyntheticLoadSpec:
             published.append(dict(output.completed_decode_window_saves))
             assert tracker.decode_window_save_inflight_end is None
 
-        assert published == [{}, {}, {req_id: 512}]
+        assert published == [{}, {}, {}]
         assert tracker.decode_window_save_committed_end == 512
         assert list(tracker.decode_window_save_pending_commits) == [768, 1024]
 
@@ -1417,7 +1966,7 @@ class TestBuildConnectorMetaSparseSyntheticLoadSpec:
 
         assert tracker.decode_window_save_committed_end == 256
         assert list(tracker.decode_window_save_pending_commits) == []
-        assert output.completed_decode_window_saves == {req_id: 256}
+        assert output.completed_decode_window_saves == {}
 
     def test_decode_window_commit_delay_counts_catch_up_save_once(self) -> None:
         impl = _make_scheduler_impl()
@@ -1450,7 +1999,7 @@ class TestBuildConnectorMetaSparseSyntheticLoadSpec:
         )
         impl.update_connector_output(second_output)
 
-        assert second_output.completed_decode_window_saves == {req_id: 1024}
+        assert second_output.completed_decode_window_saves == {}
         assert tracker.decode_window_save_committed_end == 1024
 
     def test_decode_window_completion_rejects_partial_value(self) -> None:
@@ -1560,6 +2109,7 @@ class TestZombieRequestInMetadata:
             allocated_block_ids=[0],
         )
         impl._unfinished_requests[req_id] = SimpleNamespace(request_id=req_id)
+        impl._dsa_kv_policy_states[req_id] = "sparse_managed"
 
         scheduler_output = StubSchedulerOutput(
             finished_req_ids={req_id},
@@ -1575,6 +2125,7 @@ class TestZombieRequestInMetadata:
         impl.build_connector_meta(scheduler_output)
         assert req_id not in impl._request_trackers
         assert req_id not in impl._unfinished_requests
+        assert req_id not in impl._dsa_kv_policy_states
 
 
 class TestDecodeWindowSaveMetadata:
@@ -1675,8 +2226,20 @@ class TestDecodeWindowSaveMetadata:
 
         meta = impl.build_connector_meta(scheduler_output)
 
-        assert len(meta.requests) == 1
-        req_meta = meta.requests[0]
+        assert len(meta.requests) == 2
+        req_meta = next(
+            request
+            for request in meta.requests
+            if request.is_decode_window_save
+        )
+        main_meta = next(
+            request
+            for request in meta.requests
+            if not request.is_decode_window_save
+        )
+        assert main_meta.dsa_current_released_frontier == 0
+        assert main_meta.dsa_nonresident_frontier == 0
+        assert not main_meta.is_sparse_decode
         assert req_meta.is_decode_window_save is True
         assert req_meta.decode_window_start == 256
         assert req_meta.decode_window_end == 512
@@ -1731,7 +2294,10 @@ class TestDecodeWindowSaveMetadata:
 
         meta = impl.build_connector_meta(scheduler_output)
 
-        assert meta.requests == []
+        assert len(meta.requests) == 1
+        assert not meta.requests[0].is_decode_window_save
+        assert meta.requests[0].dsa_current_released_frontier == 0
+        assert meta.requests[0].dsa_nonresident_frontier == 0
         assert tracker.num_saved_tokens == 256
         assert tracker.decode_window_save_next_start == 256
 
@@ -1810,6 +2376,122 @@ class TestDecodeWindowSaveMetadata:
         assert list(tracker.decode_window_save_pending_commits) == []
         assert tracker.sparse_meta_frontier is None
 
+    def test_released_frontier_survives_preemption(self) -> None:
+        tracker = RequestTracker(
+            req_id="released",
+            prompt_len=356,
+            token_ids=list(range(768)),
+            allocated_block_ids=list(range(48)),
+            num_saved_tokens=768,
+            dsa_nonresident_frontier=768,
+            dsa_current_released_frontier=768,
+        )
+
+        tracker.update(
+            new_token_ids=[999],
+            new_block_ids=[],
+            preempted=True,
+            lmcache_cached_tokens=256,
+            vllm_cached_tokens=0,
+            all_token_ids=list(range(900)),
+        )
+
+        assert tracker.dsa_nonresident_frontier == 768
+        assert tracker.decode_window_save_committed_end == 768
+        assert tracker.dsa_current_released_frontier == 0
+
+    def test_cold_compact_nonresident_survives_preemption_without_release(
+        self,
+    ) -> None:
+        tracker = RequestTracker(
+            req_id="cold-preempted",
+            prompt_len=10_001,
+            token_ids=list(range(10_001)),
+            allocated_block_ids=list(range(80)),
+            num_saved_tokens=10_001,
+            dsa_nonresident_frontier=10_000,
+            dsa_current_released_frontier=0,
+        )
+        tracker.sparse_remap_frontier = 10_000
+
+        tracker.update(
+            new_token_ids=[10_001],
+            new_block_ids=list(range(80, 160)),
+            preempted=True,
+            lmcache_cached_tokens=10_001,
+            vllm_cached_tokens=0,
+            all_token_ids=list(range(10_002)),
+        )
+
+        assert tracker.dsa_nonresident_frontier == 10_000
+        assert tracker.dsa_current_released_frontier == 0
+        assert tracker.sparse_remap_frontier == 10_000
+
+    def test_decode_window_release_is_gated_by_kv_policy_threshold(self) -> None:
+        impl = _make_scheduler_impl()
+        impl._decode_window_save_window_size = 256
+        impl._dsa_kv_policy_threshold = 10000
+        tracker = RequestTracker(
+            req_id="threshold-gate",
+            prompt_len=5120,
+            token_ids=list(range(5376)),
+            allocated_block_ids=list(range(336)),
+            num_saved_tokens=5120,
+            decode_window_save_committed_end=5120,
+        )
+        tracker.is_decode_phase = True
+        tracker.decode_window_save_anchor = 5120
+        tracker.decode_window_save_next_start = 5376
+        tracker.decode_window_save_inflight_end = 5376
+        impl._request_trackers[tracker.req_id] = tracker
+        output = SimpleNamespace(
+            completed_decode_window_saves={tracker.req_id: 5376}
+        )
+
+        impl.update_connector_output(output)
+
+        assert tracker.decode_window_save_committed_end == 5376
+        assert tracker.dsa_nonresident_frontier == 0
+        assert tracker.dsa_current_released_frontier == 0
+        assert output.completed_decode_window_saves == {}
+
+        tracker.token_ids.extend(range(5376, 10240))
+        tracker.decode_window_save_next_start = 10240
+        tracker.decode_window_save_inflight_end = 10240
+        output.completed_decode_window_saves[tracker.req_id] = 10240
+
+        impl.update_connector_output(output)
+
+        assert tracker.dsa_nonresident_frontier == 10240
+        assert tracker.dsa_current_released_frontier == 10240
+        assert output.completed_decode_window_saves == {tracker.req_id: 10240}
+
+    def test_preempted_block_table_can_republish_sticky_frontier(self) -> None:
+        impl = _make_scheduler_impl()
+        impl._dsa_kv_policy_threshold = 10000
+        tracker = RequestTracker(
+            req_id="preempted-release",
+            prompt_len=12000,
+            token_ids=list(range(12288)),
+            allocated_block_ids=list(range(768)),
+            num_saved_tokens=12288,
+            decode_window_save_committed_end=12288,
+            dsa_nonresident_frontier=12288,
+            dsa_current_released_frontier=0,
+        )
+        impl._request_trackers[tracker.req_id] = tracker
+        output = SimpleNamespace(
+            completed_decode_window_saves={tracker.req_id: 12288}
+        )
+
+        impl.update_connector_output(output)
+
+        assert tracker.dsa_nonresident_frontier == 12288
+        assert tracker.dsa_current_released_frontier == 12288
+        assert output.completed_decode_window_saves == {
+            tracker.req_id: 12288
+        }
+
     def test_two_group_decode_window_save_without_shared_cpu_allows_latent_only(
         self,
     ) -> None:
@@ -1820,8 +2502,12 @@ class TestDecodeWindowSaveMetadata:
 
         meta = impl.build_connector_meta(scheduler_output)
 
-        assert len(meta.requests) == 1
-        req_meta = meta.requests[0]
+        assert len(meta.requests) == 2
+        req_meta = next(
+            request
+            for request in meta.requests
+            if request.is_decode_window_save
+        )
         assert req_meta.is_decode_window_save is True
         assert req_meta.save_spec is not None
         assert req_meta.save_spec.can_save_indexer is False
@@ -1919,7 +2605,10 @@ class TestDecodeWindowSaveMetadata:
 
         meta = impl.build_connector_meta(scheduler_output)
 
-        assert meta.requests == []
+        assert len(meta.requests) == 1
+        assert not meta.requests[0].is_decode_window_save
+        assert meta.requests[0].dsa_current_released_frontier == 0
+        assert meta.requests[0].dsa_nonresident_frontier == 0
         assert tracker.decode_window_save_next_start == 256
         assert not any(
             event.get("event") == "window_group_plan" for event in events
@@ -1936,8 +2625,12 @@ class TestDecodeWindowSaveMetadata:
 
         meta = impl.build_connector_meta(scheduler_output)
 
-        assert len(meta.requests) == 1
-        req_meta = meta.requests[0]
+        assert len(meta.requests) == 2
+        req_meta = next(
+            request
+            for request in meta.requests
+            if request.is_decode_window_save
+        )
         assert req_meta.is_decode_window_save is True
         assert req_meta.save_spec is not None
         assert req_meta.save_spec.can_save_indexer is True

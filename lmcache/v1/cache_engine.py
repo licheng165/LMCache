@@ -26,6 +26,7 @@ import math
 import multiprocessing
 import os
 import socket
+import threading
 import time
 
 # Third Party
@@ -215,6 +216,14 @@ class LMCacheEngine:
         self.shared_cpu_cache_mapping: Optional[SharedSlabMapping] = None
         self.shared_cpu_cache_passive_allocator = None
         self._shared_cpu_request_leases: dict[str, SharedCPURequestLease] = {}
+        self._shared_envelope_condition = threading.Condition()
+        self._shared_envelope_receive_active = False
+        self._pending_shared_envelopes: dict[
+            tuple[str, str, int, int, int, int], SharedHandleEnvelope
+        ] = {}
+        self._shared_envelope_waiters: dict[
+            tuple[str, str, int, int, int, int], int
+        ] = {}
         self._sampled_lookup_local_fallback_logged = False
         self._validate_shared_cpu_cache_contract()
         self._prepare_shared_cpu_cache_name()
@@ -1019,7 +1028,9 @@ class LMCacheEngine:
     def _broadcast_shared_envelope(self, envelope: SharedHandleEnvelope) -> None:
         perf_enabled = cold_start_perf_enabled()
         started = cold_start_perf_now() if perf_enabled else None
-        self.broadcast_object_fn(envelope.to_dict(), self.metadata.first_rank)
+        condition, _, _ = self._shared_envelope_mailbox()
+        with condition:
+            self.broadcast_object_fn(envelope.to_dict(), self.metadata.first_rank)
         if perf_enabled:
             cold_start_perf_log(
                 logger,
@@ -1066,6 +1077,118 @@ class LMCacheEngine:
                 rank=self.metadata.worker_id,
             )
         return envelope
+
+    @staticmethod
+    def _shared_envelope_identity(
+        envelope: SharedHandleEnvelope,
+    ) -> tuple[str, str, int, int, int, int]:
+        return (
+            envelope.request_id,
+            envelope.phase,
+            envelope.request_ordinal,
+            envelope.layer_id,
+            envelope.kv_group,
+            envelope.generation,
+        )
+
+    def _shared_envelope_mailbox(
+        self,
+    ) -> tuple[
+        threading.Condition,
+        dict[tuple[str, str, int, int, int, int], SharedHandleEnvelope],
+        dict[tuple[str, str, int, int, int, int], int],
+    ]:
+        # Some unit tests construct an engine without calling __init__.
+        condition = getattr(self, "_shared_envelope_condition", None)
+        if condition is None:
+            condition = threading.Condition()
+            self._shared_envelope_condition = condition
+            self._shared_envelope_receive_active = False
+        pending = getattr(self, "_pending_shared_envelopes", None)
+        if pending is None:
+            pending = {}
+            self._pending_shared_envelopes = pending
+        waiters = getattr(self, "_shared_envelope_waiters", None)
+        if waiters is None:
+            waiters = {}
+            self._shared_envelope_waiters = waiters
+        return condition, pending, waiters
+
+    def _receive_matching_shared_envelope(
+        self,
+        *,
+        req_id: str,
+        phase: str,
+        request_ordinal: int,
+        layer_id: int,
+        kv_group: int,
+    ) -> SharedHandleEnvelope:
+        expected = (
+            req_id,
+            phase,
+            int(request_ordinal),
+            layer_id,
+            kv_group,
+            self.shared_cpu_cache_generation,
+        )
+        condition, pending, waiters = self._shared_envelope_mailbox()
+        with condition:
+            waiters[expected] = waiters.get(expected, 0) + 1
+
+        try:
+            # Async cold-compact and foreground layerwise loads can reach the
+            # same TP collective from different local threads. Rank 0 defines
+            # the wire order; passive ranks dispatch each envelope to the
+            # matching local generator without overlapping collective calls.
+            while True:
+                with condition:
+                    buffered = pending.pop(expected, None)
+                    if buffered is not None:
+                        condition.notify_all()
+                        return buffered
+                    if self._shared_envelope_receive_active:
+                        condition.wait()
+                        continue
+                    self._shared_envelope_receive_active = True
+
+                try:
+                    envelope = self._receive_shared_envelope()
+                    if envelope.generation != self.shared_cpu_cache_generation:
+                        raise ValueError(
+                            "Shared CPU cache received a layerwise envelope from "
+                            f"generation {envelope.generation}; expected "
+                            f"{self.shared_cpu_cache_generation}"
+                        )
+                except BaseException:
+                    with condition:
+                        self._shared_envelope_receive_active = False
+                        condition.notify_all()
+                    raise
+
+                identity = self._shared_envelope_identity(envelope)
+                with condition:
+                    self._shared_envelope_receive_active = False
+                    if identity == expected:
+                        condition.notify_all()
+                        return envelope
+                    if identity in pending:
+                        condition.notify_all()
+                        raise ValueError(
+                            "Shared CPU cache received duplicate out-of-order "
+                            f"layerwise envelope: identity={identity!r}"
+                        )
+                    pending[identity] = envelope
+                    condition.notify_all()
+                    while identity in pending and waiters.get(identity, 0) > 0:
+                        condition.wait()
+        finally:
+            with condition:
+                remaining = waiters[expected] - 1
+                if remaining:
+                    waiters[expected] = remaining
+                else:
+                    waiters.pop(expected)
+                condition.notify_all()
 
     def _validate_shared_layerwise_envelope(
         self,
@@ -2673,7 +2796,7 @@ class LMCacheEngine:
         key: CacheEngineKey,
     ) -> Optional[str]:
         assert self.storage_manager is not None
-        if isinstance(key, LayerCacheEngineKey) and mooncake_layer_pages_enabled(
+        if isinstance(key, LayerCacheEngineKey) and mooncake_page_layout_enabled(
             self.config
         ):
             hits, mapping = self.storage_manager.batched_contains_layer_pages(
@@ -2739,14 +2862,9 @@ class LMCacheEngine:
                             LayerPageMemoryObj,
                         )
                     ):
-                        if missed_layers:
-                            return None
                         continue
                     for layer_id, key in enumerate(chunk):
-                        if key in hot_cache:
-                            if layer_id in missed_layers:
-                                return None
-                        else:
+                        if key not in hot_cache:
                             missed_layers.add(layer_id)
                             local_chunks = min(local_chunks, chunk_index)
         if local_chunks == len(keys_by_chunk):
@@ -4036,7 +4154,13 @@ class LMCacheEngine:
             for layer_id in range(self.num_layers):
                 envelope = None
                 if compact_batch is None:
-                    envelope = self._receive_shared_envelope()
+                    envelope = self._receive_matching_shared_envelope(
+                        req_id=req_id,
+                        phase=phase,
+                        request_ordinal=request_ordinal,
+                        layer_id=layer_id,
+                        kv_group=kv_group,
+                    )
                     if perf_enabled and not consume_started:
                         consume_started = cold_start_perf_now()
                     self._validate_shared_layerwise_envelope(
@@ -4272,7 +4396,13 @@ class LMCacheEngine:
                     )
                 )
             else:
-                envelope = self._receive_shared_envelope()
+                envelope = self._receive_matching_shared_envelope(
+                    req_id=req_id,
+                    phase=phase,
+                    request_ordinal=int(request_ordinal),
+                    layer_id=layer_id,
+                    kv_group=kv_group,
+                )
                 self._validate_shared_layerwise_envelope(
                     envelope,
                     req_id=req_id,
@@ -5189,6 +5319,7 @@ class LMCacheEngine:
             tail_plan: Optional[list[str]] = None
             if mooncake_page_layout_enabled(self.config):
                 candidates = list(candidates)
+                layer_pages = mooncake_layer_pages_enabled(self.config)
                 page_candidates = (
                     candidates[
                         : next(
@@ -5200,13 +5331,15 @@ class LMCacheEngine:
                             len(candidates),
                         )
                     ]
-                    if mooncake_layer_pages_enabled(self.config)
+                    if layer_pages
                     else candidates
                 )
                 if page_candidates:
                     batch_plan = self._shared_page_first_location_plan(
                         [
                             [item[2].get_first_layer()]
+                            if layer_pages
+                            else item[2].split_layers(self.num_layers)
                             for item in page_candidates
                         ]
                     )
