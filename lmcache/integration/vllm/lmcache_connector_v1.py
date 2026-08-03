@@ -1,6 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
 
-from collections.abc import Collection
 from typing import TYPE_CHECKING, Any, Optional
 
 # Third Party
@@ -84,7 +83,6 @@ class LMCacheConnectorV1Dynamic(KVConnectorBase_V1):
         target_slot_mapping=None,
         payload_event=None,
         selected_token_counts=None,
-        require_complete_sparse_load: bool | Collection[str] = False,
     ) -> None:
         """
         Block until the KV for a specific layer is loaded into vLLM's
@@ -112,7 +110,6 @@ class LMCacheConnectorV1Dynamic(KVConnectorBase_V1):
             target_slot_mapping=target_slot_mapping,
             payload_event=payload_event,
             selected_token_counts=selected_token_counts,
-            require_complete_sparse_load=require_complete_sparse_load,
         )
 
     def save_kv_layer(

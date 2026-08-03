@@ -3,6 +3,7 @@
 
 # Standard
 from contextlib import contextmanager
+import inspect
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
@@ -20,7 +21,6 @@ from lmcache.integration.vllm.vllm_v1_adapter import (
     RequestTracker,
     SaveSpec,
     WorkerRetrieveState,
-    _requires_complete_sparse_load,
 )
 from lmcache.v1.cache_engine import LayerwiseStoreResult, LMCacheEngine
 from lmcache.v1.gpu_connector.sparse import PreparedSparseSource
@@ -41,47 +41,6 @@ def _make_impl() -> LMCacheConnectorV1Impl:
     impl.kv_role = "kv_both"
     impl._late_finished_sending = set()
     return impl
-
-
-def test_complete_sparse_retrieve_requirement_is_boundary_scoped():
-    active = frozenset({"active"})
-
-    assert _requires_complete_sparse_load(active, "active")
-    assert not _requires_complete_sparse_load(active, "resident")
-    assert _requires_complete_sparse_load(True, "resident")
-    assert not _requires_complete_sparse_load(False, "active")
-
-
-def test_complete_sparse_retrieve_validation_accepts_requested_mask():
-    request = SimpleNamespace(
-        req_id="req",
-        decode_token_mask=torch.tensor([False, True, True]),
-    )
-    LMCacheConnectorV1Impl._validate_complete_sparse_retrieve(
-        request,
-        torch.tensor([False, True, True]),
-    )
-
-
-def test_complete_sparse_retrieve_validation_rejects_partial_mask():
-    request = SimpleNamespace(
-        req_id="req",
-        decode_token_mask=torch.tensor([False, True, True]),
-    )
-    with pytest.raises(RuntimeError, match="partial"):
-        LMCacheConnectorV1Impl._validate_complete_sparse_retrieve(
-            request,
-            torch.tensor([False, True, False]),
-        )
-
-
-def test_complete_sparse_retrieve_validation_rejects_missing_mask():
-    request = SimpleNamespace(req_id="req", decode_token_mask=None)
-    with pytest.raises(RuntimeError, match="no completion mask"):
-        LMCacheConnectorV1Impl._validate_complete_sparse_retrieve(
-            request,
-            None,
-        )
 
 
 def _make_shared_engine(
@@ -1954,6 +1913,37 @@ class TestWorkerRetrieveState:
         assert len(captured) == 1
         assert captured[0]["selected_token_counts"].item() == 3
         assert captured[0]["selected_token_ids"].shape == (4,)
+
+    def test_sparse_layer_wait_has_no_completion_mask_validation(self):
+        assert (
+            "require_complete_sparse_load"
+            not in inspect.signature(
+                LMCacheConnectorV1Impl.wait_for_layer_load
+            ).parameters
+        )
+
+        req = make_sparse_req_meta("req-1", token_count=4)
+        req.decode_token_mask = torch.ones(4, dtype=torch.bool)
+        impl, _, _ = make_worker_connector([req], use_layerwise=True)
+        impl.current_layer = 0
+        impl.num_layers = 2
+        impl._layerwise_retriever_is_sparse = [True]
+
+        def _retriever():
+            yield None
+            yield torch.zeros(4, dtype=torch.bool)
+
+        retriever = _retriever()
+        next(retriever)
+        impl.layerwise_retrievers = [(retriever, None)]
+
+        impl.wait_for_layer_load(
+            "model.layers.0.self_attn.attn",
+            selected_tokens=torch.tensor([[0]], dtype=torch.int32),
+            request_ids=["req-1"],
+        )
+
+        assert impl.current_layer == 1
 
     def test_retrieve_stats_combine_mtp_rows_and_reset_each_window(
         self, monkeypatch
