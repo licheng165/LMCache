@@ -738,6 +738,127 @@ class TestDisaggSpecOwnership:
         assert tracker.disagg_spec is not None
         assert tracker.disagg_spec.receiver_id == "decode-host9000"
 class TestBuildConnectorMetaSparseSyntheticLoadSpec:
+    def test_default_zero_threshold_keeps_sparse_decode(
+        self,
+    ) -> None:
+        """方案 A: with the default threshold 0 (unset or '0') the dense
+        fast-path is disabled, so even short prompts keep sparse decode."""
+        impl = _make_scheduler_impl()
+        impl._dsa_dense_threshold = 0
+        req_id = "zero-threshold"
+        prompt_len = 300
+        decode_token = 999
+        vllm_req = _make_vllm_request(
+            req_id, prompt_len, prompt_len, decode_token
+        )
+
+        impl._unfinished_requests[req_id] = vllm_req
+        impl._request_trackers[req_id] = RequestTracker(
+            req_id=req_id,
+            prompt_len=prompt_len,
+            token_ids=list(range(prompt_len)),
+            allocated_block_ids=list(range(19)),
+            num_saved_tokens=prompt_len,
+        )
+        scheduler_output = StubSchedulerOutput(
+            finished_req_ids=set(),
+            scheduled_new_reqs=[],
+            scheduled_cached_reqs=StubCachedRequestData(
+                req_ids=[req_id],
+                new_token_ids=[[decode_token]],
+                new_block_ids=[[]],
+            ),
+            num_scheduled_tokens={req_id: 1},
+        )
+
+        meta = impl.build_connector_meta(scheduler_output)
+
+        assert len(meta.requests) == 1
+        req_meta = meta.requests[0]
+        assert req_meta.is_sparse_decode
+        assert req_meta.load_spec is not None
+
+    def test_short_prompt_within_dense_threshold_skips_sparse_decode(
+        self,
+    ) -> None:
+        """方案 A: requests whose prompt_len is within the dense threshold take
+        the dense path (is_sparse_decode=False) instead of the sparse decode."""
+        impl = _make_scheduler_impl()
+        impl._dsa_dense_threshold = 2048
+        req_id = "short-prompt"
+        prompt_len = 300
+        decode_token = 999
+        vllm_req = _make_vllm_request(
+            req_id, prompt_len, prompt_len, decode_token
+        )
+
+        impl._unfinished_requests[req_id] = vllm_req
+        impl._request_trackers[req_id] = RequestTracker(
+            req_id=req_id,
+            prompt_len=prompt_len,
+            token_ids=list(range(prompt_len)),
+            allocated_block_ids=list(range(19)),
+            num_saved_tokens=prompt_len,
+        )
+        scheduler_output = StubSchedulerOutput(
+            finished_req_ids=set(),
+            scheduled_new_reqs=[],
+            scheduled_cached_reqs=StubCachedRequestData(
+                req_ids=[req_id],
+                new_token_ids=[[decode_token]],
+                new_block_ids=[[]],
+            ),
+            num_scheduled_tokens={req_id: 1},
+        )
+
+        meta = impl.build_connector_meta(scheduler_output)
+
+        assert len(meta.requests) == 1
+        req_meta = meta.requests[0]
+        assert not req_meta.is_sparse_decode
+        assert req_meta.load_spec is None
+
+    def test_long_prompt_beyond_dense_threshold_keeps_sparse_decode(
+        self,
+    ) -> None:
+        """方案 A: requests whose prompt_len exceeds the dense threshold keep
+        the sparse decode path unchanged."""
+        impl = _make_scheduler_impl()
+        impl._dsa_dense_threshold = 2048
+        req_id = "long-prompt"
+        prompt_len = 4096
+        decode_token = 999
+        vllm_req = _make_vllm_request(
+            req_id, prompt_len, prompt_len, decode_token
+        )
+
+        impl._unfinished_requests[req_id] = vllm_req
+        impl._request_trackers[req_id] = RequestTracker(
+            req_id=req_id,
+            prompt_len=prompt_len,
+            token_ids=list(range(prompt_len)),
+            allocated_block_ids=list(range(256)),
+            num_saved_tokens=prompt_len,
+        )
+        scheduler_output = StubSchedulerOutput(
+            finished_req_ids=set(),
+            scheduled_new_reqs=[],
+            scheduled_cached_reqs=StubCachedRequestData(
+                req_ids=[req_id],
+                new_token_ids=[[decode_token]],
+                new_block_ids=[[]],
+            ),
+            num_scheduled_tokens={req_id: 1},
+        )
+
+        meta = impl.build_connector_meta(scheduler_output)
+
+        assert len(meta.requests) == 1
+        req_meta = meta.requests[0]
+        assert req_meta.is_sparse_decode
+        assert req_meta.load_spec is not None
+        assert req_meta.load_spec.lmcache_cached_tokens == prompt_len
+
     def test_first_decode_step_keeps_short_prompt_resident(self) -> None:
         impl = _make_scheduler_impl()
         impl._decode_window_save_window_size = 256

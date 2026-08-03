@@ -1578,8 +1578,34 @@ class LMCacheConnectorV1Impl:
             (1 + max(int(getattr(vllm_config, "num_speculative_tokens", 0)), 0))
             * dsa_topk
         )
+        # Short-context dense fast-path threshold (tokens). Requests whose prompt
+        # length does not exceed this threshold skip the DSA sparse machinery and
+        # take the existing dense load path, since sparse selection over a context
+        # no longer than index_topk is mathematically identical to dense attention.
+        # 0 (default, unset or "0") disables the dense fast-path entirely (pure
+        # sparse path); a positive value is used as-is (no cap), so a value larger
+        # than index_topk forces the dense load path for longer prompts too.
+        raw_dense_threshold = os.environ.get("VLLM_ASCEND_DSA_DENSE_THRESHOLD")
+        if raw_dense_threshold is None:
+            self._dsa_dense_threshold = 0
+        else:
+            try:
+                parsed_threshold = int(raw_dense_threshold)
+            except (TypeError, ValueError):
+                parsed_threshold = 0
+            self._dsa_dense_threshold = (
+                parsed_threshold if parsed_threshold > 0 else 0
+            )
         self.load_specs: dict[str, LoadSpec] = {}
         self._request_trackers: dict[str, RequestTracker] = {}
+        # Per-request dense-vs-sparse path state for diagnostics
+        # (VLLM_ASCEND_DSA_DENSE_PATH_LOG). Maps req_id -> "dense"/"sparse"
+        # for the last scheduled step; used to log path (re)entries/switches
+        # exactly once per transition.
+        self._dsa_dense_path_log = os.environ.get(
+            "VLLM_ASCEND_DSA_DENSE_PATH_LOG", "0"
+        ).lower() in ("1", "true", "yes", "on")
+        self._dsa_dense_path_states: dict[str, str] = {}
 
         self._discard_partial_chunks = (
             vllm_config.kv_transfer_config.get_from_extra_config(
@@ -8373,6 +8399,36 @@ class LMCacheConnectorV1Impl:
         )
         return start
 
+    def _log_dsa_dense_path(
+        self,
+        req_id: str,
+        is_sparse_decode: bool,
+        prompt_len: int,
+        num_computed_tokens: int,
+    ) -> None:
+        """Log the dense-vs-sparse decode path for one request, once per
+        transition (or on first appearance).
+
+        "dense"  = the DSA dense fast-path (short-context dense load);
+        "sparse" = the DSA sparse decode path. Controlled by
+        VLLM_ASCEND_DSA_DENSE_PATH_LOG=1.
+        """
+        path = "sparse" if is_sparse_decode else "dense"
+        prev = self._dsa_dense_path_states.get(req_id)
+        if prev == path:
+            return
+        self._dsa_dense_path_states[req_id] = path
+        logger.info(
+            "[DSA_DENSE_PATH] req=%s path=%s%s prompt_len=%d computed=%d "
+            "threshold=%d",
+            req_id,
+            path,
+            f" (switched from {prev})" if prev is not None else " (first)",
+            prompt_len,
+            num_computed_tokens,
+            getattr(self, "_dsa_dense_threshold", 0),
+        )
+
     def _build_request_meta(
         self,
         tracker: RequestTracker,
@@ -8875,9 +8931,19 @@ class LMCacheConnectorV1Impl:
             )
 
             self._add_decode_window_save_metas(meta, request_tracker)
-            is_sparse_decode = self.enable_sparse_attention and (
-                request.num_computed_tokens >= request_tracker.prompt_len
+            is_sparse_decode = (
+                self.enable_sparse_attention
+                and request.num_computed_tokens >= request_tracker.prompt_len
+                and request_tracker.prompt_len
+                > getattr(self, "_dsa_dense_threshold", 0)
             )
+            if self._dsa_dense_path_log:
+                self._log_dsa_dense_path(
+                    req_id,
+                    is_sparse_decode,
+                    request_tracker.prompt_len,
+                    request.num_computed_tokens,
+                )
             if is_sparse_decode:
                 # Sparse direct decode should only retrieve the prefix whose
                 # boundary is also used by SFA scratch_remap. Keep the final
@@ -8908,7 +8974,11 @@ class LMCacheConnectorV1Impl:
                 )
                 dsa_release_frontier = (
                     committed_end
-                    if committed_end > self._dsa_scratch_capacity
+                    if committed_end
+                    > max(
+                        self._dsa_scratch_capacity,
+                        getattr(self, "_dsa_dense_threshold", 0),
+                    )
                     else 0
                 )
                 dsa_remap_frontier = getattr(
