@@ -68,6 +68,7 @@ from lmcache.v1.metadata import LMCacheMetadata
 from lmcache.v1.mooncake_layout import (
     mooncake_layer_pages_enabled,
     mooncake_page_layout_enabled,
+    mooncake_page_key,
 )
 from lmcache.v1.pin_monitor import PinMonitor
 from lmcache.v1.sampled_lookup import (
@@ -1491,6 +1492,7 @@ class LMCacheEngine:
         if not chunks:
             return 0
         assert self.storage_manager is not None
+        perf_enabled = cold_start_perf_enabled()
 
         def tiered_locations(
             base_keys: list[CacheEngineKey],
@@ -1625,10 +1627,74 @@ class LMCacheEngine:
                 raise
             return mapping
 
+        def diagnose(base_key: CacheEngineKey) -> list[dict[str, Any]]:
+            details = []
+            page_layout = mooncake_page_layout_enabled(self.config)
+            for kv_group in self._layerwise_lookup_kv_groups():
+                group_key = self._lookup_key_for_kv_group(
+                    base_key,
+                    kv_group=kv_group,
+                    request_configs=request_configs,
+                )
+                layer_keys = group_key.split_layers(self.num_layers)
+                sampled = first_last_layer_keys([group_key], self.num_layers)
+                remote_page_hits = (
+                    self.storage_manager.batched_contains_layer_pages(
+                        layer_keys[:1], ["RemoteBackend"], False
+                    )[0]
+                    if page_layout
+                    else 0
+                )
+                remote_legacy_hits = self.storage_manager.batched_contains(
+                    sampled, ["RemoteBackend"], False
+                )[0]
+                details.append(
+                    {
+                        "kv_group": kv_group,
+                        "page_key": (
+                            mooncake_page_key(layer_keys[0], self.num_layers)
+                            if page_layout
+                            else None
+                        ),
+                        "legacy_first_key": sampled[0].to_string(),
+                        "legacy_last_key": sampled[-1].to_string(),
+                        "remote_page_hits": remote_page_hits,
+                        "remote_legacy_hits": remote_legacy_hits,
+                        "result": (
+                            "remote_page"
+                            if remote_page_hits == 1
+                            else "remote_legacy"
+                            if remote_legacy_hits == len(sampled)
+                            else "missing"
+                        ),
+                    }
+                )
+            return details
+
         local_groups_by_chunk: dict[int, set[int]] = {}
 
         def chunk_exists(index: int) -> bool:
             locations = tiered_locations([chunks[index][1]])
+            if perf_enabled and index == 0:
+                try:
+                    details = diagnose(chunks[index][1])
+                    diagnostic_error = None
+                except Exception as error:
+                    details = []
+                    diagnostic_error = f"{type(error).__name__}: {error}"
+                cold_start_perf_log(
+                    logger,
+                    "scheduler_sample_probe",
+                    lookup_id=lookup_id,
+                    chunk_index=index,
+                    chunk_end=chunks[index][0],
+                    chunk_hash=chunks[index][1].chunk_hash_hex,
+                    sample_count=len(chunks),
+                    found=locations is not None,
+                    diagnostic_extra_probes=True,
+                    diagnostic_error=diagnostic_error,
+                    groups=details,
+                )
             if locations is None:
                 return False
             local_groups_by_chunk[index] = {

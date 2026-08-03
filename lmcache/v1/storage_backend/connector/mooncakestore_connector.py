@@ -1474,6 +1474,9 @@ class MooncakestoreConnector(RemoteConnector):
                     for index in indices
                 }.values()
             )
+            put_started = (
+                cold_start_perf_now() if cold_start_perf_enabled() else None
+            )
             statuses = await self._run_blocking_put(
                 "batch_put_from_multi_buffers",
                 self.store.batch_put_from_multi_buffers,
@@ -1497,6 +1500,25 @@ class MooncakestoreConnector(RemoteConnector):
                             "Mooncake page put failed for "
                             f"{page_key}: status {status}"
                         )
+            if put_started is not None:
+                cold_start_perf_log(
+                    logger,
+                    "mooncake_page_put",
+                    started=put_started,
+                    pages=len(page_keys),
+                    buffers=sum(map(len, all_buffer_ptrs)),
+                    bytes=sum(map(sum, all_buffer_sizes)),
+                    kv_groups=sorted(
+                        {
+                            int(keys[indices[0]].kv_group)
+                            for _, indices in page_groups
+                        }
+                    ),
+                    first_page_key=page_keys[0],
+                    last_page_key=page_keys[-1],
+                    legacy_objects=len(legacy_indices),
+                    status="ok",
+                )
         if legacy_indices:
             legacy_indices = sorted(set(legacy_indices))
             await self._batched_put_zero_copy_legacy(

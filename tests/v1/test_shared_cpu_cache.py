@@ -11,6 +11,7 @@ import pytest
 import torch
 
 from lmcache.utils import CacheEngineKey
+from lmcache.v1 import cache_engine as cache_engine_module
 from lmcache.v1.cache_engine import LMCacheEngine, LMCacheEngineBuilder
 from lmcache.v1.memory_management import (
     LayerPageMemoryObj,
@@ -1062,6 +1063,41 @@ def test_sampled_lookup_recognizes_remote_pages_without_local_page_objects():
         len(keys) == 1 and search_range == ["RemoteBackend"]
         for keys, search_range, _ in page_calls
     )
+
+
+def test_sampled_lookup_logs_first_chunk_page_miss_by_group(monkeypatch):
+    engine = _make_sampled_lookup_engine([])
+    engine.config.extra_config = {"mooncake_page_first_multi_buffer": True}
+    events = []
+    monkeypatch.setattr(
+        cache_engine_module, "cold_start_perf_enabled", lambda: True
+    )
+    monkeypatch.setattr(
+        cache_engine_module,
+        "cold_start_perf_log",
+        lambda _logger, event, **fields: events.append((event, fields)),
+    )
+
+    def batched_contains_layer_pages(keys, search_range=None, pin=False):
+        hit = int(keys[0].kv_group == 0)
+        return hit, {"RemoteBackend": list(keys)} if hit else {}
+
+    engine.storage_manager.batched_contains_layer_pages = (
+        batched_contains_layer_pages
+    )
+
+    assert engine.lookup(list(range(14)), pin=False) == 0
+    event, fields = events[0]
+    assert event == "scheduler_sample_probe"
+    assert fields["chunk_index"] == 0
+    assert fields["found"] is False
+    assert [group["result"] for group in fields["groups"]] == [
+        "remote_page",
+        "missing",
+    ]
+    assert fields["groups"][0]["remote_page_hits"] == 1
+    assert fields["groups"][1]["remote_page_hits"] == 0
+    assert fields["groups"][1]["remote_legacy_hits"] == 0
 
 
 def test_sampled_lookup_combines_local_and_remote_keys() -> None:

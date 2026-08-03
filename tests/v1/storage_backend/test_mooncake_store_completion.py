@@ -425,7 +425,9 @@ def test_mooncake_page_alias_requires_complete_batch() -> None:
     assert connector.batched_contains_layer_pages(keys[:1]) == 1
 
 
-def test_mooncake_page_put_keeps_partial_tail_in_legacy_layout() -> None:
+def test_mooncake_page_put_keeps_partial_tail_in_legacy_layout(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     class _PageStore:
         def __init__(self) -> None:
             self.page_args = None
@@ -450,6 +452,15 @@ def test_mooncake_page_put_keeps_partial_tail_in_legacy_layout() -> None:
     )
     connector._metadata_for_raw_key = lambda _key: ([], [], None, 4)
     connector.store = _PageStore()
+    events = []
+    monkeypatch.setattr(
+        mooncake_connector, "cold_start_perf_enabled", lambda: True
+    )
+    monkeypatch.setattr(
+        mooncake_connector,
+        "cold_start_perf_log",
+        lambda _logger, event, **fields: events.append((event, fields)),
+    )
     keys = [
         _layer_key(1, 0),
         _layer_key(2, 0),
@@ -470,6 +481,15 @@ def test_mooncake_page_put_keeps_partial_tail_in_legacy_layout() -> None:
     assert connector.store.legacy_args[1] == [200, 400]
     assert connector.store.legacy_args[2] == [8, 8]
     assert all(memory_obj.ref_count == 1 for memory_obj in memory_objs)
+    event, fields = events[0]
+    assert event == "mooncake_page_put"
+    assert fields["pages"] == 1
+    assert fields["buffers"] == 2
+    assert fields["bytes"] == 32
+    assert fields["kv_groups"] == [0]
+    assert fields["first_page_key"] == connector.store.page_args[0][0]
+    assert fields["last_page_key"] == connector.store.page_args[0][0]
+    assert fields["legacy_objects"] == 2
 
 
 def test_mooncake_page_put_selects_each_layer_buffer() -> None:
