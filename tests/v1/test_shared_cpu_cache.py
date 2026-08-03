@@ -399,6 +399,24 @@ def test_shared_page_first_location_plan_uses_local_then_one_remote_probe():
     assert len(calls) == 2
 
 
+def test_shared_page_first_common_prefix_plan_keeps_ascend_contract():
+    locations = [
+        ["LocalCPUBackend", "RemoteBackend", "RemoteBackend"],
+        ["LocalCPUBackend", "LocalCPUBackend", "RemoteBackend"],
+    ]
+
+    assert LMCacheEngine._shared_page_first_common_prefix_plan(locations) == [
+        ["LocalCPUBackend", "RemoteBackend", "RemoteBackend"],
+        ["LocalCPUBackend", "RemoteBackend", "RemoteBackend"],
+    ]
+    assert (
+        LMCacheEngine._shared_page_first_common_prefix_plan(
+            [["RemoteBackend", "LocalCPUBackend"]]
+        )
+        is None
+    )
+
+
 def test_layer_page_location_plan_probes_one_remote_key_per_chunk():
     engine = object.__new__(LMCacheEngine)
     engine.config = SimpleNamespace(

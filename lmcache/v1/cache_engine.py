@@ -2461,6 +2461,24 @@ class LMCacheEngine:
                     return False
         return True
 
+    @classmethod
+    def _shared_page_first_common_prefix_plan(
+        cls,
+        locations_layer_major: list[list[str]],
+    ) -> Optional[list[list[str]]]:
+        """Normalize per-layer prefixes to one page-compatible boundary."""
+        if not cls._is_shared_page_first_location_plan(locations_layer_major):
+            return None
+        local_chunks = min(
+            locations.count("LocalCPUBackend")
+            for locations in locations_layer_major
+        )
+        return [
+            ["LocalCPUBackend"] * local_chunks
+            + ["RemoteBackend"] * (len(locations) - local_chunks)
+            for locations in locations_layer_major
+        ]
+
     def _resolve_shared_rank0_layer_mem_objs(
         self,
         *,
