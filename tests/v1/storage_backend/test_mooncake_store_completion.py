@@ -347,7 +347,9 @@ def test_mooncake_page_get_scatter_returns_layer_objects() -> None:
     assert [memory_obj.ref_count for memory_obj in allocated] == [1, 1, 0, 0]
 
 
-def test_mooncake_layer_page_get_allocates_one_object_per_chunk() -> None:
+def test_mooncake_layer_page_get_allocates_one_object_per_chunk(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     class _PageStore:
         def __init__(self) -> None:
             self.args = None
@@ -388,6 +390,15 @@ def test_mooncake_layer_page_get_allocates_one_object_per_chunk() -> None:
 
     connector._metadata_for_raw_key = metadata_for_raw_key
     keys = [_layer_key(chunk_hash, 0) for chunk_hash in (1, 2)]
+    events = []
+    monkeypatch.setattr(
+        mooncake_connector, "cold_start_perf_enabled", lambda: True
+    )
+    monkeypatch.setattr(
+        mooncake_connector,
+        "cold_start_perf_log",
+        lambda _logger, event, **fields: events.append((event, fields)),
+    )
 
     pages = asyncio.run(connector.batched_get_layer_pages(keys))
 
@@ -400,6 +411,28 @@ def test_mooncake_layer_page_get_allocates_one_object_per_chunk() -> None:
     submitted_keys, submitted_pages = connector.local_cpu_backend.submitted
     assert submitted_pages == pages
     assert submitted_keys == [keys[0].without_layer(), keys[1].without_layer()]
+    event, fields = events.pop()
+    assert event == "mooncake_page_get"
+    assert fields["layout"] == "layer_merged"
+    assert fields["kv_group"] == 0
+    assert fields["kv_groups"] == [0]
+    assert fields["pages"] == 2
+    assert fields["submitted_pages"] == 2
+    assert fields["completed_pages"] == 2
+    assert fields["layers"] == 2
+    assert fields["buffers"] == 4
+    assert fields["bytes"] == 64
+    assert fields["status"] == "ok"
+    assert all(
+        fields[name] >= 0
+        for name in (
+            "metadata_ms",
+            "allocation_ms",
+            "buffer_setup_ms",
+            "transfer_ms",
+            "publish_ms",
+        )
+    )
     for page in pages:
         page.ref_count_down()
 

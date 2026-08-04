@@ -1013,6 +1013,8 @@ class MooncakestoreConnector(RemoteConnector):
         self, keys: List[CacheEngineKey]
     ) -> list[LayerPageMemoryObj]:
         """Load pages identified by one representative layer key per chunk."""
+        perf_enabled = cold_start_perf_enabled()
+        perf_started = cold_start_perf_now() if perf_enabled else 0.0
         if not self._layer_merged_pages:
             raise RuntimeError("Layer-merged page objects are not enabled")
         if not keys or any(not isinstance(key, LayerCacheEngineKey) for key in keys):
@@ -1033,17 +1035,55 @@ class MooncakestoreConnector(RemoteConnector):
             for key in layer_keys[1:]
         ):
             raise ValueError("Layer-page retrieval requires one homogeneous tensor")
+        metadata_ms = (
+            (cold_start_perf_now() - perf_started) * 1000 if perf_enabled else 0.0
+        )
+        allocation_started = cold_start_perf_now() if perf_enabled else 0.0
         pages = self.local_cpu_backend.batched_allocate_layer_pages(
             shapes, dtypes, len(page_keys), self._page_num_layers, fmt
         )
+        allocation_ms = (
+            (cold_start_perf_now() - allocation_started) * 1000
+            if perf_enabled
+            else 0.0
+        )
         if pages is None:
+            if perf_enabled:
+                cold_start_perf_log(
+                    logger,
+                    "mooncake_page_get",
+                    started=perf_started,
+                    layout="layer_merged",
+                    kv_group=int(first_key.kv_group),
+                    kv_groups=[int(first_key.kv_group)],
+                    layers=self._page_num_layers,
+                    pages=len(page_keys),
+                    submitted_pages=0,
+                    completed_pages=0,
+                    buffers=0,
+                    bytes=0,
+                    metadata_ms=round(metadata_ms, 3),
+                    allocation_ms=round(allocation_ms, 3),
+                    buffer_setup_ms=0.0,
+                    transfer_ms=0.0,
+                    publish_ms=0.0,
+                    status="allocation_failed",
+                )
             return []
 
+        setup_started = cold_start_perf_now() if perf_enabled else 0.0
         sizes = [[page.layer_size] * self._page_num_layers for page in pages]
         ptrs = [
             [page.layer_data_ptr(layer) for layer in range(self._page_num_layers)]
             for page in pages
         ]
+        expected = [sum(page_sizes) for page_sizes in sizes]
+        buffer_setup_ms = (
+            (cold_start_perf_now() - setup_started) * 1000
+            if perf_enabled
+            else 0.0
+        )
+        transfer_started = cold_start_perf_now() if perf_enabled else 0.0
         transfer = asyncio.create_task(
             asyncio.to_thread(
                 self.store.batch_get_into_multi_buffers,
@@ -1052,19 +1092,34 @@ class MooncakestoreConnector(RemoteConnector):
                 sizes,
             )
         )
+        transfer_ms: float | None = None
+        publish_ms = 0.0
+        status = "error"
         try:
             statuses = await asyncio.shield(transfer)
-            expected = [sum(page_sizes) for page_sizes in sizes]
+            transfer_ms = (
+                (cold_start_perf_now() - transfer_started) * 1000
+                if perf_enabled
+                else 0.0
+            )
             if list(statuses) != expected:
                 raise RuntimeError(
                     f"Mooncake layer-page get returned {list(statuses)}, "
                     f"expected {expected}"
                 )
+            publish_started = cold_start_perf_now() if perf_enabled else 0.0
             self.local_cpu_backend.batched_submit_layer_pages(
                 [key.without_layer() for key in layer_keys], pages
             )
+            publish_ms = (
+                (cold_start_perf_now() - publish_started) * 1000
+                if perf_enabled
+                else 0.0
+            )
+            status = "ok"
             return pages
         except asyncio.CancelledError:
+            status = "cancelled"
             try:
                 await transfer
             finally:
@@ -1077,6 +1132,30 @@ class MooncakestoreConnector(RemoteConnector):
                 if page.is_valid():
                     page.ref_count_down()
             raise
+        finally:
+            if perf_enabled:
+                if transfer_ms is None:
+                    transfer_ms = (cold_start_perf_now() - transfer_started) * 1000
+                cold_start_perf_log(
+                    logger,
+                    "mooncake_page_get",
+                    started=perf_started,
+                    layout="layer_merged",
+                    kv_group=int(first_key.kv_group),
+                    kv_groups=[int(first_key.kv_group)],
+                    layers=self._page_num_layers,
+                    pages=len(page_keys),
+                    submitted_pages=len(page_keys),
+                    completed_pages=len(page_keys) if status == "ok" else 0,
+                    buffers=len(page_keys) * self._page_num_layers,
+                    bytes=sum(expected),
+                    metadata_ms=round(metadata_ms, 3),
+                    allocation_ms=round(allocation_ms, 3),
+                    buffer_setup_ms=round(buffer_setup_ms, 3),
+                    transfer_ms=round(transfer_ms, 3),
+                    publish_ms=round(publish_ms, 3),
+                    status=status,
+                )
 
     async def _batch_get_into(
         self, keys: List[CacheEngineKey]
