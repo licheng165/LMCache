@@ -62,7 +62,7 @@ def _parser() -> ArgumentParser:
         "--mooncake-device",
         default="0",
         help=(
-            "device exposed only for Mooncake client initialization; use "
+            "device exposed and initialized for Mooncake client setup; use "
             "'none' with a Mooncake build that honors MC_FORCE_TCP before "
             "installing AscendDirect (default: 0)"
         ),
@@ -235,6 +235,14 @@ async def _open_client(args: dict[str, Any]):
 def _prepare_child_environment(args: dict[str, Any]) -> None:
     device = args["mooncake_device"]
     os.environ["ASCEND_RT_VISIBLE_DEVICES"] = "" if device == "none" else device
+
+
+def _initialize_mooncake_device(args: dict[str, Any]) -> None:
+    _prepare_child_environment(args)
+    if args["mooncake_device"] != "none":
+        import torch_npu
+
+        torch_npu.npu.set_device(0)
 
 
 def _pattern(group: int, chunk: int, layer: int) -> int:
@@ -494,12 +502,20 @@ def _error(role: str, exc: BaseException) -> dict[str, Any]:
 
 
 def _producer_entry(args: dict[str, Any], queue, stop: Event) -> None:
-    _prepare_child_environment(args)
+    try:
+        _initialize_mooncake_device(args)
+    except BaseException as exc:
+        queue.put(_error("producer", exc))
+        return
     asyncio.run(_producer(args, queue, stop))
 
 
 def _consumer_entry(args: dict[str, Any], queue) -> None:
-    _prepare_child_environment(args)
+    try:
+        _initialize_mooncake_device(args)
+    except BaseException as exc:
+        queue.put(_error("consumer", exc))
+        return
     asyncio.run(_consumer(args, queue))
 
 
@@ -558,6 +574,8 @@ def main() -> int:
     shared_args.pop("fail_on_visibility_error")
     shared_args["run_id"] = uuid.uuid4().hex
 
+    # Spawned children must inherit visibility before importing the Ascend stack.
+    _prepare_child_environment(shared_args)
     context = mp.get_context("spawn")
     queue = context.Queue()
     stop = context.Event()
