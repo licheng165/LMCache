@@ -2,14 +2,17 @@
 
 # Standard
 import os
+from types import SimpleNamespace
 
 # Third Party
 import pytest
 
 # First Party
 from benchmarks.storage_backend_io.mooncake_page_lookup_repro import (
+    _load_config,
     _prepare_child_environment,
     classify_result,
+    lmcache_config,
 )
 
 
@@ -29,6 +32,11 @@ def _group(page_hits=2, layer_hits=72, retrieved=2, mismatches=None):
     [
         (
             {"status": "ready", "groups": {"0": _group(page_hits=0)}},
+            {"status": "done", "groups": {"0": _group()}},
+            "producer_put_not_visible",
+        ),
+        (
+            {"status": "ready", "groups": {"0": _group(layer_hits=0)}},
             {"status": "done", "groups": {"0": _group()}},
             "producer_put_not_visible",
         ),
@@ -90,3 +98,26 @@ def test_prepare_child_environment(monkeypatch, device, expected):
     monkeypatch.delenv("ASCEND_RT_VISIBLE_DEVICES", raising=False)
     _prepare_child_environment({"mooncake_device": device})
     assert os.environ["ASCEND_RT_VISIBLE_DEVICES"] == expected
+
+
+def test_load_config_uses_current_config_class(monkeypatch):
+    loaded = SimpleNamespace(extra_config={})
+
+    class CurrentConfig:
+        @classmethod
+        def from_file(cls, path):
+            assert path == "config.yaml"
+            return loaded
+
+    monkeypatch.setattr(lmcache_config, "LMCacheEngineConfig", CurrentConfig)
+    config = _load_config(
+        {
+            "config": "config.yaml",
+            "client_global_segment_size": 0,
+            "prefer_local_alloc": False,
+            "client_protocol": "tcp",
+        }
+    )
+
+    assert config is loaded
+    assert config.extra_config["mooncake_layer_merged_page_objects"] is True

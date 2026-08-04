@@ -28,9 +28,8 @@ import uuid
 import torch
 
 # First Party
+import lmcache.v1.config as lmcache_config
 from lmcache.utils import LayerCacheEngineKey
-from lmcache.v1.config import LMCacheEngineConfig
-from lmcache.v1.lookup_client.mooncake_lookup_client import MooncakeLookupClient
 from lmcache.v1.memory_management import LayerPageMemoryObj, MixedMemoryAllocator
 from lmcache.v1.metadata import LMCacheMetadata
 from lmcache.v1.mooncake_layout import mooncake_page_key
@@ -103,8 +102,8 @@ def _validate_args(args: Namespace) -> None:
         )
 
 
-def _load_config(args: dict[str, Any]) -> LMCacheEngineConfig:
-    config = LMCacheEngineConfig.from_file(args["config"])
+def _load_config(args: dict[str, Any]) -> lmcache_config.LMCacheEngineConfig:
+    config = lmcache_config.LMCacheEngineConfig.from_file(args["config"])
     extra = dict(config.extra_config or {})
     extra.update(
         {
@@ -155,7 +154,7 @@ def _pool_bytes(args: dict[str, Any], chunk_size: int) -> int:
 
 
 def _keys(
-    config: LMCacheEngineConfig,
+    config: lmcache_config.LMCacheEngineConfig,
     metadata: LMCacheMetadata,
     args: dict[str, Any],
 ) -> dict[int, tuple[list[LayerCacheEngineKey], list[LayerCacheEngineKey]]]:
@@ -220,7 +219,7 @@ async def _open_client(args: dict[str, Any]):
             await connector.close()
         backend.close()
         raise
-    return config, metadata, allocator.buffer, backend, connector
+    return config, metadata, backend, connector
 
 
 def _prepare_child_environment(args: dict[str, Any]) -> None:
@@ -324,12 +323,17 @@ def _client_config(connector: MooncakestoreConnector) -> dict[str, Any]:
 
 
 def _scheduler_lookup(
-    config: LMCacheEngineConfig,
+    config: lmcache_config.LMCacheEngineConfig,
     metadata: LMCacheMetadata,
     args: dict[str, Any],
     page_keys: list[str],
     master_address: str,
 ) -> dict[str, Any]:
+    # First Party
+    from lmcache.v1.lookup_client.mooncake_lookup_client import (
+        MooncakeLookupClient,
+    )
+
     client = None
     try:
         client = MooncakeLookupClient(config, metadata, master_address)
@@ -371,7 +375,7 @@ async def _producer(args: dict[str, Any], queue, stop: Event) -> None:
     backend = connector = None
     pages_by_group: list[LayerPageMemoryObj] = []
     try:
-        config, metadata, _owner, backend, connector = await _open_client(args)
+        config, metadata, backend, connector = await _open_client(args)
         keys_by_group = _keys(config, metadata, args)
         groups = {}
         for group, (representatives, layer_keys) in keys_by_group.items():
@@ -388,6 +392,13 @@ async def _producer(args: dict[str, Any], queue, stop: Event) -> None:
             )
             if pages is None:
                 raise RuntimeError(f"Unable to allocate group {group} pages")
+            if len(pages) != len(representatives):
+                for page in pages:
+                    page.ref_count_down()
+                raise RuntimeError(
+                    f"Allocated {len(pages)} group {group} pages, "
+                    f"expected {len(representatives)}"
+                )
             pages_by_group.extend(pages)
             _fill_pages(pages, group)
             repeated = [page for page in pages for _ in range(args["num_layers"])]
@@ -430,7 +441,7 @@ async def _timed_async(call, *args):
 async def _consumer(args: dict[str, Any], queue) -> None:
     backend = connector = None
     try:
-        config, metadata, _owner, backend, connector = await _open_client(args)
+        config, metadata, backend, connector = await _open_client(args)
         groups = {}
         keys_by_group = _keys(config, metadata, args)
         page_keys = [
@@ -527,6 +538,7 @@ def classify_result(producer: dict[str, Any], consumer: dict[str, Any]) -> str:
     consumer_groups = consumer["groups"]
     if any(
         group["page_hits"] != group["expected_pages"]
+        or group["layer_hits"] != group["expected_layer_keys"]
         for group in producer_groups.values()
     ):
         return "producer_put_not_visible"
