@@ -182,3 +182,26 @@ PY
 ## Output
 
 The script prints a summary and optionally writes JSON results if `--output-json` is provided.
+
+## Mooncake exact-key tracing
+
+Set `LMCACHE_MOONCAKE_KEY_TRACE_FILE` before starting vLLM to record every
+physical Mooncake key submitted by LMCache put and existence-lookup calls. Use
+`{pid}` to keep concurrent process output in separate valid JSONL files:
+
+```bash
+LMCACHE_MOONCAKE_KEY_TRACE_FILE='/workspace/qzy/mooncake-keys-{pid}.jsonl' \
+vllm serve ...
+```
+
+Each record contains a UTC timestamp, PID, call ID, operation, exact key and
+Mooncake result. This diagnostic is intentionally verbose and should not be
+enabled for normal serving.
+
+Query a recorded physical key without retrieving its payload:
+
+```bash
+python3 benchmarks/storage_backend_io/mooncake_key_lookup.py \
+  --config /workspace/qzy/lmcache_config.yaml \
+  '__lmcache_page_v1__@36@...'
+```

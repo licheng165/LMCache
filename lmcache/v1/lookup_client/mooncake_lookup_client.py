@@ -11,6 +11,7 @@ from lmcache.utils import CacheEngineKey
 from lmcache.v1.config import LMCacheEngineConfig
 from lmcache.v1.lookup_client.abstract_client import LookupClientInterface
 from lmcache.v1.metadata import LMCacheMetadata
+from lmcache.v1.mooncake_key_trace import trace_mooncake_keys
 from lmcache.v1.mooncake_layout import (
     mooncake_page_key,
     mooncake_page_layout_enabled,
@@ -126,6 +127,13 @@ class MooncakeLookupClient(LookupClientInterface):
                 if not keys:
                     return False
                 results = self.store.batch_is_exist(keys)
+                trace_mooncake_keys(
+                    "lookup",
+                    keys,
+                    results,
+                    api="MooncakeLookupClient.batch_is_exist",
+                    lookup_id=lookup_id,
+                )
                 return len(results) == len(keys) and all(
                     result == 1 for result in results
                 )
@@ -140,6 +148,13 @@ class MooncakeLookupClient(LookupClientInterface):
         # rets is list of int: 1 = found, 0 = not found, -1 = error
         keys = [key for chunk_keys in chunk_keys_by_chunk for key in chunk_keys]
         rets = self.store.batch_is_exist(keys)
+        trace_mooncake_keys(
+            "lookup",
+            keys,
+            rets,
+            api="MooncakeLookupClient.batch_is_exist",
+            lookup_id=lookup_id,
+        )
 
         # Find the first key that doesn't exist (ret != 1)
         # This follows the same logic as cache engine's lookup method

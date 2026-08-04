@@ -19,6 +19,7 @@ from lmcache.v1.cold_start_perf import (
 )
 from lmcache.v1.config import LMCacheEngineConfig
 from lmcache.v1.memory_management import LayerPageMemoryObj, MemoryFormat, MemoryObj
+from lmcache.v1.mooncake_key_trace import trace_mooncake_keys
 from lmcache.v1.mooncake_layout import (
     mooncake_layer_pages_enabled,
     mooncake_page_key,
@@ -601,6 +602,12 @@ class MooncakestoreConnector(RemoteConnector):
                 dict.fromkeys(key for key in page_keys if key is not None)
             )
             raw_page_results = self.store.batch_is_exist(queried_page_keys)
+            trace_mooncake_keys(
+                "lookup",
+                queried_page_keys,
+                raw_page_results,
+                api="connector.page_aware_exists",
+            )
             result_by_page = dict(
                 zip(queried_page_keys, raw_page_results, strict=False)
             )
@@ -613,8 +620,13 @@ class MooncakestoreConnector(RemoteConnector):
             index for index, result in enumerate(page_results) if result != 1
         ]
         if legacy_positions:
-            legacy_results = self.store.batch_is_exist(
-                [keys[index].to_string() for index in legacy_positions]
+            legacy_keys = [keys[index].to_string() for index in legacy_positions]
+            legacy_results = self.store.batch_is_exist(legacy_keys)
+            trace_mooncake_keys(
+                "lookup",
+                legacy_keys,
+                legacy_results,
+                api="connector.page_aware_exists_legacy",
             )
             for index, result in zip(
                 legacy_positions, legacy_results, strict=False
@@ -743,12 +755,15 @@ class MooncakestoreConnector(RemoteConnector):
         if getattr(self, "_page_first_multi_buffer", False):
             results = self._page_aware_exists_many(keys)
         else:
-            results = [
-                result == 1
-                for result in self.store.batch_is_exist(
-                    [key.to_string() for key in keys]
-                )
-            ]
+            key_strings = [key.to_string() for key in keys]
+            raw_results = self.store.batch_is_exist(key_strings)
+            trace_mooncake_keys(
+                "lookup",
+                key_strings,
+                raw_results,
+                api="connector.batched_contains",
+            )
+            results = [result == 1 for result in raw_results]
         hit_count = 0
         for result in results:
             if not result:
@@ -766,6 +781,12 @@ class MooncakestoreConnector(RemoteConnector):
             batch_exists(page_keys)
             if callable(batch_exists)
             else [self.store.is_exist(key) for key in page_keys]
+        )
+        trace_mooncake_keys(
+            "lookup",
+            cast(list[str], page_keys),
+            results,
+            api="connector.batched_contains_layer_pages",
         )
         return next(
             (index for index, result in enumerate(results) if result != 1),
@@ -806,10 +827,20 @@ class MooncakestoreConnector(RemoteConnector):
         return memory_objs
 
     async def exists(self, key: CacheEngineKey) -> bool:
-        return bool(self.store.is_exist(key.to_string()))
+        key_string = key.to_string()
+        result = self.store.is_exist(key_string)
+        trace_mooncake_keys(
+            "lookup", [key_string], result, api="connector.exists"
+        )
+        return bool(result)
 
     def exists_sync(self, key: CacheEngineKey) -> bool:
-        return bool(self.store.is_exist(key.to_string()))
+        key_string = key.to_string()
+        result = self.store.is_exist(key_string)
+        trace_mooncake_keys(
+            "lookup", [key_string], result, api="connector.exists_sync"
+        )
+        return bool(result)
 
     async def batched_get(
         self, keys: List[CacheEngineKey]
@@ -842,7 +873,16 @@ class MooncakestoreConnector(RemoteConnector):
             return self.batched_contains(keys)
         num_hit_counts = 0
         for key in keys:
-            if not self.store.is_exist(key.to_string()):
+            key_string = key.to_string()
+            result = self.store.is_exist(key_string)
+            trace_mooncake_keys(
+                "lookup",
+                [key_string],
+                result,
+                api="connector.batched_async_contains",
+                lookup_id=lookup_id,
+            )
+            if not result:
                 break
             num_hit_counts += 1
         return num_hit_counts
@@ -1064,9 +1104,16 @@ class MooncakestoreConnector(RemoteConnector):
                 )
             return await self._batch_get_into_legacy(keys)
 
+        page_keys = [page_key for page_key, _ in complete_groups]
         page_exists = await asyncio.to_thread(
             self.store.batch_is_exist,
-            [page_key for page_key, _ in complete_groups],
+            page_keys,
+        )
+        trace_mooncake_keys(
+            "lookup",
+            page_keys,
+            page_exists,
+            api="connector.batch_get_page_lookup",
         )
         page_groups: list[tuple[str, list[int]]] = []
         for group, exists in zip(complete_groups, page_exists, strict=False):
@@ -1490,6 +1537,12 @@ class MooncakestoreConnector(RemoteConnector):
                 ),
                 page_memory_objs,
             )
+            trace_mooncake_keys(
+                "put",
+                page_keys,
+                statuses if statuses is not None else 0,
+                api="connector.batch_put_from_multi_buffers",
+            )
             if statuses is not None:
                 if len(statuses) != len(page_keys):
                     raise RuntimeError(
@@ -1549,6 +1602,12 @@ class MooncakestoreConnector(RemoteConnector):
             (key_strs, buffer_ptrs, buffer_sizes, self.replica_config),
             memory_objs,
         )
+        trace_mooncake_keys(
+            "put",
+            key_strs,
+            statuses if statuses is not None else 0,
+            api="connector.batch_put_from",
+        )
         self._check_batched_put_status(keys, statuses)
 
     async def _batched_put_with_metadata(
@@ -1576,6 +1635,12 @@ class MooncakestoreConnector(RemoteConnector):
                 self.store.put_from,
                 (key.to_string(), buffer_ptr, buffer_size, self.replica_config),
                 [memory_obj],
+            )
+            trace_mooncake_keys(
+                "put",
+                [key.to_string()],
+                0 if status is None else status,
+                api="connector.put_from",
             )
             self._check_put_status("put_from", status)
         except Exception as e:
@@ -1607,6 +1672,12 @@ class MooncakestoreConnector(RemoteConnector):
                 self.store.put_parts,
                 (key_str, metadata_bytes, kv_bytes),
                 [memory_obj],
+            )
+            trace_mooncake_keys(
+                "put",
+                [key_str],
+                0 if status is None else status,
+                api="connector.put_parts",
             )
             self._check_put_status("put_parts", status)
         except Exception as e:
