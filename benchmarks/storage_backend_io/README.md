@@ -10,7 +10,9 @@ worker connector lookup and vLLM's separate `MooncakeLookupClient` scheduler
 lookup. All test payloads remain in CPU memory and the benchmark launches no
 NPU kernels or tensors. Mooncake 0.3.8 Ascend builds nevertheless require a
 visible device and initialized runtime context while creating their transfer
-engine.
+engine. The clients use the same Ascend pinned-host allocator installed by the
+serving plugin; ordinary pageable `torch.empty(..., device="cpu")` buffers are
+not registrable by AscendDirect.
 
 ```bash
 cd /workspace/qzy/LMCache

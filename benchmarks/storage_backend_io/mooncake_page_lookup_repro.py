@@ -31,7 +31,7 @@ import torch
 from lmcache.utils import LayerCacheEngineKey
 from lmcache.v1.config import LMCacheEngineConfig
 from lmcache.v1.lookup_client.mooncake_lookup_client import MooncakeLookupClient
-from lmcache.v1.memory_management import LayerPageMemoryObj, TensorMemoryAllocator
+from lmcache.v1.memory_management import LayerPageMemoryObj, MixedMemoryAllocator
 from lmcache.v1.metadata import LMCacheMetadata
 from lmcache.v1.mooncake_layout import mooncake_page_key
 from lmcache.v1.storage_backend.connector.mooncakestore_connector import (
@@ -154,13 +154,6 @@ def _pool_bytes(args: dict[str, Any], chunk_size: int) -> int:
     return payload + max(payload // 8, 1 << 20)
 
 
-def _aligned_cpu_buffer(size: int) -> tuple[torch.Tensor, torch.Tensor]:
-    page_size = 4096
-    owner = torch.empty(size + page_size, dtype=torch.uint8, device="cpu")
-    offset = -owner.data_ptr() % page_size
-    return owner, owner[offset : offset + size]
-
-
 def _keys(
     config: LMCacheEngineConfig,
     metadata: LMCacheMetadata,
@@ -207,9 +200,7 @@ async def _open_client(args: dict[str, Any]):
         os.environ["MC_FORCE_TCP"] = "1"
     config = _load_config(args)
     metadata = _metadata(args, config.chunk_size)
-    owner, buffer = _aligned_cpu_buffer(_pool_bytes(args, config.chunk_size))
-    allocator = TensorMemoryAllocator(buffer)
-    allocator.pin_allocator = allocator
+    allocator = MixedMemoryAllocator(_pool_bytes(args, config.chunk_size))
     backend = LocalCPUBackend(
         config, metadata, dst_device="cpu", memory_allocator=allocator
     )
@@ -229,7 +220,7 @@ async def _open_client(args: dict[str, Any]):
             await connector.close()
         backend.close()
         raise
-    return config, metadata, owner, backend, connector
+    return config, metadata, allocator.buffer, backend, connector
 
 
 def _prepare_child_environment(args: dict[str, Any]) -> None:
@@ -243,6 +234,15 @@ def _initialize_mooncake_device(args: dict[str, Any]) -> None:
         import torch_npu
 
         torch_npu.npu.set_device(0)
+
+        # The serving plugin installs Ascend's aclrtMallocHost allocator before
+        # LMCache creates its CPU slab. This standalone script imports LMCache
+        # earlier, so update the already-loaded allocator module explicitly.
+        import lmcache_ascend  # noqa: F401
+        import lmcache_ascend.c_ops as ascend_c_ops
+        import lmcache.v1.memory_management as memory_management
+
+        memory_management.lmc_ops = ascend_c_ops
 
 
 def _pattern(group: int, chunk: int, layer: int) -> int:
