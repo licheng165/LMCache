@@ -54,8 +54,9 @@ def _parser() -> ArgumentParser:
     parser.add_argument("--process-timeout", type=float, default=120.0)
     parser.add_argument(
         "--client-protocol",
-        default="tcp",
-        help="Mooncake transport for CPU test clients (default: tcp)",
+        choices=("auto", "tcp", "ascend"),
+        default="auto",
+        help="Mooncake transport; auto selects ascend when a device is visible",
     )
     parser.add_argument(
         "--mooncake-device",
@@ -88,6 +89,13 @@ def _parser() -> ArgumentParser:
     return parser
 
 
+def _client_protocol(args: dict[str, Any]) -> str:
+    protocol = args["client_protocol"]
+    if protocol == "auto":
+        return "tcp" if args["mooncake_device"] == "none" else "ascend"
+    return protocol
+
+
 def _validate_args(args: Namespace) -> None:
     for name in ("num_layers", "world_size", "chunks"):
         if getattr(args, name) < 1:
@@ -115,7 +123,7 @@ def _load_config(args: dict[str, Any]) -> lmcache_config.LMCacheEngineConfig:
             "global_segment_size": args["client_global_segment_size"],
             "local_buffer_size": 0,
             "mooncake_prefer_local_alloc": args["prefer_local_alloc"],
-            "protocol": args["client_protocol"],
+            "protocol": _client_protocol(args),
         }
     )
     config.extra_config = extra
@@ -192,12 +200,23 @@ def _request_config(args: dict[str, Any]) -> dict[str, str]:
     return {"lmcache.tag.mooncake_cpu_repro": args["run_id"]}
 
 
-async def _open_client(args: dict[str, Any]):
+async def _open_client(
+    args: dict[str, Any], *, contribute_storage: bool = False
+):
     # The explicit LMCache config must win over any unrelated shell setting.
     os.environ.pop("MOONCAKE_CONFIG_PATH", None)
-    if args["client_protocol"] == "tcp":
+    protocol = _client_protocol(args)
+    if protocol == "tcp":
         os.environ["MC_FORCE_TCP"] = "1"
+    else:
+        os.environ.pop("MC_FORCE_TCP", None)
     config = _load_config(args)
+    if not contribute_storage:
+        config.extra_config = {
+            **config.extra_config,
+            "global_segment_size": 0,
+            "mooncake_prefer_local_alloc": False,
+        }
     metadata = _metadata(args, config.chunk_size)
     allocator = MixedMemoryAllocator(_pool_bytes(args, config.chunk_size))
     backend = LocalCPUBackend(
@@ -353,7 +372,7 @@ def _scheduler_lookup(
                 "local_hostname": "localhost",
                 "metadata_server": "P2PHANDSHAKE",
                 "global_segment_size": 0,
-                "local_buffer_size": 16 * 1024 * 1024,
+                "local_buffer_size": 0,
                 "protocol": "tcp",
                 "master_server_address": master_address,
             },
@@ -375,7 +394,9 @@ async def _producer(args: dict[str, Any], queue, stop: Event) -> None:
     backend = connector = None
     pages_by_group: list[LayerPageMemoryObj] = []
     try:
-        config, metadata, backend, connector = await _open_client(args)
+        config, metadata, backend, connector = await _open_client(
+            args, contribute_storage=True
+        )
         keys_by_group = _keys(config, metadata, args)
         groups = {}
         for group, (representatives, layer_keys) in keys_by_group.items():
@@ -627,7 +648,7 @@ def main() -> int:
             "chunks": args.chunks,
             "consumer_delay": args.consumer_delay,
             "client_global_segment_size": args.client_global_segment_size,
-            "client_protocol": args.client_protocol,
+            "client_protocol": _client_protocol(shared_args),
             "mooncake_device": args.mooncake_device,
             "prefer_local_alloc": args.prefer_local_alloc,
         },

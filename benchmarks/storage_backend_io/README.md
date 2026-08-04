@@ -32,12 +32,13 @@ python3 benchmarks/storage_backend_io/mooncake_page_lookup_repro.py \
 The default `--client-global-segment-size 0` makes both diagnostic clients use
 the existing Mooncake pool instead of each requesting the 100 GB segment from
 the serving config. `mooncake_prefer_local_alloc` is disabled for the same
-reason. The test clients request TCP and set `MC_FORCE_TCP=1`. The installed
-Mooncake 0.3.8 Ascend build applies that switch only after it initializes
-AscendDirect, so `--mooncake-device 0` supplies the required runtime context;
-the child calls `torch_npu.npu.set_device(0)` but does not move the benchmark
-payload to the NPU. A newer Mooncake build that checks `MC_FORCE_TCP` before
-installing AscendDirect can run with `--mooncake-device none`.
+reason. Protocol `auto` selects `ascend` when `--mooncake-device` is visible,
+because Mooncake 0.3.8 must allocate client-owned segments with
+`aclrtMallocHost`; its TCP allocator produces pageable memory that
+AscendDirect cannot register. Only the producer contributes a requested
+segment. The child initializes the NPU runtime but keeps benchmark payloads in
+pinned CPU memory. A newer Mooncake build that disables AscendDirect before
+allocation can run with `--mooncake-device none`, which selects TCP.
 The output verdict is one of:
 
 - `ok`: both processes see the page keys and the retrieved bytes match.

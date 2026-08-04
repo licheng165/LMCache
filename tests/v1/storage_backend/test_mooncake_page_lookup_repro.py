@@ -9,6 +9,7 @@ import pytest
 
 # First Party
 from benchmarks.storage_backend_io.mooncake_page_lookup_repro import (
+    _client_protocol,
     _load_config,
     _prepare_child_environment,
     classify_result,
@@ -98,6 +99,23 @@ def test_prepare_child_environment(monkeypatch, device, expected):
     monkeypatch.delenv("ASCEND_RT_VISIBLE_DEVICES", raising=False)
     _prepare_child_environment({"mooncake_device": device})
     assert os.environ["ASCEND_RT_VISIBLE_DEVICES"] == expected
+
+
+@pytest.mark.parametrize(
+    ("protocol", "device", "expected"),
+    [
+        ("auto", "0", "ascend"),
+        ("auto", "none", "tcp"),
+        ("tcp", "0", "tcp"),
+    ],
+)
+def test_client_protocol(protocol, device, expected):
+    assert (
+        _client_protocol(
+            {"client_protocol": protocol, "mooncake_device": device}
+        )
+        == expected
+    )
 
 
 def test_load_config_uses_current_config_class(monkeypatch):

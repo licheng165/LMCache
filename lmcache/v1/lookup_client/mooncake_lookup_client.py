@@ -36,15 +36,17 @@ class MooncakeLookupClient(LookupClientInterface):
         self.config = config
         self.metadata = metadata
         self.store = MooncakeDistributedStore()
-        self.store.setup(
+        status = self.store.setup(
             "localhost",
             "P2PHANDSHAKE",
             0,
-            16 * 1024 * 1024,
+            0,
             "tcp",
             "",
             master_addr,
         )
+        if status not in (None, 0):
+            raise RuntimeError(f"Mooncake lookup setup failed: status={status}")
 
         # Initialize token database for processing tokens
         assert isinstance(config, LMCacheEngineConfig), (

@@ -234,7 +234,7 @@ class MooncakestoreConnector(RemoteConnector):
                     f"Failed to determine NUMA mapping before Mooncake setup: {e}"
                 )
 
-            self.store.setup(
+            status = self.store.setup(
                 self.config.local_hostname,
                 self.config.metadata_server,
                 self.config.global_segment_size,
@@ -243,6 +243,8 @@ class MooncakestoreConnector(RemoteConnector):
                 self.config.device_name,
                 self.config.master_server_address,
             )
+            if status not in (None, 0):
+                raise RuntimeError(f"Mooncake setup failed: status={status}")
 
             logger.info("Mooncake store setup completed successfully")
 
