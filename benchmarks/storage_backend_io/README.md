@@ -1,5 +1,65 @@
 # Storage Backend I/O Benchmark
 
+## CPU-only Mooncake page lookup repro
+
+`mooncake_page_lookup_repro.py` starts independent producer and consumer
+processes against an already-running Mooncake master. The producer publishes
+the same layer-merged, page-first keys used by layerwise MLA serving and remains
+alive while the consumer checks and retrieves them. The consumer runs both the
+worker connector lookup and vLLM's separate `MooncakeLookupClient` scheduler
+lookup. It does not initialize an NPU.
+
+```bash
+cd /workspace/qzy/LMCache
+
+PYTHONHASHSEED=0 \
+python3 benchmarks/storage_backend_io/mooncake_page_lookup_repro.py \
+  --config /workspace/qzy/lmcache_config.yaml \
+  --model /workspace/models/GLM-5.1-w4a8 \
+  --num-layers 36 \
+  --world-size 4 \
+  --chunks 2 \
+  --consumer-delay 5 \
+  --output-json /workspace/qzy/mooncake-page-lookup-repro.json
+```
+
+The default `--client-global-segment-size 0` makes both diagnostic clients use
+the existing Mooncake pool instead of each requesting the 100 GB segment from
+the serving config. `mooncake_prefer_local_alloc` is disabled for the same
+reason. The test clients also default to the TCP transport, so no NPU transport
+or device is initialized; this does not change Mooncake page-key semantics.
+The output verdict is one of:
+
+- `ok`: both processes see the page keys and the retrieved bytes match.
+- `producer_put_not_visible`: the producer cannot see its completed put.
+- `cross_process_visibility_failure`: producer sees the pages but consumer does
+  not, reproducing the serving lookup failure.
+- `scheduler_lookup_client_failure`: the decode worker sees the pages, but the
+  scheduler's independent Mooncake lookup client does not.
+- `scheduler_lookup_client_error`: that independent scheduler client cannot
+  initialize or query the master.
+- `lookup_visible_get_failed` or `payload_mismatch`: metadata lookup succeeds,
+  but retrieval is incomplete or returns wrong bytes.
+
+Use `--fail-on-visibility-error` when a non-`ok` verdict should produce exit
+status 2. Infrastructure/setup errors always produce exit status 1.
+Each run uses a unique LMCache tag, so it cannot hit stale diagnostic data or
+collide with serving keys. The small diagnostic pages remain in Mooncake until
+normal eviction or master restart.
+
+If the zero-segment run is `ok`, repeat with a small producer-owned segment and
+the production placement preference. For two chunks and 36 layers, 64 MiB is
+sufficient:
+
+```bash
+PYTHONHASHSEED=0 \
+python3 benchmarks/storage_backend_io/mooncake_page_lookup_repro.py \
+  --config /workspace/qzy/lmcache_config.yaml \
+  --num-layers 36 --world-size 4 --chunks 2 \
+  --client-global-segment-size 67108864 \
+  --prefer-local-alloc
+```
+
 This microbenchmark compares **LocalDiskBackend** vs **RustRawBlockBackend** under high write-concurrency.
 
 ## What It Measures
