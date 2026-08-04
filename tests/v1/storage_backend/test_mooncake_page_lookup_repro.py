@@ -1,10 +1,14 @@
 # SPDX-License-Identifier: Apache-2.0
 
+# Standard
+import os
+
 # Third Party
 import pytest
 
 # First Party
 from benchmarks.storage_backend_io.mooncake_page_lookup_repro import (
+    _prepare_child_environment,
     classify_result,
 )
 
@@ -79,3 +83,10 @@ def test_classify_infrastructure_error():
     assert classify_result({"status": "error"}, {"status": "done"}) == (
         "infrastructure_error"
     )
+
+
+@pytest.mark.parametrize(("device", "expected"), [("3", "3"), ("none", "")])
+def test_prepare_child_environment(monkeypatch, device, expected):
+    monkeypatch.delenv("ASCEND_RT_VISIBLE_DEVICES", raising=False)
+    _prepare_child_environment({"mooncake_device": device})
+    assert os.environ["ASCEND_RT_VISIBLE_DEVICES"] == expected

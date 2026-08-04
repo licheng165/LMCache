@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
-"""Reproduce cross-process Mooncake page lookup failures without an NPU.
+"""Reproduce cross-process Mooncake page lookup failures with CPU payloads.
 
 The producer remains alive after publishing layer-merged pages so its registered
 CPU buffer remains valid while an independent consumer performs the same lookup
-and retrieval used by layerwise LMCache serving.
+and retrieval used by layerwise LMCache serving. Older Ascend Mooncake builds
+still require a visible device while initializing their transfer engine.
 """
 
 # Standard
@@ -56,6 +57,15 @@ def _parser() -> ArgumentParser:
         "--client-protocol",
         default="tcp",
         help="Mooncake transport for CPU test clients (default: tcp)",
+    )
+    parser.add_argument(
+        "--mooncake-device",
+        default="0",
+        help=(
+            "device exposed only for Mooncake client initialization; use "
+            "'none' with a Mooncake build that honors MC_FORCE_TCP before "
+            "installing AscendDirect (default: 0)"
+        ),
     )
     parser.add_argument(
         "--client-global-segment-size",
@@ -209,13 +219,22 @@ async def _open_client(args: dict[str, Any]):
             "", 0, "", asyncio.get_running_loop(), backend, config
         )
         if connector.registered_buffer_ptr is None:
-            raise RuntimeError("Mooncake failed to register the CPU test buffer")
+            device = os.environ.get("ASCEND_RT_VISIBLE_DEVICES")
+            raise RuntimeError(
+                "Mooncake failed to register the CPU test buffer "
+                f"(ASCEND_RT_VISIBLE_DEVICES={device!r})"
+            )
     except Exception:
         if connector is not None:
             await connector.close()
         backend.close()
         raise
     return config, metadata, owner, backend, connector
+
+
+def _prepare_child_environment(args: dict[str, Any]) -> None:
+    device = args["mooncake_device"]
+    os.environ["ASCEND_RT_VISIBLE_DEVICES"] = "" if device == "none" else device
 
 
 def _pattern(group: int, chunk: int, layer: int) -> int:
@@ -291,6 +310,7 @@ def _client_config(connector: MooncakestoreConnector) -> dict[str, Any]:
         "global_segment_size": config.global_segment_size,
         "prefer_local_alloc": config.prefer_local_alloc,
         "force_tcp": os.environ.get("MC_FORCE_TCP"),
+        "visible_devices": os.environ.get("ASCEND_RT_VISIBLE_DEVICES"),
         "registered_buffer": connector.registered_buffer_ptr is not None,
     }
 
@@ -474,10 +494,12 @@ def _error(role: str, exc: BaseException) -> dict[str, Any]:
 
 
 def _producer_entry(args: dict[str, Any], queue, stop: Event) -> None:
+    _prepare_child_environment(args)
     asyncio.run(_producer(args, queue, stop))
 
 
 def _consumer_entry(args: dict[str, Any], queue) -> None:
+    _prepare_child_environment(args)
     asyncio.run(_consumer(args, queue))
 
 
@@ -576,6 +598,7 @@ def main() -> int:
             "consumer_delay": args.consumer_delay,
             "client_global_segment_size": args.client_global_segment_size,
             "client_protocol": args.client_protocol,
+            "mooncake_device": args.mooncake_device,
             "prefer_local_alloc": args.prefer_local_alloc,
         },
         "producer": producer,

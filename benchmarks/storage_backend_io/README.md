@@ -7,7 +7,9 @@ processes against an already-running Mooncake master. The producer publishes
 the same layer-merged, page-first keys used by layerwise MLA serving and remains
 alive while the consumer checks and retrieves them. The consumer runs both the
 worker connector lookup and vLLM's separate `MooncakeLookupClient` scheduler
-lookup. It does not initialize an NPU.
+lookup. All test payloads remain in CPU memory and the benchmark launches no
+NPU kernels. Mooncake 0.3.8 Ascend builds nevertheless require one visible
+device while initializing their transfer engine.
 
 ```bash
 cd /workspace/qzy/LMCache
@@ -19,6 +21,7 @@ python3 benchmarks/storage_backend_io/mooncake_page_lookup_repro.py \
   --num-layers 36 \
   --world-size 4 \
   --chunks 2 \
+  --mooncake-device 0 \
   --consumer-delay 5 \
   --output-json /workspace/qzy/mooncake-page-lookup-repro.json
 ```
@@ -26,9 +29,12 @@ python3 benchmarks/storage_backend_io/mooncake_page_lookup_repro.py \
 The default `--client-global-segment-size 0` makes both diagnostic clients use
 the existing Mooncake pool instead of each requesting the 100 GB segment from
 the serving config. `mooncake_prefer_local_alloc` is disabled for the same
-reason. The test clients also default to the TCP transport, so no NPU transport
-or device is initialized. The script sets Mooncake's `MC_FORCE_TCP=1` runtime
-switch before client setup; this does not change Mooncake page-key semantics.
+reason. The test clients request TCP and set `MC_FORCE_TCP=1`. The installed
+Mooncake 0.3.8 Ascend build applies that switch only after it initializes
+AscendDirect, so `--mooncake-device 0` supplies the required runtime context;
+it does not move the benchmark payload to the NPU. A newer Mooncake build that
+checks `MC_FORCE_TCP` before installing AscendDirect can run with
+`--mooncake-device none`.
 The output verdict is one of:
 
 - `ok`: both processes see the page keys and the retrieved bytes match.
