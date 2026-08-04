@@ -945,7 +945,7 @@ class LayerPageMemoryObj(TensorMemoryObj):
         sizes = {
             right - left
             for left, right in zip(
-                self.group_prefix_sum, self.group_prefix_sum[1:], strict=True
+                self.group_prefix_sum, self.group_prefix_sum[1:], strict=False
             )
         }
         if len(sizes) != 1:

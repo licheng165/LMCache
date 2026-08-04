@@ -193,6 +193,8 @@ def _request_config(args: dict[str, Any]) -> dict[str, str]:
 async def _open_client(args: dict[str, Any]):
     # The explicit LMCache config must win over any unrelated shell setting.
     os.environ.pop("MOONCAKE_CONFIG_PATH", None)
+    if args["client_protocol"] == "tcp":
+        os.environ["MC_FORCE_TCP"] = "1"
     config = _load_config(args)
     metadata = _metadata(args, config.chunk_size)
     owner, buffer = _aligned_cpu_buffer(_pool_bytes(args, config.chunk_size))
@@ -201,11 +203,16 @@ async def _open_client(args: dict[str, Any]):
     backend = LocalCPUBackend(
         config, metadata, dst_device="cpu", memory_allocator=allocator
     )
+    connector = None
     try:
         connector = MooncakestoreConnector(
             "", 0, "", asyncio.get_running_loop(), backend, config
         )
+        if connector.registered_buffer_ptr is None:
+            raise RuntimeError("Mooncake failed to register the CPU test buffer")
     except Exception:
+        if connector is not None:
+            await connector.close()
         backend.close()
         raise
     return config, metadata, owner, backend, connector
@@ -283,6 +290,7 @@ def _client_config(connector: MooncakestoreConnector) -> dict[str, Any]:
         "protocol": config.protocol,
         "global_segment_size": config.global_segment_size,
         "prefer_local_alloc": config.prefer_local_alloc,
+        "force_tcp": os.environ.get("MC_FORCE_TCP"),
         "registered_buffer": connector.registered_buffer_ptr is not None,
     }
 

@@ -27,7 +27,8 @@ The default `--client-global-segment-size 0` makes both diagnostic clients use
 the existing Mooncake pool instead of each requesting the 100 GB segment from
 the serving config. `mooncake_prefer_local_alloc` is disabled for the same
 reason. The test clients also default to the TCP transport, so no NPU transport
-or device is initialized; this does not change Mooncake page-key semantics.
+or device is initialized. The script sets Mooncake's `MC_FORCE_TCP=1` runtime
+switch before client setup; this does not change Mooncake page-key semantics.
 The output verdict is one of:
 
 - `ok`: both processes see the page keys and the retrieved bytes match.
