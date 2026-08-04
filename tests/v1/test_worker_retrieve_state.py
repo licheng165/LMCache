@@ -1241,6 +1241,7 @@ class TestWorkerRetrieveState:
         impl.lmcache_engine = engine
         backing_obj = FakeMemObj()
         request = _make_request()
+        request.token_ids = list(range(256))
         state = WorkerRetrieveState(
             cached_keys=[["k"]],
             cached_starts=[0],
@@ -1268,6 +1269,7 @@ class TestWorkerRetrieveState:
         assert state.shared_generation == 9
         assert state.pointer_cache_generation == 9
         assert state.shared_request_active is True
+        assert state.metadata_token_ids == request.token_ids[:256]
 
         LMCacheConnectorV1Impl._release_shared_worker_retrieve_state(
             state,
@@ -1276,6 +1278,7 @@ class TestWorkerRetrieveState:
         assert backing_obj.unpinned == 1
         assert backing_obj.released == 1
         assert state.cached_memory_objs == []
+        assert state.metadata_token_ids == []
 
     def test_tp1_shared_state_cleanup_keeps_local_cpu_hot_cache_reference(self):
         class BorrowedLocalCPUObj:
@@ -4205,35 +4208,100 @@ class TestWorkerRetrieveState:
         assert state.cached_ends_indexer == [256]
         assert state.token_count == 256
 
-    def test_shared_indexer_resident_only_when_present_and_covered(self):
+    def test_shared_indexer_selects_mode_by_npu_and_metadata_state(self):
         request = _make_request()
         request.load_spec.lmcache_cached_tokens = 512
         state = WorkerRetrieveState(
             token_count=512,
             shared_request_active=True,
             shared_index_status="present",
+            indexer_npu_resident=True,
         )
 
-        assert LMCacheConnectorV1Impl._shared_sparse_decode_indexer_is_resident(
-            request,
-            state,
-            512,
+        assert (
+            LMCacheConnectorV1Impl._shared_sparse_decode_indexer_retrieve_mode(
+                request, state, 512
+            )
+            == adapter_mod.INDEXER_RETRIEVE_RESIDENT_SKIP
         )
 
         request.load_spec.lmcache_cached_tokens = 768
-        assert not LMCacheConnectorV1Impl._shared_sparse_decode_indexer_is_resident(
-            request,
-            state,
-            768,
+        assert (
+            LMCacheConnectorV1Impl._shared_sparse_decode_indexer_retrieve_mode(
+                request, state, 768
+            )
+            == adapter_mod.INDEXER_RETRIEVE_METADATA_ONLY
         )
 
         request.load_spec.lmcache_cached_tokens = 512
         state.shared_index_status = "missing"
-        assert not LMCacheConnectorV1Impl._shared_sparse_decode_indexer_is_resident(
+        assert (
+            LMCacheConnectorV1Impl._shared_sparse_decode_indexer_retrieve_mode(
+                request, state, 512
+            )
+            == adapter_mod.INDEXER_RETRIEVE_FULL
+        )
+
+        state.shared_index_status = "present"
+        request.resumed_from_preemption = True
+        assert (
+            LMCacheConnectorV1Impl._shared_sparse_decode_indexer_retrieve_mode(
+                request, state, 512
+            )
+            == adapter_mod.INDEXER_RETRIEVE_FULL
+        )
+
+    def test_indexer_metadata_only_refresh_uses_materialize_only(self):
+        impl = _make_impl()
+        request = _make_request()
+        request.token_ids = list(range(512))
+        request.load_spec.lmcache_cached_tokens = 512
+        state = WorkerRetrieveState(
+            cached_keys_indexer=[["key"]],
+            cached_starts_indexer=[0],
+            cached_ends_indexer=[256],
+            metadata_token_ids=list(range(256)),
+            token_count=256,
+        )
+
+        kwargs, _, prepared = impl._sparse_retrieve_kwargs(
             request,
             state,
-            512,
+            state,
+            kvcaches=[torch.zeros(1)],
+            slot_mapping=torch.arange(512),
+            sync=True,
+            kv_group=1,
+            request_ordinal=0,
+            dsa_two_groups=True,
+            token_count=512,
+            shared_cpu_enabled=True,
+            shared_cpu_preflight_state={},
+            metadata_only=True,
         )
+
+        assert prepared is None
+        assert kwargs["materialize_only"] is True
+        assert kwargs["cached_metadata_token_ids"] == list(range(256))
+        assert "prepared_sparse_source" not in kwargs
+
+    def test_full_indexer_materialization_commits_at_finalization(self):
+        impl = _make_impl()
+        request = _make_request()
+        request.is_sparse_decode = True
+        state = WorkerRetrieveState(
+            cached_keys=[["key"]],
+            indexer_npu_materialization_pending=True,
+        )
+        impl._worker_retrieve_state[request.req_id] = state
+        impl._prepared_sparse_sources_current = MagicMock(return_value=True)
+
+        impl._finalize_worker_retrieve_state_from_metadata(
+            SimpleNamespace(requests=[request])
+        )
+
+        assert state.indexer_npu_resident is True
+        assert state.indexer_npu_materialization_pending is False
 
     def test_current_shared_state_skip_requires_validation_signature(self):
         impl = _make_impl()

@@ -390,6 +390,7 @@ def test_dsa_cold_ready_state_survives_cross_rank_completion_gap() -> None:
         shared_request_active=True,
         shared_latent_status="present",
         shared_index_status="present",
+        indexer_npu_resident=True,
     )
     setattr(state, "_dsa_cold_prune_protected", True)
     impl._worker_retrieve_state = {"cold-ready-gap": state}
@@ -406,10 +407,9 @@ def test_dsa_cold_ready_state_survives_cross_rank_completion_gap() -> None:
     request = SimpleNamespace(
         load_spec=SimpleNamespace(lmcache_cached_tokens=8192)
     )
-    assert impl._shared_sparse_decode_indexer_is_resident(
-        request,
-        state,
-        8192,
+    assert (
+        impl._shared_sparse_decode_indexer_retrieve_mode(request, state, 8192)
+        == adapter_module.INDEXER_RETRIEVE_RESIDENT_SKIP
     )
 
 
