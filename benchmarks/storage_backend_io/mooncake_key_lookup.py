@@ -1,5 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
+# Standard
 import json
+import os
 import sys
 import time
 from argparse import ArgumentParser, Namespace
@@ -18,12 +20,31 @@ def _arguments() -> Namespace:
     parser.add_argument("--master")
     parser.add_argument("--local-hostname", default="localhost")
     parser.add_argument("--metadata-server", default="P2PHANDSHAKE")
+    parser.add_argument(
+        "--mooncake-device",
+        default="0",
+        help="physical Ascend device initialized before Mooncake setup, or 'none'",
+    )
     return parser.parse_args()
 
 
 def _extra_config(path: Path) -> dict[str, Any]:
     loaded = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
     return dict(loaded.get("extra_config") or {})
+
+
+def _initialize_device(device: str) -> None:
+    if device == "none":
+        os.environ["MC_FORCE_TCP"] = "1"
+        return
+    if not device.isdigit():
+        raise ValueError("--mooncake-device must be a non-negative integer or 'none'")
+    os.environ["ASCEND_RT_VISIBLE_DEVICES"] = device
+
+    # Third Party
+    import torch_npu
+
+    torch_npu.npu.set_device(0)
 
 
 def main() -> int:
@@ -33,6 +54,7 @@ def main() -> int:
     master = args.master or extra.get("master_server_address")
     if not master:
         raise ValueError("Mooncake master is absent; pass --master")
+    _initialize_device(args.mooncake_device)
 
     # Third Party
     from mooncake.store import MooncakeDistributedStore
@@ -62,6 +84,7 @@ def main() -> int:
                         timespec="microseconds"
                     ),
                     "master": master,
+                    "mooncake_device": args.mooncake_device,
                     "elapsed_ms": round(elapsed_ms, 3),
                     "keys": [
                         {

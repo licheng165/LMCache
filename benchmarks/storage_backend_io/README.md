@@ -203,5 +203,6 @@ Query a recorded physical key without retrieving its payload:
 ```bash
 python3 benchmarks/storage_backend_io/mooncake_key_lookup.py \
   --config /workspace/qzy/lmcache_config.yaml \
+  --mooncake-device 0 \
   '__lmcache_page_v1__@36@...'
 ```
