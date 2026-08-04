@@ -1,9 +1,12 @@
 # SPDX-License-Identifier: Apache-2.0
 
 # Standard
-from types import SimpleNamespace
+from types import ModuleType, SimpleNamespace
+import os
+import sys
 
 # Third Party
+import pytest
 import torch
 
 # First Party
@@ -22,6 +25,34 @@ class _FakeStore:
         self.keys = keys
         self.calls.append(list(keys))
         return self.rets if self.rets is not None else [1 for _ in keys]
+
+
+def test_mooncake_lookup_forces_tcp_before_store_setup(monkeypatch):
+    observed = {}
+
+    class FailingStore:
+        def setup(self, *args):
+            observed["force_tcp"] = os.environ.get("MC_FORCE_TCP")
+            observed["protocol"] = args[4]
+            return -1
+
+        def close(self):
+            observed["closed"] = True
+
+    package = ModuleType("mooncake")
+    package.__path__ = []  # type: ignore[attr-defined]
+    store_module = ModuleType("mooncake.store")
+    store_module.MooncakeDistributedStore = FailingStore
+    package.store = store_module
+    monkeypatch.setitem(sys.modules, "mooncake", package)
+    monkeypatch.setitem(sys.modules, "mooncake.store", store_module)
+    monkeypatch.delenv("MC_FORCE_TCP", raising=False)
+
+    with pytest.raises(RuntimeError, match="status=-1"):
+        MooncakeLookupClient(SimpleNamespace(), SimpleNamespace(), "master")
+
+    assert observed == {"force_tcp": "1", "protocol": "tcp", "closed": True}
+    assert "MC_FORCE_TCP" not in os.environ
 
 
 class _FakeTokenDatabase:

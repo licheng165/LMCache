@@ -12,6 +12,7 @@ from benchmarks.storage_backend_io.mooncake_page_lookup_repro import (
     _client_protocol,
     _load_config,
     _prepare_child_environment,
+    _role_device,
     classify_result,
     lmcache_config,
 )
@@ -94,11 +95,37 @@ def test_classify_infrastructure_error():
     )
 
 
-@pytest.mark.parametrize(("device", "expected"), [("3", "3"), ("none", "")])
+@pytest.mark.parametrize(("device", "expected"), [("3", "3,4"), ("none", "")])
 def test_prepare_child_environment(monkeypatch, device, expected):
     monkeypatch.delenv("ASCEND_RT_VISIBLE_DEVICES", raising=False)
     _prepare_child_environment({"mooncake_device": device})
     assert os.environ["ASCEND_RT_VISIBLE_DEVICES"] == expected
+
+
+def test_prepare_consumer_environment(monkeypatch):
+    monkeypatch.delenv("ASCEND_RT_VISIBLE_DEVICES", raising=False)
+    _prepare_child_environment(
+        {"mooncake_device": "0", "consumer_mooncake_device": "1"},
+        "consumer",
+    )
+    assert os.environ["ASCEND_RT_VISIBLE_DEVICES"] == "0,1"
+
+
+@pytest.mark.parametrize(
+    ("producer", "consumer", "expected"),
+    [("0", "auto", "1"), ("3", "5", "5"), ("none", "auto", "none")],
+)
+def test_consumer_device_selection(producer, consumer, expected):
+    assert (
+        _role_device(
+            {
+                "mooncake_device": producer,
+                "consumer_mooncake_device": consumer,
+            },
+            "consumer",
+        )
+        == expected
+    )
 
 
 @pytest.mark.parametrize(

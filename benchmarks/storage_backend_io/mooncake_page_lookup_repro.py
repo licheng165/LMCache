@@ -62,10 +62,15 @@ def _parser() -> ArgumentParser:
         "--mooncake-device",
         default="0",
         help=(
-            "device exposed and initialized for Mooncake client setup; use "
+            "producer device exposed for Mooncake client setup; use "
             "'none' with a Mooncake build that honors MC_FORCE_TCP before "
             "installing AscendDirect (default: 0)"
         ),
+    )
+    parser.add_argument(
+        "--consumer-mooncake-device",
+        default="auto",
+        help="consumer device; auto selects the next NPU (default: auto)",
     )
     parser.add_argument(
         "--client-global-segment-size",
@@ -89,6 +94,19 @@ def _parser() -> ArgumentParser:
     return parser
 
 
+def _role_device(args: dict[str, Any], role: str) -> str:
+    producer = args["mooncake_device"]
+    if role == "producer":
+        return producer
+    consumer = args.get("consumer_mooncake_device", "auto")
+    if consumer != "auto" or producer == "none":
+        return consumer if consumer != "auto" else "none"
+    try:
+        return str(int(producer) + 1)
+    except ValueError:
+        return producer
+
+
 def _client_protocol(args: dict[str, Any]) -> str:
     protocol = args["client_protocol"]
     if protocol == "auto":
@@ -104,6 +122,15 @@ def _validate_args(args: Namespace) -> None:
         raise ValueError("delays must be non-negative and timeout must be positive")
     if args.client_global_segment_size < 0:
         raise ValueError("--client-global-segment-size cannot be negative")
+    values = vars(args)
+    devices = [_role_device(values, role) for role in ("producer", "consumer")]
+    if any(device != "none" and not device.isdigit() for device in devices):
+        raise ValueError("Mooncake devices must be non-negative integers or 'none'")
+    if _client_protocol(values) == "ascend":
+        if "none" in devices:
+            raise ValueError("Ascend protocol requires producer and consumer devices")
+        if devices[0] == devices[1]:
+            raise ValueError("producer and consumer require different Ascend devices")
     if os.environ.get("PYTHONHASHSEED") != "0":
         raise RuntimeError(
             "Run with PYTHONHASHSEED=0 so both processes build same keys"
@@ -241,17 +268,25 @@ async def _open_client(
     return config, metadata, backend, connector
 
 
-def _prepare_child_environment(args: dict[str, Any]) -> None:
-    device = args["mooncake_device"]
-    os.environ["ASCEND_RT_VISIBLE_DEVICES"] = "" if device == "none" else device
+def _prepare_child_environment(
+    args: dict[str, Any], _role: str = "producer"
+) -> None:
+    devices = dict.fromkeys(
+        _role_device(args, current) for current in ("producer", "consumer")
+    )
+    os.environ["ASCEND_RT_VISIBLE_DEVICES"] = ",".join(
+        device for device in devices if device != "none"
+    )
 
 
-def _initialize_mooncake_device(args: dict[str, Any]) -> None:
-    _prepare_child_environment(args)
-    if args["mooncake_device"] != "none":
+def _initialize_mooncake_device(args: dict[str, Any], role: str) -> None:
+    _prepare_child_environment(args, role)
+    device = _role_device(args, role)
+    if device != "none":
         import torch_npu
 
-        torch_npu.npu.set_device(0)
+        visible = os.environ["ASCEND_RT_VISIBLE_DEVICES"].split(",")
+        torch_npu.npu.set_device(visible.index(device))
 
         # The serving plugin installs Ascend's aclrtMallocHost allocator before
         # LMCache creates its CPU slab. This standalone script imports LMCache
@@ -390,6 +425,24 @@ def _scheduler_lookup(
                 pass
 
 
+def _standalone_scheduler_lookup(args: dict[str, Any]) -> dict[str, Any]:
+    config = _load_config(args)
+    metadata = _metadata(args, config.chunk_size)
+    extra_config = config.extra_config or {}
+    page_keys = [
+        mooncake_page_key(key, args["num_layers"])
+        for representatives, _ in _keys(config, metadata, args).values()
+        for key in representatives
+    ]
+    return _scheduler_lookup(
+        config,
+        metadata,
+        args,
+        page_keys,
+        extra_config["master_server_address"],
+    )
+
+
 async def _producer(args: dict[str, Any], queue, stop: Event) -> None:
     backend = connector = None
     pages_by_group: list[LayerPageMemoryObj] = []
@@ -465,18 +518,6 @@ async def _consumer(args: dict[str, Any], queue) -> None:
         config, metadata, backend, connector = await _open_client(args)
         groups = {}
         keys_by_group = _keys(config, metadata, args)
-        page_keys = [
-            mooncake_page_key(key, args["num_layers"])
-            for representatives, _ in keys_by_group.values()
-            for key in representatives
-        ]
-        scheduler = _scheduler_lookup(
-            config,
-            metadata,
-            args,
-            page_keys,
-            connector.config.master_server_address,
-        )
         for group, (representatives, layer_keys) in keys_by_group.items():
             result = _lookup_group(
                 connector, representatives, layer_keys, args["num_layers"]
@@ -509,7 +550,6 @@ async def _consumer(args: dict[str, Any], queue) -> None:
                 "pid": os.getpid(),
                 "client": _client_config(connector),
                 "groups": groups,
-                "scheduler": scheduler,
             }
         )
     except BaseException as exc:
@@ -535,7 +575,7 @@ def _error(role: str, exc: BaseException) -> dict[str, Any]:
 
 def _producer_entry(args: dict[str, Any], queue, stop: Event) -> None:
     try:
-        _initialize_mooncake_device(args)
+        _initialize_mooncake_device(args, "producer")
     except BaseException as exc:
         queue.put(_error("producer", exc))
         return
@@ -544,11 +584,24 @@ def _producer_entry(args: dict[str, Any], queue, stop: Event) -> None:
 
 def _consumer_entry(args: dict[str, Any], queue) -> None:
     try:
-        _initialize_mooncake_device(args)
+        _initialize_mooncake_device(args, "consumer")
     except BaseException as exc:
         queue.put(_error("consumer", exc))
         return
     asyncio.run(_consumer(args, queue))
+
+
+def _scheduler_entry(args: dict[str, Any], queue) -> None:
+    try:
+        queue.put(
+            {
+                "role": "scheduler",
+                "status": "done",
+                "lookup": _standalone_scheduler_lookup(args),
+            }
+        )
+    except BaseException as exc:
+        queue.put(_error("scheduler", exc))
 
 
 def classify_result(producer: dict[str, Any], consumer: dict[str, Any]) -> str:
@@ -608,7 +661,7 @@ def main() -> int:
     shared_args["run_id"] = uuid.uuid4().hex
 
     # Spawned children must inherit visibility before importing the Ascend stack.
-    _prepare_child_environment(shared_args)
+    _prepare_child_environment(shared_args, "producer")
     context = mp.get_context("spawn")
     queue = context.Queue()
     stop = context.Event()
@@ -618,19 +671,35 @@ def main() -> int:
     consumer_process = context.Process(
         target=_consumer_entry, args=(shared_args, queue), name="consumer"
     )
+    scheduler_process = context.Process(
+        target=_scheduler_entry, args=(shared_args, queue), name="scheduler"
+    )
     producer_process.start()
     producer = _receive(queue, "producer", args.process_timeout)
     consumer = {"role": "consumer", "status": "skipped"}
     try:
         if producer.get("status") == "ready":
             time.sleep(args.consumer_delay)
+            os.environ["ASCEND_RT_VISIBLE_DEVICES"] = ""
+            scheduler_process.start()
+            scheduler_result = _receive(queue, "scheduler", args.process_timeout)
+            scheduler = scheduler_result.get(
+                "lookup",
+                {
+                    "error": scheduler_result.get("error", "scheduler failed"),
+                    "traceback": scheduler_result.get("traceback"),
+                },
+            )
+            scheduler_process.join(timeout=5)
+            _prepare_child_environment(shared_args, "consumer")
             consumer_process.start()
             consumer = _receive(queue, "consumer", args.process_timeout)
+            consumer["scheduler"] = scheduler
             consumer_process.join(timeout=5)
     finally:
         stop.set()
         producer_process.join(timeout=10)
-        for process in (consumer_process, producer_process):
+        for process in (consumer_process, scheduler_process, producer_process):
             if process.pid is not None and process.is_alive():
                 process.terminate()
                 process.join()
@@ -650,6 +719,7 @@ def main() -> int:
             "client_global_segment_size": args.client_global_segment_size,
             "client_protocol": _client_protocol(shared_args),
             "mooncake_device": args.mooncake_device,
+            "consumer_mooncake_device": _role_device(shared_args, "consumer"),
             "prefer_local_alloc": args.prefer_local_alloc,
         },
         "producer": producer,

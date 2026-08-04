@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # Standard
+import os
 from typing import Optional, Union
 
 # Third Party
@@ -30,22 +31,31 @@ class MooncakeLookupClient(LookupClientInterface):
         metadata: LMCacheMetadata,
         master_addr: str,
     ):
-        # Third Party
-        from mooncake.store import MooncakeDistributedStore
-
         self.config = config
         self.metadata = metadata
-        self.store = MooncakeDistributedStore()
-        status = self.store.setup(
-            "localhost",
-            "P2PHANDSHAKE",
-            0,
-            0,
-            "tcp",
-            "",
-            master_addr,
-        )
+        previous_force_tcp = os.environ.get("MC_FORCE_TCP")
+        os.environ["MC_FORCE_TCP"] = "1"
+        try:
+            # Third Party
+            from mooncake.store import MooncakeDistributedStore
+
+            self.store = MooncakeDistributedStore()
+            status = self.store.setup(
+                "localhost",
+                "P2PHANDSHAKE",
+                0,
+                0,
+                "tcp",
+                "",
+                master_addr,
+            )
+        finally:
+            if previous_force_tcp is None:
+                os.environ.pop("MC_FORCE_TCP", None)
+            else:
+                os.environ["MC_FORCE_TCP"] = previous_force_tcp
         if status not in (None, 0):
+            self.store.close()
             raise RuntimeError(f"Mooncake lookup setup failed: status={status}")
 
         # Initialize token database for processing tokens
@@ -162,5 +172,4 @@ class MooncakeLookupClient(LookupClientInterface):
         return True
 
     def close(self):
-        # nothing here
-        pass
+        self.store.close()

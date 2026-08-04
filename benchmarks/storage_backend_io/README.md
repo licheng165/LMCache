@@ -5,9 +5,9 @@
 `mooncake_page_lookup_repro.py` starts independent producer and consumer
 processes against an already-running Mooncake master. The producer publishes
 the same layer-merged, page-first keys used by layerwise MLA serving and remains
-alive while the consumer checks and retrieves them. The consumer runs both the
-worker connector lookup and vLLM's separate `MooncakeLookupClient` scheduler
-lookup. All test payloads remain in CPU memory and the benchmark launches no
+alive while the consumer checks and retrieves them. A third process independently
+runs vLLM's `MooncakeLookupClient` scheduler lookup. All test payloads remain
+in CPU memory and the benchmark launches no
 NPU kernels or tensors. Mooncake 0.3.8 Ascend builds nevertheless require a
 visible device and initialized runtime context while creating their transfer
 engine. The clients use the same Ascend pinned-host allocator installed by the
@@ -25,6 +25,7 @@ python3 benchmarks/storage_backend_io/mooncake_page_lookup_repro.py \
   --world-size 4 \
   --chunks 2 \
   --mooncake-device 0 \
+  --consumer-mooncake-device 1 \
   --consumer-delay 5 \
   --output-json /workspace/qzy/mooncake-page-lookup-repro.json
 ```
@@ -39,6 +40,10 @@ AscendDirect cannot register. Only the producer contributes a requested
 segment. The child initializes the NPU runtime but keeps benchmark payloads in
 pinned CPU memory. A newer Mooncake build that disables AscendDirect before
 allocation can run with `--mooncake-device none`, which selects TCP.
+On one Ascend host, producer and consumer use different physical devices. This
+matches separate serving workers and avoids the same-device ADXL failure seen in
+this Mooncake build. The scheduler remains an independent TCP-only metadata
+client.
 The output verdict is one of:
 
 - `ok`: both processes see the page keys and the retrieved bytes match.
@@ -67,6 +72,7 @@ PYTHONHASHSEED=0 \
 python3 benchmarks/storage_backend_io/mooncake_page_lookup_repro.py \
   --config /workspace/qzy/lmcache_config.yaml \
   --num-layers 36 --world-size 4 --chunks 2 \
+  --mooncake-device 0 --consumer-mooncake-device 1 \
   --client-global-segment-size 67108864 \
   --prefer-local-alloc
 ```
