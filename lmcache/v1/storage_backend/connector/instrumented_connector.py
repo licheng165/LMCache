@@ -176,7 +176,7 @@ class InstrumentedRemoteConnector(RemoteConnector):
 
     async def batched_get_layer_pages(
         self, keys: List[CacheEngineKey]
-    ) -> list[LayerPageMemoryObj]:
+    ) -> List[LayerPageMemoryObj]:
         """Delegate layer-page retrieval to the wrapped connector."""
         retrieve = getattr(self._connector, "batched_get_layer_pages")
         return await retrieve(keys)
