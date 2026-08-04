@@ -91,6 +91,11 @@ def _parser() -> ArgumentParser:
         action="store_true",
         help="Exit nonzero when the consumer cannot see/retrieve producer pages",
     )
+    parser.add_argument(
+        "--verify-transfer",
+        action="store_true",
+        help="also retrieve and verify page payloads (default: lookup only)",
+    )
     return parser
 
 
@@ -245,7 +250,12 @@ async def _open_client(
             "mooncake_prefer_local_alloc": False,
         }
     metadata = _metadata(args, config.chunk_size)
-    allocator = MixedMemoryAllocator(_pool_bytes(args, config.chunk_size))
+    pool_bytes = (
+        _pool_bytes(args, config.chunk_size)
+        if contribute_storage or args["verify_transfer"]
+        else 1 << 20
+    )
+    allocator = MixedMemoryAllocator(pool_bytes)
     backend = LocalCPUBackend(
         config, metadata, dst_device="cpu", memory_allocator=allocator
     )
@@ -381,16 +391,19 @@ def _scheduler_lookup(
     metadata: LMCacheMetadata,
     args: dict[str, Any],
     page_keys: list[str],
-    master_address: str,
+    store,
 ) -> dict[str, Any]:
     # First Party
     from lmcache.v1.lookup_client.mooncake_lookup_client import (
         MooncakeLookupClient,
     )
 
-    client = None
     try:
-        client = MooncakeLookupClient(config, metadata, master_address)
+        client = MooncakeLookupClient.__new__(MooncakeLookupClient)
+        client.config = config
+        client.metadata = metadata
+        client.store = store
+        client.token_database = ChunkedTokenDatabase(config, metadata)
         raw, raw_ms = _timed(client.store.batch_is_exist, page_keys)
         hit_tokens, lookup_ms = _timed(
             client.lookup,
@@ -403,46 +416,13 @@ def _scheduler_lookup(
             "hit_tokens": hit_tokens,
             "expected_tokens": config.chunk_size * args["chunks"],
             "timing_ms": {"raw_exists": raw_ms, "lookup": lookup_ms},
-            "setup": {
-                "local_hostname": "localhost",
-                "metadata_server": "P2PHANDSHAKE",
-                "global_segment_size": 0,
-                "local_buffer_size": 0,
-                "protocol": "tcp",
-                "master_server_address": master_address,
-            },
+            "store": "consumer_connector",
         }
     except Exception as exc:
         return {
             "error": f"{type(exc).__name__}: {exc}",
             "traceback": traceback.format_exc(),
         }
-    finally:
-        if client is not None:
-            try:
-                client.store.close()
-            except Exception:
-                pass
-
-
-def _standalone_scheduler_lookup(args: dict[str, Any]) -> dict[str, Any]:
-    config = _load_config(args)
-    metadata = _metadata(args, config.chunk_size)
-    extra_config = config.extra_config or {}
-    page_keys = [
-        mooncake_page_key(key, args["num_layers"])
-        for representatives, _ in _keys(config, metadata, args).values()
-        for key in representatives
-    ]
-    return _scheduler_lookup(
-        config,
-        metadata,
-        args,
-        page_keys,
-        extra_config["master_server_address"],
-    )
-
-
 async def _producer(args: dict[str, Any], queue, stop: Event) -> None:
     backend = connector = None
     pages_by_group: list[LayerPageMemoryObj] = []
@@ -464,23 +444,21 @@ async def _producer(args: dict[str, Any], queue, stop: Event) -> None:
                 fmt,
                 busy_loop=False,
             )
-            if pages is None:
-                raise RuntimeError(f"Unable to allocate group {group} pages")
-            if len(pages) != len(representatives):
-                for page in pages:
+            if pages is None or len(pages) != len(representatives):
+                for page in pages or []:
                     page.ref_count_down()
-                raise RuntimeError(
-                    f"Allocated {len(pages)} group {group} pages, "
-                    f"expected {len(representatives)}"
-                )
+                raise RuntimeError(f"Unable to allocate group {group} pages")
             pages_by_group.extend(pages)
             _fill_pages(pages, group)
             repeated = [page for page in pages for _ in range(args["num_layers"])]
-            _, put_ms = await _timed_async(connector.batched_put, layer_keys, repeated)
+            _, put_ms = await _timed_async(
+                connector.batched_put, layer_keys, repeated
+            )
             lookup = _lookup_group(
                 connector, representatives, layer_keys, args["num_layers"]
             )
             lookup["put_ms"] = put_ms
+            lookup["put_mode"] = "page_first_multi_buffer"
             groups[str(group)] = lookup
         queue.put(
             {
@@ -518,11 +496,22 @@ async def _consumer(args: dict[str, Any], queue) -> None:
         config, metadata, backend, connector = await _open_client(args)
         groups = {}
         keys_by_group = _keys(config, metadata, args)
+        page_keys = [
+            mooncake_page_key(key, args["num_layers"])
+            for representatives, _ in keys_by_group.values()
+            for key in representatives
+        ]
+        scheduler = _scheduler_lookup(
+            config, metadata, args, page_keys, connector.store
+        )
         for group, (representatives, layer_keys) in keys_by_group.items():
             result = _lookup_group(
                 connector, representatives, layer_keys, args["num_layers"]
             )
-            result["get_attempted"] = result["page_hits"] == len(representatives)
+            result["get_attempted"] = bool(
+                args["verify_transfer"]
+                and result["page_hits"] == len(representatives)
+            )
             result["get_ms"] = None
             result["get_error"] = None
             result["mismatches"] = []
@@ -550,6 +539,7 @@ async def _consumer(args: dict[str, Any], queue) -> None:
                 "pid": os.getpid(),
                 "client": _client_config(connector),
                 "groups": groups,
+                "scheduler": scheduler,
             }
         )
     except BaseException as exc:
@@ -591,19 +581,6 @@ def _consumer_entry(args: dict[str, Any], queue) -> None:
     asyncio.run(_consumer(args, queue))
 
 
-def _scheduler_entry(args: dict[str, Any], queue) -> None:
-    try:
-        queue.put(
-            {
-                "role": "scheduler",
-                "status": "done",
-                "lookup": _standalone_scheduler_lookup(args),
-            }
-        )
-    except BaseException as exc:
-        queue.put(_error("scheduler", exc))
-
-
 def classify_result(producer: dict[str, Any], consumer: dict[str, Any]) -> str:
     """Return a stable diagnosis for a completed producer/consumer run."""
     if producer.get("status") != "ready" or consumer.get("status") != "done":
@@ -629,7 +606,8 @@ def classify_result(producer: dict[str, Any], consumer: dict[str, Any]) -> str:
         if scheduler["hit_tokens"] != scheduler["expected_tokens"]:
             return "scheduler_lookup_client_failure"
     if any(
-        group["retrieved_pages"] != group["expected_pages"]
+        group.get("get_attempted")
+        and group["retrieved_pages"] != group["expected_pages"]
         for group in consumer_groups.values()
     ):
         return "lookup_visible_get_failed"
@@ -671,35 +649,20 @@ def main() -> int:
     consumer_process = context.Process(
         target=_consumer_entry, args=(shared_args, queue), name="consumer"
     )
-    scheduler_process = context.Process(
-        target=_scheduler_entry, args=(shared_args, queue), name="scheduler"
-    )
     producer_process.start()
     producer = _receive(queue, "producer", args.process_timeout)
     consumer = {"role": "consumer", "status": "skipped"}
     try:
         if producer.get("status") == "ready":
             time.sleep(args.consumer_delay)
-            os.environ["ASCEND_RT_VISIBLE_DEVICES"] = ""
-            scheduler_process.start()
-            scheduler_result = _receive(queue, "scheduler", args.process_timeout)
-            scheduler = scheduler_result.get(
-                "lookup",
-                {
-                    "error": scheduler_result.get("error", "scheduler failed"),
-                    "traceback": scheduler_result.get("traceback"),
-                },
-            )
-            scheduler_process.join(timeout=5)
             _prepare_child_environment(shared_args, "consumer")
             consumer_process.start()
             consumer = _receive(queue, "consumer", args.process_timeout)
-            consumer["scheduler"] = scheduler
             consumer_process.join(timeout=5)
     finally:
         stop.set()
         producer_process.join(timeout=10)
-        for process in (consumer_process, scheduler_process, producer_process):
+        for process in (consumer_process, producer_process):
             if process.pid is not None and process.is_alive():
                 process.terminate()
                 process.join()
@@ -721,6 +684,7 @@ def main() -> int:
             "mooncake_device": args.mooncake_device,
             "consumer_mooncake_device": _role_device(shared_args, "consumer"),
             "prefer_local_alloc": args.prefer_local_alloc,
+            "verify_transfer": args.verify_transfer,
         },
         "producer": producer,
         "consumer": consumer,

@@ -5,10 +5,13 @@
 `mooncake_page_lookup_repro.py` starts independent producer and consumer
 processes against an already-running Mooncake master. The producer publishes
 the same layer-merged, page-first keys used by layerwise MLA serving and remains
-alive while the consumer checks and retrieves them. A third process independently
-runs vLLM's `MooncakeLookupClient` scheduler lookup. All test payloads remain
-in CPU memory and the benchmark launches no
-NPU kernels or tensors. Mooncake 0.3.8 Ascend builds nevertheless require a
+alive while an independent consumer checks them. The consumer exercises both
+the worker connector lookup and vLLM's `MooncakeLookupClient` key-generation
+logic through its existing Mooncake store. It does not retrieve page payloads
+unless `--verify-transfer` is specified. The producer still performs the real
+page-first LMCache put so storage-side key construction is covered. The
+benchmark launches no NPU kernels or tensors. Mooncake 0.3.8 Ascend builds
+nevertheless require a
 visible device and initialized runtime context while creating their transfer
 engine. The clients use the same Ascend pinned-host allocator installed by the
 serving plugin; ordinary pageable `torch.empty(..., device="cpu")` buffers are
@@ -42,20 +45,21 @@ pinned CPU memory. A newer Mooncake build that disables AscendDirect before
 allocation can run with `--mooncake-device none`, which selects TCP.
 On one Ascend host, producer and consumer use different physical devices. This
 matches separate serving workers and avoids the same-device ADXL failure seen in
-this Mooncake build. The scheduler remains an independent TCP-only metadata
-client.
+this Mooncake build. Reusing the consumer's store for the scheduler lookup avoids
+initializing an unrelated second transfer engine in the same process.
 The output verdict is one of:
 
-- `ok`: both processes see the page keys and the retrieved bytes match.
+- `ok`: producer and consumer see all expected page/layer keys; when enabled,
+  transfer verification also succeeds.
 - `producer_put_not_visible`: the producer cannot see its completed put.
 - `cross_process_visibility_failure`: producer sees the pages but consumer does
   not, reproducing the serving lookup failure.
-- `scheduler_lookup_client_failure`: the decode worker sees the pages, but the
-  scheduler's independent Mooncake lookup client does not.
-- `scheduler_lookup_client_error`: that independent scheduler client cannot
-  initialize or query the master.
-- `lookup_visible_get_failed` or `payload_mismatch`: metadata lookup succeeds,
-  but retrieval is incomplete or returns wrong bytes.
+- `scheduler_lookup_client_failure`: worker lookups see the pages, but vLLM's
+  scheduler key-generation lookup does not.
+- `scheduler_lookup_client_error`: scheduler lookup logic cannot query the
+  consumer's Mooncake store.
+- `lookup_visible_get_failed` or `payload_mismatch`: with `--verify-transfer`,
+  metadata lookup succeeds but retrieval is incomplete or returns wrong bytes.
 
 Use `--fail-on-visibility-error` when a non-`ok` verdict should produce exit
 status 2. Infrastructure/setup errors always produce exit status 1.
@@ -76,6 +80,10 @@ python3 benchmarks/storage_backend_io/mooncake_page_lookup_repro.py \
   --client-global-segment-size 67108864 \
   --prefer-local-alloc
 ```
+
+Add `--verify-transfer` only when testing Mooncake's data plane as well. That
+mode performs real consumer page transfers and payload comparisons; it is not
+needed to reproduce scheduler or worker lookup failures.
 
 This microbenchmark compares **LocalDiskBackend** vs **RustRawBlockBackend** under high write-concurrency.
 

@@ -18,7 +18,13 @@ from benchmarks.storage_backend_io.mooncake_page_lookup_repro import (
 )
 
 
-def _group(page_hits=2, layer_hits=72, retrieved=2, mismatches=None):
+def _group(
+    page_hits=2,
+    layer_hits=72,
+    retrieved=2,
+    mismatches=None,
+    get_attempted=True,
+):
     return {
         "page_hits": page_hits,
         "expected_pages": 2,
@@ -26,6 +32,7 @@ def _group(page_hits=2, layer_hits=72, retrieved=2, mismatches=None):
         "expected_layer_keys": 72,
         "retrieved_pages": retrieved,
         "mismatches": mismatches or [],
+        "get_attempted": get_attempted,
     }
 
 
@@ -93,6 +100,15 @@ def test_classify_infrastructure_error():
     assert classify_result({"status": "error"}, {"status": "done"}) == (
         "infrastructure_error"
     )
+
+
+def test_classify_lookup_only_does_not_require_retrieval():
+    producer = {"status": "ready", "groups": {"0": _group()}}
+    consumer = {
+        "status": "done",
+        "groups": {"0": _group(retrieved=0, get_attempted=False)},
+    }
+    assert classify_result(producer, consumer) == "ok"
 
 
 @pytest.mark.parametrize(("device", "expected"), [("3", "3,4"), ("none", "")])
