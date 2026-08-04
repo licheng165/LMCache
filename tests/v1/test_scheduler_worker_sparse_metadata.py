@@ -161,6 +161,52 @@ def test_dsa_cold_compact_async_requires_complete_prompt_hit() -> None:
     assert not hasattr(partial_spec, "dsa_release_frontier")
 
 
+def test_dsa_cold_compact_is_skipped_when_frontier_below_scratch_capacity() -> None:
+    """Regression: 0804-4. Cold compact materializes the prefix in indexer
+    blocks that only the SFA compact-scratch remap can read, and the remap
+    requires a frontier of zero or >= scratch_capacity. A short prompt would
+    resume with the raw unclamped frontier (hit_tokens - 1, e.g. 49), which
+    the staged-SFA route rejects as FATAL frontier_too_short. Prompts whose
+    cold-compact frontier would land below scratch_capacity must fall back to
+    the normal dense-prefix load path instead."""
+    impl = _make_scheduler_impl()
+    impl.config.enable_dsa_cold_compact_load = True
+    impl.config.dsa_two_groups = True
+    impl.config.enable_shared_cpu_cache = True
+    impl.config.min_retrieve_tokens = 0
+    lookup_client = MagicMock()
+    lookup_client.lookup_cache.return_value = 50
+    impl._manager = SimpleNamespace(lookup_client=lookup_client)
+    request = SimpleNamespace(request_id="short-prompt", num_tokens=50)
+
+    assert impl.get_num_new_matched_tokens(request, 0) == 49
+    assert not impl.should_load_kv_async(request.request_id)
+    load_spec = impl.load_specs[request.request_id]
+    assert not hasattr(load_spec, "dsa_cold_compact_load")
+    assert not hasattr(load_spec, "dsa_release_frontier")
+    assert load_spec.dsa_committed_end == 0
+    assert load_spec.dsa_scratch_capacity == 4096
+
+    # The band between zero and scratch_capacity must also skip cold compact:
+    # the raw frontier (2999) is below the scratch capacity (4096).
+    lookup_client.lookup_cache.return_value = 3000
+    mid = SimpleNamespace(request_id="mid-prompt", num_tokens=3000)
+    assert impl.get_num_new_matched_tokens(mid, 0) == 2999
+    assert not impl.should_load_kv_async(mid.request_id)
+    assert not hasattr(impl.load_specs[mid.request_id], "dsa_cold_compact_load")
+    assert impl.load_specs[mid.request_id].dsa_committed_end == 2999 // 256 * 256
+
+    # A long prompt whose frontier reaches scratch_capacity still engages the
+    # compact load (see test_dsa_cold_compact_async_requires_complete_prompt_hit).
+    lookup_client.lookup_cache.return_value = 8192
+    long = SimpleNamespace(request_id="long-prompt", num_tokens=8192)
+    assert impl.get_num_new_matched_tokens(long, 0) == 8191
+    assert impl.should_load_kv_async(long.request_id)
+    assert getattr(
+        impl.load_specs[long.request_id], "dsa_cold_compact_load"
+    )
+
+
 def test_dsa_cold_compact_is_disabled_with_vllm_prefix_caching() -> None:
     impl = _make_scheduler_impl()
     impl.config.enable_dsa_cold_compact_load = True

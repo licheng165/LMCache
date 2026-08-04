@@ -8063,6 +8063,13 @@ class LMCacheConnectorV1Impl:
             and need_to_allocate > 0
             and cdiv(num_external_hit_tokens, self._block_size)
             == cdiv(need_to_allocate, self._block_size)
+            # The compact load materializes the prefix in indexer blocks that
+            # only the SFA compact-scratch remap can read. That machinery
+            # requires a frontier of zero or >= scratch_capacity; a smaller
+            # frontier (e.g. a short prompt) is rejected by the staged-SFA
+            # route (frontier_too_short FATAL). Such prompts take the normal
+            # dense-prefix load path instead (short-context dense fast-path).
+            and num_external_hit_tokens - 1 >= self._dsa_scratch_capacity
         )
         below_min_retrieve = (
             not dsa_prefix_hit
