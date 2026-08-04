@@ -196,6 +196,32 @@ def test_instrumented_put_preserves_connector_failure_policy(
     assert memory_obj.ref_count == 0
 
 
+def test_instrumented_connector_delegates_layer_page_operations() -> None:
+    keys = [_layer_key(1, 0)]
+    pages = [_MemoryObj()]
+
+    class _PageConnector:
+        @staticmethod
+        def batched_contains_layer_pages(
+            actual_keys: list[LayerCacheEngineKey],
+        ) -> int:
+            assert actual_keys == keys
+            return 1
+
+        @staticmethod
+        async def batched_get_layer_pages(
+            actual_keys: list[LayerCacheEngineKey],
+        ) -> list[_MemoryObj]:
+            assert actual_keys == keys
+            return pages
+
+    connector = object.__new__(InstrumentedRemoteConnector)
+    connector._connector = _PageConnector()
+
+    assert connector.batched_contains_layer_pages(keys) == 1
+    assert asyncio.run(connector.batched_get_layer_pages(keys)) == pages
+
+
 def test_mooncake_requires_put_completion() -> None:
     connector = object.__new__(MooncakestoreConnector)
     assert connector.requires_put_completion()
