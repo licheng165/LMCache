@@ -738,6 +738,52 @@ class TestDisaggSpecOwnership:
         assert tracker.disagg_spec is not None
         assert tracker.disagg_spec.receiver_id == "decode-host9000"
 class TestBuildConnectorMetaSparseSyntheticLoadSpec:
+    def test_cold_compact_resume_marker_is_one_shot(self) -> None:
+        impl = _make_scheduler_impl()
+        req_id = "cold-resume"
+        prompt_len = 8193
+        request = SimpleNamespace(
+            req_id=req_id,
+            prompt_token_ids=list(range(prompt_len)),
+            block_ids=list(range(513)),
+            num_computed_tokens=prompt_len - 1,
+            sampling_params=SimpleNamespace(extra_args=None),
+        )
+        impl._dsa_cold_loaded_req_ids = {req_id}
+        impl.load_specs[req_id] = LoadSpec(
+            vllm_cached_tokens=0,
+            lmcache_cached_tokens=prompt_len,
+            can_load=True,
+            dsa_committed_end=prompt_len - 1,
+        )
+        setattr(impl.load_specs[req_id], "dsa_cold_compact_load", True)
+
+        first = impl.build_connector_meta(
+            StubSchedulerOutput(
+                finished_req_ids=set(),
+                scheduled_new_reqs=[request],
+                scheduled_cached_reqs=StubCachedRequestData([], [], []),
+                num_scheduled_tokens={req_id: 1},
+            )
+        ).requests[0]
+
+        assert first.is_sparse_decode
+        assert first.load_spec.dsa_committed_end == prompt_len - 1
+        assert first.load_spec.dsa_cold_compact_resume is True
+        assert not hasattr(first.load_spec, "dsa_cold_compact_load")
+
+        second = impl.build_connector_meta(
+            StubSchedulerOutput(
+                finished_req_ids=set(),
+                scheduled_new_reqs=[],
+                scheduled_cached_reqs=StubCachedRequestData(
+                    [req_id], [[prompt_len]], [[]]
+                ),
+                num_scheduled_tokens={req_id: 1},
+            )
+        ).requests[0]
+        assert not hasattr(second.load_spec, "dsa_cold_compact_resume")
+
     def test_first_decode_step_keeps_short_prompt_resident(self) -> None:
         impl = _make_scheduler_impl()
         impl._decode_window_save_window_size = 256
