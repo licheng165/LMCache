@@ -142,6 +142,138 @@ def test_tensor_allocator(use_paging):
     allocator.close()
 
 
+def test_tensor_batched_allocate_contiguous_and_fragmented() -> None:
+    block_size = 4096
+
+    class TracingAllocator(TensorMemoryAllocator):
+        def __init__(self, tensor: torch.Tensor) -> None:
+            super().__init__(tensor)
+            self.slice_calls: list[tuple[int, int]] = []
+
+        def _get_buffer_slice(self, start: int, size: int) -> torch.Tensor:
+            self.slice_calls.append((start, size))
+            return super()._get_buffer_slice(start, size)
+
+    allocator = TracingAllocator(torch.zeros(block_size * 5, dtype=torch.uint8))
+    assert allocator.batched_allocate(torch.Size([block_size]), torch.uint8, 0) == []
+    assert allocator.slice_calls == []
+    contiguous = allocator.batched_allocate(torch.Size([block_size]), torch.uint8, 3)
+    assert contiguous is not None
+    assert allocator.slice_calls == [(0, block_size * 3)]
+    assert [obj.meta.address for obj in contiguous] == [0, block_size, block_size * 2]
+    allocator.batched_free(contiguous)
+
+    allocated = [
+        allocator.allocate(torch.Size([block_size]), torch.uint8) for _ in range(5)
+    ]
+    allocated_objs = [obj for obj in allocated if obj is not None]
+    assert len(allocated_objs) == 5
+    allocator.free(allocated_objs[0])
+    allocator.free(allocated_objs[2])
+    allocator.slice_calls.clear()
+
+    fragmented = allocator.batched_allocate(torch.Size([block_size]), torch.uint8, 2)
+    assert fragmented is not None
+    assert allocator.slice_calls == [(0, block_size), (block_size * 2, block_size)]
+
+    allocator.batched_free(fragmented)
+    allocator.batched_free([allocated_objs[index] for index in (1, 3, 4)])
+    assert allocator.memcheck()
+
+
+def test_tensor_batched_allocation_provenance_validates_tail_size() -> None:
+    allocator = TensorMemoryAllocator(torch.zeros(16384, dtype=torch.uint8))
+    objects = allocator.batched_allocate(
+        torch.Size([1024]),
+        torch.uint8,
+        3,
+        MemoryFormat.KV_MLA_LATENT_FMT,
+    )
+    assert objects is not None
+
+    validation_cache = {}
+    expected = {
+        "parent": allocator,
+        "slab_size": allocator.buffer.numel(),
+        "dtype": torch.uint8,
+        "fmt": MemoryFormat.KV_MLA_LATENT_FMT,
+    }
+    assert all(
+        obj.is_trusted_allocation_batch_member(validation_cache, **expected)
+        for obj in objects
+    )
+    assert len(validation_cache) == 1
+
+    logical_size = objects[-1].get_size()
+    objects[-1].group_prefix_sum = (0, objects[-1].meta.phy_size + 1)
+    assert not objects[-1].is_trusted_allocation_batch_member(
+        validation_cache, **expected
+    )
+    objects[-1].group_prefix_sum = (0, logical_size)
+    objects[-1].meta.dtype = torch.float16
+    assert not objects[-1].is_trusted_allocation_batch_member(
+        validation_cache, **expected
+    )
+    objects[-1].meta.dtype = torch.uint8
+    objects[-1].parent_allocator = None
+    assert not objects[-1].is_trusted_allocation_batch_member(
+        validation_cache, **expected
+    )
+    objects[-1].parent_allocator = allocator
+    assert not objects[0].is_trusted_allocation_batch_member(
+        {},
+        **{**expected, "fmt": MemoryFormat.KV_DSA_INDEX_FMT},
+    )
+
+    allocator.batched_free(objects)
+    assert not any(
+        obj.is_trusted_allocation_batch_member(validation_cache, **expected)
+        for obj in objects
+    )
+
+
+def test_tensor_address_backed_batch_preserves_tensor_access() -> None:
+    block_size = 4096
+    buffer = torch.zeros(block_size * 3, dtype=torch.uint8)
+    allocator = TensorMemoryAllocator(buffer)
+    objects = allocator.batched_allocate_address_backed(
+        torch.Size([block_size]), torch.uint8, 3
+    )
+    assert objects is not None
+    assert all(obj.has_tensor_storage for obj in objects)
+    assert len({id(obj.group_prefix_sum) for obj in objects}) == 1
+    assert [obj.data_ptr for obj in objects] == [
+        buffer.data_ptr() + obj.meta.address for obj in objects
+    ]
+
+    objects[-1].resize_raw_view(1024)
+    objects[-1].meta.shape = torch.Size([1024])
+    objects[-1].meta.shapes = [torch.Size([1024])]
+    objects[-1].refresh_metadata_view()
+    assert objects[0].get_size() == block_size
+    raw_tensor = objects[-1].raw_tensor
+    assert raw_tensor is not None and raw_tensor.numel() == 1024
+    assert objects[-1].raw_data is raw_tensor
+    assert objects[-1].tensor is not None
+    assert objects[-1].tensor.shape == torch.Size([1024])
+    with pytest.raises(ValueError, match="Invalid raw tensor view size"):
+        objects[-1].resize_raw_view(2048)
+
+    allocator.batched_free(objects)
+    assert allocator.memcheck()
+
+
+def test_mixed_address_backed_batch_preserves_format_validation() -> None:
+    allocator = object.__new__(MixedMemoryAllocator)
+    allocator.pin_allocator = TensorMemoryAllocator(
+        torch.zeros(4096, dtype=torch.uint8)
+    )
+    with pytest.raises(ValueError, match="Unsupported memory format"):
+        allocator.batched_allocate_address_backed(
+            torch.Size([1024]), torch.uint8, 1, MemoryFormat.UNDEFINED
+        )
+
+
 def test_paged_allocator_refreshes_size_for_reused_partial_pages():
     full_shape = torch.Size([32, 8])
     partial_shape = torch.Size([19, 8])
@@ -562,6 +694,47 @@ def test_tensor_memory_obj_pin_monitor_integration():
 
     memory_obj.unpin()
     assert pin_monitor.get_monitored_count() == initial_count  # Fully unregistered
+
+
+def test_tensor_memory_obj_batch_pin_is_transactional(monkeypatch):
+    allocator = TensorMemoryAllocator(torch.empty(16384, dtype=torch.uint8))
+    memory_objs = allocator.batched_allocate(
+        torch.Size([16]),
+        torch.float32,
+        3,
+    )
+    assert memory_objs is not None
+
+    registered = []
+    monitor = type(
+        "_Monitor",
+        (),
+        {
+            "on_pin_many": lambda _self, objs: registered.append(tuple(objs)),
+            "on_unpin": lambda _self, _obj: None,
+        },
+    )()
+    monkeypatch.setattr(PinMonitor, "GetOrCreate", lambda _config=None: monitor)
+    initial_pinned = TensorMemoryObj.monitor.pinned_memory_objs_count
+
+    TensorMemoryObj.pin_many(memory_objs)
+    assert len(registered) == 1
+    assert {id(obj) for obj in registered[0]} == {id(obj) for obj in memory_objs}
+    assert all(obj.metadata.pin_count == 1 for obj in memory_objs)
+
+    for obj in memory_objs:
+        obj.unpin()
+
+    monitor.on_pin_many = lambda _objs: (_ for _ in ()).throw(
+        RuntimeError("registration failed")
+    )
+    with pytest.raises(RuntimeError, match="registration failed"):
+        TensorMemoryObj.pin_many(memory_objs)
+    assert all(obj.metadata.pin_count == 0 for obj in memory_objs)
+    assert TensorMemoryObj.monitor.pinned_memory_objs_count == initial_pinned
+
+    for obj in memory_objs:
+        obj.ref_count_down()
 
 
 # =============================================================================

@@ -219,6 +219,9 @@ class TestAscendEngineWarmColdMetadata:
         assert AscendLMCacheEngine._has_retrieve_data_cache(
             None, cached_memory_objs, 2
         )
+        assert AscendLMCacheEngine._has_retrieve_data_cache(
+            [[], []], cached_memory_objs, 2
+        )
 
     def test_metadata_refresh_when_prefix_grows(self) -> None:
         assert AscendLMCacheEngine._needs_retrieve_metadata_refresh(

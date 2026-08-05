@@ -9,6 +9,9 @@ from typing import Optional
 # Third Party
 import torch
 
+# First Party
+from lmcache.v1.memory_management import MemoryObj
+
 
 @dataclass(frozen=True, slots=True)
 class PreparedSparseSourceLayer:
@@ -16,6 +19,7 @@ class PreparedSparseSourceLayer:
 
     tensors: tuple[torch.Tensor, ...]
     chunk_ptrs_npu: torch.Tensor
+    memory_objs: tuple[MemoryObj, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -36,6 +40,7 @@ def build_prepared_sparse_source(
     total_tokens: int,
     chunk_token_counts: Optional[Sequence[int]] = None,
     expected_pointer_device: Optional[torch.device] = None,
+    cached_memory_objs: Optional[Sequence[Sequence[MemoryObj]]] = None,
 ) -> Optional[PreparedSparseSource]:
     """Seal a complete layer cache into immutable hot-path source metadata.
 
@@ -46,6 +51,9 @@ def build_prepared_sparse_source(
         total_tokens: Number of valid source tokens represented by the cache.
         chunk_token_counts: Request-owned token coverage for each CPU chunk.
         expected_pointer_device: Accelerator device that owns pointer tables.
+        cached_memory_objs: Optional pointer-first CPU chunk owners. Complete
+            owner layers can replace ``cached_tensors`` without constructing
+            per-chunk typed views.
 
     Returns:
         A prepared source, or ``None`` while bootstrap data is incomplete.
@@ -60,7 +68,11 @@ def build_prepared_sparse_source(
     """
     if num_layers <= 0 or total_tokens <= 0:
         return None
-    if len(cached_tensors) != num_layers:
+    tensors_complete = len(cached_tensors) == num_layers
+    owners_complete = (
+        cached_memory_objs is not None and len(cached_memory_objs) == num_layers
+    )
+    if not tensors_complete and not owners_complete:
         return None
     if len(cached_chunk_ptrs_npu) != num_layers:
         return None
@@ -77,15 +89,30 @@ def build_prepared_sparse_source(
     layers: list[PreparedSparseSourceLayer] = []
     pointer_device: Optional[torch.device] = None
     for layer_id in range(num_layers):
-        layer_tensors = cached_tensors[layer_id]
+        layer_tensors = cached_tensors[layer_id] if tensors_complete else ()
         if isinstance(layer_tensors, torch.Tensor):
             raise TypeError(
                 "Prepared sparse source layers must contain tensor sequences: "
                 f"layer_id={layer_id}"
             )
         tensors = tuple(layer_tensors)
+        memory_objs = (
+            tuple(cached_memory_objs[layer_id])
+            if cached_memory_objs is not None and owners_complete
+            else ()
+        )
+        chunk_counts = {len(chunks) for chunks in (tensors, memory_objs) if chunks}
+        if not chunk_counts:
+            return None
+        if len(chunk_counts) != 1:
+            raise ValueError(
+                "Prepared sparse tensor and MemoryObj caches disagree: "
+                f"layer_id={layer_id}, tensors={len(tensors)}, "
+                f"memory_objs={len(memory_objs)}"
+            )
+        chunk_count = chunk_counts.pop()
         chunk_ptrs_npu = cached_chunk_ptrs_npu[layer_id]
-        if not tensors or chunk_ptrs_npu is None:
+        if chunk_ptrs_npu is None:
             return None
         if any(not isinstance(tensor, torch.Tensor) for tensor in tensors):
             raise TypeError(
@@ -108,17 +135,17 @@ def build_prepared_sparse_source(
                 "Prepared sparse pointer cache must be contiguous: "
                 f"layer_id={layer_id}, stride={chunk_ptrs_npu.stride()}"
             )
-        if int(chunk_ptrs_npu.numel()) != len(tensors):
+        if int(chunk_ptrs_npu.numel()) != chunk_count:
             raise ValueError(
                 "Prepared sparse pointer coverage does not match CPU chunks: "
                 f"layer_id={layer_id}, pointers={chunk_ptrs_npu.numel()}, "
-                f"chunks={len(tensors)}"
+                f"chunks={chunk_count}"
             )
-        if normalized_chunk_counts and len(normalized_chunk_counts) != len(tensors):
+        if normalized_chunk_counts and len(normalized_chunk_counts) != chunk_count:
             raise ValueError(
                 "Prepared sparse chunk coverage does not match CPU chunks: "
                 f"layer_id={layer_id}, coverage={len(normalized_chunk_counts)}, "
-                f"chunks={len(tensors)}"
+                f"chunks={chunk_count}"
             )
         if pointer_device is None:
             pointer_device = chunk_ptrs_npu.device
@@ -148,6 +175,7 @@ def build_prepared_sparse_source(
             PreparedSparseSourceLayer(
                 tensors=tensors,
                 chunk_ptrs_npu=chunk_ptrs_npu,
+                memory_objs=memory_objs,
             )
         )
 

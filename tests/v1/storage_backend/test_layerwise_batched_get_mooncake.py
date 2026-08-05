@@ -222,6 +222,28 @@ class TestMooncakeConnectorCapabilities:
         assert conn.support_batched_get() is True
         assert conn.support_batched_get_non_blocking() is False
 
+    def test_lmcache_config_exposes_page_first_multi_buffer(self):
+        from lmcache.v1.storage_backend.connector.mooncakestore_connector import (
+            MooncakeStoreConfig,
+        )
+
+        config = SimpleNamespace(
+            extra_config={
+                "local_hostname": "decoder",
+                "metadata_server": "127.0.0.1:8080",
+                "master_server_address": "127.0.0.1:50051",
+                "protocol": "rdma",
+                "device_name": "mlx5_0",
+                "mooncake_page_first_multi_buffer": True,
+            }
+        )
+
+        mooncake_config = MooncakeStoreConfig.load_from_lmcache_config(config)
+
+        assert mooncake_config.protocol == "rdma"
+        assert mooncake_config.device_name == "mlx5_0"
+        assert mooncake_config.page_first_multi_buffer is True
+
 
 class TestStorageManagerLayerwiseHelpers:
     def test_normalize_layerwise_prefix_releases_after_first_none(
@@ -491,7 +513,7 @@ class TestMooncakeConnectorBatchedContains:
         conn.config = SimpleNamespace(experimental_sampled_layerwise_lookup=False)
         assert not conn.support_batched_contains()
 
-        conn.config.experimental_sampled_layerwise_lookup = True
+        conn._sampled_layerwise_lookup = True
         assert conn.support_batched_contains()
         assert conn.batched_contains(keys) == 2
         assert conn.store.keys == [key.to_string() for key in keys]

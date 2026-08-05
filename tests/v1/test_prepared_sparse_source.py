@@ -1,11 +1,15 @@
 # SPDX-License-Identifier: Apache-2.0
 
+# Standard
+from unittest.mock import MagicMock
+
 # Third Party
 import pytest
 import torch
 
 # First Party
 from lmcache.v1.gpu_connector.sparse import build_prepared_sparse_source
+from lmcache.v1.memory_management import MemoryObj
 
 
 def test_build_prepared_sparse_source_seals_complete_layers() -> None:
@@ -44,6 +48,44 @@ def test_build_prepared_sparse_source_waits_for_complete_bootstrap() -> None:
     )
 
     assert source is None
+
+
+def test_build_prepared_sparse_source_accepts_memory_obj_owners() -> None:
+    owners = [
+        [MagicMock(spec=MemoryObj), MagicMock(spec=MemoryObj)],
+        [MagicMock(spec=MemoryObj), MagicMock(spec=MemoryObj)],
+    ]
+    pointer_tables = [
+        torch.tensor([101, 102], dtype=torch.int64),
+        torch.tensor([201, 202], dtype=torch.int64),
+    ]
+
+    source = build_prepared_sparse_source(
+        [],
+        pointer_tables,
+        num_layers=2,
+        total_tokens=6,
+        chunk_token_counts=(4, 2),
+        cached_memory_objs=owners,
+    )
+
+    assert source is not None
+    assert source.layers[0].tensors == ()
+    assert source.layers[0].memory_objs == tuple(owners[0])
+    assert source.layers[1].chunk_ptrs_npu is pointer_tables[1]
+
+
+def test_build_prepared_sparse_source_rejects_owner_pointer_mismatch() -> None:
+    with pytest.raises(ValueError, match="pointer coverage"):
+        build_prepared_sparse_source(
+            [],
+            [torch.tensor([101], dtype=torch.int64)],
+            num_layers=1,
+            total_tokens=6,
+            cached_memory_objs=[
+                [MagicMock(spec=MemoryObj), MagicMock(spec=MemoryObj)]
+            ],
+        )
 
 
 def test_build_prepared_sparse_source_rejects_partial_pointer_coverage() -> None:

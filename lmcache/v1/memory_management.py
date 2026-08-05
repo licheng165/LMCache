@@ -4,7 +4,7 @@ from collections import deque
 from contextlib import nullcontext
 from dataclasses import dataclass
 from enum import Enum, auto
-from functools import wraps
+from functools import cached_property, wraps
 from typing import Any, List, Optional, Tuple, Union
 import abc
 import ctypes
@@ -32,6 +32,19 @@ else:
 
 
 logger = init_logger(__name__)
+
+
+def _group_prefix_sums(
+    shapes: Optional[list[torch.Size]],
+    dtypes: Optional[list[torch.dtype]],
+    size: int,
+) -> tuple[int, ...]:
+    if shapes is None or dtypes is None:
+        return (0, size)
+    prefix = [0]
+    for shape, dtype in zip(shapes, dtypes, strict=True):
+        prefix.append(prefix[-1] + shape.numel() * dtype.itemsize)
+    return tuple(prefix)
 
 
 # Helper functions for thread safety
@@ -193,6 +206,40 @@ class MemoryObjMetadata:
         if self.shapes is not None and self.dtypes is not None:
             return get_size_bytes(self.shapes, self.dtypes)
         return self.shape.numel() * self.dtype.itemsize  # type: ignore
+
+
+@dataclass(frozen=True, slots=True)
+class _TensorAllocationBatch:
+    """Immutable provenance for one homogeneous tensor allocation."""
+
+    parent: Any
+    slab_size: int
+    dtype: torch.dtype
+    fmt: MemoryFormat
+    addresses: tuple[int, ...]
+    physical_size: int
+    member_ids: tuple[int, ...]
+
+    def matches(
+        self,
+        parent: Any,
+        slab_size: int,
+        dtype: torch.dtype,
+        fmt: MemoryFormat,
+    ) -> bool:
+        return (
+            self.parent is parent
+            and self.slab_size == slab_size
+            and self.dtype == dtype
+            and self.fmt == fmt
+            and len(self.addresses) == len(self.member_ids)
+            and self.physical_size > 0
+            and all(
+                address >= 0
+                and address + self.physical_size <= slab_size
+                for address in self.addresses
+            )
+        )
 
 
 class MemoryObj(metaclass=abc.ABCMeta):
@@ -493,38 +540,104 @@ def _allocate_gpu_memory(
 
 class TensorMemoryObj(MemoryObj):
     """
-    Wraps a raw flat tensor with some metadata
+    Wraps eager or address-backed tensor storage with metadata.
     """
 
     monitor = LMCStatsMonitor.GetOrCreate()
 
     def __init__(
         self,
-        raw_data: torch.Tensor,
+        raw_data: Optional[torch.Tensor],
         metadata: MemoryObjMetadata,
         parent_allocator: Optional["MemoryAllocatorInterface"],
+        group_prefix_sum: Optional[tuple[int, ...]] = None,
+        raw_view_size: Optional[int] = None,
     ):
         assert metadata.dtype is not None, "dtype must be specified for TensorMemoryObj"
         super().__init__(metadata)
-        self.raw_data = raw_data
+        if raw_data is not None:
+            self.raw_data = raw_data
+        self._raw_view_size = (
+            raw_view_size
+            if raw_view_size is not None
+            else raw_data.numel() * raw_data.element_size()
+            if raw_data is not None
+            else metadata.phy_size
+        )
         self.valid = True
         self.lock = threading.Lock()
         self.parent_allocator = parent_allocator
-        self.group_prefix_sum: list[int] = []
-        self.refresh_metadata_view()
+        self.group_prefix_sum: tuple[int, ...] = (
+            group_prefix_sum if group_prefix_sum is not None else ()
+        )
+        self._allocation_batch: Optional[_TensorAllocationBatch] = None
+        self._allocation_batch_index = -1
+        if group_prefix_sum is None:
+            self.refresh_metadata_view()
 
     def refresh_metadata_view(self) -> None:
         # Calculate the prefix sum of the group sizes. If there are two
         # groups, the prefix sum will be:
         # [0, size_of_group_1, size_of_group_1 + size_of_group_2].
-        self.group_prefix_sum = [0]
-        if self.meta.shapes is not None and self.meta.dtypes is not None:
-            size_in_bytes = 0
-            for shape, dtype in zip(self.meta.shapes, self.meta.dtypes, strict=True):
-                size_in_bytes += shape.numel() * dtype.itemsize
-                self.group_prefix_sum.append(size_in_bytes)
-        else:
-            self.group_prefix_sum.append(self.meta.get_size())
+        fallback_size = (
+            self.meta.get_size()
+            if self.meta.shapes is None or self.meta.dtypes is None
+            else 0
+        )
+        self.group_prefix_sum = _group_prefix_sums(
+            self.meta.shapes, self.meta.dtypes, fallback_size
+        )
+
+    @cached_property
+    def raw_data(self) -> torch.Tensor:
+        """Return the raw view, materializing address-backed storage on demand."""
+        buffer = getattr(self.parent_allocator, "buffer", None)
+        start = self.meta.address
+        end = start + self._raw_view_size
+        if (
+            not isinstance(buffer, torch.Tensor)
+            or start < 0
+            or end > buffer.numel()
+        ):
+            raise RuntimeError("Address-backed tensor storage is unavailable")
+        return buffer[start:end]
+
+    def resize_raw_view(self, size: int) -> None:
+        """Shrink the logical raw view to ``size`` bytes.
+
+        Raises:
+            ValueError: If ``size`` exceeds the current view or is not aligned
+                to an already-materialized tensor's element size.
+        """
+        raw_data = self.__dict__.get("raw_data")
+        current_size = (
+            raw_data.numel() * raw_data.element_size()
+            if raw_data is not None
+            else self._raw_view_size
+        )
+        if size < 0 or size > current_size:
+            raise ValueError(f"Invalid raw tensor view size: {size}")
+        if raw_data is not None:
+            element_size = raw_data.element_size()
+            if size % element_size:
+                raise ValueError(f"Raw tensor view size is unaligned: {size}")
+            self.raw_data = raw_data[: size // element_size]
+        self._raw_view_size = size
+
+    @property
+    def has_tensor_storage(self) -> bool:
+        """Return whether this valid object has accessible backing storage."""
+        if not self.valid:
+            return False
+        if "raw_data" in self.__dict__:
+            return True
+        buffer = getattr(self.parent_allocator, "buffer", None)
+        start = self.meta.address
+        return (
+            isinstance(buffer, torch.Tensor)
+            and start >= 0
+            and start + self._raw_view_size <= buffer.numel()
+        )
 
     def __del__(self):
         """
@@ -546,12 +659,48 @@ class TensorMemoryObj(MemoryObj):
 
     def invalidate(self):
         self.valid = False
+        self._allocation_batch = None
+        self._allocation_batch_index = -1
 
     def is_valid(self):
         return self.valid
 
     def get_size(self) -> int:
         return self.group_prefix_sum[-1]
+
+    def is_trusted_allocation_batch_member(
+        self,
+        validation_cache: dict[int, bool],
+        *,
+        parent: Any,
+        slab_size: int,
+        dtype: torch.dtype,
+        fmt: MemoryFormat,
+    ) -> bool:
+        """Validate batch invariants once, then only this object's membership."""
+        batch = self._allocation_batch
+        if batch is None:
+            return False
+        batch_id = id(batch)
+        if batch_id not in validation_cache:
+            validation_cache[batch_id] = batch.matches(
+                parent, slab_size, dtype, fmt
+            )
+        index = self._allocation_batch_index
+        metadata = self.meta
+        logical_size = self.get_size()
+        return (
+            self.valid
+            and validation_cache[batch_id]
+            and 0 <= index < len(batch.member_ids)
+            and batch.member_ids[index] == id(self)
+            and self.parent_allocator is batch.parent
+            and metadata.address == batch.addresses[index]
+            and metadata.phy_size == batch.physical_size
+            and metadata.dtype == batch.dtype
+            and metadata.fmt == batch.fmt
+            and 0 < logical_size <= batch.physical_size
+        )
 
     # TODO(chunxiaozheng): use get_shapes and get_dtypes to replace
     #  get_shape and get_dtype
@@ -620,6 +769,39 @@ class TensorMemoryObj(MemoryObj):
             pin_monitor.on_pin(self)
             return True
 
+    @classmethod
+    def pin_many(cls, memory_objs: list["TensorMemoryObj"]) -> bool:
+        """Pin a homogeneous batch with one monitor update."""
+        if not memory_objs:
+            return True
+
+        unique = sorted({id(obj): obj for obj in memory_objs}.values(), key=id)
+        locked: list[TensorMemoryObj] = []
+        newly_pinned = 0
+        stats_updated = False
+        try:
+            for obj in unique:
+                obj.lock.acquire()
+                locked.append(obj)
+            newly_pinned = sum(obj.meta.pin_count == 0 for obj in unique)
+            for obj in memory_objs:
+                obj.meta.pin_count += 1
+            try:
+                if newly_pinned:
+                    cls.monitor.update_pinned_memory_objs_count(newly_pinned)
+                    stats_updated = True
+                PinMonitor.GetOrCreate().on_pin_many(unique)
+            except Exception:
+                for obj in memory_objs:
+                    obj.meta.pin_count -= 1
+                if stats_updated:
+                    cls.monitor.update_pinned_memory_objs_count(-newly_pinned)
+                raise
+            return True
+        finally:
+            for obj in reversed(locked):
+                obj.lock.release()
+
     def unpin(self) -> bool:
         with self.lock:
             self.meta.pin_count -= 1
@@ -662,8 +844,8 @@ class TensorMemoryObj(MemoryObj):
             return None
         assert self.meta.dtype is not None
         # TODO(Jiayi): consider caching the `get_size()`
-        return (
-            self.raw_data[: self.get_size()].view(self.meta.dtype).view(self.meta.shape)
+        return self.raw_data[: self.get_size()].view(self.meta.dtype).view(
+            self.meta.shape
         )
 
     @property
@@ -679,8 +861,9 @@ class TensorMemoryObj(MemoryObj):
         #   "byte_array only works with CPU tensors"
         # return memoryview(self.raw_data.contiguous().numpy())
 
-        num_bytes = self.raw_data.numel() * self.raw_data.element_size()
-        ptr = self.raw_data.data_ptr()
+        raw_data = self.raw_data
+        num_bytes = raw_data.numel() * raw_data.element_size()
+        ptr = raw_data.data_ptr()
         ubyte_ptr = ctypes.cast(ptr, ctypes.POINTER(ctypes.c_ubyte))
         byte_array = (ctypes.c_ubyte * num_bytes).from_address(
             ctypes.addressof(ubyte_ptr.contents)
@@ -689,7 +872,16 @@ class TensorMemoryObj(MemoryObj):
 
     @property
     def data_ptr(self) -> int:
-        return self.raw_data.data_ptr()
+        raw_data = self.__dict__.get("raw_data")
+        if raw_data is not None:
+            return raw_data.data_ptr()
+        if not self.has_tensor_storage:
+            raise RuntimeError("Address-backed tensor storage is unavailable")
+        assert self.parent_allocator is not None
+        return (
+            self.parent_allocator.buffer.data_ptr()  # type: ignore[attr-defined]
+            + self.meta.address
+        )
 
     @property
     def is_pinned(self) -> bool:
@@ -1396,6 +1588,38 @@ class TensorMemoryAllocator(MemoryAllocatorInterface):
         """
         Batched allocate tensor memory objs with equal sizes.
         """
+        return self._batched_allocate(
+            shapes, dtypes, batch_size, fmt, materialize_views=True
+        )
+
+    @_lmcache_nvtx_annotate
+    def batched_allocate_address_backed(
+        self,
+        shapes: Union[torch.Size, list[torch.Size]],
+        dtypes: Union[torch.dtype, list[torch.dtype]],
+        batch_size: int,
+        fmt: MemoryFormat = MemoryFormat.KV_2LTD,
+        allocator_type: Optional[str] = None,
+    ) -> Optional[List[TensorMemoryObj]]:
+        """Allocate a homogeneous batch without constructing tensor views.
+
+        Arguments and return semantics match :meth:`batched_allocate`. Each
+        returned object computes its pointer from the backing buffer and
+        materializes a compatible raw tensor view only when requested.
+        """
+        return self._batched_allocate(
+            shapes, dtypes, batch_size, fmt, materialize_views=False
+        )
+
+    def _batched_allocate(
+        self,
+        shapes: Union[torch.Size, list[torch.Size]],
+        dtypes: Union[torch.dtype, list[torch.dtype]],
+        batch_size: int,
+        fmt: MemoryFormat,
+        *,
+        materialize_views: bool,
+    ) -> Optional[List[TensorMemoryObj]]:
         shapes, dtypes = self._adapt_shapes_and_dtypes(shapes, dtypes)
 
         # Calculate the size of the tensor
@@ -1409,9 +1633,25 @@ class TensorMemoryAllocator(MemoryAllocatorInterface):
         except RuntimeError:
             return None
         addresses = [addr for addr, _ in alloc_results]
-        raw_datas = [
-            self._get_buffer_slice(addr, unit_aligned_size) for addr in addresses
-        ]
+        raw_datas: list[Optional[torch.Tensor]]
+        if materialize_views:
+            contiguous = len(addresses) > 1 and all(
+                curr == prev + unit_aligned_size
+                for prev, curr in zip(addresses, addresses[1:], strict=False)
+            )
+            if contiguous:
+                raw_datas = list(
+                    self._get_buffer_slice(
+                        addresses[0], unit_aligned_size * batch_size
+                    ).split(unit_aligned_size)
+                )
+            else:
+                raw_datas = [
+                    self._get_buffer_slice(addr, unit_aligned_size)
+                    for addr in addresses
+                ]
+        else:
+            raw_datas = [None] * batch_size
 
         # For debug
         self.num_active_allocations += batch_size
@@ -1422,6 +1662,7 @@ class TensorMemoryAllocator(MemoryAllocatorInterface):
         )
         self.stats_monitor.update_active_memory_objs_count(self.num_active_allocations)
 
+        group_prefix_sum = _group_prefix_sums(shapes, dtypes, unit_raw_size)
         tensor_mem_objs = []
         for raw_data, address in zip(raw_datas, addresses, strict=True):
             tensor_mem_objs.append(
@@ -1439,8 +1680,23 @@ class TensorMemoryAllocator(MemoryAllocatorInterface):
                         dtypes=dtypes,
                     ),
                     parent_allocator=self,
+                    group_prefix_sum=group_prefix_sum,
+                    raw_view_size=unit_aligned_size,
                 )
             )
+
+        batch = _TensorAllocationBatch(
+            self,
+            int(self.buffer.numel()),
+            dtypes[0],
+            fmt,
+            tuple(addresses),
+            unit_aligned_size,
+            tuple(map(id, tensor_mem_objs)),
+        )
+        for index, memory_obj in enumerate(tensor_mem_objs):
+            memory_obj._allocation_batch = batch
+            memory_obj._allocation_batch_index = index
 
         return tensor_mem_objs
 
@@ -2178,6 +2434,34 @@ class MixedMemoryAllocator(MemoryAllocatorInterface):
                 )
         else:
             raise ValueError(f"Unsupported memory format: {fmt}")
+
+    def batched_allocate_address_backed(
+        self,
+        shapes: Union[torch.Size, list[torch.Size]],
+        dtypes: Union[torch.dtype, list[torch.dtype]],
+        batch_size: int,
+        fmt: MemoryFormat = MemoryFormat.KV_2LTD,
+        allocator_type: Optional[str] = None,
+    ) -> Optional[List[MemoryObj]]:
+        """Allocate an address-backed batch from the pinned tensor allocator.
+
+        Arguments and return semantics match :meth:`batched_allocate`.
+        Unsupported formats and allocators retain the normal allocation path.
+        """
+        allocate = getattr(
+            self.pin_allocator, "batched_allocate_address_backed", None
+        )
+        if fmt not in (
+            MemoryFormat.KV_2LTD,
+            MemoryFormat.KV_2TD,
+            MemoryFormat.KV_T2D,
+            MemoryFormat.KV_MLA_FMT,
+            MemoryFormat.KV_MLA_LATENT_FMT,
+            MemoryFormat.KV_DSA_INDEX_FMT,
+        ) or not callable(allocate):
+            return self.batched_allocate(shapes, dtypes, batch_size, fmt)
+        with self.host_mem_lock:
+            return allocate(shapes, dtypes, batch_size, fmt, str(self))
 
     @_lmcache_nvtx_annotate
     def free(self, memory_obj: MemoryObj, allocator_type: Optional[str] = None):

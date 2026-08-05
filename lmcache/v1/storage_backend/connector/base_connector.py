@@ -138,7 +138,11 @@ class RemoteConnector(metaclass=abc.ABCMeta):
         shape_list = list(memory_obj.meta.shape)
         shape_list[2] = bytes_read // self.single_token_size
         actual_shape = torch.Size(shape_list)
-        memory_obj.raw_data = memory_obj.raw_data[:bytes_read]
+        resize_raw_view = getattr(memory_obj, "resize_raw_view", None)
+        if callable(resize_raw_view):
+            resize_raw_view(bytes_read)
+        else:
+            memory_obj.raw_data = memory_obj.raw_data[:bytes_read]
         memory_obj.meta.shape = actual_shape
         if memory_obj.meta.shapes:
             memory_obj.meta.shapes = [actual_shape]

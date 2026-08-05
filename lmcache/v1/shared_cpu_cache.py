@@ -556,9 +556,10 @@ class SharedHandleEnvelope:
     handles: list[SharedChunkHandle]
     message: Optional[str] = None
     error_details: Optional[dict[str, Any]] = None
+    batch: Optional["SharedHandleBatch"] = None
 
     def to_dict(self) -> dict[str, Any]:
-        return {
+        payload = {
             "request_id": self.request_id,
             "phase": self.phase,
             "request_ordinal": self.request_ordinal,
@@ -570,6 +571,9 @@ class SharedHandleEnvelope:
             "message": self.message,
             "error_details": self.error_details,
         }
+        if self.batch is not None:
+            payload["batch"] = self.batch.to_dict()
+        return payload
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> "SharedHandleEnvelope":
@@ -623,6 +627,70 @@ class SharedHandleEnvelope:
             ],
             message=data["message"],
             error_details=data["error_details"],
+            batch=SharedHandleBatch.from_dict(data["batch"])
+            if data.get("batch") is not None
+            else None,
+        )
+
+
+@dataclass(frozen=True)
+class SharedHandleBatch:
+    """Compact slab offsets for a layer-major homogeneous dense prefix."""
+
+    shm_name: str
+    producer_rank: int
+    num_layers: int
+    num_chunks: int
+    physical_sizes: list[int]
+    chunk_hashes: list[int]
+    offsets: list[int]
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "shm_name": self.shm_name,
+            "producer_rank": self.producer_rank,
+            "num_layers": self.num_layers,
+            "num_chunks": self.num_chunks,
+            "physical_sizes": self.physical_sizes,
+            "chunk_hashes": self.chunk_hashes,
+            "offsets": self.offsets,
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> "SharedHandleBatch":
+        if not isinstance(data, dict):
+            raise SharedCPUCacheValidationError(
+                f"SharedHandleBatch expected dict payload, got {type(data)!r}"
+            )
+        _reject_private_fields(data, _FORBIDDEN_TRANSPORT_FIELDS, "SharedHandleBatch")
+        _require_fields(
+            data,
+            {
+                "shm_name",
+                "producer_rank",
+                "num_layers",
+                "num_chunks",
+                "physical_sizes",
+                "chunk_hashes",
+                "offsets",
+            },
+            "SharedHandleBatch",
+        )
+        if not all(
+            isinstance(data[field], list)
+            for field in ("physical_sizes", "chunk_hashes", "offsets")
+        ):
+            raise SharedCPUCacheValidationError(
+                "SharedHandleBatch sizes, hashes, and offsets must be lists"
+            )
+        return cls(
+            shm_name=data["shm_name"],
+            producer_rank=int(data["producer_rank"]),
+            num_layers=int(data["num_layers"]),
+            num_chunks=int(data["num_chunks"]),
+            physical_sizes=[int(size) for size in data["physical_sizes"]],
+            chunk_hashes=[int(value) for value in data["chunk_hashes"]],
+            offsets=[int(offset) for offset in data["offsets"]],
         )
 
 
@@ -758,6 +826,62 @@ def validate_shared_handle(
         )
 
 
+def validate_shared_handle_batch(
+    batch: SharedHandleBatch,
+    *,
+    expected_shm_name: str,
+    expected_producer_rank: int,
+    expected_num_layers: int,
+    expected_num_chunks: int,
+    expected_chunk_hashes: list[int],
+    slab_size: int,
+) -> None:
+    failures = []
+    if batch.shm_name != expected_shm_name:
+        failures.append(
+            f"shm_name={batch.shm_name!r}, expected={expected_shm_name!r}"
+        )
+    if batch.producer_rank != expected_producer_rank:
+        failures.append(
+            f"producer_rank={batch.producer_rank}, "
+            f"expected={expected_producer_rank}"
+        )
+    if batch.num_layers != expected_num_layers:
+        failures.append(
+            f"num_layers={batch.num_layers}, expected={expected_num_layers}"
+        )
+    if batch.num_chunks != expected_num_chunks:
+        failures.append(
+            f"num_chunks={batch.num_chunks}, expected={expected_num_chunks}"
+        )
+    if batch.chunk_hashes != expected_chunk_hashes:
+        failures.append("chunk hashes do not match passive request metadata")
+    sizes_valid = len(batch.physical_sizes) == expected_num_chunks and all(
+        size > 0 for size in batch.physical_sizes
+    )
+    if not sizes_valid:
+        failures.append("physical sizes must contain one positive size per chunk")
+    expected_offsets = expected_num_layers * expected_num_chunks
+    if len(batch.offsets) != expected_offsets:
+        failures.append(
+            f"offsets={len(batch.offsets)}, expected={expected_offsets}"
+        )
+    if any(offset < 0 for offset in batch.offsets) or (
+        sizes_valid
+        and expected_num_chunks > 0
+        and any(
+            offset + batch.physical_sizes[index % expected_num_chunks] > slab_size
+            for index, offset in enumerate(batch.offsets)
+        )
+    ):
+        failures.append("one or more offsets exceed shared slab bounds")
+    if failures:
+        raise SharedCPUCacheValidationError(
+            "Invalid shared CPU cache batch before passive view creation: "
+            + "; ".join(failures)
+        )
+
+
 class PassiveSharedViewAllocator(MemoryAllocatorInterface):
     """Allocator for passive-rank shm views.
 
@@ -836,6 +960,43 @@ class PassiveSharedViewAllocator(MemoryAllocatorInterface):
         return TensorMemoryObj(
             raw_data=raw_data,
             metadata=metadata,
+            parent_allocator=self,
+        )
+
+    def create_batch_view(
+        self,
+        batch: SharedHandleBatch,
+        *,
+        layer_id: int,
+        chunk_index: int,
+        shape: torch.Size,
+        dtype: torch.dtype,
+        fmt: MemoryFormat,
+        cached_positions: Iterable[int],
+    ) -> TensorMemoryObj:
+        offset = batch.offsets[layer_id * batch.num_chunks + chunk_index]
+        physical_size = batch.physical_sizes[chunk_index]
+        logical_size = shape.numel() * dtype.itemsize
+        if logical_size <= 0 or logical_size > physical_size:
+            raise SharedCPUCacheValidationError(
+                "Invalid compact shared view logical size: "
+                f"logical_size={logical_size}, physical_size={physical_size}"
+            )
+        positions = torch.tensor(list(cached_positions), dtype=torch.int64)
+        return TensorMemoryObj(
+            raw_data=self.slab_tensor[offset : offset + logical_size],
+            metadata=MemoryObjMetadata(
+                shape=shape,
+                dtype=dtype,
+                address=offset,
+                phy_size=physical_size,
+                ref_count=1,
+                pin_count=0,
+                fmt=fmt,
+                cached_positions=positions,
+                shapes=[shape],
+                dtypes=[dtype],
+            ),
             parent_allocator=self,
         )
 

@@ -225,11 +225,31 @@ class LocalCPUBackend(AllocatorBackendInterface):
         if not self.use_hot:
             return
 
-        # TODO(Jiayi): optimize this with batching
-        for key, memory_obj in zip(keys, memory_objs, strict=False):
-            self.submit_put_task(
-                key, memory_obj, on_complete_callback=on_complete_callback
-            )
+        stored_keys: list[CacheEngineKey] = []
+        with self.cpu_lock:
+            for key, memory_obj in zip(keys, memory_objs, strict=False):
+                if key in self.hot_cache:
+                    continue
+                memory_obj.ref_count_up()
+                self.hot_cache[key] = memory_obj
+                stored_keys.append(key)
+            if stored_keys:
+                self.cache_policy.update_on_put_many(stored_keys)
+            for key in stored_keys:
+                if self.batched_msg_sender is not None:
+                    self.batched_msg_sender.add_kv_op(
+                        op_type=OpType.ADMIT,
+                        key=key.chunk_hash,
+                    )
+
+        if on_complete_callback is not None:
+            for key in stored_keys:
+                try:
+                    on_complete_callback(key)
+                except Exception as e:
+                    logger.warning(
+                        f"on_complete_callback failed for key {key}: {e}"
+                    )
 
     def get_blocking(
         self,
@@ -263,6 +283,57 @@ class LocalCPUBackend(AllocatorBackendInterface):
                 memory_obj.ref_count_up()
                 local_memory_objs.append(memory_obj)
         return LocalCPUPrefixGetResult(local_memory_objs, [], [])
+
+    def batched_get_prefixes_with_misses(
+        self,
+        keys_layer_major: List[List[CacheEngineKey]],
+    ) -> List[LocalCPUPrefixGetResult]:
+        """Get several layer prefixes while holding the cache lock once.
+
+        Args:
+            keys_layer_major: Cache keys grouped by model layer. Each layer is
+                resolved only up to its first local miss, matching
+                :meth:`batched_get_prefix_with_misses`.
+
+        Returns:
+            One prefix result per input layer, in the same order. Every local
+            object in a returned result owns a caller reference that must be
+            released by the consumer.
+
+        Notes:
+            Sparse cold bootstrap probes every layer before issuing its
+            Mooncake request. Acquiring the same lock once avoids one Python
+            call and one lock round trip per model layer without changing
+            prefix or reference-count semantics.
+        """
+        results: List[LocalCPUPrefixGetResult] = []
+        retained: List[MemoryObj] = []
+        try:
+            with self.cpu_lock:
+                for keys in keys_layer_major:
+                    local_memory_objs: List[Optional[MemoryObj]] = []
+                    first_miss = len(keys)
+                    for position, key in enumerate(keys):
+                        memory_obj = self.hot_cache.get(key)
+                        if memory_obj is None:
+                            first_miss = position
+                            break
+                        memory_obj.ref_count_up()
+                        retained.append(memory_obj)
+                        local_memory_objs.append(memory_obj)
+                    results.append(
+                        LocalCPUPrefixGetResult(
+                            local_memory_objs,
+                            list(range(first_miss, len(keys))),
+                            list(keys[first_miss:]),
+                        )
+                    )
+            return results
+        except Exception:
+            for memory_obj in reversed(retained):
+                if memory_obj.is_valid():
+                    memory_obj.ref_count_down()
+            raise
 
     async def batched_get_non_blocking(
         self,
@@ -668,12 +739,16 @@ class LocalCPUBackend(AllocatorBackendInterface):
         fmt: Optional[MemoryFormat] = None,
         eviction: bool = True,
         busy_loop: bool = True,
+        address_backed: bool = False,
     ) -> Optional[List[MemoryObj]]:
         """
         Batched allocate `batch_size` memory objects of shape and dtype
         evict if necessary. Storage manager should always call
         local_cpu_backend.allocate() to get memory objects
         regardless of whether local_cpu is True or False
+
+        ``address_backed`` requests lazy tensor-view construction when the
+        configured allocator supports it; otherwise allocation remains eager.
 
         busy_loop should only be used for retrieve
         the reasoning is that:
@@ -700,9 +775,14 @@ class LocalCPUBackend(AllocatorBackendInterface):
             else:
                 fmt = MemoryFormat.KV_2LTD
 
-        memory_objs = self.memory_allocator.batched_allocate(
-            shapes, dtypes, batch_size, fmt
-        )
+        allocate_batch = self.memory_allocator.batched_allocate
+        if address_backed:
+            allocate_batch = getattr(
+                self.memory_allocator,
+                "batched_allocate_address_backed",
+                allocate_batch,
+            )
+        memory_objs = allocate_batch(shapes, dtypes, batch_size, fmt)
 
         if memory_objs is not None or not eviction:
             return memory_objs
@@ -771,9 +851,7 @@ class LocalCPUBackend(AllocatorBackendInterface):
                 # do not hold the lock during sleep
                 time.sleep(time_to_wait)
 
-            memory_objs = self.memory_allocator.batched_allocate(
-                shapes, dtypes, batch_size, fmt
-            )
+            memory_objs = allocate_batch(shapes, dtypes, batch_size, fmt)
             if memory_objs:
                 break
 

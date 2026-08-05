@@ -11,9 +11,15 @@ import torch
 
 # First Party
 from lmcache.logging import init_logger
-from lmcache.utils import CacheEngineKey
+from lmcache.utils import CacheEngineKey, LayerCacheEngineKey
+from lmcache.v1.cold_start_perf import (
+    cold_start_perf_enabled,
+    cold_start_perf_log,
+    cold_start_perf_now,
+)
 from lmcache.v1.config import LMCacheEngineConfig
 from lmcache.v1.memory_management import MemoryFormat, MemoryObj
+from lmcache.v1.mooncake_layout import mooncake_page_key
 from lmcache.v1.protocol import RemoteMetadata
 from lmcache.v1.storage_backend.connector.base_connector import RemoteConnector
 from lmcache.v1.storage_backend.local_cpu_backend import LocalCPUBackend
@@ -34,6 +40,7 @@ class MooncakeStoreConfig:
     transfer_timeout: int
     storage_root_dir: str
     prefer_local_alloc: bool = False
+    page_first_multi_buffer: bool = False
 
     @staticmethod
     def from_file(file_path: str) -> "MooncakeStoreConfig":
@@ -54,6 +61,9 @@ class MooncakeStoreConfig:
             transfer_timeout=config.get("transfer_timeout", 1),
             storage_root_dir=config.get("storage_root_dir", ""),
             prefer_local_alloc=prefer_local_alloc,
+            page_first_multi_buffer=config.get(
+                "mooncake_page_first_multi_buffer", False
+            ),
         )
 
     @staticmethod
@@ -88,6 +98,9 @@ class MooncakeStoreConfig:
             transfer_timeout=extra_config.get("transfer_timeout", 1),
             storage_root_dir=extra_config.get("storage_root_dir", ""),
             prefer_local_alloc=prefer_local_alloc,
+            page_first_multi_buffer=extra_config.get(
+                "mooncake_page_first_multi_buffer", False
+            ),
         )
 
 
@@ -103,6 +116,13 @@ class MooncakestoreConnector(RemoteConnector):
     ):
         # initialize base class, which includes some common attributes
         super().__init__(local_cpu_backend.config, local_cpu_backend.metadata)
+        self._sampled_layerwise_lookup = bool(
+            getattr(
+                local_cpu_backend.config,
+                "experimental_sampled_layerwise_lookup",
+                False,
+            )
+        )
         logger.info(
             "Mooncake connector save_chunk_meta=%s, meta_shapes=%s",
             self.save_chunk_meta,
@@ -220,6 +240,7 @@ class MooncakestoreConnector(RemoteConnector):
                 self.config.device_name,
                 self.config.master_server_address,
             )
+
             logger.info("Mooncake store setup completed successfully")
 
         except ValueError as e:
@@ -229,11 +250,35 @@ class MooncakestoreConnector(RemoteConnector):
             logger.error("An error occurred while loading the configuration: %s", exc)
             raise
 
+        self._page_first_multi_buffer = self.config.page_first_multi_buffer
+        self._page_num_layers = int(
+            getattr(local_cpu_backend.metadata, "kv_shape", (1,))[0]
+        )
+        if getattr(self, "_page_first_multi_buffer", False):
+            if self.save_chunk_meta:
+                raise ValueError(
+                    "mooncake_page_first_multi_buffer requires "
+                    "save_chunk_meta=False"
+                )
+            required_methods = (
+                "batch_get_into_multi_buffers",
+                "batch_put_from_multi_buffers",
+                "batch_is_exist",
+            )
+            missing_methods = [
+                name
+                for name in required_methods
+                if not callable(getattr(self.store, name, None))
+            ]
+            if missing_methods:
+                raise RuntimeError(
+                    "Installed Mooncake lacks page-first APIs: "
+                    f"{missing_methods}"
+                )
         self.loop = loop
         self.local_cpu_backend = local_cpu_backend
         self.registered_buffer_ptr = None
         self._inflight_put_tasks: set[asyncio.Task[Any]] = set()
-
         # Initialize ReplicateConfig
         self.replica_config = ReplicateConfig()
         self.replica_config.replica_num = 1
@@ -458,7 +503,11 @@ class MooncakestoreConnector(RemoteConnector):
             shape_list[token_dim] = bytes_read // single_token_size
 
         actual_shape = torch.Size(shape_list)
-        memory_obj.raw_data = memory_obj.raw_data[:bytes_read]
+        resize_raw_view = getattr(memory_obj, "resize_raw_view", None)
+        if callable(resize_raw_view):
+            resize_raw_view(bytes_read)
+        else:
+            memory_obj.raw_data = memory_obj.raw_data[:bytes_read]
         memory_obj.meta.shape = actual_shape
         if memory_obj.meta.shapes:
             memory_obj.meta.shapes = [actual_shape]
@@ -501,6 +550,155 @@ class MooncakestoreConnector(RemoteConnector):
                 logger.warning(f"Buffer unregistration failed: error={result}")
             self.registered_buffer_ptr = None
 
+    def _page_key_for(self, key: CacheEngineKey) -> Optional[str]:
+        if not getattr(self, "_page_first_multi_buffer", False) or not isinstance(
+            key, LayerCacheEngineKey
+        ):
+            return None
+        return mooncake_page_key(key, self._page_num_layers)
+
+    def _page_keys_for(self, keys: List[CacheEngineKey]) -> list[Optional[str]]:
+        """Resolve one serialized page key per unique layer-key identity."""
+        if not getattr(self, "_page_first_multi_buffer", False):
+            return [None] * len(keys)
+
+        page_keys_by_identity: dict[tuple[Any, ...], str] = {}
+        page_keys: list[Optional[str]] = []
+        for key in keys:
+            if not isinstance(key, LayerCacheEngineKey):
+                page_keys.append(None)
+                continue
+            identity = (
+                key.model_name,
+                key.world_size,
+                key.worker_id,
+                key.chunk_hash,
+                key.dtype,
+                key.tags,
+                key.kv_group,
+            )
+            page_key = page_keys_by_identity.get(identity)
+            if page_key is None:
+                page_key = mooncake_page_key(key, self._page_num_layers)
+                page_keys_by_identity[identity] = page_key
+            page_keys.append(page_key)
+        return page_keys
+
+    def _page_aware_exists_many(self, keys: List[CacheEngineKey]) -> list[bool]:
+        page_keys = self._page_keys_for(keys)
+        page_results = [0] * len(keys)
+        page_positions = [index for index, key in enumerate(page_keys) if key]
+        if page_positions:
+            queried_page_keys: list[str] = list(
+                dict.fromkeys(key for key in page_keys if key is not None)
+            )
+            raw_page_results = self.store.batch_is_exist(queried_page_keys)
+            result_by_page = dict(
+                zip(queried_page_keys, raw_page_results, strict=False)
+            )
+            for index in page_positions:
+                page_key = page_keys[index]
+                assert page_key is not None
+                page_results[index] = result_by_page.get(page_key, 0)
+
+        legacy_positions = [
+            index for index, result in enumerate(page_results) if result != 1
+        ]
+        if legacy_positions:
+            legacy_results = self.store.batch_is_exist(
+                [keys[index].to_string() for index in legacy_positions]
+            )
+            for index, result in zip(
+                legacy_positions, legacy_results, strict=False
+            ):
+                page_results[index] = result
+        return [result == 1 for result in page_results]
+
+    def _complete_page_groups(
+        self, keys: List[CacheEngineKey]
+    ) -> tuple[list[tuple[str, list[int]]], list[int]]:
+        grouped: dict[str, list[int]] = {}
+        legacy_indices: list[int] = []
+        for index, page_key in enumerate(self._page_keys_for(keys)):
+            if page_key is None:
+                legacy_indices.append(index)
+                continue
+            grouped.setdefault(page_key, []).append(index)
+
+        complete: list[tuple[str, list[int]]] = []
+        expected_layers = list(range(self._page_num_layers))
+        for page_key, indices in grouped.items():
+            ordered = sorted(
+                indices,
+                key=lambda index: keys[index].layer_id,  # type: ignore[attr-defined]
+            )
+            layer_ids = [
+                keys[index].layer_id  # type: ignore[attr-defined]
+                for index in ordered
+            ]
+            if layer_ids == expected_layers:
+                complete.append((page_key, ordered))
+            else:
+                legacy_indices.extend(indices)
+        legacy_indices.sort()
+        return complete, legacy_indices
+
+    @staticmethod
+    def _has_zero_copy_storage(memory_obj: MemoryObj) -> bool:
+        available = getattr(memory_obj, "has_tensor_storage", None)
+        return bool(
+            memory_obj.raw_tensor is not None if available is None else available
+        )
+
+    def _allocate_zero_copy_buffers(
+        self, keys: List[CacheEngineKey]
+    ) -> tuple[
+        list[Optional[MemoryObj]],
+        list[tuple[list[torch.Size], list[torch.dtype], MemoryFormat, int]],
+        str,
+    ]:
+        first_key = keys[0]
+        first_metadata = self._metadata_for_raw_key(first_key)
+        same_group = all(key.kv_group == first_key.kv_group for key in keys)
+        key_metadata = [first_metadata]
+        if same_group:
+            key_metadata *= len(keys)
+        else:
+            key_metadata.extend(self._metadata_for_raw_key(key) for key in keys[1:])
+        memory_objs: list[Optional[MemoryObj]] = []
+        allocation_mode = "individual"
+        first_shapes, first_dtypes, first_fmt, _ = key_metadata[0]
+        uniform_metadata = same_group or all(
+            shapes == first_shapes and dtypes == first_dtypes and fmt == first_fmt
+            for shapes, dtypes, fmt, _ in key_metadata
+        )
+        if uniform_metadata:
+            batched = self.local_cpu_backend.batched_allocate(
+                first_shapes,
+                first_dtypes,
+                batch_size=len(keys),
+                fmt=first_fmt,
+                eviction=False,
+                busy_loop=False,
+                address_backed=getattr(self, "_page_first_multi_buffer", False),
+            )
+            if batched is not None:
+                if len(batched) == len(keys) and all(
+                    self._has_zero_copy_storage(obj) for obj in batched
+                ):
+                    memory_objs = list(batched)
+                    allocation_mode = "batched"
+                else:
+                    for obj in batched:
+                        if obj.is_valid():
+                            obj.ref_count_down()
+        if not memory_objs:
+            memory_objs = [
+                self.local_cpu_backend.allocate(shapes, dtypes, fmt)
+                for shapes, dtypes, fmt, _ in key_metadata
+            ]
+        return memory_objs, key_metadata, allocation_mode
+
     def support_batched_get(self) -> bool:
         """
         Check if the connector supports batched get
@@ -512,7 +710,11 @@ class MooncakestoreConnector(RemoteConnector):
 
     def support_batched_contains(self) -> bool:
         return bool(
-            getattr(self.config, "experimental_sampled_layerwise_lookup", False)
+            getattr(
+                self,
+                "_sampled_layerwise_lookup",
+                getattr(self.config, "experimental_sampled_layerwise_lookup", False),
+            )
             and callable(getattr(self.store, "batch_is_exist", None))
         )
 
@@ -520,10 +722,18 @@ class MooncakestoreConnector(RemoteConnector):
         if not keys:
             return 0
 
-        results = self.store.batch_is_exist([key.to_string() for key in keys])
+        if getattr(self, "_page_first_multi_buffer", False):
+            results = self._page_aware_exists_many(keys)
+        else:
+            results = [
+                result == 1
+                for result in self.store.batch_is_exist(
+                    [key.to_string() for key in keys]
+                )
+            ]
         hit_count = 0
         for result in results:
-            if result != 1:
+            if not result:
                 break
             hit_count += 1
         return hit_count
@@ -562,10 +772,18 @@ class MooncakestoreConnector(RemoteConnector):
         return memory_objs
 
     async def exists(self, key: CacheEngineKey) -> bool:
-        return self.store.is_exist(key.to_string())
+        page_key = self._page_key_for(key)
+        return bool(
+            (page_key is not None and self.store.is_exist(page_key))
+            or self.store.is_exist(key.to_string())
+        )
 
     def exists_sync(self, key: CacheEngineKey) -> bool:
-        return self.store.is_exist(key.to_string())
+        page_key = self._page_key_for(key)
+        return bool(
+            (page_key is not None and self.store.is_exist(page_key))
+            or self.store.is_exist(key.to_string())
+        )
 
     async def batched_get(
         self, keys: List[CacheEngineKey]
@@ -594,6 +812,8 @@ class MooncakestoreConnector(RemoteConnector):
         keys: List[CacheEngineKey],
         pin: bool = False,
     ) -> int:
+        if getattr(self, "_page_first_multi_buffer", False):
+            return self.batched_contains(keys)
         num_hit_counts = 0
         for key in keys:
             if not self.store.is_exist(key.to_string()):
@@ -601,7 +821,200 @@ class MooncakestoreConnector(RemoteConnector):
             num_hit_counts += 1
         return num_hit_counts
 
+    async def _batch_get_pages(
+        self,
+        keys: List[CacheEngineKey],
+        page_groups: list[tuple[str, list[int]]],
+    ) -> List[Optional[MemoryObj]]:
+        perf_enabled = cold_start_perf_enabled()
+        perf_started = cold_start_perf_now() if perf_enabled else 0.0
+        results: List[Optional[MemoryObj]] = [None] * len(keys)
+        page_keys = [keys[index] for _, indices in page_groups for index in indices]
+        allocation_started = cold_start_perf_now() if perf_enabled else 0.0
+        memory_objs, _, _ = self._allocate_zero_copy_buffers(page_keys)
+        allocation_ms = (
+            (cold_start_perf_now() - allocation_started) * 1000
+            if perf_enabled
+            else 0.0
+        )
+
+        submission_started = cold_start_perf_now() if perf_enabled else 0.0
+        submitted_groups: list[tuple[str, list[int], int]] = []
+        all_buffer_ptrs: list[list[int]] = []
+        all_buffer_sizes: list[list[int]] = []
+        offset = 0
+        for page_key, indices in page_groups:
+            end = offset + len(indices)
+            page_objects = [
+                obj
+                for obj in memory_objs[offset:end]
+                if obj is not None
+                and self._has_zero_copy_storage(obj)
+            ]
+            if len(page_objects) != len(indices):
+                offset = end
+                continue
+            submitted_groups.append((page_key, indices, offset))
+            all_buffer_ptrs.append([obj.data_ptr for obj in page_objects])
+            all_buffer_sizes.append([obj.get_size() for obj in page_objects])
+            offset = end
+        submission_ms = (
+            (cold_start_perf_now() - submission_started) * 1000
+            if perf_enabled
+            else 0.0
+        )
+        transfer_ms = 0.0
+        completed_pages = 0
+        result_status = "empty"
+
+        try:
+            if not submitted_groups:
+                return results
+            transfer_started = cold_start_perf_now() if perf_enabled else 0.0
+            statuses = await asyncio.to_thread(
+                self.store.batch_get_into_multi_buffers,
+                [page_key for page_key, _, _ in submitted_groups],
+                all_buffer_ptrs,
+                all_buffer_sizes,
+            )
+            transfer_ms = (
+                (cold_start_perf_now() - transfer_started) * 1000
+                if perf_enabled
+                else 0.0
+            )
+            result_status = (
+                "ok"
+                if len(submitted_groups) == len(page_groups)
+                else "partial"
+            )
+            for group_index, (page_key, indices, offset) in enumerate(
+                submitted_groups
+            ):
+                if group_index >= len(statuses):
+                    result_status = "partial"
+                    logger.warning(
+                        "Mooncake page get omitted status for page=%s", page_key
+                    )
+                    continue
+                expected_bytes = sum(all_buffer_sizes[group_index])
+                page_status = statuses[group_index]
+                if page_status != expected_bytes:
+                    logger.warning(
+                        "Mooncake page get failed or was short: page=%s "
+                        "status=%s expected_bytes=%d",
+                        page_key,
+                        page_status,
+                        expected_bytes,
+                    )
+                    result_status = "partial"
+                    continue
+                completed_pages += 1
+                for position, index in enumerate(indices, start=offset):
+                    memory_obj = memory_objs[position]
+                    assert memory_obj is not None
+                    results[index] = memory_obj
+                    memory_objs[position] = None
+
+            return results
+        except Exception as exc:
+            result_status = "error"
+            logger.error("Mooncake page-first get failed: %s", exc)
+            return results
+        finally:
+            for memory_obj in memory_objs:
+                if memory_obj is not None and memory_obj.is_valid():
+                    memory_obj.ref_count_down()
+            if perf_enabled:
+                cold_start_perf_log(
+                    logger,
+                    "mooncake_page_get",
+                    started=perf_started,
+                    kv_groups=sorted(
+                        {int(getattr(key, "kv_group", 0)) for key in page_keys}
+                    ),
+                    pages=len(page_groups),
+                    submitted_pages=len(submitted_groups),
+                    completed_pages=completed_pages,
+                    buffers=sum(len(indices) for _, indices in page_groups),
+                    bytes=sum(sum(sizes) for sizes in all_buffer_sizes),
+                    allocation_ms=round(allocation_ms, 3),
+                    submission_ms=round(submission_ms, 3),
+                    transfer_ms=round(transfer_ms, 3),
+                    status=result_status,
+                )
+
     async def _batch_get_into(
+        self, keys: List[CacheEngineKey]
+    ) -> List[Optional[MemoryObj]]:
+        if not getattr(self, "_page_first_multi_buffer", False):
+            return await self._batch_get_into_legacy(keys)
+
+        perf_enabled = cold_start_perf_enabled()
+        lookup_started = cold_start_perf_now() if perf_enabled else 0.0
+        complete_groups, legacy_indices = self._complete_page_groups(keys)
+        if not complete_groups:
+            if perf_enabled:
+                cold_start_perf_log(
+                    logger,
+                    "mooncake_page_lookup",
+                    started=lookup_started,
+                    kv_groups=sorted(
+                        {int(getattr(key, "kv_group", 0)) for key in keys}
+                    ),
+                    keys=len(keys),
+                    complete_pages=0,
+                    found_pages=0,
+                    legacy_keys=len(keys),
+                    status="legacy",
+                )
+            return await self._batch_get_into_legacy(keys)
+
+        page_exists = await asyncio.to_thread(
+            self.store.batch_is_exist,
+            [page_key for page_key, _ in complete_groups],
+        )
+        page_groups: list[tuple[str, list[int]]] = []
+        for group, exists in zip(complete_groups, page_exists, strict=False):
+            if exists == 1:
+                page_groups.append(group)
+            else:
+                legacy_indices.extend(group[1])
+        if len(page_exists) < len(complete_groups):
+            for group in complete_groups[len(page_exists) :]:
+                legacy_indices.extend(group[1])
+        if perf_enabled:
+            cold_start_perf_log(
+                logger,
+                "mooncake_page_lookup",
+                started=lookup_started,
+                kv_groups=sorted(
+                    {int(getattr(key, "kv_group", 0)) for key in keys}
+                ),
+                keys=len(keys),
+                complete_pages=len(complete_groups),
+                found_pages=len(page_groups),
+                legacy_keys=len(set(legacy_indices)),
+                status="ok" if not legacy_indices else "partial",
+            )
+
+        results = (
+            await self._batch_get_pages(keys, page_groups)
+            if page_groups
+            else [None] * len(keys)
+        )
+
+        if legacy_indices:
+            legacy_indices = sorted(set(legacy_indices))
+            legacy_results = await self._batch_get_into_legacy(
+                [keys[index] for index in legacy_indices]
+            )
+            for index, memory_obj in zip(
+                legacy_indices, legacy_results, strict=False
+            ):
+                results[index] = memory_obj
+        return results
+
+    async def _batch_get_into_legacy(
         self, keys: List[CacheEngineKey]
     ) -> List[Optional[MemoryObj]]:
         """
@@ -619,24 +1032,29 @@ class MooncakestoreConnector(RemoteConnector):
 
         logger.debug(f"Using batch_get_into for {len(keys)} keys (zero-copy mode)")
 
-        # Reserve a buffer for every requested chunk
-        memory_objs: list[Optional[MemoryObj]] = []
+        perf_enabled = cold_start_perf_enabled()
+        perf_started = cold_start_perf_now() if perf_enabled else 0.0
         valid_idx: list[int] = []
-
         key_strs: list[str] = []
         buffer_ptrs: list[int] = []
         buffer_sizes: list[int] = []
 
         single_token_sizes: dict[int, int] = {}
-        for i, key in enumerate(keys):
-            meta_shapes, meta_dtypes, meta_fmt, single_token_size = (
-                self._metadata_for_raw_key(key)
-            )
-            obj = self.local_cpu_backend.allocate(
-                meta_shapes, meta_dtypes, meta_fmt
-            )
-            memory_objs.append(obj)
-            if obj is not None and obj.raw_tensor is not None:
+        allocation_started = cold_start_perf_now() if perf_enabled else 0.0
+        memory_objs, key_metadata, allocation_mode = (
+            self._allocate_zero_copy_buffers(keys)
+        )
+        allocation_ms = (
+            (cold_start_perf_now() - allocation_started) * 1000
+            if perf_enabled
+            else 0.0
+        )
+
+        for i, (key, metadata_entry, obj) in enumerate(
+            zip(keys, key_metadata, memory_objs, strict=True)
+        ):
+            single_token_size = metadata_entry[3]
+            if obj is not None and self._has_zero_copy_storage(obj):
                 valid_idx.append(i)
                 single_token_sizes[i] = single_token_size
 
@@ -647,13 +1065,35 @@ class MooncakestoreConnector(RemoteConnector):
 
         if not valid_idx:
             logger.warning("Batch-get aborted: unable to allocate any buffers.")
+            if perf_enabled:
+                cold_start_perf_log(
+                    logger,
+                    "mooncake_legacy_get",
+                    started=perf_started,
+                    kv_groups=sorted(
+                        {int(getattr(key, "kv_group", 0)) for key in keys}
+                    ),
+                    keys=len(keys),
+                    valid_buffers=0,
+                    bytes=0,
+                    allocation_mode=allocation_mode,
+                    allocation_ms=round(allocation_ms, 3),
+                    transfer_ms=0.0,
+                    status="no_buffers",
+                )
             return [None] * len(keys)
 
         try:
             # Single RPC call for multiple chunks
             logger.debug(f"Calling batch_get_into with {len(key_strs)} keys")
+            transfer_started = cold_start_perf_now() if perf_enabled else 0.0
             bytes_read_list = await asyncio.to_thread(
                 self.store.batch_get_into, key_strs, buffer_ptrs, buffer_sizes
+            )
+            transfer_ms = (
+                (cold_start_perf_now() - transfer_started) * 1000
+                if perf_enabled
+                else 0.0
             )
             logger.debug(f"batch_get_into returned: {bytes_read_list}")
 
@@ -678,6 +1118,32 @@ class MooncakestoreConnector(RemoteConnector):
                     logger.error(f"Reshape failed for key {keys[i]}: {exc}")
                     memory_objs[i].ref_count_down()  # type: ignore
 
+            for i in valid_idx[len(bytes_read_list) :]:
+                memory_objs[i].ref_count_down()  # type: ignore
+
+            if perf_enabled:
+                cold_start_perf_log(
+                    logger,
+                    "mooncake_legacy_get",
+                    started=perf_started,
+                    kv_groups=sorted(
+                        {int(getattr(key, "kv_group", 0)) for key in keys}
+                    ),
+                    keys=len(keys),
+                    valid_buffers=len(valid_idx),
+                    bytes=sum(buffer_sizes),
+                    bytes_read=sum(
+                        max(int(value), 0) for value in bytes_read_list
+                    ),
+                    allocation_mode=allocation_mode,
+                    allocation_ms=round(allocation_ms, 3),
+                    transfer_ms=round(transfer_ms, 3),
+                    status=(
+                        "ok"
+                        if all(results[index] is not None for index in valid_idx)
+                        else "partial"
+                    ),
+                )
             return results
 
         except Exception as exc:
@@ -685,6 +1151,22 @@ class MooncakestoreConnector(RemoteConnector):
             # Release any buffers we successfully allocated
             for i in valid_idx:
                 memory_objs[i].ref_count_down()  # type: ignore
+            if perf_enabled:
+                cold_start_perf_log(
+                    logger,
+                    "mooncake_legacy_get",
+                    started=perf_started,
+                    kv_groups=sorted(
+                        {int(getattr(key, "kv_group", 0)) for key in keys}
+                    ),
+                    keys=len(keys),
+                    valid_buffers=len(valid_idx),
+                    bytes=sum(buffer_sizes),
+                    allocation_mode=allocation_mode,
+                    allocation_ms=round(allocation_ms, 3),
+                    status="error",
+                    error=type(exc).__name__,
+                )
             return [None] * len(keys)
 
     async def _batch_get_buffer(
@@ -863,11 +1345,78 @@ class MooncakestoreConnector(RemoteConnector):
         keys: List[CacheEngineKey],
         memory_objs: List[MemoryObj],
     ) -> None:
+        if not getattr(self, "_page_first_multi_buffer", False):
+            await self._batched_put_zero_copy_legacy(keys, memory_objs)
+            return
+
+        complete_groups, legacy_indices = self._complete_page_groups(keys)
+        page_groups: list[tuple[str, list[int]]] = []
+        chunk_size = self.local_cpu_backend.metadata.chunk_size
+        for page_key, indices in complete_groups:
+            is_full_page = all(
+                memory_objs[index].get_size()
+                == self._metadata_for_raw_key(keys[index])[3] * chunk_size
+                for index in indices
+            )
+            if is_full_page:
+                page_groups.append((page_key, indices))
+            else:
+                legacy_indices.extend(indices)
+
+        if page_groups:
+            page_keys = [page_key for page_key, _ in page_groups]
+            all_buffer_ptrs = [
+                [memory_objs[index].data_ptr for index in indices]
+                for _, indices in page_groups
+            ]
+            all_buffer_sizes = [
+                [memory_objs[index].get_size() for index in indices]
+                for _, indices in page_groups
+            ]
+            page_memory_objs = [
+                memory_objs[index] for _, indices in page_groups for index in indices
+            ]
+            statuses = await self._run_blocking_put(
+                "batch_put_from_multi_buffers",
+                self.store.batch_put_from_multi_buffers,
+                (
+                    page_keys,
+                    all_buffer_ptrs,
+                    all_buffer_sizes,
+                    self.replica_config,
+                ),
+                page_memory_objs,
+            )
+            if statuses is not None:
+                if len(statuses) != len(page_keys):
+                    raise RuntimeError(
+                        "Mooncake page put returned "
+                        f"{len(statuses)} statuses for {len(page_keys)} pages"
+                    )
+                for page_key, status in zip(page_keys, statuses, strict=True):
+                    if status != 0:
+                        raise RuntimeError(
+                            "Mooncake page put failed for "
+                            f"{page_key}: status {status}"
+                        )
+        if legacy_indices:
+            legacy_indices = sorted(set(legacy_indices))
+            await self._batched_put_zero_copy_legacy(
+                [keys[index] for index in legacy_indices],
+                [memory_objs[index] for index in legacy_indices],
+            )
+
+    async def _batched_put_zero_copy_legacy(
+        self,
+        keys: List[CacheEngineKey],
+        memory_objs: List[MemoryObj],
+    ) -> None:
         key_strs = [k.to_string() for k in keys]
         buffer_ptrs: list[int] = []
         buffer_sizes: list[int] = []
         for obj in memory_objs:
-            assert obj.raw_tensor is not None
+            if not self._has_zero_copy_storage(obj):
+                raise ValueError("Mooncake zero-copy put requires tensor storage")
             buffer_ptrs.append(obj.data_ptr)
             buffer_sizes.append(obj.get_size())
 
@@ -893,7 +1442,8 @@ class MooncakestoreConnector(RemoteConnector):
         This is used when save_chunk_meta=False (matches _batch_get_into).
         """
         try:
-            assert memory_obj.raw_tensor is not None
+            if not self._has_zero_copy_storage(memory_obj):
+                raise ValueError("Mooncake zero-copy put requires tensor storage")
             buffer_ptr = memory_obj.data_ptr
             buffer_size = memory_obj.get_size()
 

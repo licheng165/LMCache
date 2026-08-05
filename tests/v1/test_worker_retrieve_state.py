@@ -150,6 +150,72 @@ class TestWorkerRetrieveState:
             "pointer_cache_generation": 0,
         }
 
+    def test_clear_group_drops_its_prepared_source(self) -> None:
+        state = WorkerRetrieveState(
+            cached_memory_objs=[[object()]],
+            cached_memory_objs_indexer=[[object()]],
+            prepared_sparse_sources={0: object(), 1: object()},
+        )
+
+        state.clear_group(1)
+
+        assert state.cached_memory_objs
+        assert state.cached_memory_objs_indexer == []
+        assert set(state.prepared_sparse_sources) == {0}
+
+    def test_dense_prefix_seed_trims_partial_tail_for_sparse(self) -> None:
+        class MemoryObj:
+            def __init__(self):
+                self.released = 0
+
+            def is_valid(self):
+                return self.released == 0
+
+            def ref_count_down(self):
+                self.released += 1
+
+        impl = _make_impl()
+        impl.config = SimpleNamespace(dsa_two_groups=True)
+        impl.lmcache_engine = _make_shared_engine(rank0=False)
+        latent = [[MemoryObj(), MemoryObj()]]
+        indexer = [[MemoryObj(), MemoryObj()]]
+        latent_tail = latent[0][1]
+        indexer_tail = indexer[0][1]
+        state = WorkerRetrieveState(
+            req_id="req-1",
+            cached_keys=[["lk0", "lk1"]],
+            cached_starts=[0, 256],
+            cached_ends=[256, 300],
+            cached_memory_objs=latent,
+            cached_shared_handles=[["lh0", "lh1"]],
+            cached_keys_indexer=[["ik0", "ik1"]],
+            cached_starts_indexer=[0, 256],
+            cached_ends_indexer=[256, 300],
+            cached_memory_objs_indexer=indexer,
+            cached_shared_handles_indexer=[["ih0", "ih1"]],
+            dense_prefix_seed=True,
+            metadata_warm=True,
+            token_count=300,
+        )
+        impl.lmcache_engine.register_shared_cpu_sparse_request(
+            state.req_id,
+            owned_groups={0: latent, 1: indexer},
+        )
+
+        assert impl._trim_dense_prefix_seed_for_sparse(state, 256)
+        assert state.token_count == 256
+        assert state.cached_ends == [256]
+        assert state.cached_ends_indexer == [256]
+        assert state.cached_shared_handles == [["lh0"]]
+        assert state.cached_shared_handles_indexer == [["ih0"]]
+        assert latent[0][0].released == 0
+        assert indexer[0][0].released == 0
+        assert latent_tail.released == 1
+        assert indexer_tail.released == 1
+        assert impl.lmcache_engine._shared_cpu_request_leases[
+            "req-1"
+        ].object_ids() == {id(latent[0][0]), id(indexer[0][0])}
+
     def test_deep_retrieve_state_requires_both_gates_and_is_bounded_once(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
@@ -2785,11 +2851,12 @@ class TestWorkerRetrieveState:
 
     def test_sparse_decode_start_uses_minimal_prepared_kwargs(self):
         req = make_sparse_req_meta("req-1", token_count=256)
+        owner = object()
         state = WorkerRetrieveState(
             cached_keys=[["layer-key"]],
             cached_starts=[0],
             cached_ends=[256],
-            cached_tensors=[[torch.zeros(256)]],
+            cached_memory_objs=[[owner]],
             cached_chunk_ptrs_npu=[torch.tensor([123], dtype=torch.long)],
         )
         impl, _, _ = make_worker_connector([req], use_layerwise=True)
@@ -2849,6 +2916,8 @@ class TestWorkerRetrieveState:
         assert prepared_source.total_tokens == 256
         assert prepared_source.chunk_token_counts == (256,)
         assert prepared_source.pointer_device == torch.device("cpu")
+        assert prepared_source.layers[0].tensors == ()
+        assert prepared_source.layers[0].memory_objs == (owner,)
         assert not hasattr(req, "cached_keys")
         assert impl._worker_retrieve_state[req.req_id] is state
         impl._drain_layerwise_retrievers()
@@ -3466,7 +3535,7 @@ class TestWorkerRetrieveState:
             cached_starts=[0],
             cached_ends=[256],
             cached_memory_objs=[["m0"]],
-            cached_tensors=[["t0"]],
+            cached_tensors=[],
             cached_chunk_dev_ptrs=[[111]],
             cached_chunk_ptrs_npu=[old_ptrs],
             cached_shared_handles=[["h0"]],
@@ -3495,6 +3564,7 @@ class TestWorkerRetrieveState:
         state = impl._worker_retrieve_state["req-1"]
         assert state.cached_starts == [0, 256]
         assert state.cached_ends == [256, 512]
+        assert state.cached_tensors == []
         assert state.cached_chunk_dev_ptrs == [[111, 222]]
         assert state.cached_chunk_ptrs_npu[0].tolist() == [111, 222]
         # Decode-save does not broadcast shm handles. The next retrieve must
@@ -3503,6 +3573,139 @@ class TestWorkerRetrieveState:
         assert state.token_count == 512
         assert state.request_scope_token == "req-1:5:512"
         assert state.shared_validation_signature is None
+
+    def test_store_merge_does_not_publish_suffix_only_pointer_cache(self):
+        starts = [0]
+        ends = [256]
+        memory_objs = [["prefix"]]
+        chunk_ptrs = []
+
+        merged = LMCacheConnectorV1Impl._merge_cache_group_by_ranges(
+            dst_starts=starts,
+            dst_ends=ends,
+            dst_keys=[["prefix-key"]],
+            dst_memory_objs=memory_objs,
+            dst_tensors=[],
+            dst_chunk_dev_ptrs=[],
+            dst_chunk_ptrs_npu=chunk_ptrs,
+            dst_shared_handles=[[]],
+            src_starts=[256],
+            src_ends=[512],
+            src_keys=[["suffix-key"]],
+            src_memory_objs=[["suffix"]],
+            src_tensors=[],
+            src_chunk_dev_ptrs=[[222]],
+            src_chunk_ptrs_npu=[torch.tensor([222], dtype=torch.long)],
+            src_shared_handles=[],
+        )
+
+        assert merged == 1
+        assert starts == [0, 256]
+        assert ends == [256, 512]
+        assert memory_objs == [["prefix", "suffix"]]
+        assert chunk_ptrs == [None]
+
+    def test_store_merge_extends_complete_32_chunk_prefix(self):
+        prefix_chunks = 32
+        suffix_chunks = 16
+        starts = [chunk * 256 for chunk in range(prefix_chunks)]
+        ends = [start + 256 for start in starts]
+        memory_objs = [[f"m{chunk}" for chunk in range(prefix_chunks)]]
+        chunk_ptrs = [torch.arange(prefix_chunks, dtype=torch.long)]
+        suffix_starts = [
+            (prefix_chunks + chunk) * 256 for chunk in range(suffix_chunks)
+        ]
+
+        merged = LMCacheConnectorV1Impl._merge_cache_group_by_ranges(
+            dst_starts=starts,
+            dst_ends=ends,
+            dst_keys=[[f"k{chunk}" for chunk in range(prefix_chunks)]],
+            dst_memory_objs=memory_objs,
+            dst_tensors=[],
+            dst_chunk_dev_ptrs=[list(range(prefix_chunks))],
+            dst_chunk_ptrs_npu=chunk_ptrs,
+            dst_shared_handles=[[]],
+            src_starts=suffix_starts,
+            src_ends=[start + 256 for start in suffix_starts],
+            src_keys=[
+                [f"k{prefix_chunks + chunk}" for chunk in range(suffix_chunks)]
+            ],
+            src_memory_objs=[
+                [f"m{prefix_chunks + chunk}" for chunk in range(suffix_chunks)]
+            ],
+            src_tensors=[],
+            src_chunk_dev_ptrs=[list(range(prefix_chunks, 48))],
+            src_chunk_ptrs_npu=[
+                torch.arange(prefix_chunks, 48, dtype=torch.long)
+            ],
+            src_shared_handles=[],
+            require_pointer_cache=True,
+        )
+
+        assert merged == suffix_chunks
+        assert len(starts) == 48
+        assert len(memory_objs[0]) == 48
+        assert chunk_ptrs[0].tolist() == list(range(48))
+
+    def test_store_merge_rejects_suffix_without_prefix_owners(self):
+        starts = [chunk * 256 for chunk in range(32)]
+        ends = [start + 256 for start in starts]
+        keys = [[f"k{chunk}" for chunk in range(32)]]
+
+        merged = LMCacheConnectorV1Impl._merge_cache_group_by_ranges(
+            dst_starts=starts,
+            dst_ends=ends,
+            dst_keys=keys,
+            dst_memory_objs=[],
+            dst_tensors=[[f"t{chunk}" for chunk in range(32)]],
+            dst_chunk_dev_ptrs=[],
+            dst_chunk_ptrs_npu=[],
+            dst_shared_handles=[],
+            src_starts=[8192],
+            src_ends=[8448],
+            src_keys=[["suffix-key"]],
+            src_memory_objs=[["suffix-owner"]],
+            src_tensors=[],
+            src_chunk_dev_ptrs=[[1]],
+            src_chunk_ptrs_npu=[torch.tensor([1], dtype=torch.long)],
+            src_shared_handles=[],
+        )
+
+        assert merged == 0
+        assert len(starts) == 32
+        assert len(ends) == 32
+        assert len(keys[0]) == 32
+
+    def test_store_merge_replaces_partial_tail_with_complete_pointer_cache(self):
+        starts = [0, 256]
+        ends = [256, 300]
+        memory_objs = [["full-prefix", "partial-tail"]]
+        chunk_ptrs = [torch.tensor([111, 222], dtype=torch.long)]
+
+        merged = LMCacheConnectorV1Impl._merge_cache_group_by_ranges(
+            dst_starts=starts,
+            dst_ends=ends,
+            dst_keys=[["prefix-key", "partial-key"]],
+            dst_memory_objs=memory_objs,
+            dst_tensors=[],
+            dst_chunk_dev_ptrs=[[111, 222]],
+            dst_chunk_ptrs_npu=chunk_ptrs,
+            dst_shared_handles=[[]],
+            src_starts=[256],
+            src_ends=[512],
+            src_keys=[["full-tail-key"]],
+            src_memory_objs=[["full-tail"]],
+            src_tensors=[],
+            src_chunk_dev_ptrs=[[333]],
+            src_chunk_ptrs_npu=[torch.tensor([333], dtype=torch.long)],
+            src_shared_handles=[],
+        )
+
+        assert merged == 1
+        assert starts == [0, 256]
+        assert ends == [256, 512]
+        assert memory_objs == [["full-prefix", "full-tail"]]
+        assert chunk_ptrs[0].tolist() == [111, 333]
 
     def test_decode_window_save_tail_only_does_not_seed_warm_state(self):
         impl = _make_impl()
@@ -4425,6 +4628,23 @@ class TestWorkerRetrieveState:
         impl._prune_worker_retrieve_state({"req-1"})
 
         assert impl._worker_retrieve_state is pruned_states
+
+    def test_prune_reopens_initial_release_after_preemption(self):
+        impl = _make_impl()
+        impl._initial_sparse_release_published = {"req-1", "req-2"}
+        impl._prefill_save_completed_groups = {
+            ("req-1", "normal_save", 0, 0, 256): 256,
+            ("req-2", "normal_save", 0, 0, 256): 256,
+        }
+
+        impl._prune_worker_retrieve_state(
+            {"req-1", "req-2"}, resumed_req_ids={"req-1"}
+        )
+
+        assert impl._initial_sparse_release_published == {"req-2"}
+        assert set(impl._prefill_save_completed_groups) == {
+            ("req-2", "normal_save", 0, 0, 256)
+        }
 
     def test_registry_change_invalidates_prune_key(self):
         impl = _make_impl()

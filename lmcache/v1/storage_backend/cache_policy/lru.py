@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # Standard
 from collections import OrderedDict
+from collections.abc import Iterable
 from typing import Any, Dict
 import time
 
@@ -55,7 +56,15 @@ class LRUCachePolicy(BaseCachePolicy[KeyType, OrderedDict[KeyType, Any]]):
         key: KeyType,
     ) -> None:
         self.update_chunk_hash_dict(key)
-        pass
+
+    def update_on_put_many(self, keys: Iterable[KeyType]) -> None:
+        """Record at most one reuse event per chunk hash in this batch."""
+        unique = dict.fromkeys(
+            key.chunk_hash if isinstance(key, CacheEngineKey) else key
+            for key in keys
+        )
+        for key in unique:
+            self.update_chunk_hash_dict(key)
 
     def update_on_force_evict(
         self,
