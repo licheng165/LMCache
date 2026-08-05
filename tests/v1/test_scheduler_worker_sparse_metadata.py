@@ -64,6 +64,7 @@ def _make_scheduler_impl() -> LMCacheConnectorV1Impl:
     impl._unfinished_requests = {}
     impl.load_specs = {}
     impl._requests_priority = {}
+    impl._cold_perf_lookup_started = {}
     return impl
 
 
@@ -139,7 +140,8 @@ def test_dsa_cold_compact_async_requires_complete_prompt_hit() -> None:
     lookup_client.lookup_cache.return_value = 8194
     unaligned = SimpleNamespace(request_id="cold-unaligned", num_tokens=8194)
     assert impl.get_num_new_matched_tokens(unaligned, 0) == 8193
-    assert impl.load_specs[unaligned.request_id].dsa_committed_end == 8192
+    assert impl.load_specs[unaligned.request_id].dsa_committed_end == 8194
+    assert impl.load_specs[unaligned.request_id].dsa_remap_frontier == 8193
     assert (
         getattr(impl.load_specs[unaligned.request_id], "dsa_release_frontier")
         == 8192

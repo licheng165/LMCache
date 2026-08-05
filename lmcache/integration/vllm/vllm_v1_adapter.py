@@ -7732,6 +7732,7 @@ class LMCacheConnectorV1Impl:
             was_aborted = bool(aborted_ids is not None and req_id in aborted_ids)
             try:
                 assert request.load_spec is not None
+                state = future.result()
                 actual_generation = getattr(
                     request.load_spec, "dsa_cold_load_generation", None
                 )
@@ -7741,7 +7742,6 @@ class LMCacheConnectorV1Impl:
                         f"req_id={req_id}, expected={generation}, "
                         f"actual={actual_generation}"
                     )
-                state = future.result()
                 if was_aborted:
                     self._release_unadopted_shared_request_objects(state, request)
                     self._release_shared_worker_retrieve_state(

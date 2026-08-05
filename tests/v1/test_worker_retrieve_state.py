@@ -38,6 +38,9 @@ def _make_impl() -> LMCacheConnectorV1Impl:
     impl._worker_retrieve_last_prune_key = None
     impl._layerwise_save_storers = {}
     impl._deferred_latent_pending = set()
+    impl._cold_perf_load_started = {}
+    impl._cold_perf_dense_load_started = {}
+    impl._cold_perf_dense_load_completed = {}
     impl.kv_role = "kv_both"
     impl._late_finished_sending = set()
     return impl
@@ -3245,11 +3248,14 @@ class TestWorkerRetrieveState:
 
     def test_start_load_kv_without_attention_skips_step_setup(self):
         impl = _make_impl()
-        impl._parent = SimpleNamespace(_get_connector_metadata=MagicMock())
+        metadata = LMCacheConnectorMetadata(requests=[])
+        impl._parent = SimpleNamespace(
+            _get_connector_metadata=MagicMock(return_value=metadata)
+        )
 
         impl.start_load_kv(SimpleNamespace(attn_metadata=None))
 
-        impl._parent._get_connector_metadata.assert_not_called()
+        impl._parent._get_connector_metadata.assert_called_once_with()
         assert impl.current_layer == 0
         assert impl._wait_for_save_done is False
 

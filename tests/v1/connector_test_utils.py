@@ -91,6 +91,9 @@ def make_worker_connector(
     connector._lmcache_chunk_size = 256
     connector._layerwise_save_storers = {}
     connector._worker_retrieve_state = {}
+    connector._cold_perf_load_started = {}
+    connector._cold_perf_dense_load_started = {}
+    connector._cold_perf_dense_load_completed = {}
     connector.kv_caches = {"layer0": torch.zeros(1)}
     connector.config = MagicMock()
     connector.config.get_extra_config_value = lambda key, default=False: default
@@ -101,6 +104,9 @@ def make_worker_connector(
 def make_worker_impl() -> LMCacheConnectorV1Impl:
     impl = LMCacheConnectorV1Impl.__new__(LMCacheConnectorV1Impl)
     impl._worker_retrieve_state = {}
+    impl._cold_perf_load_started = {}
+    impl._cold_perf_dense_load_started = {}
+    impl._cold_perf_dense_load_completed = {}
     impl.lmcache_engine = None
     impl.kv_role = "kv_both"
     impl._lmcache_chunk_size = 256
