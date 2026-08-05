@@ -12,7 +12,7 @@ from lmcache.observability import LMCStatsMonitor, PrometheusLogger
 from lmcache.utils import CacheEngineKey, _lmcache_nvtx_annotate
 from lmcache.v1.config import LMCacheEngineConfig
 from lmcache.v1.exceptions import IrrecoverableException
-from lmcache.v1.memory_management import MemoryObj
+from lmcache.v1.memory_management import LayerPageMemoryObj, MemoryObj
 from lmcache.v1.metadata import LMCacheMetadata
 from lmcache.v1.storage_backend.abstract_backend import StorageBackendInterface
 from lmcache.v1.storage_backend.connector import CreateConnector
@@ -200,6 +200,23 @@ class RemoteBackend(StorageBackendInterface):
             return self.connection.batched_contains(keys)
         except Exception as e:
             logger.warning(f"Remote connection failed in batched_contains: {e}")
+            return 0
+
+    def batched_contains_layer_pages(
+        self, keys: List[CacheEngineKey], pin: bool = False
+    ) -> int:
+        """Check Mooncake page keys without accepting legacy layer objects."""
+        if self.connection is None:
+            return 0
+        contains = getattr(self.connection, "batched_contains_layer_pages", None)
+        if not callable(contains):
+            return 0
+        if self._mla_worker_id_as0_mode:
+            keys = [key.with_new_worker_id(0) for key in keys]
+        try:
+            return contains(keys)
+        except Exception as error:
+            logger.warning(f"Remote layer-page lookup failed: {error}")
             return 0
 
     def exists_in_put_tasks(self, key: CacheEngineKey) -> bool:
@@ -512,6 +529,39 @@ class RemoteBackend(StorageBackendInterface):
             f"decompressed memory objs length: {len(decompressed_memory_objs)}"
         )
         return decompressed_memory_objs
+
+    def batched_get_layer_pages(
+        self, keys: List[CacheEngineKey]
+    ) -> list[LayerPageMemoryObj]:
+        """Retrieve pages identified by one representative key per chunk."""
+        if self.connection is None:
+            raise RuntimeError("Remote connection is unavailable")
+        if self._mla_worker_id_as0_mode:
+            keys = [key.with_new_worker_id(0) for key in keys]
+        retrieve = getattr(self.connection, "batched_get_layer_pages", None)
+        if not callable(retrieve):
+            raise RuntimeError("Remote connector does not support layer pages")
+        future = asyncio.run_coroutine_threadsafe(retrieve(keys), self.loop)
+        try:
+            return future.result(self.config.blocking_timeout_secs)
+        except TimeoutError:
+            def release_late_result(done: Future) -> None:
+                try:
+                    pages = done.result()
+                except BaseException:
+                    return
+                for page in pages:
+                    try:
+                        if page.is_valid():
+                            page.ref_count_down()
+                    except Exception:
+                        logger.exception("Failed to release a late layer-page result")
+
+            future.add_done_callback(release_late_result)
+            raise
+        except BaseException:
+            future.cancel()
+            raise
 
     async def support_batched_async_contains(self) -> bool:
         return (

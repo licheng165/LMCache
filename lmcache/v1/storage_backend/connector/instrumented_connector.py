@@ -7,7 +7,7 @@ import time
 from lmcache.logging import init_logger
 from lmcache.observability import LMCStatsMonitor
 from lmcache.utils import CacheEngineKey
-from lmcache.v1.memory_management import MemoryObj
+from lmcache.v1.memory_management import LayerPageMemoryObj, MemoryObj
 from lmcache.v1.storage_backend.connector.base_connector import RemoteConnector
 
 logger = init_logger(__name__)
@@ -174,6 +174,13 @@ class InstrumentedRemoteConnector(RemoteConnector):
             )
         return memory_objs
 
+    async def batched_get_layer_pages(
+        self, keys: List[CacheEngineKey]
+    ) -> List[LayerPageMemoryObj]:
+        """Delegate layer-page retrieval to the wrapped connector."""
+        retrieve = getattr(self._connector, "batched_get_layer_pages")
+        return await retrieve(keys)
+
     async def batched_put(
         self, keys: List[CacheEngineKey], memory_objs: List[MemoryObj]
     ):
@@ -208,6 +215,11 @@ class InstrumentedRemoteConnector(RemoteConnector):
 
     def batched_contains(self, keys: List[CacheEngineKey]) -> int:
         return self._connector.batched_contains(keys)
+
+    def batched_contains_layer_pages(self, keys: List[CacheEngineKey]) -> int:
+        """Delegate layer-page lookup to the wrapped connector."""
+        contains = getattr(self._connector, "batched_contains_layer_pages")
+        return contains(keys)
 
     def support_batched_contains(self) -> bool:
         return self._connector.support_batched_contains()

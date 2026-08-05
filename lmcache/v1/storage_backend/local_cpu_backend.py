@@ -13,7 +13,7 @@ import torch
 from lmcache.integration.vllm.utils import get_size_bytes
 from lmcache.logging import init_logger
 from lmcache.observability import LMCStatsMonitor, PrometheusLogger
-from lmcache.utils import CacheEngineKey, _lmcache_nvtx_annotate
+from lmcache.utils import CacheEngineKey, LayerCacheEngineKey, _lmcache_nvtx_annotate
 from lmcache.v1.cache_controller.message import OpType
 from lmcache.v1.config import LMCacheEngineConfig
 from lmcache.v1.memory_management import (
@@ -22,8 +22,10 @@ from lmcache.v1.memory_management import (
     MemoryObj,
     MixedMemoryAllocator,
     PagedCpuGpuMemoryAllocator,
+    LayerPageMemoryObj,
 )
 from lmcache.v1.metadata import LMCacheMetadata
+from lmcache.v1.mooncake_layout import mooncake_layer_pages_enabled
 from lmcache.v1.storage_backend.abstract_backend import AllocatorBackendInterface
 from lmcache.v1.storage_backend.batched_message_sender import BatchedMessageSender
 from lmcache.v1.storage_backend.cache_policy import get_cache_policy
@@ -108,6 +110,11 @@ class LocalCPUBackend(AllocatorBackendInterface):
 
         self.layerwise = config.use_layerwise
         self.enable_blending = config.enable_blending
+        self.layer_page_objects = bool(
+            mooncake_layer_pages_enabled(config)
+            and metadata is not None
+            and metadata.use_mla
+        )
 
         # Store config and metadata for chunk budget calculation
         self.config = config
@@ -156,6 +163,46 @@ class LocalCPUBackend(AllocatorBackendInterface):
                 # vllm lookup sets pin to True
                 self.keys_in_request.append(key)
             return True
+
+    def batched_contains(
+        self, keys: List[CacheEngineKey], pin: bool = False
+    ) -> int:
+        hits: list[CacheEngineKey] = []
+        with self.cpu_lock:
+            for key in keys:
+                if key not in self.hot_cache:
+                    break
+                hits.append(key)
+            if pin:
+                for cache_key in hits:
+                    self.hot_cache[cache_key].pin()
+                    self.keys_in_request.append(cache_key)
+        return len(hits)
+
+    def batched_contains_layer_pages(
+        self, keys: Sequence[LayerCacheEngineKey], pin: bool = False
+    ) -> int:
+        """Check physical page objects using one representative layer key."""
+        pages: list[tuple[CacheEngineKey, LayerPageMemoryObj]] = []
+        with self.cpu_lock:
+            for key in keys:
+                page_key = key.without_layer()
+                page = self.hot_cache.get(page_key)
+                if not isinstance(page, LayerPageMemoryObj):
+                    break
+                pages.append((page_key, page))
+            if pin:
+                LayerPageMemoryObj.pin_many([page for _, page in pages])
+                self.keys_in_request.extend(page_key for page_key, _ in pages)
+        return len(pages)
+
+    def batched_unpin(self, keys: Sequence[CacheEngineKey]) -> None:
+        """Unpin each stored key occurrence."""
+        with self.cpu_lock:
+            for key in keys:
+                if key not in self.hot_cache:
+                    continue
+                self.hot_cache[key].unpin()
 
     def touch_cache(self):
         # flip the order of the keys in the request
@@ -250,6 +297,41 @@ class LocalCPUBackend(AllocatorBackendInterface):
                     logger.warning(
                         f"on_complete_callback failed for key {key}: {e}"
                     )
+
+    def batched_submit_layer_pages(
+        self,
+        keys: Sequence[CacheEngineKey],
+        pages: List[LayerPageMemoryObj],
+    ) -> None:
+        """Install allocator-owned pages under their layer-independent keys."""
+        if (
+            len(keys) != len(pages)
+            or len(set(keys)) != len(keys)
+            or len({id(page) for page in pages}) != len(pages)
+        ):
+            raise ValueError("Layer-page admission requires one unique key per page")
+        if any(not page.is_valid() for page in pages):
+            raise ValueError("Layer-page admission cannot store invalid pages")
+        self.batched_submit_put_task(keys, pages)
+
+    def batched_get_layer_page_prefix(
+        self, keys: Sequence[CacheEngineKey]
+    ) -> tuple[list[LayerPageMemoryObj], int]:
+        """Retain and return the contiguous prefix of cached layer pages."""
+        pages: list[LayerPageMemoryObj] = []
+        with self.cpu_lock:
+            for key in keys:
+                page = self.hot_cache.get(key)
+                if not isinstance(page, LayerPageMemoryObj):
+                    break
+                page.ref_count_up()
+                pages.append(page)
+        return pages, len(pages)
+
+    def contains_any_exact(self, keys: Sequence[CacheEngineKey]) -> bool:
+        """Return whether any key exists without resolving page aliases."""
+        with self.cpu_lock:
+            return any(key in self.hot_cache for key in keys)
 
     def get_blocking(
         self,
@@ -355,18 +437,7 @@ class LocalCPUBackend(AllocatorBackendInterface):
         keys: List[CacheEngineKey],
         pin: bool = False,
     ) -> int:
-        # NOTE(Jiayi): Only prefix chunks are counted.
-        num_hit_chunks = 0
-        with self.cpu_lock:
-            for key in keys:
-                if key not in self.hot_cache:
-                    return num_hit_chunks
-                if pin:
-                    self.hot_cache[key].pin()
-                    # vllm lookup sets pin to True
-                    self.keys_in_request.append(key)
-                num_hit_chunks += 1
-        return num_hit_chunks
+        return self.batched_contains(keys, pin)
 
     def pin(self, key: CacheEngineKey) -> bool:
         with self.cpu_lock:
@@ -811,7 +882,14 @@ class LocalCPUBackend(AllocatorBackendInterface):
                         evict_keys_count += len(evict_keys)
                         wait_other_requests = False
                         for evict_key in evict_keys:
-                            evict_key_all_layer = evict_key.split_layers(batch_size)
+                            evict_key_all_layer = (
+                                [evict_key]
+                                if isinstance(
+                                    self.hot_cache.get(evict_key),
+                                    LayerPageMemoryObj,
+                                )
+                                else evict_key.split_layers(batch_size)
+                            )
 
                             # TODO(Jiayi): batched allocate is not supported through
                             # `batched_remove`. Therefore, features like usage tracking
@@ -862,6 +940,61 @@ class LocalCPUBackend(AllocatorBackendInterface):
             )
         self.stats_monitor.update_local_cpu_evict_metrics(evict_keys_count)
         return memory_objs
+
+    def batched_allocate_layer_pages(
+        self,
+        shapes: list[torch.Size],
+        dtypes: list[torch.dtype],
+        batch_size: int,
+        num_layers: int,
+        fmt: MemoryFormat,
+        busy_loop: bool = True,
+    ) -> Optional[list[LayerPageMemoryObj]]:
+        """Allocate layer pages, evicting cache entries when required."""
+        allocate = getattr(
+            self.memory_allocator, "batched_allocate_layer_pages", None
+        )
+        if not callable(allocate):
+            return None
+        pages = allocate(shapes, dtypes, batch_size, num_layers, fmt)
+        evicted = 0
+        deadline = time.monotonic() + float(
+            getattr(self.config, "blocking_timeout_secs", 60)
+        )
+        while pages is None and self.use_hot:
+            keys: list[CacheEngineKey] = []
+            with self.cpu_lock:
+                candidates = self.cache_policy.get_evict_candidates(
+                    self.hot_cache, num_candidates=1
+                )
+                if candidates:
+                    key = candidates[0]
+                    keys = (
+                        [key]
+                        if isinstance(self.hot_cache.get(key), LayerPageMemoryObj)
+                        or not isinstance(key, LayerCacheEngineKey)
+                        else [
+                            item
+                            for item in key.split_layers(num_layers)
+                            if item in self.hot_cache
+                        ]
+                    )
+                    objects = [self.hot_cache.pop(item) for item in keys]
+                    for item in keys:
+                        self.cache_policy.update_on_force_evict(item)
+                else:
+                    objects = []
+            for memory_obj in objects:
+                memory_obj.ref_count_down()
+            evicted += len(keys)
+            if not objects:
+                self.stats_monitor.update_local_cpu_evict_failed_count(1)
+                if not busy_loop or time.monotonic() >= deadline:
+                    break
+                time.sleep(0.1)
+            pages = allocate(shapes, dtypes, batch_size, num_layers, fmt)
+        self.stats_monitor.update_local_cpu_evict_metrics(evicted)
+        return pages
 
     def get_full_chunk_size_bytes(self) -> int:
         logger.info("Calculating the size of a single LMCache chunk")

@@ -597,6 +597,45 @@ def medians(samples: list[dict[str, float]]) -> dict[str, float]:
     }
 
 
+def run_layer_page_sample(
+    buffer: torch.Tensor,
+    *,
+    chunks: int,
+    layers: int,
+    shape: torch.Size,
+    fmt: MemoryFormat,
+) -> dict[str, float]:
+    allocator = TensorMemoryAllocator(buffer, align_bytes=ALIGN_BYTES)
+    started = time.perf_counter()
+    pages = allocator.batched_allocate_layer_pages(
+        shape, torch.bfloat16, chunks, layers, fmt
+    )
+    allocation_s = time.perf_counter() - started
+    if pages is None:
+        raise RuntimeError("layer-page allocation failed")
+
+    started = time.perf_counter()
+    pointers = [
+        page.layer_data_ptr(layer) for layer in range(layers) for page in pages
+    ]
+    pointer_s = time.perf_counter() - started
+    started = time.perf_counter()
+    views = [page.layer_tensor(layer) for layer in range(layers) for page in pages]
+    view_s = time.perf_counter() - started
+    if len(pages) != chunks or any(
+        tensor.data_ptr() != pointer
+        for tensor, pointer in zip(views, pointers, strict=True)
+    ):
+        raise AssertionError("layer-page pointer or view layout mismatch")
+    allocator.batched_free(pages)
+    return {
+        "allocation_s": allocation_s,
+        "pointer_s": pointer_s,
+        "view_s": view_s,
+        "objects": float(len(pages)),
+    }
+
+
 def ms(seconds: float) -> float:
     return seconds * 1000
 
@@ -605,6 +644,7 @@ def print_results(
     results: list[dict],
     hot_results: dict[int, dict[str, float]],
     tensor_access_results: dict[int, dict[str, float]],
+    layer_page_results: dict[int, dict[str, float]],
 ) -> None:
     print("\nEnd-to-end production-object path (median ms)")
     print(
@@ -675,6 +715,19 @@ def print_results(
             f"{sample['tensor_s'] / sample['bulk_typed_s']:13.3f}x"
         )
 
+    print("\nExperimental layer-page path (median ms)")
+    print(
+        f"{'group':>5} {'objects':>9} {'allocator':>10} "
+        f"{'pointers':>10} {'views':>10}"
+    )
+    for group, sample in layer_page_results.items():
+        print(
+            f"{group:5d} {int(sample['objects']):9d} "
+            f"{ms(sample['allocation_s']):10.3f} "
+            f"{ms(sample['pointer_s']):10.3f} "
+            f"{ms(sample['view_s']):10.3f}"
+        )
+
 
 def build_parser() -> ArgumentParser:
     parser = ArgumentParser(description=__doc__)
@@ -713,6 +766,7 @@ def main() -> None:
     results: list[dict] = []
     hot_results: dict[int, dict[str, float]] = {}
     tensor_access_results: dict[int, dict[str, float]] = {}
+    layer_page_results: dict[int, dict[str, float]] = {}
     print(
         f"tokens={args.num_tokens} chunks={chunks} layers={args.num_layers} "
         f"objects/group={object_count}"
@@ -793,10 +847,24 @@ def main() -> None:
             if repeat >= args.warmup:
                 tensor_access_samples.append(sample)
         tensor_access_results[group] = medians(tensor_access_samples)
+
+        page_samples = []
+        for repeat in range(args.warmup + args.repeats):
+            gc.collect()
+            sample = run_layer_page_sample(
+                buffer,
+                chunks=chunks,
+                layers=args.num_layers,
+                shape=torch.Size([args.chunk_size * TOKEN_DIMS[group]]),
+                fmt=fmt,
+            )
+            if repeat >= args.warmup:
+                page_samples.append(sample)
+        layer_page_results[group] = medians(page_samples)
         del buffer
         gc.collect()
 
-    print_results(results, hot_results, tensor_access_results)
+    print_results(results, hot_results, tensor_access_results, layer_page_results)
     if args.output_json:
         args.output_json.parent.mkdir(parents=True, exist_ok=True)
         payload = {
@@ -812,6 +880,7 @@ def main() -> None:
             "results": results,
             "hot_results": hot_results,
             "tensor_access_results": tensor_access_results,
+            "layer_page_results": layer_page_results,
         }
         args.output_json.write_text(
             json.dumps(payload, indent=2),
