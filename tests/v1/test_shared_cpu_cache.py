@@ -65,6 +65,25 @@ class _LeaseMemoryObj:
         return True
 
 
+class _DenseRetentionConnector:
+    def supports_dense_sparse_cache_retention(self) -> bool:
+        return True
+
+
+def _dense_retention_caches(
+    rows: list[list[int]],
+) -> dict[str, list]:
+    return {
+        "cached_keys": [],
+        "cached_starts": [],
+        "cached_ends": [],
+        "cached_memory_objs": [],
+        "cached_chunk_dev_ptrs": [list(row) for row in rows],
+        "cached_chunk_ptrs_npu": [torch.tensor(row) for row in rows],
+        "cached_shared_handles": [],
+    }
+
+
 def test_shared_cpu_request_lease_retains_store_seed_once() -> None:
     memory_obj = _LeaseMemoryObj()
     lease = SharedCPURequestLease(
@@ -475,24 +494,22 @@ def test_page_first_plan_uses_shortest_local_layer_prefix():
 def test_dense_shared_cache_adoption_transfers_ownership():
     engine = object.__new__(LMCacheEngine)
     engine.num_layers = 2
+    engine.gpu_connector = _DenseRetentionConnector()
     engine.shared_cpu_cache_generation = 9
     engine._shared_cpu_request_leases = {}
     engine.metadata = SimpleNamespace(is_first_rank=lambda: False)
-    memory_objs = [[_LeaseMemoryObj()], [_LeaseMemoryObj()]]
-    keys = [[_make_key()], [_make_key()]]
-    handles = [[object()], [object()]]
-    caches = {
-        "cached_keys": [],
-        "cached_starts": [],
-        "cached_ends": [],
-        "cached_memory_objs": [],
-        "cached_shared_handles": [],
-    }
+    memory_objs = [
+        [_LeaseMemoryObj(), _LeaseMemoryObj()],
+        [_LeaseMemoryObj(), _LeaseMemoryObj()],
+    ]
+    keys = [[_make_key(), _make_key()], [_make_key(), _make_key()]]
+    handles = [[object(), object()], [object(), object()]]
+    caches = _dense_retention_caches([[101, 102], [201, 202]])
 
     adopted = engine._adopt_dense_shared_retrieve_cache(
         req_id="req-dense",
-        starts=[0],
-        ends=[256],
+        starts=[0, 256],
+        ends=[256, 300],
         keys_layer_major=keys,
         memory_objs=memory_objs,
         handles=handles,
@@ -507,18 +524,15 @@ def test_dense_shared_cache_adoption_transfers_ownership():
     assert engine._shared_cpu_request_leases["req-dense"].object_ids(0) == {
         id(obj) for layer in memory_objs for obj in layer
     }
-    index_objs = [[_LeaseMemoryObj()], [_LeaseMemoryObj()]]
-    index_caches = {
-        "cached_keys": [],
-        "cached_starts": [],
-        "cached_ends": [],
-        "cached_memory_objs": [],
-        "cached_shared_handles": [],
-    }
+    index_objs = [
+        [_LeaseMemoryObj(), _LeaseMemoryObj()],
+        [_LeaseMemoryObj(), _LeaseMemoryObj()],
+    ]
+    index_caches = _dense_retention_caches([[301, 302], [401, 402]])
     assert engine._adopt_dense_shared_retrieve_cache(
         req_id="req-dense",
-        starts=[0],
-        ends=[256],
+        starts=[0, 256],
+        ends=[256, 300],
         keys_layer_major=keys,
         memory_objs=index_objs,
         handles=handles,
@@ -543,16 +557,11 @@ def test_dense_shared_cache_adoption_transfers_ownership():
 def test_dense_shared_cache_adoption_falls_back_when_incomplete():
     engine = object.__new__(LMCacheEngine)
     engine.num_layers = 2
+    engine.gpu_connector = _DenseRetentionConnector()
     engine.shared_cpu_cache_generation = 9
     engine._shared_cpu_request_leases = {}
     engine.metadata = SimpleNamespace(is_first_rank=lambda: False)
-    caches = {
-        "cached_keys": [],
-        "cached_starts": [],
-        "cached_ends": [],
-        "cached_memory_objs": [],
-        "cached_shared_handles": [],
-    }
+    caches = _dense_retention_caches([[101], [201]])
 
     assert not engine._adopt_dense_shared_retrieve_cache(
         req_id="req-incomplete",
@@ -571,18 +580,14 @@ def test_dense_shared_cache_adoption_falls_back_when_incomplete():
 def test_dense_shared_cache_adoption_rolls_back_before_ownership_transfer():
     engine = object.__new__(LMCacheEngine)
     engine.num_layers = 1
+    engine.gpu_connector = _DenseRetentionConnector()
+
     def fail_registration(*_args, **_kwargs):
         raise RuntimeError("registration failed")
 
     engine.register_shared_cpu_sparse_request = fail_registration
     memory_obj = _LeaseMemoryObj()
-    caches = {
-        "cached_keys": [],
-        "cached_starts": [],
-        "cached_ends": [],
-        "cached_memory_objs": [],
-        "cached_shared_handles": [],
-    }
+    caches = _dense_retention_caches([[101]])
 
     with pytest.raises(RuntimeError, match="registration failed"):
         engine._adopt_dense_shared_retrieve_cache(
@@ -598,6 +603,49 @@ def test_dense_shared_cache_adoption_rolls_back_before_ownership_transfer():
 
     assert not any(caches.values())
     assert memory_obj.valid
+
+
+def test_dense_shared_cache_adoption_rejects_incomplete_pointer_rows():
+    engine = object.__new__(LMCacheEngine)
+    engine.num_layers = 2
+    engine.gpu_connector = _DenseRetentionConnector()
+    engine.shared_cpu_cache_generation = 9
+    engine._shared_cpu_request_leases = {}
+    engine.metadata = SimpleNamespace(is_first_rank=lambda: False)
+    caches = _dense_retention_caches([[101], []])
+
+    assert not engine._adopt_dense_shared_retrieve_cache(
+        req_id="req-incomplete-pointers",
+        starts=[0],
+        ends=[256],
+        keys_layer_major=[[_make_key()], [_make_key()]],
+        memory_objs=[[_LeaseMemoryObj()], [_LeaseMemoryObj()]],
+        handles=[[object()], [object()]],
+        kv_group=0,
+        kwargs={"_retain_shared_dense_cache": True, **caches},
+    )
+    assert "req-incomplete-pointers" not in engine._shared_cpu_request_leases
+    assert not any(caches.values())
+
+
+def test_dense_shared_cache_adoption_is_capability_gated():
+    engine = object.__new__(LMCacheEngine)
+    engine.num_layers = 1
+    engine.gpu_connector = SimpleNamespace()
+    caches = _dense_retention_caches([[101]])
+
+    assert not engine._adopt_dense_shared_retrieve_cache(
+        req_id="req-unsupported",
+        starts=[0],
+        ends=[256],
+        keys_layer_major=[[_make_key()]],
+        memory_objs=[[_LeaseMemoryObj()]],
+        handles=[[object()]],
+        kv_group=0,
+        kwargs={"_retain_shared_dense_cache": True, **caches},
+    )
+    assert caches["cached_chunk_dev_ptrs"] == [[101]]
+    assert caches["cached_chunk_ptrs_npu"][0].tolist() == [101]
 
 
 class _FakeLayerwiseStorageManager:

@@ -6298,9 +6298,16 @@ class LMCacheConnectorV1Impl:
                             False,
                         )
                     )
+                    supports_dense_retention = getattr(
+                        self.lmcache_engine,
+                        "supports_dense_sparse_cache_retention",
+                        None,
+                    )
                     retain_dense_seed = (
                         shared_cpu_enabled
                         and getattr(self, "enable_sparse_attention", False)
+                        and callable(supports_dense_retention)
+                        and supports_dense_retention()
                     )
                     if retain_dense_seed and (
                         retrieve_state.shared_request_active

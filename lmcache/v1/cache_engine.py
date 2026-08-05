@@ -1663,6 +1663,16 @@ class LMCacheEngine:
             True,
         )
 
+    def supports_dense_sparse_cache_retention(self) -> bool:
+        """Return whether dense retrieval can seed complete sparse state."""
+        connector = self.gpu_connector
+        supports = getattr(
+            connector,
+            "supports_dense_sparse_cache_retention",
+            None,
+        )
+        return bool(callable(supports) and supports())
+
     def register_shared_cpu_sparse_request(
         self,
         req_id: str,
@@ -2959,6 +2969,8 @@ class LMCacheEngine:
         """Move a completed dense retrieve directly into sparse request state."""
         if not req_id or not kwargs.get("_retain_shared_dense_cache"):
             return False
+        if not self.supports_dense_sparse_cache_retention():
+            return False
         caches = {
             name: kwargs.get(name)
             for name in (
@@ -2966,6 +2978,8 @@ class LMCacheEngine:
                 "cached_starts",
                 "cached_ends",
                 "cached_memory_objs",
+                "cached_chunk_dev_ptrs",
+                "cached_chunk_ptrs_npu",
                 "cached_shared_handles",
             )
         }
@@ -2980,12 +2994,25 @@ class LMCacheEngine:
         ):
             raise ValueError("Dense shared cache retention target is not empty.")
         chunks = len(starts)
-        layers = (keys_layer_major, memory_objs, handles)
+        layers = (
+            keys_layer_major,
+            memory_objs,
+            handles,
+            caches["cached_chunk_dev_ptrs"],
+        )
+        pointer_rows = caches["cached_chunk_ptrs_npu"]
         if (
             len(ends) != chunks
             or any(len(values) != self.num_layers for values in layers)
             or any(len(layer) != chunks for values in layers for layer in values)
+            or len(pointer_rows) != self.num_layers
+            or any(
+                not isinstance(row, torch.Tensor) or row.numel() != chunks
+                for row in pointer_rows
+            )
         ):
+            caches["cached_chunk_dev_ptrs"].clear()
+            pointer_rows.clear()
             return False
 
         try:

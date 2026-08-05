@@ -186,11 +186,15 @@ class TestWorkerRetrieveState:
             cached_starts=[0, 256],
             cached_ends=[256, 300],
             cached_memory_objs=latent,
+            cached_chunk_dev_ptrs=[[111, 222]],
+            cached_chunk_ptrs_npu=[torch.tensor([111, 222])],
             cached_shared_handles=[["lh0", "lh1"]],
             cached_keys_indexer=[["ik0", "ik1"]],
             cached_starts_indexer=[0, 256],
             cached_ends_indexer=[256, 300],
             cached_memory_objs_indexer=indexer,
+            cached_chunk_dev_ptrs_indexer=[[333, 444]],
+            cached_chunk_ptrs_npu_indexer=[torch.tensor([333, 444])],
             cached_shared_handles_indexer=[["ih0", "ih1"]],
             dense_prefix_seed=True,
             metadata_warm=True,
@@ -207,6 +211,10 @@ class TestWorkerRetrieveState:
         assert state.cached_ends_indexer == [256]
         assert state.cached_shared_handles == [["lh0"]]
         assert state.cached_shared_handles_indexer == [["ih0"]]
+        assert state.cached_chunk_dev_ptrs == [[111]]
+        assert state.cached_chunk_ptrs_npu[0].tolist() == [111]
+        assert state.cached_chunk_dev_ptrs_indexer == [[333]]
+        assert state.cached_chunk_ptrs_npu_indexer[0].tolist() == [333]
         assert latent[0][0].released == 0
         assert indexer[0][0].released == 0
         assert latent_tail.released == 1

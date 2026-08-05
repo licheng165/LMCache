@@ -140,6 +140,15 @@ class GPUConnectorInterface(metaclass=abc.ABCMeta):
             if isinstance(self.kvcaches, list) and self.kvcaches:
                 self.num_layers = len(self.kvcaches)
 
+    def supports_dense_sparse_cache_retention(self) -> bool:
+        """Return whether dense loads populate complete sparse pointer caches.
+
+        Connectors must return ``True`` only when a dense layerwise retrieve
+        fills both the host and device pointer rows passed in its keyword
+        arguments without an additional pointer-resolution pass.
+        """
+        return False
+
 
 class VLLMPagedMemGPUConnectorV2(GPUConnectorInterface):
     """
