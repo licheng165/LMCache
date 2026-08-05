@@ -4,6 +4,7 @@ from collections import deque
 from collections.abc import Iterable
 from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass, field
+import hashlib
 import json
 import os
 import time
@@ -23,6 +24,14 @@ from vllm.distributed.parallel_state import (
     get_pp_group,
 )
 from vllm.sampling_params import SamplingParams
+from vllm.v1.core.sched.dsa_types import (
+    DSAControlEvent,
+    DSAOperationCommand,
+    DSAOperationReceipt,
+    DSAReceiptExpectation,
+    DSASourceLease,
+    RequestKey,
+)
 from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.request import RequestStatus
 from vllm.version import __version__ as VLLM_VERSION
@@ -81,6 +90,10 @@ RETRIEVE_STATS_INTERVAL_SECONDS_ENV = (
     "VLLM_ASCEND_LMCACHE_RETRIEVE_STATS_INTERVAL_SECONDS"
 )
 LayerwiseSaveKey = tuple[str, str, int, int, int]
+DSAStoreProgressKey = tuple[RequestKey, str, str, int]
+DSASealedSourceKey = tuple[RequestKey, str]
+DSA_RELEASE_TOMBSTONE_LIMIT = 4096
+DSA_TERMINAL_COMMAND_LIMIT = 4096
 
 
 def _mtp_dw_diag_enabled() -> bool:
@@ -581,6 +594,9 @@ class RequestTracker:
     dsa_execution_seq: int = field(default=-1, repr=False)
     dsa_remap_end: int = field(default=0, repr=False)
     dsa_sparse_release_authorized: bool = field(default=False, repr=False)
+    dsa_active_generation_id: Optional[str] = field(default=None, repr=False)
+    dsa_active_token_prefix_digest: Optional[str] = field(default=None, repr=False)
+    dsa_source_lease: Optional[DSASourceLease] = field(default=None, repr=False)
 
     @_lmcache_nvtx_annotate
     @staticmethod
@@ -770,6 +786,18 @@ class WorkerRetrieveState:
         default_factory=dict,
         repr=False,
     )
+    # Positive-threshold DSA bindings are lifecycle- and generation-scoped.
+    # These fields prevent a reused bare request ID from adopting stale source
+    # memory retained by a prior request incarnation.
+    dsa_request_key: Optional[RequestKey] = field(default=None, repr=False)
+    dsa_generation_id: Optional[str] = field(default=None, repr=False)
+    dsa_operation_id: Optional[str] = field(default=None, repr=False)
+    dsa_route_epoch: int = field(default=-1, repr=False)
+    dsa_token_prefix_digest: Optional[str] = field(default=None, repr=False)
+    dsa_cache_namespace_fingerprint: Optional[str] = field(
+        default=None,
+        repr=False,
+    )
 
     def cache_kwargs(self, kv_group: int, dsa_two_groups: bool) -> dict[str, Any]:
         """Return mutable engine cache arguments for one KV group."""
@@ -825,6 +853,21 @@ class ReqMeta:
     decode_window_start: Optional[int] = None
     decode_window_end: Optional[int] = None
     decode_window_size: Optional[int] = None
+
+    # A command-owned store is independent of all legacy save gates. Its
+    # operation identity and exact range remain authoritative on the worker.
+    dsa_store_command: Optional[DSAOperationCommand] = field(
+        default=None,
+        repr=False,
+    )
+    dsa_command_error: Optional[str] = field(default=None, repr=False)
+    dsa_request_key: Optional[RequestKey] = field(default=None, repr=False)
+    dsa_route_state: Optional[str] = field(default=None, repr=False)
+    dsa_route_authoritative: bool = field(default=False, repr=False)
+    dsa_route_epoch: int = field(default=-1, repr=False)
+    dsa_active_generation_id: Optional[str] = field(default=None, repr=False)
+    dsa_active_token_prefix_digest: Optional[str] = field(default=None, repr=False)
+    dsa_source_lease: Optional[DSASourceLease] = field(default=None, repr=False)
 
     # Set by scheduler when a cached request resumes after preemption.
     resumed_from_preemption: bool = False
@@ -965,6 +1008,54 @@ class ReqMeta:
             decode_window_end=window_end,
             decode_window_size=window_size,
         )
+
+    @staticmethod
+    def from_dsa_store_command(
+        tracker: RequestTracker,
+        block_size: int,
+        command: DSAOperationCommand,
+        required_groups: set[int],
+    ) -> "ReqMeta":
+        """Create exact, command-owned metadata for a registered DSA store."""
+        operation = command.operation
+        if operation.kind != "store":
+            raise ValueError("DSA store metadata requires a store command")
+
+        request = ReqMeta.from_decode_window_save(
+            tracker,
+            block_size,
+            operation.range_start,
+            operation.range_end,
+            operation.range_end - operation.range_start,
+            windowed_sparse_layerwise_save=True,
+        )
+        if request is None:
+            request = ReqMeta(
+                req_id=tracker.req_id,
+                token_ids=tracker.token_ids[: operation.range_end].copy(),
+                save_spec=SaveSpec(
+                    operation.range_start,
+                    True,
+                    can_save_latent=0 in required_groups,
+                    can_save_indexer=1 in required_groups,
+                ),
+                dsa_command_error="store_metadata_unavailable",
+            )
+        else:
+            # Decode-window metadata is reused only as an exact range/mapping
+            # builder. Command work must never publish through the legacy
+            # completed_decode_window_saves channel.
+            request.is_decode_window_save = False
+            assert request.save_spec is not None
+            request.save_spec.can_save = True
+            request.save_spec.can_save_latent = 0 in required_groups
+            request.save_spec.can_save_indexer = 1 in required_groups
+        request.is_last_prefill = True
+        request.disagg_spec = None
+        request.dsa_store_command = command
+        request.dsa_request_key = command.request_key
+        request.dsa_route_epoch = operation.route_epoch
+        return request
 
     @staticmethod
     def from_request_tracker(
@@ -1383,8 +1474,61 @@ class ReqMeta:
 
 
 @dataclass
+class DSAStoreProgress:
+    """Worker-local proof state for one command generation and KV group."""
+
+    command: DSAOperationCommand
+    kv_group: int
+    expectations: tuple[DSAReceiptExpectation, ...]
+    required_layers: tuple[int, ...]
+    required_chunks: tuple[tuple[int, int], ...]
+    request: Optional[ReqMeta] = None
+    initial_error_code: Optional[str] = None
+    result: Optional[LayerwiseStoreResult] = None
+    error_code: Optional[str] = None
+    completed: bool = False
+
+
+@dataclass(frozen=True)
+class DSASealedSourceGroup:
+    """Immutable full-prefix manifest retained for one sealed KV group."""
+
+    layers: tuple[int, ...]
+    chunks: tuple[tuple[int, int], ...]
+    keys: tuple[tuple[Any, ...], ...]
+    memory_objs: tuple[tuple[Any, ...], ...]
+    tensors: tuple[tuple[torch.Tensor, ...], ...]
+    chunk_dev_ptrs: tuple[tuple[int, ...], ...]
+    chunk_ptrs: tuple[torch.Tensor, ...]
+    prepared_source: PreparedSparseSource
+
+
+@dataclass
+class DSASealedSourceGeneration:
+    """Generation-bound sparse source with explicit MemoryObj ownership."""
+
+    request_key: RequestKey
+    generation_id: str
+    operation_id: str
+    route_epoch: int
+    token_prefix_digest: str
+    cache_namespace_fingerprint: str
+    range_end: int
+    groups: dict[int, DSASealedSourceGroup]
+    retained_memory_objs: tuple[Any, ...]
+    pinned_memory_objs: tuple[Any, ...]
+    source_lease_ids: set[str] = field(default_factory=set)
+    pending_active: bool = False
+    active: bool = False
+    retired: bool = False
+    ownership_released: bool = False
+    ownership_release_failed: bool = False
+
+
+@dataclass
 class LMCacheConnectorMetadata(KVConnectorMetadata):
     requests: list[ReqMeta] = field(default_factory=list)
+    dsa_commands: tuple[DSAOperationCommand, ...] = ()
 
     @_lmcache_nvtx_annotate
     def add_request(self, req_meta: ReqMeta) -> None:
@@ -1668,6 +1812,29 @@ class LMCacheConnectorV1Impl:
             self._completed_decode_window_saves: dict[str, int] = {}
             self._decode_window_save_completed_groups: set[LayerwiseSaveKey] = set()
             self._decode_window_save_expected_start: dict[str, int] = {}
+            self._dsa_operation_receipts: deque[DSAOperationReceipt] = deque()
+            self._dsa_control_events: deque[DSAControlEvent] = deque()
+            self._dsa_store_progress: dict[
+                DSAStoreProgressKey, DSAStoreProgress
+            ] = {}
+            self._dsa_terminal_commands: set[tuple[RequestKey, str]] = set()
+            self._dsa_terminal_command_outputs: dict[
+                tuple[RequestKey, str],
+                tuple[DSAOperationCommand, tuple[DSAOperationReceipt, ...]],
+            ] = {}
+            self._dsa_sealed_sources: dict[
+                DSASealedSourceKey, DSASealedSourceGeneration
+            ] = {}
+            self._dsa_pending_active_generations: dict[RequestKey, str] = {}
+            self._dsa_active_generations: dict[RequestKey, str] = {}
+            self._dsa_source_lease_bindings: dict[str, DSASealedSourceKey] = {}
+            self._dsa_bound_source_leases: dict[str, DSASourceLease] = {}
+            self._dsa_released_source_leases: deque[DSASourceLease] = deque(
+                maxlen=DSA_RELEASE_TOMBSTONE_LIMIT
+            )
+            self._dsa_source_lease_release_tombstones: dict[
+                str, DSASourceLease
+            ] = {}
             self._warn_mla_per_rank_lookup_config(config)
 
     def _warn_mla_per_rank_lookup_config(self, config: LMCacheEngineConfig) -> None:
@@ -2905,6 +3072,11 @@ class LMCacheConnectorV1Impl:
     def _is_decode_window_save_request(request: ReqMeta) -> bool:
         return bool(getattr(request, "is_decode_window_save", False))
 
+    @staticmethod
+    def _is_dsa_store_request(request: ReqMeta) -> bool:
+        command = getattr(request, "dsa_store_command", None)
+        return bool(command is not None and command.operation.kind == "store")
+
     def _windowed_sparse_layerwise_save_enabled(self) -> bool:
         config = getattr(self, "config", None)
         use_layerwise = getattr(
@@ -2924,14 +3096,23 @@ class LMCacheConnectorV1Impl:
         expected_base: int,
     ) -> Optional[torch.Tensor]:
         """Return the request-local save mapping for the selected KV group."""
-        if not self._windowed_sparse_layerwise_save_enabled():
+        command_owned = self._is_dsa_store_request(request)
+        if not command_owned and not self._windowed_sparse_layerwise_save_enabled():
             return None
         if not bool(getattr(request, "windowed_sparse_save", False)):
             return None
         # Disaggregated producers intentionally resend the whole prefix. Use
         # their request-owned full mapping rather than batched attention
         # metadata, which can belong to another request in the same forward.
-        if (
+        if command_owned:
+            mapping_attr = (
+                "save_indexer_slot_mapping"
+                if kv_group == 1
+                else "save_slot_mapping"
+            )
+            mappings = getattr(request, mapping_attr, None)
+            base = getattr(request, "save_slot_mapping_base", None)
+        elif (
             self.kv_role == "kv_producer"
             and not self._is_decode_window_save_request(request)
         ):
@@ -2973,6 +3154,10 @@ class LMCacheConnectorV1Impl:
         return mapping
 
     def _layerwise_save_range(self, request: ReqMeta) -> tuple[int, int]:
+        if self._is_dsa_store_request(request):
+            assert request.dsa_store_command is not None
+            operation = request.dsa_store_command.operation
+            return operation.range_start, operation.range_end
         if self._is_decode_window_save_request(request):
             return (
                 int(getattr(request, "decode_window_start", 0) or 0),
@@ -2990,11 +3175,19 @@ class LMCacheConnectorV1Impl:
         self, request: ReqMeta, kv_group: int = 0
     ) -> LayerwiseSaveKey:
         start, end = self._layerwise_save_range(request)
-        kind = (
-            "decode_window_save"
-            if self._is_decode_window_save_request(request)
-            else "normal_save"
-        )
+        if self._is_dsa_store_request(request):
+            assert request.dsa_store_command is not None
+            operation = request.dsa_store_command.operation
+            kind = (
+                f"dsa_store:{operation.operation_id}:"
+                f"{operation.output_generation_id}"
+            )
+        else:
+            kind = (
+                "decode_window_save"
+                if self._is_decode_window_save_request(request)
+                else "normal_save"
+            )
         return request.req_id, kind, kv_group, start, end
 
     def _clear_decode_window_save_groups_for_req(self, req_id: str) -> None:
@@ -3185,7 +3378,9 @@ class LMCacheConnectorV1Impl:
             return
         engine = manager.lmcache_engine
         if engine is not None:
-            engine.lookup_unpin(req_id)
+            lookup_unpin = getattr(engine, "lookup_unpin", None)
+            if callable(lookup_unpin):
+                lookup_unpin(req_id)
 
     def _maybe_lookup_unpin_for_request(self, request: ReqMeta) -> None:
         if self._is_decode_window_save_request(request):
@@ -3297,6 +3492,7 @@ class LMCacheConnectorV1Impl:
             not request.is_last_prefill
             or request.is_sparse_decode
             or self._is_decode_window_save_request(request)
+            or self._is_dsa_store_request(request)
         ):
             return
         committed_end = (
@@ -3338,6 +3534,1478 @@ class LMCacheConnectorV1Impl:
         drained = dict(completed)
         completed.clear()
         return drained
+
+    def get_dsa_operation_receipts(self) -> tuple[DSAOperationReceipt, ...]:
+        """Drain worker DSA operation receipts exactly once."""
+        receipts = getattr(self, "_dsa_operation_receipts", None)
+        if not receipts:
+            return ()
+        drained = tuple(receipts)
+        receipts.clear()
+        return drained
+
+    def get_dsa_control_events(self) -> tuple[DSAControlEvent, ...]:
+        """Drain worker DSA control events exactly once."""
+        events = getattr(self, "_dsa_control_events", None)
+        if not events:
+            return ()
+        drained = tuple(events)
+        events.clear()
+        return drained
+
+    def get_released_dsa_source_leases(self) -> tuple[DSASourceLease, ...]:
+        """Drain source leases released after their final accelerator fence."""
+        leases = getattr(self, "_dsa_released_source_leases", None)
+        if not leases:
+            return ()
+        drained = tuple(leases)
+        leases.clear()
+        return drained
+
+    def _ensure_dsa_worker_protocol_state(self) -> None:
+        """Initialize protocol containers for tests that construct via __new__."""
+        if not hasattr(self, "_dsa_operation_receipts"):
+            self._dsa_operation_receipts = deque()
+        if not hasattr(self, "_dsa_control_events"):
+            self._dsa_control_events = deque()
+        if not hasattr(self, "_dsa_store_progress"):
+            self._dsa_store_progress = {}
+        if not hasattr(self, "_dsa_terminal_commands"):
+            self._dsa_terminal_commands = set()
+        if not hasattr(self, "_dsa_terminal_command_outputs"):
+            self._dsa_terminal_command_outputs = {}
+        if not hasattr(self, "_dsa_sealed_sources"):
+            self._dsa_sealed_sources = {}
+        if not hasattr(self, "_dsa_pending_active_generations"):
+            self._dsa_pending_active_generations = {}
+        if not hasattr(self, "_dsa_active_generations"):
+            self._dsa_active_generations = {}
+        if not hasattr(self, "_dsa_source_lease_bindings"):
+            self._dsa_source_lease_bindings = {}
+        if not hasattr(self, "_dsa_bound_source_leases"):
+            self._dsa_bound_source_leases = {}
+        if not hasattr(self, "_dsa_released_source_leases"):
+            self._dsa_released_source_leases = deque(
+                maxlen=DSA_RELEASE_TOMBSTONE_LIMIT
+            )
+        if not hasattr(self, "_dsa_source_lease_release_tombstones"):
+            self._dsa_source_lease_release_tombstones = {}
+
+    def _local_dsa_expectations(
+        self,
+        command: DSAOperationCommand,
+    ) -> tuple[DSAReceiptExpectation, ...]:
+        """Select exactly the expectations owned by this worker participant."""
+        expectations = tuple(command.expected_receipts)
+        participants = tuple(
+            dict.fromkeys(expectation.participant for expectation in expectations)
+        )
+        engine_metadata = getattr(
+            getattr(self, "lmcache_engine", None),
+            "metadata",
+            None,
+        )
+        worker_rank = getattr(engine_metadata, "worker_id", None)
+        parallel_config = getattr(
+            getattr(self, "_vllm_config", None),
+            "parallel_config",
+            None,
+        )
+        if worker_rank is None:
+            worker_rank = getattr(parallel_config, "rank", None)
+        dp_rank = getattr(parallel_config, "data_parallel_rank", None)
+        tp_size = int(
+            getattr(parallel_config, "tensor_parallel_size", 0) or 0
+        )
+
+        if worker_rank is None:
+            if len(participants) != 1:
+                return ()
+            local_participant = participants[0]
+        else:
+            local_tp_rank = (
+                int(worker_rank) % tp_size if tp_size > 0 else int(worker_rank)
+            )
+            matches = [
+                participant
+                for participant in participants
+                if participant.worker_rank == int(worker_rank)
+                or participant.tp_rank == local_tp_rank
+            ]
+            if dp_rank is not None:
+                dp_matches = [
+                    participant
+                    for participant in matches
+                    if participant.dp_rank == int(dp_rank)
+                ]
+                if dp_matches:
+                    matches = dp_matches
+            if len(matches) != 1:
+                return ()
+            local_participant = matches[0]
+        return tuple(
+            expectation
+            for expectation in expectations
+            if expectation.participant == local_participant
+        )
+
+    @staticmethod
+    def _dsa_store_progress_key(
+        command: DSAOperationCommand,
+        kv_group: int,
+    ) -> DSAStoreProgressKey:
+        generation = command.operation.output_generation_id or ""
+        return (
+            command.request_key,
+            command.operation.operation_id,
+            generation,
+            kv_group,
+        )
+
+    def _queue_terminal_dsa_command_replay(
+        self,
+        command: DSAOperationCommand,
+    ) -> None:
+        command_key = (command.request_key, command.operation.operation_id)
+        cached = self._dsa_terminal_command_outputs.get(command_key)
+        if cached is None:
+            raise RuntimeError("DSA terminal command has no replay record")
+        cached_command, cached_receipts = cached
+        if cached_command != command:
+            raise RuntimeError("Conflicting replay of a terminal DSA command")
+        queued_ids = {
+            receipt.receipt_id for receipt in self._dsa_operation_receipts
+        }
+        self._dsa_operation_receipts.extend(
+            receipt
+            for receipt in cached_receipts
+            if receipt.receipt_id not in queued_ids
+        )
+
+    def _remember_terminal_dsa_command(
+        self,
+        command: DSAOperationCommand,
+        receipts: tuple[DSAOperationReceipt, ...],
+    ) -> None:
+        command_key = (command.request_key, command.operation.operation_id)
+        self._dsa_terminal_commands.add(command_key)
+        self._dsa_terminal_command_outputs[command_key] = (command, receipts)
+        while len(self._dsa_terminal_command_outputs) > DSA_TERMINAL_COMMAND_LIMIT:
+            oldest = next(iter(self._dsa_terminal_command_outputs))
+            self._dsa_terminal_command_outputs.pop(oldest)
+            self._dsa_terminal_commands.discard(oldest)
+
+    def _initialize_dsa_commands(
+        self,
+        metadata: LMCacheConnectorMetadata,
+    ) -> None:
+        """Create exact worker-local ledgers for newly bound commands."""
+        self._ensure_dsa_worker_protocol_state()
+        command_requests = {
+            command.operation.operation_id: request
+            for request in metadata.requests
+            if (command := getattr(request, "dsa_store_command", None)) is not None
+        }
+        for command in metadata.dsa_commands:
+            command_key = (command.request_key, command.operation.operation_id)
+            if command_key in self._dsa_terminal_commands:
+                self._queue_terminal_dsa_command_replay(command)
+                continue
+            if command.operation.kind != "store":
+                continue
+            command_expectations = tuple(command.expected_receipts)
+            participants = tuple(
+                dict.fromkeys(
+                    expectation.participant
+                    for expectation in command_expectations
+                )
+            )
+            local_expectations = self._local_dsa_expectations(command)
+            request = command_requests.get(command.operation.operation_id)
+            for kv_group in sorted(
+                {expectation.kv_group for expectation in command_expectations}
+            ):
+                group_expectations = tuple(
+                    expectation
+                    for expectation in local_expectations
+                    if expectation.kv_group == kv_group
+                )
+                command_group_expectations = tuple(
+                    expectation
+                    for expectation in command_expectations
+                    if expectation.kv_group == kv_group
+                )
+                key = self._dsa_store_progress_key(command, kv_group)
+                if key in self._dsa_store_progress:
+                    continue
+                layers = {
+                    tuple(sorted(expectation.layers))
+                    for expectation in command_group_expectations
+                }
+                chunks = {
+                    tuple(sorted(expectation.chunks))
+                    for expectation in command_group_expectations
+                }
+                participant_manifests = tuple(
+                    tuple(
+                        expectation
+                        for expectation in command_group_expectations
+                        if expectation.participant == participant
+                    )
+                    for participant in participants
+                )
+                error_code = None
+                if (
+                    not participants
+                    or len(layers) != 1
+                    or len(chunks) != 1
+                    or any(
+                        len(manifest) != 2
+                        or {
+                            expectation.receipt_kind
+                            for expectation in manifest
+                        }
+                        != {"storage", "source_seal"}
+                        for manifest in participant_manifests
+                    )
+                    or len(group_expectations) != 2
+                ):
+                    error_code = "malformed_receipt_expectations"
+                elif {
+                    expectation.receipt_kind
+                    for expectation in group_expectations
+                } != {"storage", "source_seal"}:
+                    error_code = "incomplete_receipt_expectations"
+                elif any(
+                    expectation.storage_tier != "local_cpu"
+                    or expectation.minimum_guarantee != "local_cpu_pinned"
+                    for expectation in command_group_expectations
+                ):
+                    error_code = "unsupported_store_guarantee"
+                initial_error_code = error_code
+                if error_code is None:
+                    if request is None:
+                        error_code = "store_metadata_unavailable"
+                    elif request.dsa_request_key != command.request_key:
+                        error_code = "stale_request_key"
+                    elif request.dsa_command_error is not None:
+                        error_code = request.dsa_command_error
+                self._dsa_store_progress[key] = DSAStoreProgress(
+                    command=command,
+                    kv_group=kv_group,
+                    expectations=group_expectations,
+                    required_layers=min(layers, default=()),
+                    required_chunks=min(chunks, default=()),
+                    request=request,
+                    initial_error_code=initial_error_code,
+                    error_code=error_code,
+                )
+
+    def _record_dsa_store_failure(
+        self,
+        request: ReqMeta,
+        kv_group: int,
+        error_code: str,
+    ) -> None:
+        command = getattr(request, "dsa_store_command", None)
+        if command is None:
+            return
+        self._ensure_dsa_worker_protocol_state()
+        progress = self._dsa_store_progress.get(
+            self._dsa_store_progress_key(command, kv_group)
+        )
+        if progress is not None and progress.error_code is None:
+            progress.error_code = error_code
+
+    def _record_dsa_store_result(
+        self,
+        request: ReqMeta,
+        kv_group: int,
+        completed: bool,
+        result: Optional[LayerwiseStoreResult],
+    ) -> None:
+        command = getattr(request, "dsa_store_command", None)
+        if command is None:
+            return
+        progress = self._dsa_store_progress.get(
+            self._dsa_store_progress_key(command, kv_group)
+        )
+        if progress is None or progress.error_code is not None:
+            return
+        if not completed:
+            progress.error_code = "layerwise_store_incomplete"
+            return
+        if result is None or not result.has_cache():
+            progress.error_code = self._dsa_empty_store_error_code()
+            return
+        if result.request_id != request.req_id:
+            progress.error_code = "store_request_mismatch"
+            return
+        if result.kv_group != kv_group:
+            progress.error_code = "store_kv_group_mismatch"
+            return
+        progress.result = result
+        progress.completed = True
+
+    def _dsa_empty_store_error_code(self) -> str:
+        return self._dsa_store_health_error_code() or "empty_store_result"
+
+    def _dsa_store_health_error_code(self) -> Optional[str]:
+        engine = getattr(self, "lmcache_engine", None)
+        if engine is None:
+            return "store_engine_unavailable"
+        is_passive = getattr(engine, "_is_passive", None)
+        if callable(is_passive) and is_passive():
+            return "passive_worker"
+        is_healthy = getattr(engine, "is_healthy", None)
+        if callable(is_healthy) and not is_healthy():
+            return "backend_unhealthy"
+        is_frozen = getattr(engine, "is_frozen", None)
+        if callable(is_frozen) and is_frozen():
+            return "backend_frozen"
+        return None
+
+    @staticmethod
+    def _dsa_receipt_id(
+        command: DSAOperationCommand,
+        expectation: DSAReceiptExpectation,
+    ) -> str:
+        participant = expectation.participant
+        identity = "\0".join(
+            (
+                str(command.request_key),
+                command.operation.operation_id,
+                expectation.receipt_kind,
+                str(expectation.kv_group),
+                participant.engine_id,
+                participant.process_instance_id,
+                str(participant.worker_rank),
+                repr(expectation.layers),
+                repr(expectation.chunks),
+                expectation.storage_tier,
+            )
+        )
+        digest = hashlib.sha256(identity.encode("utf-8")).hexdigest()[:24]
+        return f"lmcache-dsa-{digest}"
+
+    def _emit_dsa_receipts(
+        self,
+        command: DSAOperationCommand,
+        expectations: Iterable[DSAReceiptExpectation],
+        *,
+        status: str,
+        error_code: Optional[str] = None,
+    ) -> tuple[DSAOperationReceipt, ...]:
+        self._ensure_dsa_worker_protocol_state()
+        operation = command.operation
+        emitted: list[DSAOperationReceipt] = []
+        for expectation in expectations:
+            receipt = DSAOperationReceipt(
+                    receipt_id=self._dsa_receipt_id(command, expectation),
+                    request_key=command.request_key,
+                    operation_id=operation.operation_id,
+                    receipt_kind=expectation.receipt_kind,
+                    route_epoch=operation.route_epoch,
+                    input_generation_id=operation.input_generation_id,
+                    output_generation_id=operation.output_generation_id,
+                    accepted_end_at_seal=command.accepted_end_at_issue,
+                    token_prefix_digest=command.token_prefix_digest,
+                    cache_namespace_fingerprint=(
+                        command.cache_namespace_fingerprint
+                    ),
+                    range_start=operation.range_start,
+                    range_end=operation.range_end,
+                    kv_group=expectation.kv_group,
+                    participant=expectation.participant,
+                    covered_layers=expectation.layers,
+                    covered_chunks=expectation.chunks,
+                    storage_tier=expectation.storage_tier,
+                    status=status,  # type: ignore[arg-type]
+                    lease_descriptor_id=None,
+                    guarantee=(
+                        expectation.minimum_guarantee
+                        if status == "complete"
+                        else None
+                    ),
+                    error_code=error_code if status == "failed" else None,
+                )
+            self._dsa_operation_receipts.append(receipt)
+            emitted.append(receipt)
+        return tuple(emitted)
+
+    @staticmethod
+    def _dsa_result_layer_tensors(
+        result: LayerwiseStoreResult,
+        layer_id: int,
+    ) -> tuple[torch.Tensor, ...]:
+        if layer_id < len(result.tensors) and result.tensors[layer_id]:
+            return tuple(result.tensors[layer_id])
+        if layer_id >= len(result.memory_objs):
+            return ()
+        tensors = tuple(
+            getattr(memory_obj, "tensor", None)
+            for memory_obj in result.memory_objs[layer_id]
+        )
+        if any(not isinstance(tensor, torch.Tensor) for tensor in tensors):
+            return ()
+        return tensors  # type: ignore[return-value]
+
+    def _validate_dsa_store_result(
+        self,
+        progress: DSAStoreProgress,
+    ) -> Optional[str]:
+        result = progress.result
+        if not progress.completed or result is None:
+            return progress.error_code or "missing_layer_results"
+        if (
+            len(result.starts) != len(progress.required_chunks)
+            or len(result.ends) != len(progress.required_chunks)
+        ):
+            return "partial_chunk_coverage"
+        actual_chunks = tuple(
+            (int(start), int(end))
+            for start, end in zip(result.starts, result.ends, strict=False)
+        )
+        if actual_chunks != progress.required_chunks:
+            return "partial_chunk_coverage"
+        layers = progress.required_layers
+        if not layers or layers != tuple(range(len(layers))):
+            return "unsupported_layer_manifest"
+        if len(result.memory_objs) != len(layers):
+            return "partial_layer_coverage"
+        if len(result.keys) != len(layers):
+            return "partial_key_coverage"
+        chunk_count = len(progress.required_chunks)
+        if chunk_count == 0:
+            return "empty_chunk_coverage"
+        for layer_id in layers:
+            memory_objs = result.memory_objs[layer_id]
+            if len(memory_objs) != chunk_count:
+                return "partial_layer_coverage"
+            if len(result.keys[layer_id]) != chunk_count:
+                return "partial_key_coverage"
+            if len(self._dsa_result_layer_tensors(result, layer_id)) != chunk_count:
+                return "source_tensor_coverage_incomplete"
+            if any(
+                tensor.device.type != "cpu"
+                for tensor in self._dsa_result_layer_tensors(result, layer_id)
+            ):
+                return "source_not_local_cpu"
+            for memory_obj in memory_objs:
+                is_valid = getattr(memory_obj, "is_valid", None)
+                if not callable(is_valid) or not is_valid():
+                    return "invalid_memory_object"
+                if not callable(getattr(memory_obj, "ref_count_up", None)):
+                    return "source_ownership_unavailable"
+                if not callable(getattr(memory_obj, "pin", None)):
+                    return "source_pin_unavailable"
+        return None
+
+    @staticmethod
+    def _dsa_concat_layer_rows(
+        prefix: tuple[tuple[Any, ...], ...],
+        suffix: tuple[tuple[Any, ...], ...],
+    ) -> tuple[tuple[Any, ...], ...]:
+        if not prefix:
+            return suffix
+        if len(prefix) != len(suffix):
+            raise RuntimeError("DSA source layer counts do not match")
+        return tuple(
+            tuple(prefix_row) + tuple(suffix_row)
+            for prefix_row, suffix_row in zip(prefix, suffix, strict=True)
+        )
+
+    def _dsa_result_chunk_ptrs(
+        self,
+        result: LayerwiseStoreResult,
+        layers: tuple[int, ...],
+    ) -> tuple[torch.Tensor, ...]:
+        pointers: list[torch.Tensor] = []
+        expected_device = torch.device(getattr(self, "device", "cpu"))
+        for layer_id in layers:
+            pointer_tensor = (
+                result.chunk_ptrs[layer_id]
+                if layer_id < len(result.chunk_ptrs)
+                else None
+            )
+            if pointer_tensor is None:
+                if expected_device.type != "cpu":
+                    return ()
+                tensors = self._dsa_result_layer_tensors(result, layer_id)
+                if not tensors:
+                    return ()
+                pointer_tensor = torch.tensor(
+                    [tensor.data_ptr() for tensor in tensors],
+                    dtype=torch.int64,
+                    device=tensors[0].device,
+                )
+            if not isinstance(pointer_tensor, torch.Tensor):
+                return ()
+            pointers.append(pointer_tensor)
+        return tuple(pointers)
+
+    def _build_dsa_sealed_group(
+        self,
+        progress: DSAStoreProgress,
+        prior: Optional[DSASealedSourceGroup],
+        full_range_end: int,
+    ) -> tuple[Optional[DSASealedSourceGroup], Optional[str]]:
+        result = progress.result
+        assert result is not None
+        layers = progress.required_layers
+        current_keys = tuple(
+            tuple(result.keys[layer_id])
+            if layer_id < len(result.keys)
+            else ()
+            for layer_id in layers
+        )
+        current_memory_objs = tuple(
+            tuple(result.memory_objs[layer_id]) for layer_id in layers
+        )
+        current_tensors = tuple(
+            self._dsa_result_layer_tensors(result, layer_id)
+            for layer_id in layers
+        )
+        current_dev_ptrs = tuple(
+            tuple(result.chunk_dev_ptrs[layer_id])
+            if layer_id < len(result.chunk_dev_ptrs)
+            else tuple(tensor.data_ptr() for tensor in current_tensors[layer_id])
+            for layer_id in layers
+        )
+        expected_pointer_device = torch.device(
+            getattr(self, "device", "cpu")
+        )
+        if expected_pointer_device.type != "cpu" and any(
+            layer_id >= len(result.chunk_dev_ptrs)
+            or len(result.chunk_dev_ptrs[layer_id]) != len(current_tensors[layer_id])
+            or any(int(pointer) <= 0 for pointer in result.chunk_dev_ptrs[layer_id])
+            for layer_id in layers
+        ):
+            return None, "source_device_pointer_coverage_incomplete"
+        current_chunk_ptrs = self._dsa_result_chunk_ptrs(result, layers)
+        if len(current_chunk_ptrs) != len(layers):
+            return None, "source_pointer_coverage_incomplete"
+
+        chunks = progress.required_chunks
+        keys = current_keys
+        memory_objs = current_memory_objs
+        tensors = current_tensors
+        chunk_dev_ptrs = current_dev_ptrs
+        chunk_ptrs = current_chunk_ptrs
+        if prior is not None:
+            if prior.layers != layers:
+                return None, "source_layer_manifest_mismatch"
+            chunks = prior.chunks + chunks
+            try:
+                keys = self._dsa_concat_layer_rows(prior.keys, current_keys)
+                memory_objs = self._dsa_concat_layer_rows(
+                    prior.memory_objs,
+                    current_memory_objs,
+                )
+                tensors = self._dsa_concat_layer_rows(
+                    prior.tensors,
+                    current_tensors,
+                )
+                chunk_dev_ptrs = self._dsa_concat_layer_rows(
+                    prior.chunk_dev_ptrs,
+                    current_dev_ptrs,
+                )
+                chunk_ptrs = tuple(
+                    torch.cat((prior_ptrs, current_ptrs))
+                    for prior_ptrs, current_ptrs in zip(
+                        prior.chunk_ptrs,
+                        current_chunk_ptrs,
+                        strict=True,
+                    )
+                )
+            except (RuntimeError, ValueError):
+                return None, "source_manifest_merge_failed"
+
+        expected_start = 0
+        for start, end in chunks:
+            if start != expected_start or end <= start:
+                return None, "noncontiguous_source_manifest"
+            expected_start = end
+        if expected_start != full_range_end:
+            return None, "incomplete_source_manifest"
+        chunk_token_counts = tuple(end - start for start, end in chunks)
+        try:
+            prepared_source = build_prepared_sparse_source(
+                tensors,
+                chunk_ptrs,
+                num_layers=len(layers),
+                total_tokens=full_range_end,
+                chunk_token_counts=chunk_token_counts,
+                expected_pointer_device=(
+                    expected_pointer_device
+                    if expected_pointer_device.type != "cpu"
+                    else None
+                ),
+            )
+        except (TypeError, ValueError):
+            return None, "source_preparation_failed"
+        if prepared_source is None:
+            return None, "source_preparation_incomplete"
+        return (
+            DSASealedSourceGroup(
+                layers=layers,
+                chunks=chunks,
+                keys=keys,
+                memory_objs=memory_objs,
+                tensors=tensors,
+                chunk_dev_ptrs=chunk_dev_ptrs,
+                chunk_ptrs=chunk_ptrs,
+                prepared_source=prepared_source,
+            ),
+            None,
+        )
+
+    @staticmethod
+    def _release_dsa_memory_ownership(memory_objs: Iterable[Any]) -> bool:
+        released = True
+        for memory_obj in memory_objs:
+            ref_count_down = getattr(memory_obj, "ref_count_down", None)
+            if callable(ref_count_down):
+                try:
+                    ref_count_down()
+                except Exception:
+                    logger.exception("Failed to release a DSA source MemoryObj")
+                    released = False
+        return released
+
+    @staticmethod
+    def _release_dsa_memory_pins(memory_objs: Iterable[Any]) -> bool:
+        released = True
+        for memory_obj in memory_objs:
+            unpin = getattr(memory_obj, "unpin_durable", None)
+            if not callable(unpin):
+                unpin = getattr(memory_obj, "unpin", None)
+            if not callable(unpin):
+                released = False
+                continue
+            try:
+                if unpin() is False:
+                    released = False
+            except Exception:
+                logger.exception("Failed to unpin a DSA source MemoryObj")
+                released = False
+        return released
+
+    def _release_dsa_generation(
+        self,
+        source: DSASealedSourceGeneration,
+    ) -> bool:
+        if source.ownership_released:
+            return True
+        if source.ownership_release_failed:
+            return False
+        if source.source_lease_ids or source.active or source.pending_active:
+            return False
+        pins_released = self._release_dsa_memory_pins(source.pinned_memory_objs)
+        refs_released = self._release_dsa_memory_ownership(
+            source.retained_memory_objs
+        )
+        if not pins_released or not refs_released:
+            source.ownership_release_failed = True
+            logger.error(
+                "DSA source ownership cleanup could not be proven safe; "
+                "preserving generation tombstone: request_key=%s generation=%s",
+                source.request_key,
+                source.generation_id,
+            )
+            return False
+        source.ownership_released = True
+        self._dsa_sealed_sources.pop(
+            (source.request_key, source.generation_id),
+            None,
+        )
+        return True
+
+    def _seal_dsa_store_generation(
+        self,
+        command: DSAOperationCommand,
+        progresses: tuple[DSAStoreProgress, ...],
+    ) -> tuple[Optional[DSASealedSourceGeneration], Optional[str]]:
+        operation = command.operation
+        generation_id = operation.output_generation_id
+        if not generation_id:
+            return None, "missing_output_generation"
+        prior_source = None
+        if operation.input_generation_id is not None:
+            prior_source = self._dsa_sealed_sources.get(
+                (command.request_key, operation.input_generation_id)
+            )
+            if prior_source is None or prior_source.ownership_released:
+                return None, "input_generation_unavailable"
+            if prior_source.range_end != operation.range_start:
+                return None, "input_generation_range_mismatch"
+            if (
+                prior_source.cache_namespace_fingerprint
+                != command.cache_namespace_fingerprint
+            ):
+                return None, "input_generation_namespace_mismatch"
+        elif operation.range_start != 0:
+            return None, "missing_input_generation"
+
+        groups: dict[int, DSASealedSourceGroup] = {}
+        for progress in progresses:
+            prior_group = (
+                prior_source.groups.get(progress.kv_group)
+                if prior_source is not None
+                else None
+            )
+            group, error_code = self._build_dsa_sealed_group(
+                progress,
+                prior_group,
+                operation.range_end,
+            )
+            if group is None:
+                return None, error_code or "source_seal_failed"
+            groups[progress.kv_group] = group
+
+        retained: list[Any] = []
+        pinned: list[Any] = []
+        retained_ids: set[int] = set()
+        try:
+            for group in groups.values():
+                for layer_memory in group.memory_objs:
+                    for memory_obj in layer_memory:
+                        if id(memory_obj) in retained_ids:
+                            continue
+                        memory_obj.ref_count_up()
+                        retained.append(memory_obj)
+                        pin = getattr(memory_obj, "pin_durable", None)
+                        if not callable(pin):
+                            pin = memory_obj.pin
+                        if pin() is False:
+                            raise RuntimeError("MemoryObj pin was rejected")
+                        pinned.append(memory_obj)
+                        if not bool(getattr(memory_obj, "is_pinned", False)):
+                            raise RuntimeError("MemoryObj did not become pinned")
+                        retained_ids.add(id(memory_obj))
+        except Exception:
+            self._release_dsa_memory_pins(reversed(pinned))
+            self._release_dsa_memory_ownership(reversed(retained))
+            return None, "source_ownership_failed"
+
+        source = DSASealedSourceGeneration(
+            request_key=command.request_key,
+            generation_id=generation_id,
+            operation_id=operation.operation_id,
+            route_epoch=operation.route_epoch,
+            token_prefix_digest=command.token_prefix_digest,
+            cache_namespace_fingerprint=command.cache_namespace_fingerprint,
+            range_end=operation.range_end,
+            groups=groups,
+            retained_memory_objs=tuple(retained),
+            pinned_memory_objs=tuple(pinned),
+        )
+        source_key = (command.request_key, generation_id)
+        existing = self._dsa_sealed_sources.get(source_key)
+        if existing is not None:
+            self._release_dsa_memory_pins(source.pinned_memory_objs)
+            self._release_dsa_memory_ownership(source.retained_memory_objs)
+            return None, "duplicate_source_generation"
+        self._dsa_sealed_sources[source_key] = source
+        for stale_source in tuple(self._dsa_sealed_sources.values()):
+            if (
+                stale_source is source
+                or stale_source.request_key != command.request_key
+                or stale_source.active
+                or stale_source.pending_active
+                or stale_source.source_lease_ids
+            ):
+                continue
+            stale_source.retired = True
+            self._release_dsa_generation(stale_source)
+        return source, None
+
+    def _await_dsa_store_futures(self) -> None:
+        timeout = getattr(getattr(self, "config", None), "blocking_timeout_secs", None)
+        seen: set[int] = set()
+        for progress in getattr(self, "_dsa_store_progress", {}).values():
+            result = progress.result
+            if result is None:
+                continue
+            for future in getattr(result, "required_futures", ()):
+                if id(future) in seen:
+                    continue
+                seen.add(id(future))
+                try:
+                    try:
+                        future.result(timeout=timeout)
+                    except TypeError:
+                        future.result()
+                except Exception as error:
+                    raise RuntimeError("DSA backend future failed") from error
+
+    def _finalize_dsa_store_commands(
+        self,
+        forced_error: Optional[str] = None,
+    ) -> bool:
+        """Seal and emit all local command expectations after the final fence."""
+        self._ensure_dsa_worker_protocol_state()
+        by_command: dict[
+            tuple[RequestKey, str], list[DSAStoreProgress]
+        ] = {}
+        for progress in self._dsa_store_progress.values():
+            command_key = (
+                progress.command.request_key,
+                progress.command.operation.operation_id,
+            )
+            if command_key not in self._dsa_terminal_commands:
+                by_command.setdefault(command_key, []).append(progress)
+
+        engine = getattr(self, "lmcache_engine", None)
+        exchange_fn = getattr(engine, "exchange_dsa_store_result", None)
+        role_fn = getattr(engine, "dsa_store_exchange_role", None)
+        exchange_role = role_fn() if callable(role_fn) else None
+        shared_exchange = exchange_role is not None and callable(exchange_fn)
+
+        finalized = False
+        for command_key, progress_list in by_command.items():
+            command = progress_list[0].command
+            progresses = tuple(
+                sorted(progress_list, key=lambda item: item.kv_group)
+            )
+            local_expectations = self._local_dsa_expectations(command)
+            error_code = forced_error or self._dsa_store_health_error_code()
+            if exchange_role == "passive" and error_code == "passive_worker":
+                error_code = None
+            if exchange_role == "passive" and error_code is None:
+                error_code = next(
+                    (
+                        progress.initial_error_code
+                        for progress in progresses
+                        if progress.initial_error_code is not None
+                    ),
+                    None,
+                )
+
+            source: Optional[DSASealedSourceGeneration] = None
+            if error_code is None and exchange_role != "passive":
+                for progress in progresses:
+                    error_code = (
+                        progress.error_code
+                        or self._validate_dsa_store_result(progress)
+                    )
+                    if error_code is not None:
+                        break
+                if error_code is None:
+                    source, error_code = self._seal_dsa_store_generation(
+                        command,
+                        progresses,
+                    )
+
+            passive_results: list[LayerwiseStoreResult] = []
+            if shared_exchange:
+                generation_id = command.operation.output_generation_id or ""
+                for progress in progresses:
+                    request = progress.request
+                    exchange_error = error_code
+                    if request is None and exchange_error is None:
+                        exchange_error = "store_metadata_unavailable"
+                    prepare_exchange = getattr(
+                        engine,
+                        "prepare_dsa_store_exchange",
+                        None,
+                    )
+                    if exchange_error is None and callable(prepare_exchange):
+                        try:
+                            prepare_exchange(
+                                kvcaches=self._kvcaches_for_group(
+                                    progress.kv_group
+                                ),
+                                kv_group=progress.kv_group,
+                            )
+                        except Exception:
+                            logger.exception(
+                                "Failed to initialize DSA shared source layout: "
+                                "operation=%s kv_group=%d",
+                                command.operation.operation_id,
+                                progress.kv_group,
+                            )
+                            exchange_error = "shared_source_layout_unavailable"
+                    result, published_error = exchange_fn(
+                        request.token_ids if request is not None else [],
+                        request_id=command.request_key.request_id,
+                        operation_id=command.operation.operation_id,
+                        generation_id=generation_id,
+                        kv_group=progress.kv_group,
+                        required_layers=progress.required_layers,
+                        required_chunks=progress.required_chunks,
+                        request_configs=(
+                            request.request_configs
+                            if request is not None
+                            else None
+                        ),
+                        source_result=(
+                            progress.result
+                            if exchange_role == "rank0"
+                            else None
+                        ),
+                        source_error=exchange_error,
+                    )
+                    if exchange_role == "passive":
+                        progress.result = result
+                        progress.completed = result is not None
+                        progress.error_code = published_error
+                        if result is not None:
+                            passive_results.append(result)
+                    if error_code is None and published_error is not None:
+                        error_code = published_error
+
+            if exchange_role == "passive":
+                try:
+                    if error_code is None:
+                        append_ptrs = getattr(
+                            getattr(engine, "gpu_connector", None),
+                            "append_sparse_chunk_ptr_cache_for_layer",
+                            None,
+                        )
+                    else:
+                        append_ptrs = None
+                    if error_code is None and callable(append_ptrs):
+                        for progress in progresses:
+                            result = progress.result
+                            assert result is not None
+                            for layer_id in progress.required_layers:
+                                append_ptrs(
+                                    layer_id,
+                                    list(
+                                        self._dsa_result_layer_tensors(
+                                            result,
+                                            layer_id,
+                                        )
+                                    ),
+                                    result.chunk_dev_ptrs,
+                                    result.chunk_ptrs,
+                                )
+                    if error_code is None:
+                        for progress in progresses:
+                            error_code = self._validate_dsa_store_result(progress)
+                            if error_code is not None:
+                                break
+                    if error_code is None:
+                        source, error_code = self._seal_dsa_store_generation(
+                            command,
+                            progresses,
+                        )
+                except Exception:
+                    logger.exception(
+                        "Failed to seal a passive DSA shared source: operation=%s",
+                        command.operation.operation_id,
+                    )
+                    error_code = "shared_source_seal_failed"
+                finally:
+                    # Passive views begin with one transport-owned reference.
+                    # Sealing acquires its own reference before this transfer
+                    # ownership is released.
+                    self._release_dsa_memory_ownership(
+                        memory_obj
+                        for result in passive_results
+                        for layer in result.memory_objs
+                        for memory_obj in layer
+                    )
+
+            if error_code is not None and source is not None:
+                source.retired = True
+                self._release_dsa_generation(source)
+            emitted = self._emit_dsa_receipts(
+                command,
+                local_expectations,
+                status="failed" if error_code is not None else "complete",
+                error_code=error_code,
+            )
+            self._remember_terminal_dsa_command(command, emitted)
+            for progress in progress_list:
+                self._dsa_store_progress.pop(
+                    self._dsa_store_progress_key(command, progress.kv_group),
+                    None,
+                )
+            finalized = True
+        return finalized
+
+    def _validate_dsa_activation_command(
+        self,
+        command: DSAOperationCommand,
+        expectations: tuple[DSAReceiptExpectation, ...],
+    ) -> tuple[Optional[DSASealedSourceGeneration], Optional[str]]:
+        operation = command.operation
+        generation_id = operation.input_generation_id
+        if (
+            not generation_id
+            or operation.output_generation_id != generation_id
+        ):
+            return None, "activation_generation_mismatch"
+        source = self._dsa_sealed_sources.get(
+            (command.request_key, generation_id)
+        )
+        if source is None or source.ownership_released:
+            return None, "sealed_generation_unavailable"
+        if operation.parent_operation_id != source.operation_id:
+            return None, "activation_parent_mismatch"
+        if operation.route_epoch != source.route_epoch + 1:
+            return None, "activation_route_epoch_mismatch"
+        if command.token_prefix_digest != source.token_prefix_digest:
+            return None, "activation_digest_mismatch"
+        if (
+            command.cache_namespace_fingerprint
+            != source.cache_namespace_fingerprint
+        ):
+            return None, "activation_namespace_mismatch"
+        if (
+            operation.range_start != 0
+            or operation.range_end <= 0
+            or operation.range_end > source.range_end
+        ):
+            return None, "activation_range_mismatch"
+        pending_generation = self._dsa_pending_active_generations.get(
+            command.request_key
+        )
+        if pending_generation not in (None, generation_id):
+            return None, "pending_activation_conflict"
+
+        expectation_groups = tuple(
+            expectation.kv_group for expectation in expectations
+        )
+        if (
+            len(set(expectation_groups)) != len(expectation_groups)
+            or set(expectation_groups) != set(source.groups)
+        ):
+            return None, "activation_group_manifest_mismatch"
+        for expectation in expectations:
+            if (
+                expectation.receipt_kind != "route_epoch_complete"
+                or expectation.storage_tier != "npu"
+                or expectation.minimum_guarantee != "npu_materialized"
+            ):
+                return None, "activation_expectation_mismatch"
+            group = source.groups.get(expectation.kv_group)
+            if group is None or tuple(sorted(expectation.layers)) != group.layers:
+                return None, "activation_layer_manifest_mismatch"
+            covered_chunks = tuple(
+                chunk for chunk in group.chunks if chunk[1] <= operation.range_end
+            )
+            if (
+                not covered_chunks
+                or covered_chunks[-1][1] != operation.range_end
+                or tuple(sorted(expectation.chunks)) != covered_chunks
+            ):
+                return None, "activation_chunk_manifest_mismatch"
+            for layer_memory in group.memory_objs:
+                for memory_obj in layer_memory[: len(covered_chunks)]:
+                    is_valid = getattr(memory_obj, "is_valid", None)
+                    if not callable(is_valid) or not is_valid():
+                        return None, "activation_source_invalid"
+                    if not bool(getattr(memory_obj, "is_pinned", False)):
+                        return None, "activation_source_unpinned"
+        return source, None
+
+    def _fence_dsa_source_activation(self) -> None:
+        """Fence accelerator streams before route activation; CPU mocks have none."""
+        device = torch.device(getattr(self, "device", "cpu"))
+        if device.type != "cpu":
+            raise RuntimeError(
+                "The deployed connector cannot prove the NPU activation fence"
+            )
+
+    def _process_dsa_activation_commands(
+        self,
+        metadata: LMCacheConnectorMetadata,
+    ) -> None:
+        """Bind and fence command-only activations without attention metadata."""
+        self._ensure_dsa_worker_protocol_state()
+        for command in metadata.dsa_commands:
+            if command.operation.kind != "source_activation":
+                continue
+            command_key = (command.request_key, command.operation.operation_id)
+            if command_key in self._dsa_terminal_commands:
+                continue
+            expectations = tuple(
+                expectation
+                for expectation in self._local_dsa_expectations(command)
+                if expectation.receipt_kind == "route_epoch_complete"
+            )
+            if not expectations:
+                self._remember_terminal_dsa_command(command, ())
+                continue
+            try:
+                source, error_code = self._validate_dsa_activation_command(
+                    command,
+                    expectations,
+                )
+            except Exception:
+                logger.exception(
+                    "Unexpected DSA source-activation validation failure: "
+                    "operation=%s",
+                    command.operation.operation_id,
+                )
+                source = None
+                error_code = "activation_validation_failed"
+            if source is not None:
+                source.pending_active = True
+                self._dsa_pending_active_generations[command.request_key] = (
+                    source.generation_id
+                )
+                try:
+                    self._fence_dsa_source_activation()
+                except Exception:
+                    logger.exception(
+                        "DSA source-activation stream fence failed: operation=%s",
+                        command.operation.operation_id,
+                    )
+                    source.pending_active = False
+                    if (
+                        self._dsa_pending_active_generations.get(command.request_key)
+                        == source.generation_id
+                    ):
+                        self._dsa_pending_active_generations.pop(
+                            command.request_key,
+                            None,
+                        )
+                    source.retired = True
+                    self._release_dsa_generation(source)
+                    error_code = "activation_stream_fence_failed"
+            emitted = self._emit_dsa_receipts(
+                command,
+                expectations,
+                status="failed" if error_code is not None else "complete",
+                error_code=error_code,
+            )
+            self._remember_terminal_dsa_command(command, emitted)
+
+    @staticmethod
+    def _slice_dsa_sealed_group(
+        group: DSASealedSourceGroup,
+        token_count: int,
+    ) -> Optional[DSASealedSourceGroup]:
+        chunk_count = sum(end <= token_count for _, end in group.chunks)
+        if (
+            chunk_count <= 0
+            or group.chunks[chunk_count - 1][1] != token_count
+        ):
+            return None
+        chunks = group.chunks[:chunk_count]
+        keys = tuple(row[:chunk_count] for row in group.keys)
+        memory_objs = tuple(row[:chunk_count] for row in group.memory_objs)
+        tensors = tuple(row[:chunk_count] for row in group.tensors)
+        chunk_dev_ptrs = tuple(row[:chunk_count] for row in group.chunk_dev_ptrs)
+        chunk_ptrs = tuple(row[:chunk_count] for row in group.chunk_ptrs)
+        prepared = build_prepared_sparse_source(
+            tensors,
+            chunk_ptrs,
+            num_layers=len(group.layers),
+            total_tokens=token_count,
+            chunk_token_counts=tuple(end - start for start, end in chunks),
+        )
+        if prepared is None:
+            return None
+        return DSASealedSourceGroup(
+            layers=group.layers,
+            chunks=chunks,
+            keys=keys,
+            memory_objs=memory_objs,
+            tensors=tensors,
+            chunk_dev_ptrs=chunk_dev_ptrs,
+            chunk_ptrs=chunk_ptrs,
+            prepared_source=prepared,
+        )
+
+    def _worker_state_from_dsa_source(
+        self,
+        request: ReqMeta,
+        source: DSASealedSourceGeneration,
+    ) -> WorkerRetrieveState:
+        token_count = source.range_end
+        if (
+            request.load_spec is not None
+            and request.load_spec.lmcache_cached_tokens > 0
+        ):
+            token_count = int(request.load_spec.lmcache_cached_tokens)
+        if token_count > source.range_end:
+            raise RuntimeError("DSA active source does not cover the load frontier")
+
+        state = WorkerRetrieveState(
+            req_id=request.req_id,
+            metadata_warm=True,
+            token_count=token_count,
+            dsa_request_key=source.request_key,
+            dsa_generation_id=source.generation_id,
+            dsa_operation_id=source.operation_id,
+            dsa_route_epoch=request.dsa_route_epoch,
+            dsa_token_prefix_digest=source.token_prefix_digest,
+            dsa_cache_namespace_fingerprint=(
+                source.cache_namespace_fingerprint
+            ),
+        )
+        for kv_group, full_group in source.groups.items():
+            group = (
+                full_group
+                if token_count == source.range_end
+                else self._slice_dsa_sealed_group(full_group, token_count)
+            )
+            if group is None:
+                raise RuntimeError(
+                    "DSA source cannot provide an exact chunk-aligned load manifest"
+                )
+            cache = state.cache_kwargs(kv_group, dsa_two_groups=True)
+            cache["cached_starts"].extend(start for start, _ in group.chunks)
+            cache["cached_ends"].extend(end for _, end in group.chunks)
+            cache["cached_keys"].extend(list(row) for row in group.keys)
+            cache["cached_memory_objs"].extend(
+                list(row) for row in group.memory_objs
+            )
+            cache["cached_tensors"].extend(list(row) for row in group.tensors)
+            cache["cached_chunk_dev_ptrs"].extend(
+                list(row) for row in group.chunk_dev_ptrs
+            )
+            cache["cached_chunk_ptrs_npu"].extend(group.chunk_ptrs)
+            state.prepared_sparse_sources[kv_group] = group.prepared_source
+        return state
+
+    def _bind_dsa_active_source(self, request: ReqMeta) -> None:
+        request_key = getattr(request, "dsa_request_key", None)
+        generation_id = getattr(request, "dsa_active_generation_id", None)
+        if request_key is None or generation_id is None:
+            return
+        source = self._dsa_sealed_sources.get((request_key, generation_id))
+        if source is None or source.ownership_released:
+            raise RuntimeError(
+                "Authoritative DSA route references an unavailable sealed generation"
+            )
+        if request.req_id != request_key.request_id:
+            raise RuntimeError("DSA route request ID does not match its RequestKey")
+        lease = getattr(request, "dsa_source_lease", None)
+        if lease is not None:
+            released = self._dsa_source_lease_release_tombstones.get(
+                lease.source_lease_id
+            )
+            if released is not None:
+                if released != lease:
+                    raise RuntimeError("DSA source lease ID was reused")
+                raise RuntimeError("DSA source lease was already released")
+        if (
+            getattr(request, "dsa_active_token_prefix_digest", None) is not None
+            and request.dsa_active_token_prefix_digest
+            != source.token_prefix_digest
+        ):
+            raise RuntimeError("DSA active source token digest mismatch")
+        if request.dsa_route_epoch < source.route_epoch + 1:
+            raise RuntimeError("DSA active source route epoch is stale")
+        pending = self._dsa_pending_active_generations.get(request_key)
+        active = self._dsa_active_generations.get(request_key)
+        if generation_id not in (pending, active):
+            raise RuntimeError("DSA generation was not activation-fenced")
+
+        source_will_be_used = bool(
+            request.is_sparse_decode
+            and request.load_spec is not None
+            and request.load_spec.can_load
+        )
+        source_key = (request_key, generation_id)
+        if lease is not None:
+            if (
+                lease.request_key != request_key
+                or lease.source_generation_id != generation_id
+                or lease.route_epoch != request.dsa_route_epoch
+            ):
+                raise RuntimeError("DSA source lease identity mismatch")
+            existing_binding = self._dsa_source_lease_bindings.get(
+                lease.source_lease_id
+            )
+            if existing_binding not in (None, source_key):
+                raise RuntimeError("DSA source lease ID was reused")
+            existing_lease = self._dsa_bound_source_leases.get(
+                lease.source_lease_id
+            )
+            if existing_lease not in (None, lease):
+                raise RuntimeError("DSA source lease ID was reused")
+
+        current_state = self._worker_retrieve_state.get(request.req_id)
+        replacement_state = None
+        if (
+            current_state is None
+            or current_state.dsa_request_key != request_key
+            or current_state.dsa_generation_id != generation_id
+        ):
+            replacement_state = self._worker_state_from_dsa_source(
+                request,
+                source,
+            )
+
+        if active != generation_id:
+            if active is not None:
+                prior = self._dsa_sealed_sources.get((request_key, active))
+                if prior is not None:
+                    prior.active = False
+                    prior.retired = True
+                    self._release_dsa_generation(prior)
+            source.pending_active = False
+            source.active = True
+            self._dsa_pending_active_generations.pop(request_key, None)
+            self._dsa_active_generations[request_key] = generation_id
+
+        if replacement_state is not None:
+            if current_state is not None:
+                self._release_shared_worker_retrieve_state(
+                    current_state,
+                    getattr(self, "lmcache_engine", None),
+                )
+            self._set_worker_retrieve_state(
+                request.req_id,
+                replacement_state,
+            )
+
+        if lease is not None and source_will_be_used:
+            source.source_lease_ids.add(lease.source_lease_id)
+            self._dsa_source_lease_bindings[lease.source_lease_id] = source_key
+            self._dsa_bound_source_leases[lease.source_lease_id] = lease
+
+    def _reconcile_pending_dsa_activation(self, request: ReqMeta) -> None:
+        """Roll back worker-local sources rejected by an authoritative route."""
+        request_key = request.dsa_request_key
+        if request_key is None or not request.dsa_route_authoritative:
+            return
+        pending_generation = self._dsa_pending_active_generations.get(request_key)
+        if (
+            pending_generation is not None
+            and pending_generation != request.dsa_active_generation_id
+            and request.dsa_route_state not in (None, "unknown", "promoting")
+        ):
+            self._dsa_pending_active_generations.pop(request_key, None)
+            source = self._dsa_sealed_sources.get(
+                (request_key, pending_generation)
+            )
+            if source is not None:
+                source.pending_active = False
+                source.active = False
+                source.retired = True
+                self._release_dsa_generation(source)
+
+        if request.dsa_route_state not in (
+            "fallback_resident",
+            "resident",
+            "legacy",
+        ):
+            return
+        for source in tuple(self._dsa_sealed_sources.values()):
+            if (
+                source.request_key != request_key
+                or source.generation_id == request.dsa_active_generation_id
+            ):
+                continue
+            source.pending_active = False
+            source.active = False
+            source.retired = True
+            if (
+                self._dsa_pending_active_generations.get(request_key)
+                == source.generation_id
+            ):
+                self._dsa_pending_active_generations.pop(request_key, None)
+            self._release_dsa_generation(source)
+
+    def _fence_dsa_source_use(self) -> None:
+        """Fence source-consumer streams before releasing generation leases."""
+        device = torch.device(getattr(self, "device", "cpu"))
+        if device.type != "cpu":
+            raise RuntimeError(
+                "The deployed connector cannot prove the source-use stream fence"
+            )
+
+    def _release_dsa_source_leases(
+        self,
+        requests: Iterable[ReqMeta],
+    ) -> None:
+        leases = tuple(
+            request.dsa_source_lease
+            for request in requests
+            if request.dsa_source_lease is not None
+        )
+        self._release_dsa_source_lease_objects(leases)
+
+    def _release_dsa_source_leases_for_requests(
+        self,
+        req_ids: Iterable[str],
+    ) -> None:
+        """Release every bound source lease owned by the given requests."""
+        self._ensure_dsa_worker_protocol_state()
+        requested = set(req_ids)
+        leases = tuple(
+            lease
+            for lease in self._dsa_bound_source_leases.values()
+            if lease.request_key.request_id in requested
+        )
+        self._release_dsa_source_lease_objects(leases)
+
+    def _release_dsa_source_lease_objects(
+        self,
+        leases: Iterable[DSASourceLease],
+    ) -> None:
+        self._ensure_dsa_worker_protocol_state()
+        leases = tuple(leases)
+        if not leases:
+            return
+        pending: list[
+            tuple[DSASourceLease, DSASealedSourceKey, DSASealedSourceGeneration]
+        ] = []
+        seen_ids: set[str] = set()
+        for lease in leases:
+            if lease.source_lease_id in seen_ids:
+                continue
+            seen_ids.add(lease.source_lease_id)
+            released = self._dsa_source_lease_release_tombstones.get(
+                lease.source_lease_id
+            )
+            if released is not None:
+                if released != lease:
+                    raise RuntimeError("DSA source lease ID was reused")
+                continue
+            source_key = self._dsa_source_lease_bindings.get(
+                lease.source_lease_id
+            )
+            if self._dsa_bound_source_leases.get(lease.source_lease_id) != lease:
+                raise RuntimeError("DSA source lease binding identity mismatch")
+            expected_key = (lease.request_key, lease.source_generation_id)
+            if source_key is None:
+                raise RuntimeError("DSA source lease release has no binding")
+            if source_key != expected_key:
+                raise RuntimeError("DSA source lease release identity mismatch")
+            source = self._dsa_sealed_sources.get(source_key)
+            if (
+                source is None
+                or lease.source_lease_id not in source.source_lease_ids
+            ):
+                raise RuntimeError("DSA source lease release targets stale state")
+            pending.append((lease, source_key, source))
+
+        if not pending:
+            return
+        self._fence_dsa_source_use()
+        cleanup_req_ids: set[str] = set()
+        for lease, source_key, source in pending:
+            lease_id = lease.source_lease_id
+            if self._dsa_source_lease_bindings.pop(lease_id, None) != source_key:
+                raise RuntimeError("DSA source lease binding changed during release")
+            if self._dsa_bound_source_leases.pop(lease_id, None) != lease:
+                raise RuntimeError("DSA source lease identity changed during release")
+            source.source_lease_ids.remove(lease_id)
+            self._dsa_source_lease_release_tombstones[lease_id] = lease
+            self._dsa_released_source_leases.append(lease)
+            while (
+                len(self._dsa_source_lease_release_tombstones)
+                > DSA_RELEASE_TOMBSTONE_LIMIT
+            ):
+                oldest = next(iter(self._dsa_source_lease_release_tombstones))
+                self._dsa_source_lease_release_tombstones.pop(oldest)
+            if source.retired and self._release_dsa_generation(source):
+                cleanup_req_ids.add(source.request_key.request_id)
+        for req_id in cleanup_req_ids:
+            if not any(
+                source.request_key.request_id == req_id
+                for source in self._dsa_sealed_sources.values()
+            ):
+                self._drop_worker_retrieve_state(req_id)
 
     def update_connector_output(self, connector_output: Any) -> None:
         completed = getattr(connector_output, "completed_decode_window_saves", None)
@@ -3598,6 +5266,20 @@ class LMCacheConnectorV1Impl:
         engine = getattr(self, "lmcache_engine", None)
         state = None
         if hasattr(self, "_worker_retrieve_state"):
+            current = self._worker_retrieve_state.get(req_id)
+            if current is not None and current.dsa_request_key is not None:
+                source = getattr(self, "_dsa_sealed_sources", {}).get(
+                    (current.dsa_request_key, current.dsa_generation_id or "")
+                )
+                if source is not None and source.source_lease_ids:
+                    logger.warning(
+                        "Preserving DSA worker state with live source leases: "
+                        "request_key=%s generation=%s leases=%d",
+                        current.dsa_request_key,
+                        current.dsa_generation_id,
+                        len(source.source_lease_ids),
+                    )
+                    return
             state = self._worker_retrieve_state.pop(req_id, None)
         if state is not None:
             self._release_shared_worker_retrieve_state(state, engine)
@@ -3610,11 +5292,60 @@ class LMCacheConnectorV1Impl:
 
     def _release_finished_worker_requests(self, req_ids: Iterable[str]) -> None:
         """Release request-owned cache state in the worker process."""
+        req_ids = tuple(req_ids)
+        self._release_dsa_source_leases_for_requests(req_ids)
         for req_id in req_ids:
             self._drop_layerwise_save_storers(req_id)
-            self._drop_worker_retrieve_state(req_id)
+            if self._retire_dsa_request_sources(req_id):
+                self._drop_worker_retrieve_state(req_id)
+
+    def _retire_dsa_request_sources(self, req_id: str) -> bool:
+        """Retire sources only when no generation lease remains live."""
+        self._ensure_dsa_worker_protocol_state()
+        sources = [
+            source
+            for source in self._dsa_sealed_sources.values()
+            if source.request_key.request_id == req_id
+        ]
+        if not sources:
+            return True
+        if any(source.source_lease_ids for source in sources):
+            for source in sources:
+                source.retired = True
+                source.active = False
+                self._dsa_active_generations.pop(source.request_key, None)
+                if not source.source_lease_ids and not source.pending_active:
+                    self._release_dsa_generation(source)
+            logger.error(
+                "Cannot safely clean DSA request while source leases are live; "
+                "preserving generation ownership: req_id=%s",
+                req_id,
+            )
+            return False
+        if any(source.pending_active for source in sources):
+            for source in sources:
+                source.retired = True
+                source.active = False
+                source.pending_active = False
+                self._dsa_active_generations.pop(source.request_key, None)
+                self._dsa_pending_active_generations.pop(
+                    source.request_key,
+                    None,
+                )
+                self._release_dsa_generation(source)
+            return True
+        for source in sources:
+            source.active = False
+            source.retired = True
+            self._dsa_active_generations.pop(source.request_key, None)
+            self._dsa_pending_active_generations.pop(source.request_key, None)
+            if not self._release_dsa_generation(source):
+                return False
+        return True
 
     def _request_may_store_in_wait_for_save(self, request: ReqMeta) -> bool:
+        if self._is_dsa_store_request(request):
+            return True
         if self.kv_role == "kv_consumer":
             return False
         save_spec = request.save_spec
@@ -3673,6 +5404,12 @@ class LMCacheConnectorV1Impl:
         state.shared_request_active = False
         state.request_scope_token = None
         state.shared_validation_signature = None
+        state.dsa_request_key = None
+        state.dsa_generation_id = None
+        state.dsa_operation_id = None
+        state.dsa_route_epoch = -1
+        state.dsa_token_prefix_digest = None
+        state.dsa_cache_namespace_fingerprint = None
         state.slot_mapping = None
         state.indexer_slot_mapping = None
         state.decode_ret_mask = None
@@ -4206,6 +5943,14 @@ class LMCacheConnectorV1Impl:
         state = self._worker_retrieve_state.get(request.req_id)
         if state is None or not (state.metadata_warm or state.has_cache()):
             return None
+        if state.dsa_request_key is not None and (
+            state.dsa_request_key != request.dsa_request_key
+            or state.dsa_generation_id != request.dsa_active_generation_id
+        ):
+            raise RuntimeError(
+                "Worker DSA source state does not match the authoritative "
+                "RequestKey/generation"
+            )
         self._validate_shared_worker_retrieve_state(state, request)
         return state
 
@@ -5175,6 +6920,7 @@ class LMCacheConnectorV1Impl:
             engine is not None
             and getattr(engine, "enable_shared_cpu_cache", False)
             and not state.shared_request_active
+            and state.dsa_generation_id is None
         ):
             return None
         source = state.prepared_sparse_sources.get(kv_group)
@@ -5419,11 +7165,20 @@ class LMCacheConnectorV1Impl:
         except BaseException:
             metadata = self._parent._get_connector_metadata()
             assert isinstance(metadata, LMCacheConnectorMetadata)
+            requests = tuple(metadata.requests)
             self._abort_layerwise_retrieve_step(
                 request
-                for request in metadata.requests
+                for request in requests
                 if request.load_spec is not None and request.load_spec.can_load
             )
+            try:
+                self._release_dsa_source_leases_for_requests(
+                    request.req_id for request in requests
+                )
+            except Exception:
+                logger.exception(
+                    "Failed to release DSA source leases after load abort"
+                )
             raise
 
     def _start_load_kv(self, forward_context: "ForwardContext", **kwargs) -> None:
@@ -5443,6 +7198,34 @@ class LMCacheConnectorV1Impl:
 
         attn_metadata = forward_context.attn_metadata
         if attn_metadata is None:
+            # Preserve the legacy no-attention fast path while still allowing
+            # bound command-only metadata to activate a sealed generation.
+            metadata = getattr(self._parent, "_connector_metadata", None)
+            if not isinstance(metadata, LMCacheConnectorMetadata):
+                logger.debug(
+                    "In connector.start_load_kv, but the attn_metadata is None"
+                )
+                return
+        else:
+            metadata = self._parent._get_connector_metadata()
+            assert isinstance(metadata, LMCacheConnectorMetadata)
+        self._initialize_dsa_commands(metadata)
+        for request in metadata.requests:
+            self._reconcile_pending_dsa_activation(request)
+        self._process_dsa_activation_commands(metadata)
+        for request in metadata.requests:
+            if not self._is_dsa_store_request(request):
+                self._bind_dsa_active_source(request)
+
+        if attn_metadata is None:
+            if any(
+                command.operation.kind == "store"
+                for command in metadata.dsa_commands
+            ):
+                # Core's connector-only path does not run model-layer callbacks.
+                # Drive the same wait/fence protocol explicitly rather than
+                # leaving a registered command without a terminal receipt.
+                self.wait_for_save()
             logger.debug("In connector.start_load_kv, but the attn_metadata is None")
             return
 
@@ -5452,9 +7235,6 @@ class LMCacheConnectorV1Impl:
                 "use register_kv_caches to init kv_caches"
             )
             self._init_kv_caches_from_forward_context(forward_context)
-
-        metadata = self._parent._get_connector_metadata()
-        assert isinstance(metadata, LMCacheConnectorMetadata)
 
         active_req_ids: set[str] = set()
         loadable_requests: list[tuple[int, ReqMeta]] = []
@@ -6500,6 +8280,7 @@ class LMCacheConnectorV1Impl:
                         assert isinstance(metadata, LMCacheConnectorMetadata)
                     self._finalize_worker_retrieve_state_from_metadata(metadata)
                     self._drain_layerwise_retrievers()
+                    self._release_dsa_source_leases(tuple(layerwise_requests))
 
         return
 
@@ -6578,14 +8359,23 @@ class LMCacheConnectorV1Impl:
         completed: bool,
         result: Optional[LayerwiseStoreResult],
     ) -> None:
+        self._record_dsa_store_result(
+            request,
+            kv_group,
+            completed,
+            result,
+        )
         if not completed:
             return
         if result is not None and result.kv_group != kv_group:
+            if self._is_dsa_store_request(request):
+                return
             raise RuntimeError(
                 "Layerwise store result group mismatch: "
                 f"expected={kv_group}, got={result.kv_group}"
             )
-        self._promote_layerwise_store_result(request, result)
+        if not self._is_dsa_store_request(request):
+            self._promote_layerwise_store_result(request, result)
         self._record_decode_window_save_group_completed(
             request,
             kv_group,
@@ -6598,13 +8388,17 @@ class LMCacheConnectorV1Impl:
         kv_group: int,
     ) -> dict[str, Any]:
         """Build engine arguments for one layerwise store generator."""
-        decode_window_save = self._is_decode_window_save_request(request)
+        decode_window_save = self._is_decode_window_save_request(
+            request
+        ) or self._is_dsa_store_request(request)
+        range_start, range_end = self._layerwise_save_range(request)
         store_kwargs: dict[str, Any] = {
             "decode_window_save": decode_window_save,
-            "decode_window_start": getattr(request, "decode_window_start", None),
-            "decode_window_end": getattr(request, "decode_window_end", None),
+            "decode_window_start": range_start if decode_window_save else None,
+            "decode_window_end": range_end if decode_window_save else None,
             "decode_window_size": getattr(request, "decode_window_size", None),
             "request_configs": request.request_configs,
+            "dsa_command_store": self._is_dsa_store_request(request),
         }
         if self._is_dsa_two_groups() and kv_group == 1:
             store_kwargs["kv_group"] = 1
@@ -6640,7 +8434,16 @@ class LMCacheConnectorV1Impl:
         else:
             slot_mapping = slot_mapping.to(device=self.device, dtype=torch.long)
 
-        if (
+        if self._is_dsa_store_request(request):
+            assert request.dsa_store_command is not None
+            skip_leading_tokens = request.dsa_store_command.operation.range_start
+            if len(token_ids) != request.dsa_store_command.operation.range_end:
+                raise RuntimeError(
+                    "DSA store token metadata does not match its exact range: "
+                    f"req_id={request.req_id}, tokens={len(token_ids)}, "
+                    f"range_end={request.dsa_store_command.operation.range_end}"
+                )
+        elif (
             self.kv_role == "kv_producer"
             and not self._is_decode_window_save_request(request)
         ):
@@ -6766,13 +8569,6 @@ class LMCacheConnectorV1Impl:
             **kwargs: additional arguments for the save operation.
         """
         assert self.lmcache_engine is not None
-
-        if not self.use_layerwise:
-            return
-
-        if self.kv_role == "kv_consumer":
-            # Don't do save if the role is kv_consumer
-            return
         if self._parent._connector_metadata is None:
             logger.warning(
                 "In connector.save_kv_layer, but the connector metadata is None"
@@ -6780,6 +8576,33 @@ class LMCacheConnectorV1Impl:
             return
         connector_metadata = self._parent._get_connector_metadata()
         assert isinstance(connector_metadata, LMCacheConnectorMetadata)
+        self._initialize_dsa_commands(connector_metadata)
+        command_requests = [
+            request
+            for request in connector_metadata.requests
+            if self._is_dsa_store_request(request)
+        ]
+
+        if not self.use_layerwise:
+            for request in command_requests:
+                assert request.save_spec is not None
+                for kv_group in self._decode_window_save_required_groups(request) or {
+                    expectation.kv_group
+                    for expectation in self._local_dsa_expectations(
+                        request.dsa_store_command
+                    )
+                }:
+                    self._record_dsa_store_failure(
+                        request,
+                        kv_group,
+                        "layerwise_store_unavailable",
+                    )
+            return
+
+        if self.kv_role == "kv_consumer" and not command_requests:
+            # Legacy consumer behavior remains load-only. Registered DSA stores
+            # explicitly override this role gate.
+            return
 
         assert len(self.kv_caches) > 0
 
@@ -6795,14 +8618,31 @@ class LMCacheConnectorV1Impl:
         if not kvcaches:
             # No caches registered for this group (e.g. indexer not
             # registered with the connector); nothing to store.
+            for request in command_requests:
+                self._record_dsa_store_failure(
+                    request,
+                    kv_group,
+                    "kv_group_cache_unavailable",
+                )
             return
 
         for request in connector_metadata.requests:
             save_spec = request.save_spec
+            command_owned = self._is_dsa_store_request(request)
             if (
                 save_spec is None or not save_spec.can_save
-            ) and self.kv_role != "kv_producer":
+            ) and self.kv_role != "kv_producer" and not command_owned:
                 continue
+            if command_owned:
+                assert request.dsa_store_command is not None
+                progress = self._dsa_store_progress.get(
+                    self._dsa_store_progress_key(
+                        request.dsa_store_command,
+                        kv_group,
+                    )
+                )
+                if progress is None or progress.error_code is not None:
+                    continue
             self._note_decode_window_save_seen(request)
 
             # Per-group gating: in two-group mode, skip indexer save if
@@ -6876,10 +8716,32 @@ class LMCacheConnectorV1Impl:
                 # forwards; stale _latent_kvcaches pointers cause MTE OOB.
                 self._refresh_kvcaches_list()
                 kvcaches = self._kvcaches_for_group(kv_group)
-                store_inputs = self._prepare_layerwise_store_inputs(
-                    request, save_spec, kv_group
-                )
+                try:
+                    store_inputs = self._prepare_layerwise_store_inputs(
+                        request, save_spec, kv_group
+                    )
+                except Exception:
+                    if not command_owned:
+                        raise
+                    self._record_dsa_store_failure(
+                        request,
+                        kv_group,
+                        "store_metadata_invalid",
+                    )
+                    logger.exception(
+                        "Command-owned DSA store metadata is invalid: "
+                        "req_id=%s kv_group=%d",
+                        request.req_id,
+                        kv_group,
+                    )
+                    continue
                 if store_inputs is None:
+                    if command_owned:
+                        self._record_dsa_store_failure(
+                            request,
+                            kv_group,
+                            "empty_store_range",
+                        )
                     continue
                 (
                     token_ids,
@@ -7020,9 +8882,29 @@ class LMCacheConnectorV1Impl:
                     list(getattr(self, "_deferred_latent_pending", set())),
                 )
                 self._abort_save_step((request,))
+                if command_owned:
+                    self._record_dsa_store_failure(
+                        request,
+                        kv_group,
+                        "layerwise_store_exhausted",
+                    )
+                    continue
                 raise
             except BaseException:
                 self._abort_save_step((request,))
+                if command_owned:
+                    self._record_dsa_store_failure(
+                        request,
+                        kv_group,
+                        "layerwise_store_failed",
+                    )
+                    logger.exception(
+                        "Command-owned DSA layerwise store failed: req_id=%s "
+                        "kv_group=%d",
+                        request.req_id,
+                        kv_group,
+                    )
+                    continue
                 raise
 
     def _effective_skip_leading_tokens(
@@ -7060,7 +8942,7 @@ class LMCacheConnectorV1Impl:
         return slot_mapping.to(device=self.device, dtype=torch.long), {}
 
     def _finish_save_batch(self, _save_context: dict[str, Any]) -> None:
-        pass
+        self._await_dsa_store_futures()
 
     def _handle_save_request_error(
         self,
@@ -7075,35 +8957,135 @@ class LMCacheConnectorV1Impl:
 
         save_context: dict[str, Any] = {}
         save_fence_complete = False
+        metadata = self._parent._get_connector_metadata()
+        assert isinstance(metadata, LMCacheConnectorMetadata)
+        self._initialize_dsa_commands(metadata)
+        has_dsa_store_commands = any(
+            command.operation.kind == "store" for command in metadata.dsa_commands
+        )
         try:
             try:
                 self._wait_for_save_impl(save_context)
             finally:
                 self._finish_save_batch(save_context)
                 save_fence_complete = True
-        except BaseException:
-            metadata = self._parent._get_connector_metadata()
-            assert isinstance(metadata, LMCacheConnectorMetadata)
+        except BaseException as error:
             self._abort_save_step(metadata.requests)
+            if has_dsa_store_commands:
+                message = str(error).lower()
+                error_code = (
+                    "backend_future_failed"
+                    if "future" in message
+                    or "remote store" in message
+                    or "timed out" in message
+                    else "final_store_fence_failed"
+                )
+                self._finalize_dsa_store_commands(forced_error=error_code)
+                self._complete_worker_save_step()
+                logger.exception(
+                    "DSA command save failed at its final completion fence"
+                )
+                return
             if save_fence_complete:
                 self._complete_worker_save_step()
             raise
         else:
+            try:
+                self._finalize_dsa_store_commands()
+            except Exception:
+                if not has_dsa_store_commands:
+                    raise
+                logger.exception("Unexpected DSA source-seal finalization failure")
+                self._finalize_dsa_store_commands(
+                    forced_error="source_seal_failed"
+                )
+                self._complete_worker_save_step()
+                return
             for request in save_context.get("decode_window_saves", ()):
                 self._mark_decode_window_save_completed(request)
             self._complete_worker_save_step()
+
+    def _run_dsa_store_group_without_callback(
+        self,
+        request: ReqMeta,
+        kv_group: int,
+    ) -> None:
+        """Execute an exact command store when model callbacks did not run."""
+        assert request.dsa_store_command is not None
+        progress = self._dsa_store_progress.get(
+            self._dsa_store_progress_key(request.dsa_store_command, kv_group)
+        )
+        if progress is None or progress.completed or progress.error_code is not None:
+            return
+        if not self.use_layerwise or self.lmcache_engine is None:
+            progress.error_code = "layerwise_store_unavailable"
+            return
+        self._refresh_kvcaches_list()
+        kvcaches = self._kvcaches_for_group(kv_group)
+        if not kvcaches:
+            progress.error_code = "kv_group_cache_unavailable"
+            return
+        try:
+            store_inputs = self._prepare_layerwise_store_inputs(
+                request,
+                request.save_spec,
+                kv_group,
+            )
+            if store_inputs is None:
+                progress.error_code = "empty_store_range"
+                return
+            (
+                token_ids,
+                slot_mapping,
+                store_mask,
+                skip_leading_tokens,
+                store_kwargs,
+                _,
+            ) = store_inputs
+            storer = self.lmcache_engine.store_layer(
+                token_ids,
+                mask=store_mask,
+                kvcaches=kvcaches,
+                slot_mapping=slot_mapping,
+                offset=skip_leading_tokens,
+                sync=True,
+                req_id=request.req_id,
+                **store_kwargs,
+            )
+            completed, result = self._finalize_layerwise_storer(storer)
+            self._consume_completed_layerwise_store(
+                request,
+                kv_group,
+                completed,
+                result,
+            )
+        except Exception:
+            progress.error_code = "layerwise_store_failed"
+            logger.exception(
+                "DSA command fallback layerwise store failed: req_id=%s "
+                "kv_group=%d",
+                request.req_id,
+                kv_group,
+            )
 
     def _wait_for_save_impl(self, save_context: dict[str, Any]) -> None:
         connector_metadata = self._parent._get_connector_metadata()
         assert isinstance(connector_metadata, LMCacheConnectorMetadata)
 
+        dsa_store_requests = [
+            request
+            for request in connector_metadata.requests
+            if self._is_dsa_store_request(request)
+        ]
         if self.kv_role == "kv_consumer":
             assert self.lmcache_engine is not None, (
                 "LMCacheEngine must be initialized to unpin requests."
             )
             for request in connector_metadata.requests:
-                self._maybe_lookup_unpin_for_request(request)
-            return
+                if not self._is_dsa_store_request(request):
+                    self._maybe_lookup_unpin_for_request(request)
+            if not dsa_store_requests:
+                return
 
         if self.use_layerwise:
             if self._should_defer_latent_save_under_tp():
@@ -7112,10 +9094,24 @@ class LMCacheConnectorV1Impl:
                         self._layerwise_save_storer_key(request, 0)
                         in self._deferred_latent_pending
                     ):
-                        self._flush_deferred_latent_store(
-                            request,
-                            request.save_spec,
-                        )
+                        try:
+                            self._flush_deferred_latent_store(
+                                request,
+                                request.save_spec,
+                            )
+                        except Exception:
+                            if not self._is_dsa_store_request(request):
+                                raise
+                            self._record_dsa_store_failure(
+                                request,
+                                0,
+                                "layerwise_store_failed",
+                            )
+                            logger.exception(
+                                "Failed to flush deferred command-owned DSA "
+                                "latent store: req_id=%s",
+                                request.req_id,
+                            )
             for request in connector_metadata.requests:
                 for kv_group in (0, 1):
                     storer_key = self._layerwise_save_storer_key(
@@ -7127,17 +9123,42 @@ class LMCacheConnectorV1Impl:
                         None,
                     )
                     if layerwise_storer is not None:
-                        save_completed, store_result = (
-                            self._finalize_layerwise_storer(
-                                layerwise_storer,
+                        try:
+                            save_completed, store_result = (
+                                self._finalize_layerwise_storer(
+                                    layerwise_storer,
+                                )
                             )
-                        )
-                        self._consume_completed_layerwise_store(
-                            request,
-                            kv_group,
-                            save_completed,
-                            store_result,
-                        )
+                            self._consume_completed_layerwise_store(
+                                request,
+                                kv_group,
+                                save_completed,
+                                store_result,
+                            )
+                        except Exception:
+                            if not self._is_dsa_store_request(request):
+                                raise
+                            self._record_dsa_store_failure(
+                                request,
+                                kv_group,
+                                "layerwise_store_failed",
+                            )
+                            logger.exception(
+                                "Failed to finalize command-owned DSA store: "
+                                "req_id=%s kv_group=%d",
+                                request.req_id,
+                                kv_group,
+                            )
+                if self._is_dsa_store_request(request):
+                    assert request.dsa_store_command is not None
+                    for expectation in self._local_dsa_expectations(
+                        request.dsa_store_command
+                    ):
+                        if expectation.receipt_kind == "storage":
+                            self._run_dsa_store_group_without_callback(
+                                request,
+                                expectation.kv_group,
+                            )
                 if self._is_decode_window_save_request(request):
                     save_context.setdefault("decode_window_saves", []).append(
                         request
@@ -7154,6 +9175,19 @@ class LMCacheConnectorV1Impl:
         for request in connector_metadata.requests:
             self._maybe_lookup_unpin_for_request(request)
             self._mark_initial_sparse_release_ready(request)
+
+            if self._is_dsa_store_request(request):
+                assert request.dsa_store_command is not None
+                for expectation in self._local_dsa_expectations(
+                    request.dsa_store_command
+                ):
+                    if expectation.receipt_kind == "storage":
+                        self._record_dsa_store_failure(
+                            request,
+                            expectation.kv_group,
+                            "layerwise_store_unavailable",
+                        )
+                continue
 
             try:
                 save_spec = request.save_spec
@@ -7503,6 +9537,9 @@ class LMCacheConnectorV1Impl:
                 tracker.dsa_route_state = "unknown"
                 tracker.dsa_remap_end = 0
                 tracker.dsa_sparse_release_authorized = False
+                tracker.dsa_active_generation_id = None
+                tracker.dsa_active_token_prefix_digest = None
+                tracker.dsa_source_lease = None
             return None
 
         route = routes.get(tracker.req_id)
@@ -7512,6 +9549,9 @@ class LMCacheConnectorV1Impl:
             tracker.dsa_route_authoritative = True
             tracker.dsa_remap_end = 0
             tracker.dsa_sparse_release_authorized = False
+            tracker.dsa_active_generation_id = None
+            tracker.dsa_active_token_prefix_digest = None
+            tracker.dsa_source_lease = None
             return None
 
         route_state = getattr(route, "route_state", None)
@@ -7550,6 +9590,9 @@ class LMCacheConnectorV1Impl:
             tracker.dsa_route_authoritative = True
             tracker.dsa_remap_end = 0
             tracker.dsa_sparse_release_authorized = False
+            tracker.dsa_active_generation_id = None
+            tracker.dsa_active_token_prefix_digest = None
+            tracker.dsa_source_lease = None
             return route
 
         plan = getattr(route, "transfer_plan", None)
@@ -7566,8 +9609,36 @@ class LMCacheConnectorV1Impl:
             tracker.dsa_route_epoch = route_epoch
             tracker.dsa_execution_seq = execution_seq
         tracker.dsa_remap_end = int(getattr(route, "remap_end", 0) or 0)
+        sparse_source_end = int(getattr(route, "sparse_source_end", 0) or 0)
+        if (
+            tracker.dsa_route_authoritative
+            and route_state == "sparse"
+            and sparse_source_end > 0
+        ):
+            # Command-owned generations advance the legacy planning cursor so
+            # it cannot re-emit a range already proven by exact receipts. This
+            # does not publish a legacy completion or release frontier.
+            tracker.decode_window_save_next_start = max(
+                int(tracker.decode_window_save_next_start or 0),
+                sparse_source_end,
+            )
+            tracker.decode_window_save_anchor = int(
+                getattr(route, "window_anchor", 0) or 0
+            )
+            if (
+                tracker.decode_window_save_inflight_end is not None
+                and tracker.decode_window_save_inflight_end <= sparse_source_end
+            ):
+                tracker.decode_window_save_inflight_end = None
         source_lease = getattr(route, "source_lease", None)
         active_generation = getattr(route, "active_source_generation_id", None)
+        tracker.dsa_active_generation_id = active_generation
+        tracker.dsa_active_token_prefix_digest = getattr(
+            route,
+            "active_token_prefix_digest",
+            None,
+        )
+        tracker.dsa_source_lease = source_lease
         lease_generation = getattr(source_lease, "source_generation_id", None)
         tracker.dsa_sparse_release_authorized = bool(
             tracker.dsa_route_state == "sparse"
@@ -7595,6 +9666,9 @@ class LMCacheConnectorV1Impl:
         tracker.dsa_execution_seq = -1
         tracker.dsa_remap_end = 0
         tracker.dsa_sparse_release_authorized = False
+        tracker.dsa_active_generation_id = None
+        tracker.dsa_active_token_prefix_digest = None
+        tracker.dsa_source_lease = None
 
     def _clear_dsa_pending_decode_window_releases(self, req_id: str) -> None:
         pending_releases = getattr(
@@ -7801,7 +9875,7 @@ class LMCacheConnectorV1Impl:
         *,
         is_sparse_decode: bool = False,
     ) -> Optional[ReqMeta]:
-        return ReqMeta.from_request_tracker(
+        request = ReqMeta.from_request_tracker(
             tracker,
             self._block_size,
             self._lmcache_chunk_size,
@@ -7820,6 +9894,26 @@ class LMCacheConnectorV1Impl:
             ),
             save_entire_prefix=self.kv_role == "kv_producer",
         )
+        if (
+            request is None
+            and tracker.dsa_request_key is not None
+            and tracker.dsa_route_authoritative
+        ):
+            request = ReqMeta(
+                req_id=tracker.req_id,
+                token_ids=tracker.token_ids.copy(),
+            )
+        if request is not None:
+            request.dsa_request_key = tracker.dsa_request_key
+            request.dsa_route_state = tracker.dsa_route_state
+            request.dsa_route_authoritative = tracker.dsa_route_authoritative
+            request.dsa_route_epoch = tracker.dsa_route_epoch
+            request.dsa_active_generation_id = tracker.dsa_active_generation_id
+            request.dsa_active_token_prefix_digest = (
+                tracker.dsa_active_token_prefix_digest
+            )
+            request.dsa_source_lease = tracker.dsa_source_lease
+        return request
 
     def _add_decode_window_save_metas(
         self,
@@ -7987,6 +10081,174 @@ class LMCacheConnectorV1Impl:
             tracker.decode_window_save_inflight_end = window_end
             break
 
+    def _validate_dsa_command_identity(
+        self,
+        command: DSAOperationCommand,
+        scheduler_output: SchedulerOutput,
+    ) -> RequestTracker:
+        """Validate a command against the connector's authoritative lifecycle."""
+        request_key = command.request_key
+        tracker = self._request_trackers.get(request_key.request_id)
+        if (
+            tracker is None
+            or tracker.dsa_request_key is None
+            or tracker.dsa_request_key != request_key
+        ):
+            raise RuntimeError(
+                "DSA command targets an unknown or stale LMCache request key: "
+                f"request_key={request_key}"
+            )
+        if not tracker.dsa_route_authoritative:
+            raise RuntimeError(
+                "DSA command requires an authoritative LMCache route tracker: "
+                f"request_key={request_key}"
+            )
+
+        route = (getattr(scheduler_output, "dsa_routes", None) or {}).get(
+            request_key.request_id
+        )
+        if route is not None and getattr(route, "request_key", None) != request_key:
+            raise RuntimeError(
+                "DSA command request key does not match the route snapshot: "
+                f"command={request_key}, route={getattr(route, 'request_key', None)}"
+            )
+        namespace = getattr(
+            scheduler_output,
+            "dsa_data_compatibility_fingerprint",
+            None,
+        )
+        if namespace is not None and namespace != command.cache_namespace_fingerprint:
+            raise RuntimeError(
+                "DSA command cache namespace does not match SchedulerOutput"
+            )
+        operation = command.operation
+        if operation.kind not in ("store", "source_activation"):
+            raise RuntimeError(
+                f"Unsupported LMCache DSA command kind {operation.kind!r}"
+            )
+        expected_route_epoch = tracker.dsa_route_epoch + (
+            1 if operation.kind == "source_activation" else 0
+        )
+        if operation.route_epoch != expected_route_epoch:
+            raise RuntimeError(
+                "DSA command route epoch does not match the authoritative "
+                f"tracker: command={operation.route_epoch}, "
+                f"expected={expected_route_epoch}"
+            )
+        if (
+            operation.range_start < 0
+            or operation.range_end <= operation.range_start
+            or operation.range_end > command.accepted_end_at_issue
+        ):
+            raise RuntimeError(
+                "DSA command carries an invalid authoritative range: "
+                f"operation_id={operation.operation_id}, "
+                f"range=[{operation.range_start}, {operation.range_end}), "
+                f"accepted_end={command.accepted_end_at_issue}"
+            )
+        if command.accepted_end_at_issue > len(tracker.token_ids):
+            raise RuntimeError(
+                "DSA command accepted frontier exceeds LMCache token history: "
+                f"accepted_end={command.accepted_end_at_issue}, "
+                f"tokens={len(tracker.token_ids)}"
+            )
+        digest = hashlib.sha256()
+        digest.update(
+            command.accepted_end_at_issue.to_bytes(
+                8,
+                byteorder="big",
+                signed=False,
+            )
+        )
+        for token_id in tracker.token_ids[: command.accepted_end_at_issue]:
+            if type(token_id) is not int:
+                raise RuntimeError("DSA command token history is not canonical")
+            digest.update(token_id.to_bytes(8, byteorder="big", signed=True))
+        if digest.hexdigest() != command.token_prefix_digest:
+            raise RuntimeError(
+                "DSA command token-prefix digest does not match LMCache tracker"
+            )
+        return tracker
+
+    @staticmethod
+    def _disable_noncommand_saves(
+        meta: LMCacheConnectorMetadata,
+        req_id: str,
+    ) -> None:
+        """Prevent an ordinary save from racing a command-owned exact store."""
+        retained_requests: list[ReqMeta] = []
+        for request in meta.requests:
+            if (
+                request.req_id == req_id
+                and request.dsa_store_command is None
+                and request.is_decode_window_save
+            ):
+                continue
+            retained_requests.append(request)
+            if request.req_id != req_id or request.dsa_store_command is not None:
+                continue
+            save_spec = request.save_spec
+            if save_spec is None:
+                continue
+            save_spec.can_save = False
+            save_spec.can_save_latent = False
+            save_spec.can_save_indexer = False
+        meta.requests[:] = retained_requests
+
+    def _attach_dsa_commands(
+        self,
+        meta: LMCacheConnectorMetadata,
+        scheduler_output: SchedulerOutput,
+    ) -> None:
+        """Validate and forward commands, including command-only steps."""
+        commands = tuple(getattr(scheduler_output, "dsa_commands", ()) or ())
+        meta.dsa_commands = commands
+        seen: set[tuple[RequestKey, str]] = set()
+        for command in commands:
+            command_key = (command.request_key, command.operation.operation_id)
+            if command_key in seen:
+                raise RuntimeError(f"Duplicate DSA command in one step: {command_key}")
+            seen.add(command_key)
+            tracker = self._validate_dsa_command_identity(command, scheduler_output)
+            if command.operation.kind != "store":
+                continue
+
+            required_groups = {
+                expectation.kv_group
+                for expectation in command.expected_receipts
+                if expectation.receipt_kind in ("storage", "source_seal")
+            }
+            if not required_groups:
+                raise RuntimeError(
+                    "DSA store command has no storage/source-seal expectations"
+                )
+            for existing_request in meta.requests:
+                if (
+                    existing_request.req_id == tracker.req_id
+                    and existing_request.is_decode_window_save
+                ):
+                    tracker.decode_window_save_next_start = (
+                        existing_request.decode_window_start
+                    )
+                    tracker.decode_window_save_inflight_end = None
+                    break
+            self._disable_noncommand_saves(meta, tracker.req_id)
+            request = ReqMeta.from_dsa_store_command(
+                tracker,
+                self._block_size,
+                command,
+                required_groups,
+            )
+            request.request_configs = tracker.request_configs
+            request.dsa_route_state = tracker.dsa_route_state
+            request.dsa_route_authoritative = tracker.dsa_route_authoritative
+            request.dsa_active_generation_id = tracker.dsa_active_generation_id
+            request.dsa_active_token_prefix_digest = (
+                tracker.dsa_active_token_prefix_digest
+            )
+            request.dsa_source_lease = tracker.dsa_source_lease
+            meta.add_request(request)
+
     @_lmcache_nvtx_annotate
     def build_connector_meta(
         self, scheduler_output: SchedulerOutput
@@ -8124,6 +10386,7 @@ class LMCacheConnectorV1Impl:
                 if req_meta is not None:
                     req_meta.resumed_from_preemption = req.resumed_from_preemption
                     meta.add_request(req_meta)
+            self._attach_dsa_commands(meta, scheduler_output)
             return meta
 
         for i, req_id in enumerate(cached_reqs.req_ids):
@@ -8314,11 +10577,20 @@ class LMCacheConnectorV1Impl:
                     dsa_remap_end = int(getattr(dsa_route, "remap_end", 0) or 0)
                     if dsa_remap_end <= self._dsa_scratch_capacity:
                         dsa_remap_end = 0
-                if self.kv_role == "kv_consumer":
+                if self.kv_role == "kv_consumer" and (
+                    dsa_route is None or route_state_str in (None, "legacy")
+                ):
                     # Include the final partial prompt chunk in worker metadata;
                     # the release/remap frontier remains LMCache-chunk aligned below.
                     lmcache_cached_for_sparse = max(
                         lmcache_cached_for_sparse, request_tracker.prompt_len
+                    )
+                elif dsa_route is not None:
+                    # A positive-threshold route may only bind the exact sealed
+                    # source manifest. Keep any unsourced partial tail resident.
+                    lmcache_cached_for_sparse = min(
+                        len(request_tracker.token_ids),
+                        int(getattr(dsa_route, "sparse_source_end", 0) or 0),
                     )
                 if (
                     len(request_tracker.sparse_token_ids)
@@ -8347,6 +10619,7 @@ class LMCacheConnectorV1Impl:
                 req_meta.resumed_from_preemption = preempted
                 meta.add_request(req_meta)
 
+        self._attach_dsa_commands(meta, scheduler_output)
         return meta
 
     @_lmcache_nvtx_annotate

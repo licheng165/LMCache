@@ -277,6 +277,10 @@ class MemoryObj(metaclass=abc.ABCMeta):
         """
         raise NotImplementedError
 
+    def pin_durable(self) -> bool:
+        """Pin without timeout-based forced release."""
+        return self.pin()
+
     @abc.abstractmethod
     def ref_count_up(self):
         """
@@ -290,6 +294,10 @@ class MemoryObj(metaclass=abc.ABCMeta):
         Unpin the memory obj so that it can be evicted.
         """
         raise NotImplementedError
+
+    def unpin_durable(self) -> bool:
+        """Release one durable pin."""
+        return self.unpin()
 
     @abc.abstractmethod
     def ref_count_down(self):
@@ -510,6 +518,7 @@ class TensorMemoryObj(MemoryObj):
         self.valid = True
         self.lock = threading.Lock()
         self.parent_allocator = parent_allocator
+        self._durable_pin_count = 0
         self.group_prefix_sum: list[int] = []
         self.refresh_metadata_view()
 
@@ -578,6 +587,8 @@ class TensorMemoryObj(MemoryObj):
 
     def ref_count_up(self):
         with self.lock:
+            if not self.valid:
+                raise RuntimeError("Cannot retain an invalid TensorMemoryObj")
             self.meta.ref_count += 1
 
     def ref_count_down(self):
@@ -620,6 +631,16 @@ class TensorMemoryObj(MemoryObj):
             pin_monitor.on_pin(self)
             return True
 
+    def pin_durable(self) -> bool:
+        """Pin this object until its explicit generation owner releases it."""
+        with self.lock:
+            if self.meta.pin_count == 0:
+                TensorMemoryObj.monitor.update_pinned_memory_objs_count(1)
+            self.meta.pin_count += 1
+            self._durable_pin_count += 1
+            PinMonitor.GetOrCreate().on_durable_pin(self)
+            return True
+
     def unpin(self) -> bool:
         with self.lock:
             self.meta.pin_count -= 1
@@ -647,6 +668,30 @@ class TensorMemoryObj(MemoryObj):
                     "Double unpin occurred somewhere."
                     "Setting pin count back to 0 as a hack but please find the bug."
                 )
+                self.meta.pin_count = 0
+            return True
+
+    def unpin_durable(self) -> bool:
+        """Release one generation-owned durable pin."""
+        with self.lock:
+            if self._durable_pin_count <= 0:
+                return False
+            self._durable_pin_count -= 1
+            self.meta.pin_count -= 1
+            if self._durable_pin_count == 0:
+                PinMonitor.GetOrCreate().on_durable_unpin(self)
+            if self.meta.pin_count == 0:
+                TensorMemoryObj.monitor.update_pinned_memory_objs_count(-1)
+                PinMonitor.GetOrCreate().on_unpin(self)
+            if self.meta.pin_count <= 0 and self.meta.ref_count <= 0:
+                if self.parent_allocator is None:
+                    logger.error(
+                        "Parent allocator is None when trying to free MemoryObj."
+                        "This could cause memory leak"
+                    )
+                else:
+                    self.parent_allocator.free(self)
+            if self.meta.pin_count < 0:
                 self.meta.pin_count = 0
             return True
 

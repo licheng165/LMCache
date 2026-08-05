@@ -48,6 +48,7 @@ class PinMonitor(PeriodicThread):
         self._pinned_objects: dict[
             int, tuple["MemoryObj", float]
         ] = {}  # {obj_id: (memory_obj, register_time)}
+        self._durable_objects: set[int] = set()
         self._objects_lock = threading.Lock()
         self._check_interval = config.pin_check_interval_sec
         self._pin_timeout_sec = config.pin_timeout_sec
@@ -95,12 +96,28 @@ class PinMonitor(PeriodicThread):
                 current_time,
             )
 
+    def on_durable_pin(self, memory_obj: "MemoryObj") -> None:
+        """Register a pin that must not be removed by timeout recovery."""
+        obj_id = id(memory_obj)
+        with self._objects_lock:
+            self._pinned_objects[obj_id] = (memory_obj, time.time())
+            self._durable_objects.add(obj_id)
+
+    def on_durable_unpin(self, memory_obj: "MemoryObj") -> None:
+        """End durable ownership while preserving any ordinary pin timeout."""
+        obj_id = id(memory_obj)
+        with self._objects_lock:
+            self._durable_objects.discard(obj_id)
+            if memory_obj.meta.pin_count > 0 and obj_id in self._pinned_objects:
+                self._pinned_objects[obj_id] = (memory_obj, time.time())
+
     def on_unpin(self, memory_obj: "MemoryObj"):
         """Unregister a memory object from timeout monitoring."""
         obj_id = id(memory_obj)
         with self._objects_lock:
             if obj_id in self._pinned_objects:
                 del self._pinned_objects[obj_id]
+                self._durable_objects.discard(obj_id)
                 logger.debug(
                     "Unregistered pinned object %s from timeout monitoring",
                     obj_id,
@@ -120,6 +137,8 @@ class PinMonitor(PeriodicThread):
             for obj_id, (memory_obj, register_time) in list(
                 self._pinned_objects.items()
             ):
+                if obj_id in self._durable_objects:
+                    continue
                 # Check if object is still pinned and has exceeded timeout
                 if memory_obj.meta.pin_count > 0:
                     elapsed_time = current_time - register_time

@@ -11,7 +11,11 @@ import pytest
 import torch
 
 from lmcache.utils import CacheEngineKey
-from lmcache.v1.cache_engine import LMCacheEngine, LMCacheEngineBuilder
+from lmcache.v1.cache_engine import (
+    LayerwiseStoreResult,
+    LMCacheEngine,
+    LMCacheEngineBuilder,
+)
 from lmcache.v1.memory_management import (
     MemoryFormat,
     MemoryObjMetadata,
@@ -421,6 +425,186 @@ def test_layerwise_chunk_fully_stored_repairs_partial_cache() -> None:
         engine._layerwise_chunk_fully_stored(
             keys, req_id="req", kv_group=0, start=0, end=256
         )
+
+
+def test_dsa_command_store_rewrites_fully_cached_layerwise_chunk() -> None:
+    engine = object.__new__(LMCacheEngine)
+    engine.retrieve_locations = ["LocalCPUBackend"]
+    keys = _make_key().split_layers(4)
+    engine.storage_manager = _FakeLayerwiseStorageManager(
+        keys,
+        expose_local_cpu_backend=True,
+    )
+
+    assert not engine._layerwise_chunk_should_store(
+        keys,
+        req_id="req",
+        kv_group=0,
+        start=0,
+        end=256,
+        force_rewrite=False,
+    )
+    assert engine.storage_manager.removed == []
+
+    assert engine._layerwise_chunk_should_store(
+        keys,
+        req_id="req",
+        kv_group=0,
+        start=0,
+        end=256,
+        force_rewrite=True,
+    )
+    assert engine.storage_manager.removed == [(keys, None)]
+
+    engine.storage_manager = _FakeLayerwiseStorageManager(
+        keys,
+        block_mapping={"RemoteBackend": keys},
+    )
+    assert engine._layerwise_chunk_should_store(
+        keys,
+        req_id="req",
+        kv_group=0,
+        start=0,
+        end=256,
+        force_rewrite=True,
+    )
+    assert engine.storage_manager.removed == []
+
+
+def test_dsa_command_store_fails_if_cached_chunk_cannot_be_replaced() -> None:
+    engine = object.__new__(LMCacheEngine)
+    engine.retrieve_locations = ["LocalCPUBackend"]
+    keys = _make_key().split_layers(4)
+    engine.storage_manager = _FakeLayerwiseStorageManager(
+        keys,
+        remove_count=3,
+        expose_local_cpu_backend=True,
+    )
+
+    with pytest.raises(
+        ValueError,
+        match="could not replace every existing local layer",
+    ):
+        engine._layerwise_chunk_should_store(
+            keys,
+            req_id="req",
+            kv_group=0,
+            start=0,
+            end=256,
+            force_rewrite=True,
+        )
+
+
+def test_dsa_store_result_exchange_builds_valid_passive_views() -> None:
+    class _TokenDatabase:
+        def process_tokens(self, **kwargs):
+            yield 0, 4, _make_key()
+
+    slab = torch.arange(1024, dtype=torch.uint8)
+    queue = []
+    pin_allocator = SimpleNamespace(free=lambda _memory_obj: None)
+    root_memory = _make_memory_obj(slab, parent_allocator=pin_allocator)
+    root_memory.metadata.pin_count = 1
+    layer_key = _make_key().split_layers(1)[0]
+    root_result = LayerwiseStoreResult(
+        request_id="req",
+        starts=[0],
+        ends=[4],
+        keys=[[layer_key]],
+        memory_objs=[[root_memory]],
+        tensors=[[root_memory.tensor]],
+    )
+
+    root = object.__new__(LMCacheEngine)
+    root.enable_shared_cpu_cache = True
+    root.save_only_first_rank = True
+    root.num_layers = 1
+    root.shared_cpu_cache_name = "/lmcache-dsa"
+    root.shared_cpu_cache_generation = 7
+    root.metadata = SimpleNamespace(
+        world_size=2,
+        worker_id=0,
+        first_rank=0,
+        is_first_rank=lambda: True,
+    )
+    root.token_database = _TokenDatabase()
+    root.broadcast_object_fn = lambda value, _rank: queue.append(value)
+    root.storage_manager = SimpleNamespace(
+        local_cpu_backend=SimpleNamespace(
+            memory_allocator=SimpleNamespace(
+                shm_name="/lmcache-dsa",
+                pin_allocator=pin_allocator,
+                buffer=slab,
+            )
+        )
+    )
+    root._shared_cpu_dtype_for_kv_group = lambda _group: torch.float16
+    root._memory_format_for_kv_group = (
+        lambda _group: MemoryFormat.KV_MLA_LATENT_FMT
+    )
+
+    published, error = root.exchange_dsa_store_result(
+        [0, 1, 2, 3],
+        request_id="req",
+        operation_id="store-1",
+        generation_id="generation-1",
+        kv_group=0,
+        required_layers=(0,),
+        required_chunks=((0, 4),),
+        request_configs=None,
+        source_result=root_result,
+        source_error=None,
+    )
+
+    assert published is root_result
+    assert error is None
+    assert len(queue) == 1
+
+    passive = object.__new__(LMCacheEngine)
+    passive.enable_shared_cpu_cache = True
+    passive.save_only_first_rank = True
+    passive.num_layers = 1
+    passive.shared_cpu_cache_generation = 7
+    passive.metadata = SimpleNamespace(
+        world_size=2,
+        worker_id=1,
+        first_rank=0,
+        is_first_rank=lambda: False,
+    )
+    passive.token_database = _TokenDatabase()
+    passive.broadcast_object_fn = lambda _value, _rank: queue.pop(0)
+    passive.shared_cpu_cache_passive_allocator = PassiveSharedViewAllocator(
+        slab_tensor=slab,
+        shm_name="/lmcache-dsa",
+        generation=7,
+    )
+    passive._expected_shared_cpu_chunk_metadata = lambda **_kwargs: (
+        torch.Size([8]),
+        torch.float16,
+        MemoryFormat.KV_MLA_LATENT_FMT,
+    )
+
+    received, error = passive.exchange_dsa_store_result(
+        [0, 1, 2, 3],
+        request_id="req",
+        operation_id="store-1",
+        generation_id="generation-1",
+        kv_group=0,
+        required_layers=(0,),
+        required_chunks=((0, 4),),
+        request_configs=None,
+        source_result=None,
+        source_error=None,
+    )
+
+    assert error is None
+    assert received is not None
+    assert received.keys == [[layer_key]]
+    assert received.starts == [0]
+    assert received.ends == [4]
+    assert received.tensors[0][0].data_ptr() == slab[128:144].data_ptr()
+    assert queue == []
+    received.memory_objs[0][0].ref_count_down()
 
 
 class _FakeLookupTokenDatabase:
@@ -869,6 +1053,7 @@ def _make_memory_obj(
     logical_size: int = 16,
     physical_size: int = 64,
     kv_group: int = 0,
+    parent_allocator=None,
 ) -> TensorMemoryObj:
     raw = backing[offset : offset + logical_size]
     metadata = MemoryObjMetadata(
@@ -888,7 +1073,7 @@ def _make_memory_obj(
     return TensorMemoryObj(
         raw_data=raw,
         metadata=metadata,
-        parent_allocator=None,
+        parent_allocator=parent_allocator,
     )
 
 

@@ -100,6 +100,18 @@ class LMCacheConnectorV1Dynamic(KVConnectorBase_V1):
     def get_completed_decode_window_saves(self) -> dict[str, int]:
         return self._lmcache_engine.get_completed_decode_window_saves()
 
+    def get_dsa_operation_receipts(self) -> tuple[object, ...]:
+        """Drain DSA operation receipts produced by this worker."""
+        return self._lmcache_engine.get_dsa_operation_receipts()
+
+    def get_dsa_control_events(self) -> tuple[object, ...]:
+        """Drain DSA control events produced by this worker."""
+        return self._lmcache_engine.get_dsa_control_events()
+
+    def get_released_dsa_source_leases(self) -> tuple[object, ...]:
+        """Drain source leases released after their final worker fence."""
+        return self._lmcache_engine.get_released_dsa_source_leases()
+
     def shutdown(self):
         """
         Shutdown the connector. This is called when the worker process

@@ -112,6 +112,10 @@ class LayerwiseStoreResult:
     tensors: List[List[torch.Tensor]] = field(default_factory=list)
     chunk_dev_ptrs: List[List[int]] = field(default_factory=list)
     chunk_ptrs: List[Optional[torch.Tensor]] = field(default_factory=list)
+    # Persistence-completion futures returned by backends for this exact
+    # layerwise operation. Command protocols must wait for these before
+    # publishing a durable receipt.
+    required_futures: List[Any] = field(default_factory=list, repr=False)
 
     def has_cache(self) -> bool:
         """Return whether the completed store produced reusable cache data."""
@@ -1247,6 +1251,322 @@ class LMCacheEngine:
             )
             is not None
         )
+
+    def _layerwise_chunk_should_store(
+        self,
+        keys_multi_layer: list[CacheEngineKey],
+        *,
+        req_id: str,
+        kv_group: int,
+        start: int,
+        end: int,
+        force_rewrite: bool,
+    ) -> bool:
+        """Decide whether to store, refreshing command-owned source chunks."""
+        location = self._layerwise_chunk_location_if_fully_stored(
+            keys_multi_layer,
+            req_id=req_id,
+            kv_group=kv_group,
+            start=start,
+            end=end,
+            repair_partial=True,
+        )
+        if location is None:
+            return True
+        if not force_rewrite:
+            return False
+
+        assert self.storage_manager is not None
+        storage_backends = getattr(self.storage_manager, "storage_backends", {})
+        local_cpu_backend = storage_backends.get("LocalCPUBackend")
+        if location == "LocalCPUBackend" and local_cpu_backend is None:
+            raise ValueError("DSA command store cannot access LocalCPUBackend")
+        local_keys = (
+            [key for key in keys_multi_layer if local_cpu_backend.contains(key)]
+            if local_cpu_backend is not None
+            else []
+        )
+        removed = local_cpu_backend.batched_remove(local_keys) if local_keys else 0
+        if removed != len(local_keys):
+            raise ValueError(
+                "DSA command store could not replace every existing local layer: "
+                f"req_id={req_id}, kv_group={kv_group}, start={start}, "
+                f"end={end}, location={location}, removed={removed}, "
+                f"expected={len(local_keys)}"
+            )
+        return True
+
+    def dsa_store_exchange_role(self) -> Optional[str]:
+        """Return this worker's role in shared DSA source publication.
+
+        Returns:
+            ``"rank0"`` for the authoritative shared-cache writer,
+            ``"passive"`` for a view-only worker, or ``None`` when shared
+            publication is not active.
+        """
+        metadata = getattr(self, "metadata", None)
+        if (
+            not getattr(self, "enable_shared_cpu_cache", False)
+            or not getattr(self, "save_only_first_rank", False)
+            or int(getattr(metadata, "world_size", 1)) <= 1
+        ):
+            return None
+        return "rank0" if metadata.is_first_rank() else "passive"
+
+    def exchange_dsa_store_result(
+        self,
+        tokens: Union[torch.Tensor, list[int]],
+        *,
+        request_id: str,
+        operation_id: str,
+        generation_id: str,
+        kv_group: int,
+        required_layers: tuple[int, ...],
+        required_chunks: tuple[tuple[int, int], ...],
+        request_configs: Optional[dict],
+        source_result: Optional[LayerwiseStoreResult],
+        source_error: Optional[str],
+    ) -> tuple[Optional[LayerwiseStoreResult], Optional[str]]:
+        """Publish a fenced rank-0 DSA store result to passive TP ranks.
+
+        The transport carries only shared-slab offsets and tensor metadata.
+        Passive workers validate every envelope before creating local views.
+
+        Args:
+            tokens: Canonical token prefix used to recompute cache keys.
+            request_id: Request ID bound to the command.
+            operation_id: Unique DSA store operation ID.
+            generation_id: Output source generation ID.
+            kv_group: KV group represented by this result.
+            required_layers: Exact layer manifest required by the command.
+            required_chunks: Exact token chunks required by the command.
+            request_configs: Request-specific cache-key configuration.
+            source_result: Rank-0 result; passive workers pass ``None``.
+            source_error: Rank-0 failure to publish instead of handles.
+
+        Returns:
+            The local store result and an optional fail-closed error code.
+
+        Raises:
+            RuntimeError: If the underlying all-rank broadcast itself fails.
+        """
+        role = self.dsa_store_exchange_role()
+        if role is None:
+            return source_result, source_error
+
+        phase = f"dsa_store:{operation_id}:{generation_id}"
+        expected_keys: list[list[CacheEngineKey]] = []
+        setup_error: Optional[str] = None
+        try:
+            if required_layers != tuple(range(self.num_layers)):
+                raise ValueError("DSA shared source requires every local layer")
+            if not required_chunks:
+                raise ValueError("DSA shared source requires at least one chunk")
+            token_count = len(tokens)
+            mask = torch.zeros(token_count, dtype=torch.bool)
+            previous_end = required_chunks[0][0]
+            for start, end in required_chunks:
+                if start != previous_end or end <= start or end > token_count:
+                    raise ValueError("DSA shared source chunk manifest is invalid")
+                mask[start:end] = True
+                previous_end = end
+            chunk_rows: list[list[CacheEngineKey]] = []
+            actual_chunks: list[tuple[int, int]] = []
+            for start, end, key in self.token_database.process_tokens(
+                tokens=tokens,
+                mask=mask,
+                request_configs=request_configs,
+                kv_group=kv_group,
+            ):
+                if not isinstance(key, CacheEngineKey):
+                    raise TypeError("DSA shared source produced an invalid cache key")
+                actual_chunks.append((int(start), int(end)))
+                chunk_rows.append(key.split_layers(self.num_layers))
+            if tuple(actual_chunks) != required_chunks:
+                raise ValueError("DSA shared source cache keys cover the wrong chunks")
+            expected_keys = [
+                list(row) for row in zip(*chunk_rows, strict=True)
+            ]
+        except Exception:
+            logger.exception(
+                "Failed to derive DSA shared source keys: req_id=%s "
+                "operation=%s kv_group=%d",
+                request_id,
+                operation_id,
+                kv_group,
+            )
+            setup_error = "shared_source_key_validation_failed"
+
+        if role == "rank0":
+            publication_error = source_error or setup_error
+            envelopes: list[SharedHandleEnvelope] = []
+            if publication_error is None:
+                try:
+                    if source_result is None:
+                        raise ValueError("rank0 DSA source result is missing")
+                    chunks = tuple(
+                        zip(source_result.starts, source_result.ends, strict=True)
+                    )
+                    if chunks != required_chunks:
+                        raise ValueError("rank0 DSA source chunks do not match")
+                    if source_result.keys != expected_keys:
+                        raise ValueError("rank0 DSA source keys do not match")
+                    if len(source_result.memory_objs) != len(required_layers):
+                        raise ValueError("rank0 DSA source layer count does not match")
+                    for layer_id in required_layers:
+                        handles = self._make_shared_handles_for_layer(
+                            req_id=request_id,
+                            phase=phase,
+                            keys_layer=expected_keys[layer_id],
+                            mem_objs_layer=source_result.memory_objs[layer_id],
+                            layer_id=layer_id,
+                            kv_group=kv_group,
+                        )
+                        envelopes.append(
+                            SharedHandleEnvelope(
+                                request_id=request_id,
+                                phase=phase,
+                                request_ordinal=0,
+                                layer_id=layer_id,
+                                kv_group=kv_group,
+                                status="ok",
+                                generation=self.shared_cpu_cache_generation,
+                                handles=handles,
+                            )
+                        )
+                except Exception:
+                    logger.exception(
+                        "Failed to publish DSA shared source: req_id=%s "
+                        "operation=%s kv_group=%d",
+                        request_id,
+                        operation_id,
+                        kv_group,
+                    )
+                    publication_error = "shared_source_publication_failed"
+
+            if publication_error is not None:
+                envelopes = [
+                    self._shared_layerwise_error_envelope(
+                        req_id=request_id,
+                        phase=phase,
+                        request_ordinal=0,
+                        layer_id=layer_id,
+                        kv_group=kv_group,
+                        message="DSA shared source publication failed.",
+                        details={"error_code": publication_error},
+                    )
+                    for layer_id in required_layers
+                ]
+            for envelope in envelopes:
+                self._broadcast_shared_envelope(envelope)
+            return (
+                source_result if publication_error is None else None,
+                publication_error,
+            )
+
+        # Drain the complete collective before parsing any payload. A corrupt
+        # early envelope must not strand rank 0 on a later layer broadcast.
+        raw_envelopes = [
+            self.broadcast_object_fn(None, self.metadata.first_rank)
+            for _ in required_layers
+        ]
+        if source_error is not None:
+            return None, source_error
+
+        views: list[MemoryObj] = []
+        try:
+            if setup_error is not None:
+                raise ValueError(setup_error)
+            envelopes = [
+                SharedHandleEnvelope.from_dict(raw)
+                for raw in raw_envelopes
+            ]
+            root_errors = {
+                str((envelope.error_details or {}).get("error_code"))
+                for envelope in envelopes
+                if envelope.status == "error"
+            }
+            if root_errors:
+                if len(root_errors) != 1:
+                    raise ValueError("rank0 published inconsistent DSA errors")
+                return None, root_errors.pop()
+
+            memory_objs: list[list[MemoryObj]] = []
+            tensors: list[list[torch.Tensor]] = []
+            for layer_id, envelope in zip(
+                required_layers,
+                envelopes,
+                strict=True,
+            ):
+                self._validate_shared_layerwise_envelope(
+                    envelope,
+                    req_id=request_id,
+                    phase=phase,
+                    request_ordinal=0,
+                    layer_id=layer_id,
+                    kv_group=kv_group,
+                )
+                if len(envelope.handles) != len(required_chunks):
+                    raise ValueError("DSA shared source handle count does not match")
+                layer_memory: list[MemoryObj] = []
+                layer_tensors: list[torch.Tensor] = []
+                for chunk_index, (handle, (start, end)) in enumerate(
+                    zip(envelope.handles, required_chunks, strict=True)
+                ):
+                    expected_shape, expected_dtype, expected_fmt = (
+                        self._expected_shared_cpu_chunk_metadata(
+                            kv_group=kv_group,
+                            num_tokens=end - start,
+                        )
+                    )
+                    allocator = self.shared_cpu_cache_passive_allocator
+                    if allocator is None:
+                        raise ValueError("passive shared allocator is unavailable")
+                    memory_obj = allocator.create_view(
+                        handle,
+                        expected_request_id=request_id,
+                        expected_phase=phase,
+                        expected_layer_id=layer_id,
+                        expected_kv_group=kv_group,
+                        expected_chunk_index=chunk_index,
+                        expected_key=expected_keys[layer_id][chunk_index],
+                        expected_shape=expected_shape,
+                        expected_dtype=expected_dtype,
+                        expected_fmt=expected_fmt,
+                        expected_cached_positions=range(start, end),
+                        expected_producer_rank=self.metadata.first_rank,
+                    )
+                    if memory_obj.tensor is None:
+                        raise ValueError("DSA shared source view has no tensor")
+                    views.append(memory_obj)
+                    layer_memory.append(memory_obj)
+                    layer_tensors.append(memory_obj.tensor)
+                memory_objs.append(layer_memory)
+                tensors.append(layer_tensors)
+            return (
+                LayerwiseStoreResult(
+                    request_id=request_id,
+                    kv_group=kv_group,
+                    starts=[start for start, _ in required_chunks],
+                    ends=[end for _, end in required_chunks],
+                    keys=expected_keys,
+                    memory_objs=memory_objs,
+                    tensors=tensors,
+                ),
+                None,
+            )
+        except Exception:
+            logger.exception(
+                "Failed to receive DSA shared source: req_id=%s "
+                "operation=%s kv_group=%d",
+                request_id,
+                operation_id,
+                kv_group,
+            )
+            for memory_obj in reversed(views):
+                if memory_obj.is_valid():
+                    memory_obj.ref_count_down()
+            return None, "shared_source_exchange_failed"
 
     def _layerwise_lookup_kv_groups(self) -> list[int]:
         if (
@@ -3271,12 +3591,13 @@ class LMCacheEngine:
             assert isinstance(key, CacheEngineKey)
 
             keys_multi_layer = key.split_layers(self.num_layers)
-            if self._layerwise_chunk_fully_stored(
+            if not self._layerwise_chunk_should_store(
                 keys_multi_layer,
                 req_id=req_id,
                 kv_group=kv_group,
                 start=start,
                 end=end,
+                force_rewrite=bool(kwargs.get("dsa_command_store", False)),
             ):
                 continue
 
@@ -3375,11 +3696,12 @@ class LMCacheEngine:
                 for layer_id in range(self.num_layers):
                     yield
                     next(mem_obj_generator)
-                    self.storage_manager.batched_put(
+                    required_futures = self.storage_manager.batched_put(
                         keys[layer_id],
                         memory_objs[layer_id],
                         location=self.store_location,
                     )
+                    store_result.required_futures.extend(required_futures)
                     for mem_obj in memory_objs[layer_id]:
                         pending_store_release.pop(id(mem_obj), None)
 

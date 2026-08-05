@@ -142,6 +142,28 @@ def test_tensor_allocator(use_paging):
     allocator.close()
 
 
+def test_tensor_memory_obj_cannot_retain_invalid_storage() -> None:
+    memory_obj = TensorMemoryObj(
+        raw_data=torch.zeros(2, dtype=torch.uint8),
+        metadata=MemoryObjMetadata(
+            shape=torch.Size([1]),
+            dtype=torch.float16,
+            address=0,
+            phy_size=2,
+            ref_count=1,
+            pin_count=0,
+            fmt=MemoryFormat.KV_T2D,
+        ),
+        parent_allocator=None,
+    )
+    memory_obj.invalidate()
+
+    with pytest.raises(RuntimeError, match="Cannot retain an invalid"):
+        memory_obj.ref_count_up()
+
+    assert memory_obj.get_ref_count() == 1
+
+
 def test_paged_allocator_refreshes_size_for_reused_partial_pages():
     full_shape = torch.Size([32, 8])
     partial_shape = torch.Size([19, 8])
@@ -562,6 +584,41 @@ def test_tensor_memory_obj_pin_monitor_integration():
 
     memory_obj.unpin()
     assert pin_monitor.get_monitored_count() == initial_count  # Fully unregistered
+
+
+def test_durable_pin_is_not_forced_out_by_timeout() -> None:
+    PinMonitor._instance = None
+    config = LMCacheEngineConfig.from_defaults(
+        pin_timeout_sec=1,
+        pin_check_interval_sec=1,
+    )
+    pin_monitor = PinMonitor.GetOrCreate(config)
+    memory_obj = TensorMemoryObj(
+        torch.empty(1, dtype=torch.float32),
+        MemoryObjMetadata(
+            shape=torch.Size([1]),
+            dtype=torch.float32,
+            address=123,
+            phy_size=4,
+            fmt=MemoryFormat.KV_T2D,
+            ref_count=1,
+        ),
+        parent_allocator=None,
+    )
+    memory_obj.pin_durable()
+    with pin_monitor._objects_lock:
+        pin_monitor._pinned_objects[id(memory_obj)] = (
+            memory_obj,
+            time.time() - 2,
+        )
+
+    pin_monitor._check_timeouts()
+
+    assert memory_obj.is_pinned
+    assert memory_obj.metadata.pin_count == 1
+    assert memory_obj.unpin_durable()
+    assert memory_obj.metadata.pin_count == 0
+    assert id(memory_obj) not in pin_monitor._durable_objects
 
 
 # =============================================================================
