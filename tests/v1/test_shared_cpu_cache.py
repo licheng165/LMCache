@@ -5,6 +5,7 @@ from dataclasses import replace
 from contextlib import nullcontext
 from types import SimpleNamespace
 import asyncio
+import os
 import sys
 
 import pytest
@@ -1572,6 +1573,8 @@ def test_shared_cpu_size_override_wins_over_first_rank_size(monkeypatch):
 
 
 def test_shared_cpu_shm_capacity_preflight_reports_sigbus_risk(monkeypatch):
+    if not hasattr(os, "statvfs"):
+        pytest.skip("os.statvfs is unavailable on this platform")
     engine = object.__new__(LMCacheEngine)
     engine.enable_shared_cpu_cache = True
     engine.shared_cpu_cache_name = "/lmcache-too-large"
@@ -2451,6 +2454,7 @@ def test_rank0_windowed_remote_resolver_uses_cached_slab_context(monkeypatch):
     assert foreign_obj.ref_count_down_count == 1
     assert stages == [
         "windows",
+        "remote_get",
         "results",
         "classification",
         "pinning",

@@ -3,6 +3,7 @@
 
 # Standard
 from contextlib import contextmanager
+import inspect
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
@@ -37,6 +38,9 @@ def _make_impl() -> LMCacheConnectorV1Impl:
     impl._worker_retrieve_last_prune_key = None
     impl._layerwise_save_storers = {}
     impl._deferred_latent_pending = set()
+    impl._cold_perf_load_started = {}
+    impl._cold_perf_dense_load_started = {}
+    impl._cold_perf_dense_load_completed = {}
     impl.kv_role = "kv_both"
     impl._late_finished_sending = set()
     return impl
@@ -1990,6 +1994,37 @@ class TestWorkerRetrieveState:
         assert captured[0]["selected_token_counts"].item() == 3
         assert captured[0]["selected_token_ids"].shape == (4,)
 
+    def test_sparse_layer_wait_has_no_completion_mask_validation(self):
+        assert (
+            "require_complete_sparse_load"
+            not in inspect.signature(
+                LMCacheConnectorV1Impl.wait_for_layer_load
+            ).parameters
+        )
+
+        req = make_sparse_req_meta("req-1", token_count=4)
+        req.decode_token_mask = torch.ones(4, dtype=torch.bool)
+        impl, _, _ = make_worker_connector([req], use_layerwise=True)
+        impl.current_layer = 0
+        impl.num_layers = 2
+        impl._layerwise_retriever_is_sparse = [True]
+
+        def _retriever():
+            yield None
+            yield torch.zeros(4, dtype=torch.bool)
+
+        retriever = _retriever()
+        next(retriever)
+        impl.layerwise_retrievers = [(retriever, None)]
+
+        impl.wait_for_layer_load(
+            "model.layers.0.self_attn.attn",
+            selected_tokens=torch.tensor([[0]], dtype=torch.int32),
+            request_ids=["req-1"],
+        )
+
+        assert impl.current_layer == 1
+
     def test_retrieve_stats_combine_mtp_rows_and_reset_each_window(
         self, monkeypatch
     ):
@@ -3003,7 +3038,10 @@ class TestWorkerRetrieveState:
         req.slot_mapping = []
         req.sparse_warm_ref = True
         impl, _, _ = make_worker_connector([req], use_layerwise=True)
-        impl.lmcache_engine = SimpleNamespace(enable_shared_cpu_cache=False)
+        impl.lmcache_engine = SimpleNamespace(
+            enable_shared_cpu_cache=False,
+            lookup_unpin=MagicMock(),
+        )
         impl.config.dsa_two_groups = False
         impl.num_layers = 1
         impl._refresh_kvcaches_list()
@@ -3221,11 +3259,14 @@ class TestWorkerRetrieveState:
 
     def test_start_load_kv_without_attention_skips_step_setup(self):
         impl = _make_impl()
-        impl._parent = SimpleNamespace(_get_connector_metadata=MagicMock())
+        metadata = LMCacheConnectorMetadata(requests=[])
+        impl._parent = SimpleNamespace(
+            _get_connector_metadata=MagicMock(return_value=metadata)
+        )
 
         impl.start_load_kv(SimpleNamespace(attn_metadata=None))
 
-        impl._parent._get_connector_metadata.assert_not_called()
+        impl._parent._get_connector_metadata.assert_called_once_with()
         assert impl.current_layer == 0
         assert impl._wait_for_save_done is False
 

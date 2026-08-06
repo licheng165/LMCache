@@ -64,6 +64,7 @@ def _make_scheduler_impl() -> LMCacheConnectorV1Impl:
     impl._unfinished_requests = {}
     impl.load_specs = {}
     impl._requests_priority = {}
+    impl._cold_perf_lookup_started = {}
     return impl
 
 
@@ -129,7 +130,8 @@ def test_dsa_cold_compact_async_requires_complete_prompt_hit() -> None:
     assert getattr(
         impl.load_specs[request.request_id], "dsa_cold_compact_load"
     )
-    assert impl.load_specs[request.request_id].dsa_committed_end == 8191
+    assert impl.load_specs[request.request_id].dsa_committed_end == 8192
+    assert impl.load_specs[request.request_id].dsa_remap_frontier == 8191
     assert (
         getattr(impl.load_specs[request.request_id], "dsa_release_frontier")
         == 7936
@@ -138,7 +140,8 @@ def test_dsa_cold_compact_async_requires_complete_prompt_hit() -> None:
     lookup_client.lookup_cache.return_value = 8194
     unaligned = SimpleNamespace(request_id="cold-unaligned", num_tokens=8194)
     assert impl.get_num_new_matched_tokens(unaligned, 0) == 8193
-    assert impl.load_specs[unaligned.request_id].dsa_committed_end == 8192
+    assert impl.load_specs[unaligned.request_id].dsa_committed_end == 8194
+    assert impl.load_specs[unaligned.request_id].dsa_remap_frontier == 8193
     assert (
         getattr(impl.load_specs[unaligned.request_id], "dsa_release_frontier")
         == 8192
@@ -1004,7 +1007,8 @@ class TestBuildConnectorMetaSparseSyntheticLoadSpec:
 
         assert req_meta.load_spec is not None
         assert req_meta.load_spec.lmcache_cached_tokens == prompt_len
-        assert req_meta.load_spec.dsa_committed_end == prompt_len - 1
+        assert req_meta.load_spec.dsa_committed_end == release_frontier
+        assert req_meta.load_spec.dsa_remap_frontier == prompt_len - 1
         assert (
             getattr(req_meta.load_spec, "dsa_release_frontier")
             == release_frontier
@@ -1122,7 +1126,7 @@ class TestBuildConnectorMetaSparseSyntheticLoadSpec:
         assert req_meta.load_spec is not None
         assert req_meta.load_spec.can_load is True
         assert req_meta.load_spec.lmcache_cached_tokens == 256
-        assert req_meta.load_spec.dsa_committed_end == 0
+        assert req_meta.load_spec.dsa_committed_end == 256
         assert req_meta.token_ids == all_tokens[:256]
         assert tracker.sparse_token_ids == all_tokens[:256]
         assert req_meta.slot_mapping[0].numel() == 256

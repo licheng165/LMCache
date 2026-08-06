@@ -432,8 +432,13 @@ class LoadSpec:
     lmcache_cached_tokens: int
     # Whether the scheduler allow us to load the tokens
     can_load: bool
-    # Exact frontier below which sparse decode may remap from LMCache.
+    # Block-aligned prefix committed in LMCache. Consumers derive their
+    # effective remap boundary separately.
     dsa_committed_end: Optional[int] = None
+    # Exact frontier below which sparse decode may remap from LMCache. This
+    # differs from committed_end when a full prompt hit recomputes its final
+    # token.
+    dsa_remap_frontier: Optional[int] = None
     # Fixed resident prefix capacity used by DSA MTP union scratch.
     dsa_scratch_capacity: Optional[int] = None
 
@@ -7783,6 +7788,7 @@ class LMCacheConnectorV1Impl:
             was_aborted = bool(aborted_ids is not None and req_id in aborted_ids)
             try:
                 assert request.load_spec is not None
+                state = future.result()
                 actual_generation = getattr(
                     request.load_spec, "dsa_cold_load_generation", None
                 )
@@ -7792,7 +7798,6 @@ class LMCacheConnectorV1Impl:
                         f"req_id={req_id}, expected={generation}, "
                         f"actual={actual_generation}"
                     )
-                state = future.result()
                 if was_aborted:
                     self._release_unadopted_shared_request_objects(state, request)
                     self._release_shared_worker_retrieve_state(
@@ -8143,7 +8148,10 @@ class LMCacheConnectorV1Impl:
                 * self._lmcache_chunk_size
             )
             if dsa_cold_compact_load:
-                self.load_specs[req_id].dsa_committed_end = remap_frontier
+                self.load_specs[req_id].dsa_committed_end = (
+                    num_external_hit_tokens
+                )
+                self.load_specs[req_id].dsa_remap_frontier = remap_frontier
                 setattr(
                     self.load_specs[req_id],
                     "dsa_release_frontier",
@@ -8748,7 +8756,9 @@ class LMCacheConnectorV1Impl:
                 setattr(
                     request_tracker,
                     "sparse_remap_frontier",
-                    load_spec.dsa_committed_end,
+                    load_spec.dsa_remap_frontier
+                    if load_spec.dsa_remap_frontier is not None
+                    else load_spec.dsa_committed_end,
                 )
             self._request_trackers[request.req_id] = request_tracker
 
@@ -9007,7 +9017,8 @@ class LMCacheConnectorV1Impl:
                     vllm_cached_tokens=0,
                     lmcache_cached_tokens=lmcache_cached_for_sparse,
                     can_load=lmcache_cached_for_sparse > 0,
-                    dsa_committed_end=dsa_remap_frontier,
+                    dsa_committed_end=committed_end,
+                    dsa_remap_frontier=dsa_remap_frontier,
                     dsa_scratch_capacity=self._dsa_scratch_capacity,
                 )
                 if hasattr(request_tracker, "sparse_remap_frontier"):
