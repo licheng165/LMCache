@@ -5093,6 +5093,7 @@ class LMCacheEngine:
             )
             candidates: Iterable[tuple[int, int, CacheEngineKey]] = token_results
             batch_plan = None
+            tail_plan: Optional[list[str]] = None
             if mooncake_page_layout_enabled(self.config):
                 candidates = list(candidates)
                 page_candidates = (
@@ -5116,6 +5117,30 @@ class LMCacheEngine:
                             for item in page_candidates
                         ]
                     )
+                if (
+                    batch_plan is not None
+                    and len(page_candidates) < len(candidates)
+                ):
+                    tail_keys = candidates[len(page_candidates)][2].split_layers(
+                        self.num_layers
+                    )
+                    hits, mapping = self.storage_manager.batched_contains(
+                        tail_keys, self.retrieve_locations
+                    )
+                    if hits == len(tail_keys):
+                        locations = {
+                            key: name
+                            for name, found_keys in mapping.items()
+                            for key in found_keys
+                        }
+                        tail_locations = []
+                        for tail_key in tail_keys:
+                            location = locations.get(tail_key)
+                            if location is None:
+                                break
+                            tail_locations.append(location)
+                        else:
+                            tail_plan = tail_locations
             for start, end, key in candidates:
                 keys_multi_layer = key.split_layers(self.num_layers)
                 missing_layer = False
@@ -5123,8 +5148,12 @@ class LMCacheEngine:
                 locations_multi_layer: list[str] = (
                     [batch_plan[len(keys)]] * len(keys_multi_layer)
                     if planned
+                    else tail_plan
+                    if tail_plan is not None
+                    and len(keys) == len(page_candidates)
                     else []
                 )
+                planned = bool(locations_multi_layer)
                 if not planned:
                     for layer_idx, layer_key in enumerate(keys_multi_layer):
                         current_location = self._find_shared_rank0_chunk_location(

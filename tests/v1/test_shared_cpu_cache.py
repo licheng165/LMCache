@@ -499,7 +499,10 @@ def test_layer_page_location_plan_probes_one_remote_key_per_chunk():
     pages[0].ref_count_down()
 
 
-def test_layer_page_batch_plan_keeps_partial_tail_on_legacy_lookup():
+@pytest.mark.parametrize("tail_complete", [True, False])
+def test_layer_page_batch_plan_keeps_partial_tail_on_legacy_lookup(
+    tail_complete,
+):
     engine = object.__new__(LMCacheEngine)
     engine.config = SimpleNamespace(
         chunk_size=4,
@@ -513,7 +516,7 @@ def test_layer_page_batch_plan_keeps_partial_tail_on_legacy_lookup():
         },
     )
     engine.num_layers = 2
-    engine.storage_manager = object()
+    engine.storage_manager = SimpleNamespace()
     engine.gpu_connector = object()
     engine.shared_cpu_cache_strict = False
     engine.stats_monitor = SimpleNamespace(on_retrieve_request=lambda _tokens: 1)
@@ -527,6 +530,15 @@ def test_layer_page_batch_plan_keeps_partial_tail_on_legacy_lookup():
     planned = []
     engine._shared_page_first_location_plan = lambda chunks: (
         planned.extend(chunks) or ["RemoteBackend"] * len(chunks)
+    )
+    tail_batches = []
+    engine.storage_manager.batched_contains = lambda batch, locations: (
+        tail_batches.append((batch, locations))
+        or (
+            (len(batch), {"RemoteBackend": list(batch)})
+            if tail_complete
+            else (0, {})
+        )
     )
     tail_probes = []
     engine._find_shared_rank0_chunk_location = lambda key: (
@@ -543,7 +555,9 @@ def test_layer_page_batch_plan_keeps_partial_tail_on_legacy_lookup():
     list(engine.retrieve_layer(list(range(10)), req_id="req-partial"))
 
     assert len(planned) == 2
-    assert len(tail_probes) == engine.num_layers
+    assert len(tail_batches) == 1
+    assert len(tail_batches[0][0]) == engine.num_layers
+    assert len(tail_probes) == (0 if tail_complete else engine.num_layers)
     assert resolved["starts"] == [0, 4, 8]
     assert resolved["chunk_locations_layer_major"] == [
         ["RemoteBackend"] * 3,
