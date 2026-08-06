@@ -348,6 +348,13 @@ class TestCacheEngineKey:
             assert layer_key.layer_id == i
             assert layer_key.model_name == "test_model"
 
+    def test_split_layers_reuses_normalized_metadata(self, key_with_tags):
+        layers = key_with_tags.split_layers(3)
+
+        assert all(key.tags is key_with_tags.tags for key in layers)
+        assert all(key._dtype_str == key_with_tags._dtype_str for key in layers)
+        assert [key.layer_id for key in layers] == [0, 1, 2]
+
     def test_get_first_layer(self, basic_key):
         first = basic_key.get_first_layer()
         assert isinstance(first, LayerCacheEngineKey)

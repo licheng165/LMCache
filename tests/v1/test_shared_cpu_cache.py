@@ -2370,6 +2370,41 @@ def test_runtime_capacity_aligns_one_combined_layer_page():
     assert details["required_bytes"] == 12288
 
 
+def test_remote_layer_pages_skip_eviction_scan_when_free_space_suffices():
+    class _FailOnItems(dict):
+        def items(self):
+            raise AssertionError("sufficient free space scanned hot objects")
+
+    engine = _make_engine_for_sparse_capacity(max_local_cpu_size=1)
+    engine.config.extra_config.update(
+        mooncake_layer_merged_page_objects=True,
+        mooncake_page_first_multi_buffer=True,
+        save_only_first_rank=True,
+    )
+    engine.config.enable_shared_cpu_cache = engine.config.use_layerwise = True
+    engine.config.remote_url = "mooncakestore://test/"
+    engine.config.chunk_size = 4
+    engine.num_layers = 2
+    engine._estimate_shared_cpu_bytes_per_layer = lambda *_args: 5000
+    engine._shared_local_cpu_backend = lambda: _FakeLocalCPUBackend(
+        free_bytes=16384, hot_cache=_FailOnItems()
+    )
+    keys = _make_key().split_layers(2)
+
+    details = engine._shared_cpu_runtime_capacity_details(
+        req_id="req-page",
+        phase="dense_prefix",
+        kv_group=0,
+        keys_layer_major=[[keys[0]], [keys[1]]],
+        chunk_locations_layer_major=[["RemoteBackend"], ["RemoteBackend"]],
+        chunk_token_lengths=[4],
+    )
+
+    assert details["required_bytes"] == 12288
+    assert details["capacity_scan_skipped"] is True
+    assert details["available_after_eviction"] == 16384
+
+
 def test_rank0_resolver_rematerializes_non_shm_hot_cache_hit():
     engine = object.__new__(LMCacheEngine)
     engine.storage_manager = object()

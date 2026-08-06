@@ -5545,6 +5545,15 @@ class LMCacheConnectorV1Impl:
         npu_device_id = (
             int(torch.npu.current_device()) if hasattr(torch, "npu") else None
         )
+        token_count = getattr(request.load_spec, "lmcache_cached_tokens", 0)
+        submitted_at = cold_start_perf_now()
+        cold_start_perf_log(
+            logger,
+            "worker_load_start",
+            req_id=request.req_id,
+            tokens=token_count,
+            mode="dsa_cold_compact",
+        )
         future = self._get_dsa_cold_load_executor().submit(
             self._run_dsa_cold_compact_load,
             request,
@@ -5555,7 +5564,7 @@ class LMCacheConnectorV1Impl:
             future,
             request,
             indexer_block_ids,
-            time.monotonic(),
+            submitted_at,
         )
 
     def _run_dsa_cold_compact_load(
@@ -5577,6 +5586,7 @@ class LMCacheConnectorV1Impl:
         tokens = request.token_ids[:token_count]
         token_mask = torch.ones(token_count, dtype=torch.bool)
         state = WorkerRetrieveState(req_id=request.req_id)
+        started = cold_start_perf_now()
         try:
             empty_slots = torch.empty(0, dtype=torch.long)
             retrieve_kwargs, _, _ = self._sparse_retrieve_kwargs(
@@ -5642,8 +5652,11 @@ class LMCacheConnectorV1Impl:
             ):
                 raise RuntimeError("Cold compact indexer retrieve was incomplete")
 
+            sync_started = cold_start_perf_now()
             self._synchronize_dsa_cold_dense_load()
+            sync_ms = (cold_start_perf_now() - sync_started) * 1000
 
+            seal_started = cold_start_perf_now()
             state.indexer_npu_resident = True
             state.location = retrieve_kwargs.get("cached_retrieve_location")
             state.metadata_warm = state.has_cache()
@@ -5651,6 +5664,17 @@ class LMCacheConnectorV1Impl:
             self._refresh_prepared_sparse_sources(state, token_count)
             if state.prepared_sparse_sources.get(0) is None:
                 raise RuntimeError("Cold compact latent source was not sealed")
+            completed_at = cold_start_perf_now()
+            setattr(state, "_dsa_cold_load_completed_at", completed_at)
+            cold_start_perf_log(
+                logger,
+                "cold_compact_retrieve_complete",
+                started=started,
+                req_id=request.req_id,
+                tokens=token_count,
+                sync_ms=round(sync_ms, 3),
+                seal_ms=round((completed_at - seal_started) * 1000, 3),
+            )
             return state
         except BaseException as exc:
             try:
@@ -7793,6 +7817,10 @@ class LMCacheConnectorV1Impl:
                         f"actual={actual_generation}"
                     )
                 state = future.result()
+                completed_at = getattr(
+                    state, "_dsa_cold_load_completed_at", cold_start_perf_now()
+                )
+                publish_started = cold_start_perf_now()
                 if was_aborted:
                     self._release_unadopted_shared_request_objects(state, request)
                     self._release_shared_worker_retrieve_state(
@@ -7813,6 +7841,20 @@ class LMCacheConnectorV1Impl:
                     # the other workers; explicit finish/abort remains the
                     # authoritative cleanup path.
                     setattr(state, "_dsa_cold_prune_protected", True)
+                published_at = cold_start_perf_now()
+                cold_start_perf_log(
+                    logger,
+                    "worker_load_complete",
+                    started=submitted_at,
+                    req_id=req_id,
+                    tokens=request.load_spec.lmcache_cached_tokens,
+                    mode="dsa_cold_compact",
+                    background_ms=round((completed_at - submitted_at) * 1000, 3),
+                    scheduler_poll_ms=round(
+                        (publish_started - completed_at) * 1000, 3
+                    ),
+                    publish_ms=round((published_at - publish_started) * 1000, 3),
+                )
                 logger.info(
                     "[DSA_COLD_COMPACT] request=%s generation=%d "
                     "status=%s tokens=%d indexer_blocks=%d elapsed_ms=%.3f",
@@ -7821,7 +7863,7 @@ class LMCacheConnectorV1Impl:
                     "aborted" if was_aborted else "ready",
                     request.load_spec.lmcache_cached_tokens,
                     len(indexer_block_ids),
-                    (time.monotonic() - submitted_at) * 1000,
+                    (cold_start_perf_now() - submitted_at) * 1000,
                 )
             except BaseException as exc:
                 try:
@@ -7859,7 +7901,7 @@ class LMCacheConnectorV1Impl:
                     req_id,
                     generation,
                     len(indexer_block_ids),
-                    (time.monotonic() - submitted_at) * 1000,
+                    (cold_start_perf_now() - submitted_at) * 1000,
                 )
             futures.pop(req_id, None)
             if was_aborted:

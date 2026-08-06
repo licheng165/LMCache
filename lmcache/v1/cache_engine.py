@@ -2049,16 +2049,26 @@ class LMCacheEngine:
         chunk_token_lengths: Optional[list[int]] = None,
     ) -> dict[str, Any]:
         local_cpu_backend = self._shared_local_cpu_backend()
-        required_local_keys = {
-            key
-            for layer_keys, layer_locations in zip(
-                keys_layer_major,
-                chunk_locations_layer_major,
-                strict=False,
-            )
-            for key, location in zip(layer_keys, layer_locations, strict=False)
-            if location == "LocalCPUBackend"
-        }
+        has_local = any(
+            "LocalCPUBackend" in locations
+            for locations in chunk_locations_layer_major
+        )
+        required_local_keys = (
+            {
+                key
+                for layer_keys, layer_locations in zip(
+                    keys_layer_major,
+                    chunk_locations_layer_major,
+                    strict=False,
+                )
+                for key, location in zip(
+                    layer_keys, layer_locations, strict=False
+                )
+                if location == "LocalCPUBackend"
+            }
+            if has_local
+            else set()
+        )
         required_page_keys = {
             key.without_layer()
             for key, location in zip(
@@ -2124,16 +2134,55 @@ class LMCacheEngine:
             if layer_pages
             else 0
         )
-        for layer_id, (layer_keys, layer_locations) in enumerate(
-            zip(
-                keys_layer_major,
-                chunk_locations_layer_major,
-                strict=False,
+        chunks = len(keys_layer_major[0]) if keys_layer_major else 0
+        remote_page_fast = (
+            layer_pages
+            and chunks > 0
+            and len(keys_layer_major) == self.num_layers
+            and len(chunk_locations_layer_major) == self.num_layers
+            and all(len(layer) == chunks for layer in keys_layer_major)
+            and all(
+                len(locations) == chunks
+                and all(location == "RemoteBackend" for location in locations)
+                for locations in chunk_locations_layer_major
             )
-        ):
-            for chunk_index, (key, location) in enumerate(
-                zip(layer_keys, layer_locations, strict=False)
-            ):
+        )
+        if remote_page_fast:
+            missing_chunk_count = chunks * self.num_layers
+            full_pages = (
+                chunks
+                if chunk_token_lengths is None
+                else sum(
+                    index >= len(chunk_token_lengths)
+                    or chunk_token_lengths[index] == self.config.chunk_size
+                    for index in range(chunks)
+                )
+            )
+            required_bytes = full_pages * page_bytes
+            if full_pages < chunks:
+                required_bytes += sum(
+                    self._shared_cpu_estimated_physical_chunk_bytes(
+                        kv_group, num_tokens=int(num_tokens)
+                    )
+                    * self.num_layers
+                    for num_tokens in chunk_token_lengths[:chunks]
+                    if num_tokens != self.config.chunk_size
+                )
+        else:
+            entries = (
+                (layer_id, chunk_index, key, location)
+                for layer_id, (layer_keys, layer_locations) in enumerate(
+                    zip(
+                        keys_layer_major,
+                        chunk_locations_layer_major,
+                        strict=False,
+                    )
+                )
+                for chunk_index, (key, location) in enumerate(
+                    zip(layer_keys, layer_locations, strict=False)
+                )
+            )
+            for layer_id, chunk_index, key, location in entries:
                 if not location:
                     continue
                 if (
@@ -2224,6 +2273,29 @@ class LMCacheEngine:
             get_free_size = getattr(address_manager, "get_free_size", None)
             if callable(get_free_size):
                 free_bytes = int(get_free_size())
+
+        if remote_page_fast and required_bytes <= free_bytes:
+            return {
+                "request_id": req_id,
+                "phase": phase,
+                "kv_group": kv_group,
+                "token_count": int(token_count or 0),
+                "chunk_count": sum(len(layer) for layer in keys_layer_major),
+                "missing_chunk_count": missing_chunk_count,
+                "hot_chunk_count": 0,
+                "non_shm_hot_chunk_count": 0,
+                "required_bytes": required_bytes,
+                "per_chunk_physical_bytes_estimate": default_chunk_bytes,
+                "available_after_eviction": free_bytes,
+                "free_bytes": free_bytes,
+                "evictable_bytes": 0,
+                "pinned_bytes": None,
+                "protected_hot_bytes": 0,
+                "active_sparse_requests": len(active_sparse_requests),
+                "slab_size": slab_size,
+                "capacity_scan_skipped": True,
+                "fits": True,
+            }
 
         evictable_bytes = 0
         pinned_bytes = 0
@@ -5019,10 +5091,7 @@ class LMCacheEngine:
             token_results = self._dense_retrieve_token_results(
                 tokens, mask, request_configs, kv_group, kwargs
             )
-            candidates: Iterable[tuple[int, int, list[CacheEngineKey]]] = (
-                (start, end, key.split_layers(self.num_layers))
-                for start, end, key in token_results
-            )
+            candidates: Iterable[tuple[int, int, CacheEngineKey]] = token_results
             batch_plan = None
             if mooncake_page_layout_enabled(self.config):
                 candidates = list(candidates)
@@ -5042,9 +5111,13 @@ class LMCacheEngine:
                 )
                 if page_candidates:
                     batch_plan = self._shared_page_first_location_plan(
-                        [item[2] for item in page_candidates]
+                        [
+                            [item[2].get_first_layer()]
+                            for item in page_candidates
+                        ]
                     )
-            for start, end, keys_multi_layer in candidates:
+            for start, end, key in candidates:
+                keys_multi_layer = key.split_layers(self.num_layers)
                 missing_layer = False
                 planned = batch_plan is not None and len(keys) < len(batch_plan)
                 locations_multi_layer: list[str] = (

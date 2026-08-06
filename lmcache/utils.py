@@ -418,34 +418,23 @@ class CacheEngineKey:
 
     def split_layers(self, num_layers: int) -> List["LayerCacheEngineKey"]:
         """Split the key into multiple keys for each layer"""
-        keys = []
-        for layer_id in range(num_layers):
-            keys.append(
-                LayerCacheEngineKey(
-                    model_name=self.model_name,
-                    world_size=self.world_size,
-                    worker_id=self.worker_id,
-                    chunk_hash=self.chunk_hash,
-                    dtype=self.dtype,
-                    request_configs=self.request_configs,
-                    layer_id=layer_id,
-                    kv_group=self.kv_group,
-                )
-            )
-        return keys
+        get_layer = self.get_layer
+        return [get_layer(layer_id) for layer_id in range(num_layers)]
 
     def get_layer(self, layer_id: int) -> "LayerCacheEngineKey":
-        """Return the key for one layer."""
-        return LayerCacheEngineKey(
-            model_name=self.model_name,
-            world_size=self.world_size,
-            worker_id=self.worker_id,
-            chunk_hash=self.chunk_hash,
-            dtype=self.dtype,
-            request_configs=self.request_configs,
-            layer_id=layer_id,
-            kv_group=self.kv_group,
-        )
+        """Return one layer key without renormalizing validated metadata."""
+        key = LayerCacheEngineKey.__new__(LayerCacheEngineKey)
+        key.model_name = self.model_name
+        key.world_size = self.world_size
+        key.worker_id = self.worker_id
+        key.chunk_hash = self.chunk_hash
+        key.dtype = self.dtype
+        key.request_configs = self.request_configs
+        key.tags = self.tags
+        key._dtype_str = self._dtype_str
+        key.kv_group = self.kv_group
+        key.layer_id = layer_id
+        return key
 
     def get_first_layer(self) -> "LayerCacheEngineKey":
         """Return the key for the first layer."""
@@ -578,21 +567,8 @@ class LayerCacheEngineKey(CacheEngineKey):
 
     def split_layers(self, num_layers: int) -> List["LayerCacheEngineKey"]:
         """Split the key into multiple keys for each layer"""
-        keys = []
-        for layer_id in range(num_layers):
-            keys.append(
-                LayerCacheEngineKey(
-                    model_name=self.model_name,
-                    world_size=self.world_size,
-                    worker_id=self.worker_id,
-                    chunk_hash=self.chunk_hash,
-                    dtype=self.dtype,
-                    request_configs=self.request_configs,
-                    layer_id=layer_id,
-                    kv_group=self.kv_group,
-                )
-            )
-        return keys
+        get_layer = self.get_layer
+        return [get_layer(layer_id) for layer_id in range(num_layers)]
 
     def without_layer(self) -> CacheEngineKey:
         """Return the chunk identity shared by every layer of this key."""
