@@ -64,3 +64,29 @@ def test_cold_start_perf_scope_correlates_and_restores(monkeypatch):
         "c1",
     )
     assert "req_id" not in outside
+
+
+def test_cold_start_perf_preserves_aggregate_page_diagnostics(monkeypatch):
+    monkeypatch.setenv(COLD_START_PERF_ENV, "1")
+    logger = _Logger()
+
+    with cold_start_perf_scope(req_id="request-1", rank=2):
+        cold_start_perf_log(
+            logger,
+            "passive_layer_prepare",
+            physical_pages=515,
+            logical_entries=18540,
+            legacy_tail_objects=36,
+            pointer_seal_ms=12.5,
+            passive_wait_ms=None,
+            passive_wait_status="unavailable",
+        )
+
+    payload = json.loads(logger.records[0][1])
+    assert (payload["req_id"], payload["rank"]) == ("request-1", 2)
+    assert payload["physical_pages"] == 515
+    assert payload["logical_entries"] == 18540
+    assert payload["legacy_tail_objects"] == 36
+    assert payload["pointer_seal_ms"] == 12.5
+    assert payload["passive_wait_ms"] is None
+    assert payload["passive_wait_status"] == "unavailable"

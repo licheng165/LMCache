@@ -1287,6 +1287,61 @@ class LMCacheEngine:
         )
         return batch
 
+    def _make_passive_layer_page_views(
+        self,
+        batch: SharedHandleBatch,
+        *,
+        starts: list[int],
+        ends: list[int],
+        keys_layer_major: list[list[CacheEngineKey]],
+        kv_group: int,
+    ) -> tuple[LayerPageMemoryObj, ...]:
+        """Validate a compact batch and create its passive layer pages."""
+        allocator = self.shared_cpu_cache_passive_allocator
+        if allocator is None:
+            raise ValueError("Shared CPU cache passive allocator is not initialized")
+        if not keys_layer_major or not 0 < batch.num_chunks <= min(
+            len(starts), len(ends), len(keys_layer_major[0])
+        ):
+            raise ValueError(
+                "Shared CPU compact batch chunk count exceeds passive metadata."
+            )
+        validate_shared_handle_batch(
+            batch,
+            expected_shm_name=allocator.shm_name,
+            expected_producer_rank=self.metadata.first_rank,
+            expected_num_layers=self.num_layers,
+            expected_num_chunks=batch.num_chunks,
+            expected_chunk_hashes=[
+                int(key.chunk_hash)
+                for key in keys_layer_major[0][: batch.num_chunks]
+            ],
+            slab_size=allocator.slab_size,
+        )
+        pages: list[LayerPageMemoryObj] = []
+        try:
+            for chunk_index in range(len(batch.page_offsets)):
+                shape, dtype, fmt = self._expected_shared_cpu_chunk_metadata(
+                    kv_group=kv_group,
+                    num_tokens=int(ends[chunk_index] - starts[chunk_index]),
+                )
+                pages.append(
+                    allocator.create_page_view(
+                        batch,
+                        chunk_index=chunk_index,
+                        shape=shape,
+                        dtype=dtype,
+                        fmt=fmt,
+                        cached_positions=range(
+                            starts[chunk_index], ends[chunk_index]
+                        ),
+                    )
+                )
+        except Exception:
+            self._release_shared_retrieve_objs(pages, unpin=False)
+            raise
+        return tuple(pages)
+
     def _layerwise_chunk_location_if_fully_stored(
         self,
         keys_multi_layer: list[CacheEngineKey],
@@ -3835,29 +3890,6 @@ class LMCacheEngine:
                         continue
                     if envelope.batch is not None:
                         compact_batch = envelope.batch
-                        if not 0 < compact_batch.num_chunks <= len(starts_all):
-                            raise ValueError(
-                                "Shared CPU compact batch chunk count exceeds "
-                                "passive metadata."
-                            )
-                        validate_shared_handle_batch(
-                            compact_batch,
-                            expected_shm_name=(
-                                self.shared_cpu_cache_passive_allocator.shm_name
-                            ),
-                            expected_producer_rank=self.metadata.first_rank,
-                            expected_num_layers=self.num_layers,
-                            expected_num_chunks=compact_batch.num_chunks,
-                            expected_chunk_hashes=[
-                                int(key.chunk_hash)
-                                for key in keys_layer_major[0][
-                                    : compact_batch.num_chunks
-                                ]
-                            ],
-                            slab_size=(
-                                self.shared_cpu_cache_passive_allocator.slab_size
-                            ),
-                        )
 
                 if expected_handle_count is None:
                     assert envelope is not None
@@ -3880,35 +3912,17 @@ class LMCacheEngine:
                         page_view_started = (
                             cold_start_perf_now() if perf_enabled else 0.0
                         )
-                        for chunk_index in range(len(compact_batch.page_offsets)):
-                            shape, dtype, fmt = (
-                                self._expected_shared_cpu_chunk_metadata(
-                                    kv_group=kv_group,
-                                    num_tokens=int(
-                                        ends_all[chunk_index]
-                                        - starts_all[chunk_index]
-                                    ),
-                                )
-                            )
-                            passive_pages.append(
-                                self.shared_cpu_cache_passive_allocator.create_page_view(
-                                    compact_batch,
-                                    chunk_index=chunk_index,
-                                    shape=shape,
-                                    dtype=dtype,
-                                    fmt=fmt,
-                                    cached_positions=range(
-                                        int(starts_all[chunk_index]),
-                                        int(ends_all[chunk_index]),
-                                    ),
-                                )
-                            )
+                        passive_page_tuple = self._make_passive_layer_page_views(
+                            compact_batch,
+                            starts=starts_all,
+                            ends=ends_all,
+                            keys_layer_major=keys_layer_major,
+                            kv_group=kv_group,
+                        )
+                        passive_pages.extend(passive_page_tuple)
                         to_release.extend(passive_pages)
-                        passive_page_tuple = tuple(passive_pages)
                         if page_view_started:
-                            view_build_s += (
-                                cold_start_perf_now() - page_view_started
-                            )
+                            view_build_s += cold_start_perf_now() - page_view_started
                 elif (
                     compact_batch is None
                     and envelope is not None

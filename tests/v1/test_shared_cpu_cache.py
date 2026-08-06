@@ -1845,6 +1845,9 @@ class _FakePassiveSharedAllocator:
     def create_batch_view(self, *args, **kwargs):
         return self.create_view()
 
+    def create_page_view(self, *args, **kwargs):
+        return self.create_view()
+
 
 def _make_passive_shared_retrieve_engine(
     *,
@@ -4608,6 +4611,68 @@ def test_shared_dense_passive_compact_batch_preserves_layerwise_consumption(
         [engine.shared_cpu_cache_passive_allocator.views[1]],
     ]
     assert torch.equal(yielded[-1], ret_mask)
+
+
+def test_passive_layer_page_helper_creates_one_view_per_page():
+    engine = _make_passive_shared_retrieve_engine(kv_group=0)
+    key = _make_key()
+    batch = SharedHandleBatch(
+        shm_name="/lmcache-test",
+        producer_rank=0,
+        num_layers=2,
+        num_chunks=1,
+        physical_sizes=[8],
+        chunk_hashes=[key.chunk_hash],
+        offsets=[],
+        page_offsets=[0],
+        page_physical_sizes=[16],
+    )
+
+    pages = engine._make_passive_layer_page_views(
+        batch,
+        starts=[0],
+        ends=[4],
+        keys_layer_major=[[key], [key]],
+        kv_group=0,
+    )
+
+    assert len(pages) == 1
+    assert pages == tuple(engine.shared_cpu_cache_passive_allocator.views)
+
+
+def test_passive_layer_page_helper_releases_partial_failure():
+    engine = _make_passive_shared_retrieve_engine(kv_group=0)
+    key = _make_key()
+    batch = SharedHandleBatch(
+        shm_name="/lmcache-test",
+        producer_rank=0,
+        num_layers=2,
+        num_chunks=2,
+        physical_sizes=[8, 8],
+        chunk_hashes=[key.chunk_hash, key.chunk_hash],
+        offsets=[],
+        page_offsets=[0, 16],
+        page_physical_sizes=[16, 16],
+    )
+    allocator = engine.shared_cpu_cache_passive_allocator
+    create_page_view = allocator.create_page_view
+
+    def fail_second(*args, **kwargs):
+        if allocator.views:
+            raise RuntimeError("page failure")
+        return create_page_view(*args, **kwargs)
+
+    allocator.create_page_view = fail_second
+    with pytest.raises(RuntimeError, match="page failure"):
+        engine._make_passive_layer_page_views(
+            batch,
+            starts=[0, 4],
+            ends=[4, 8],
+            keys_layer_major=[[key, key], [key, key]],
+            kv_group=0,
+        )
+
+    assert allocator.views[0].ref_count_down_count == 1
 
 
 def test_shared_dense_passive_views_remain_request_owned(monkeypatch):
