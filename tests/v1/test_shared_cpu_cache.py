@@ -1127,6 +1127,43 @@ def test_sampled_lookup_recognizes_remote_pages_without_local_page_objects():
     )
 
 
+def test_sampled_lookup_batches_local_page_pins_by_group():
+    token_db = _FakeMultiChunkLookupTokenDatabase()
+    tail = [
+        key
+        for group in (0, 1)
+        for key in _layer_keys_for_chunk(token_db, 3, group)
+    ]
+    engine = _make_sampled_lookup_engine([], tail)
+    engine.config.chunk_size = 4
+    engine.config.extra_config = {
+        "mooncake_page_first_multi_buffer": True,
+        "mooncake_layer_merged_page_objects": True,
+    }
+    page_calls = []
+
+    def contains_pages(keys, search_range=None, pin=False):
+        keys = list(keys)
+        hits = next(
+            (
+                index
+                for index, key in enumerate(keys)
+                if key.chunk_hash == 0x103
+            ),
+            len(keys),
+        )
+        page_calls.append((keys, search_range, pin))
+        return hits, {"LocalCPUBackend": keys[:hits]} if hits else {}
+
+    engine.storage_manager.batched_contains_layer_pages = contains_pages
+
+    assert engine.lookup(list(range(14)), lookup_id="req", pin=True) == 14
+    pin_calls = [call for call in page_calls if call[2]]
+    assert len(pin_calls) == 2
+    assert all(len(keys) == 3 for keys, _, _ in pin_calls)
+    assert len(engine.lookup_pins["req"]["LocalCPUBackend"]) == 14
+
+
 def test_sampled_lookup_logs_first_chunk_page_miss_by_group(monkeypatch):
     engine = _make_sampled_lookup_engine([])
     engine.config.extra_config = {"mooncake_page_first_multi_buffer": True}
@@ -2210,7 +2247,8 @@ def test_runtime_capacity_skips_hot_cache_scan_for_zero_allocation():
     assert details["fits"] is True
 
 
-def test_runtime_capacity_recognizes_one_layer_page_for_all_layers():
+@pytest.mark.parametrize("location", ["LocalCPUBackend", "RemoteBackend"])
+def test_runtime_capacity_recognizes_one_layer_page_for_all_layers(location):
     engine = _make_engine_for_sparse_capacity(max_local_cpu_size=1)
     allocator = TensorMemoryAllocator(torch.zeros(4096, dtype=torch.uint8))
     pages = allocator.batched_allocate_layer_pages(
@@ -2237,8 +2275,8 @@ def test_runtime_capacity_recognizes_one_layer_page_for_all_layers():
         kv_group=0,
         keys_layer_major=[[layer_keys[0]], [layer_keys[1]]],
         chunk_locations_layer_major=[
-            ["LocalCPUBackend"],
-            ["LocalCPUBackend"],
+            [location],
+            [location],
         ],
         token_count=4,
         chunk_token_lengths=[4],

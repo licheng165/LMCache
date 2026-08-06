@@ -1576,6 +1576,68 @@ class LMCacheEngine:
                             )
 
             try:
+                if pin and local_page_lookup and len(base_keys) > 1:
+                    page_count = next(
+                        (
+                            index
+                            for index, (end, _) in enumerate(
+                                chunks[: len(base_keys)]
+                            )
+                            if end
+                            - (chunks[index - 1][0] if index else 0)
+                            != self.config.chunk_size
+                        ),
+                        len(base_keys),
+                    )
+                    for kv_group in kv_groups:
+                        page_keys = [
+                            self._lookup_key_for_kv_group(
+                                key,
+                                kv_group=kv_group,
+                                request_configs=request_configs,
+                            ).get_first_layer()
+                            for key in base_keys[:page_count]
+                        ]
+                        hits, pages = (
+                            self.storage_manager.batched_contains_layer_pages(
+                                page_keys, ["LocalCPUBackend"], True
+                            )
+                        )
+                        if hits != len(page_keys):
+                            for location, keys in pages.items():
+                                self.storage_manager.batched_unpin(
+                                    keys, [location]
+                                )
+                            rollback()
+                            mapping.clear()
+                            break
+                        for location, keys in pages.items():
+                            mapping[location].extend(keys)
+                        tail_keys = [
+                            layer_key
+                            for key in base_keys[page_count:]
+                            for layer_key in self._lookup_key_for_kv_group(
+                                key,
+                                kv_group=kv_group,
+                                request_configs=request_configs,
+                            ).split_layers(self.num_layers)
+                        ]
+                        if tail_keys:
+                            hits, tail = self.storage_manager.batched_contains(
+                                tail_keys, ["LocalCPUBackend"], True
+                            )
+                            if hits != len(tail_keys):
+                                for location, keys in tail.items():
+                                    self.storage_manager.batched_unpin(
+                                        keys, [location]
+                                    )
+                                rollback()
+                                mapping.clear()
+                                break
+                            for location, keys in tail.items():
+                                mapping[location].extend(keys)
+                    else:
+                        return mapping
                 for base_key in base_keys:
                     for kv_group in kv_groups:
                         if pin and kv_group in remote_groups:
@@ -2080,8 +2142,11 @@ class LMCacheEngine:
                 ),
                 strict=False,
             )
-            if location == "LocalCPUBackend"
-            and isinstance(key, LayerCacheEngineKey)
+            if isinstance(key, LayerCacheEngineKey)
+            and (
+                location == "LocalCPUBackend"
+                or mooncake_layer_pages_enabled(self.config)
+            )
         }
         hot_cache = getattr(local_cpu_backend, "hot_cache", {})
         cpu_lock = getattr(local_cpu_backend, "cpu_lock", None)
@@ -2146,6 +2211,7 @@ class LMCacheEngine:
                 and all(location == "RemoteBackend" for location in locations)
                 for locations in chunk_locations_layer_major
             )
+            and not rank0_shared_hot_keys
         )
         if remote_page_fast:
             missing_chunk_count = chunks * self.num_layers
@@ -2184,6 +2250,11 @@ class LMCacheEngine:
             )
             for layer_id, chunk_index, key, location in entries:
                 if not location:
+                    continue
+                if (
+                    isinstance(key, LayerCacheEngineKey)
+                    and key.without_layer() in rank0_shared_hot_keys
+                ):
                     continue
                 if (
                     location == "LocalCPUBackend"
