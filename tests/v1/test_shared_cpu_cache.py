@@ -2335,6 +2335,38 @@ def test_runtime_capacity_uses_full_chunks_for_remote_fetch():
     assert calls == [None]
 
 
+def test_runtime_capacity_aligns_one_combined_layer_page():
+    engine = _make_engine_for_sparse_capacity(max_local_cpu_size=1)
+    engine.config.extra_config["mooncake_layer_merged_page_objects"] = True
+    engine.config.extra_config["mooncake_page_first_multi_buffer"] = True
+    engine.config.extra_config["save_only_first_rank"] = True
+    engine.config.enable_shared_cpu_cache = True
+    engine.config.use_layerwise = True
+    engine.config.remote_url = "mooncakestore://test/"
+    engine.config.get_extra_config_value = (
+        lambda key, default=None: engine.config.extra_config.get(key, default)
+    )
+    engine.config.chunk_size = 4
+    engine.num_layers = 2
+    engine._estimate_shared_cpu_bytes_per_layer = lambda *_args: 5000
+    engine._shared_local_cpu_backend = lambda: _FakeLocalCPUBackend(
+        free_bytes=0, hot_cache={}
+    )
+    keys = _make_key().split_layers(2)
+
+    details = engine._shared_cpu_runtime_capacity_details(
+        req_id="req-page",
+        phase="dense_prefix",
+        kv_group=0,
+        keys_layer_major=[[keys[0]], [keys[1]]],
+        chunk_locations_layer_major=[["RemoteBackend"], ["RemoteBackend"]],
+        chunk_token_lengths=[4],
+    )
+
+    assert details["missing_chunk_count"] == 2
+    assert details["required_bytes"] == 12288
+
+
 def test_rank0_resolver_rematerializes_non_shm_hot_cache_hit():
     engine = object.__new__(LMCacheEngine)
     engine.storage_manager = object()

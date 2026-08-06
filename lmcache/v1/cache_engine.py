@@ -47,6 +47,7 @@ from lmcache.v1.cold_start_perf import (
     cold_start_perf_enabled,
     cold_start_perf_log,
     cold_start_perf_now,
+    cold_start_perf_scope,
 )
 from lmcache.v1.config import LMCacheEngineConfig
 from lmcache.v1.event_manager import EventManager, EventStatus, EventType
@@ -1961,6 +1962,20 @@ class LMCacheEngine:
             align_bytes = 4096
         return ((logical_bytes + align_bytes - 1) // align_bytes) * align_bytes
 
+    def _shared_cpu_estimated_physical_page_bytes(self, kv_group: int) -> int:
+        """Estimate one full all-layer page with allocator alignment applied once."""
+        logical_bytes = self._estimate_shared_cpu_bytes_per_layer(
+            kv_group, int(self.config.chunk_size)
+        ) * self.num_layers
+        try:
+            allocator = getattr(
+                self._shared_local_cpu_backend(), "memory_allocator", None
+            )
+            align_bytes = int(getattr(allocator, "align_bytes", 4096) or 4096)
+        except Exception:
+            align_bytes = 4096
+        return ((logical_bytes + align_bytes - 1) // align_bytes) * align_bytes
+
     def _shared_cpu_mem_obj_physical_size(self, mem_obj: MemoryObj) -> int:
         metadata = getattr(mem_obj, "metadata", None)
         if metadata is not None and getattr(metadata, "phy_size", None) is not None:
@@ -2048,10 +2063,18 @@ class LMCacheEngine:
             kv_group
         )
         chunk_bytes_by_tokens = {int(self.config.chunk_size): default_chunk_bytes}
-        for layer_keys, layer_locations in zip(
-            keys_layer_major,
-            chunk_locations_layer_major,
-            strict=False,
+        layer_pages = mooncake_layer_pages_enabled(self.config)
+        page_bytes = (
+            self._shared_cpu_estimated_physical_page_bytes(kv_group)
+            if layer_pages
+            else 0
+        )
+        for layer_id, (layer_keys, layer_locations) in enumerate(
+            zip(
+                keys_layer_major,
+                chunk_locations_layer_major,
+                strict=False,
+            )
         ):
             for chunk_index, (key, location) in enumerate(
                 zip(layer_keys, layer_locations, strict=False)
@@ -2071,7 +2094,24 @@ class LMCacheEngine:
                     continue
                 missing_chunk_count += 1
                 if location != "LocalCPUBackend":
-                    required_bytes += default_chunk_bytes
+                    full_page = (
+                        layer_pages
+                        and (
+                            chunk_token_lengths is None
+                            or chunk_index >= len(chunk_token_lengths)
+                            or chunk_token_lengths[chunk_index]
+                            == self.config.chunk_size
+                        )
+                        and all(
+                            chunk_index < len(locations)
+                            and locations[chunk_index] == location
+                            for locations in chunk_locations_layer_major
+                        )
+                    )
+                    if not full_page or layer_id == 0:
+                        required_bytes += (
+                            page_bytes if full_page else default_chunk_bytes
+                        )
                     continue
                 if (
                     chunk_token_lengths is not None
@@ -2912,11 +2952,27 @@ class LMCacheEngine:
                 if not callable(contains) or not callable(retrieve):
                     raise RuntimeError("RemoteBackend does not support layer pages")
                 remote_page_keys = page_keys[local_count:page_chunks]
-                remote_count = contains(remote_page_keys)
-                if not 0 <= remote_count <= len(remote_page_keys):
-                    raise ValueError("Remote layer-page lookup returned invalid count")
+                resolver_call_id = (
+                    f"{os.getpid()}:{time.monotonic_ns()}"
+                    if cold_start_perf_enabled()
+                    else None
+                )
+                with cold_start_perf_scope(
+                    req_id=req_id,
+                    rank=self.metadata.worker_id,
+                    resolver_call_id=resolver_call_id,
+                ):
+                    remote_count = contains(remote_page_keys)
+                    if not 0 <= remote_count <= len(remote_page_keys):
+                        raise ValueError(
+                            "Remote layer-page lookup returned invalid count"
+                        )
+                    fetched = (
+                        retrieve(remote_page_keys[:remote_count])
+                        if remote_count
+                        else []
+                    )
                 if remote_count:
-                    fetched = retrieve(remote_page_keys[:remote_count])
                     if len(fetched) != remote_count:
                         raise ValueError(
                             "Remote layer-page result count is inconsistent"
@@ -3015,6 +3071,9 @@ class LMCacheEngine:
             timing_hook = None
         perf_enabled = cold_start_perf_enabled()
         perf_started = cold_start_perf_now() if perf_enabled else 0.0
+        resolver_call_id = (
+            f"{os.getpid()}:{time.monotonic_ns()}" if perf_enabled else None
+        )
         stage_times: dict[str, float] = defaultdict(float)
 
         def start_stage() -> float:
@@ -3059,11 +3118,18 @@ class LMCacheEngine:
                 fetch_keys,
             ) in windows:
                 started = start_stage()
-                fetched = self.storage_manager.batched_get(
-                    fetch_keys,
-                    location="RemoteBackend",
-                )
-                finish_stage("remote_get", started)
+                try:
+                    with cold_start_perf_scope(
+                        req_id=req_id,
+                        rank=self.metadata.worker_id,
+                        resolver_call_id=resolver_call_id,
+                    ):
+                        fetched = self.storage_manager.batched_get(
+                            fetch_keys,
+                            location="RemoteBackend",
+                        )
+                finally:
+                    finish_stage("remote_get", started)
                 started = start_stage()
                 if len(fetched) != len(fetch_keys):
                     for fetched_obj in fetched:
@@ -3220,6 +3286,18 @@ class LMCacheEngine:
                     objects=sum(len(layer) for layer in resolved_layers),
                     windows=len(windows),
                     status="ok",
+                    rank=self.metadata.worker_id,
+                    resolver_call_id=resolver_call_id,
+                    exclusive_ms=round(
+                        max(
+                            0.0,
+                            cold_start_perf_now()
+                            - perf_started
+                            - stage_times.get("remote_get", 0.0),
+                        )
+                        * 1000,
+                        3,
+                    ),
                     **{
                         f"{stage}_ms": round(elapsed * 1000, 3)
                         for stage, elapsed in stage_times.items()
@@ -3250,6 +3328,18 @@ class LMCacheEngine:
                     windows=len(windows),
                     status="error",
                     error=type(exc).__name__,
+                    rank=self.metadata.worker_id,
+                    resolver_call_id=resolver_call_id,
+                    exclusive_ms=round(
+                        max(
+                            0.0,
+                            cold_start_perf_now()
+                            - perf_started
+                            - stage_times.get("remote_get", 0.0),
+                        )
+                        * 1000,
+                        3,
+                    ),
                     **{
                         f"{stage}_ms": round(elapsed * 1000, 3)
                         for stage, elapsed in stage_times.items()
@@ -5004,10 +5094,17 @@ class LMCacheEngine:
                 "shared_location_plan",
                 started=plan_started,
                 req_id=req_id,
+                rank=self.metadata.worker_id,
                 phase=phase,
                 kv_group=kv_group,
                 chunks=len(keys),
                 objects=sum(map(len, keys)),
+                logical_objects=sum(map(len, keys)),
+                physical_pages=(
+                    min(len(keys), len(page_candidates))
+                    if mooncake_layer_pages_enabled(self.config)
+                    else 0
+                ),
                 mode=(
                     "page_batch"
                     if batch_plan is not None and "RemoteBackend" in batch_plan

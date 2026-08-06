@@ -773,6 +773,7 @@ class MooncakestoreConnector(RemoteConnector):
 
     def batched_contains_layer_pages(self, keys: List[CacheEngineKey]) -> int:
         """Check only layer-merged page keys, without legacy-key fallback."""
+        started = cold_start_perf_now() if cold_start_perf_enabled() else None
         page_keys = self._page_keys_for(keys)
         if any(key is None for key in page_keys):
             return 0
@@ -788,10 +789,22 @@ class MooncakestoreConnector(RemoteConnector):
             results,
             api="connector.batched_contains_layer_pages",
         )
-        return next(
+        found = next(
             (index for index, result in enumerate(results) if result != 1),
             len(results),
         )
+        cold_start_perf_log(
+            logger,
+            "mooncake_page_lookup",
+            started=started,
+            kv_groups=sorted({int(key.kv_group) for key in keys}),
+            keys=len(keys),
+            complete_pages=len(page_keys),
+            found_pages=found,
+            legacy_keys=0,
+            status="ok" if found == len(page_keys) else "partial",
+        )
+        return found
 
     def support_batched_get_non_blocking(self) -> bool:
         """
