@@ -1092,7 +1092,31 @@ class ReqMeta:
                 skip_save = True
 
         if skip_save and load_spec is None:
-            return None
+            if is_sparse_decode or not tracker.is_decode_phase:
+                return None
+            # Dense fast-path (方案 A) steady-state decode: the prefix is
+            # already resident and there is nothing left to load or save, but
+            # the request must stay visible in the connector metadata so the
+            # staged-SFA route classifies it as DENSE_PREFIX_HIT and replays
+            # the captured graph. Without this entry the step looks like
+            # MISSING_CONNECTOR_METADATA, falls back to the eager path, and
+            # runs every layer through a separate fx-compiled subgraph with
+            # no graph capture (TPOT collapses to hundreds of milliseconds).
+            return ReqMeta(
+                req_id=tracker.req_id,
+                token_ids=[],
+                is_last_prefill=True,
+                is_sparse_decode=False,
+                save_spec=SaveSpec(
+                    skip_leading_tokens,
+                    False,
+                    can_save_latent=False,
+                    can_save_indexer=False,
+                ),
+                load_spec=None,
+                disagg_spec=tracker.disagg_spec,
+                request_configs=tracker.request_configs,
+            )
 
         # Calculate number of tokens to save based on discard_partial_chunks
         # setting

@@ -828,7 +828,15 @@ class TestBuildConnectorMetaSparseSyntheticLoadSpec:
         self,
     ) -> None:
         """方案 A: requests whose prompt_len is within the dense threshold take
-        the dense path (is_sparse_decode=False) instead of the sparse decode."""
+        the dense path (is_sparse_decode=False) instead of the sparse decode.
+
+        Regression: 0806-1. After the prefix transfer the load spec is
+        stripped (load_spec=None) and there is nothing left to load or save;
+        the request must STAY in the connector metadata (is_sparse_decode=False,
+        load_spec=None) so the staged-SFA route classifies the step as
+        DENSE_PREFIX_HIT and replays the captured graph. Returning no meta
+        makes the step MISSING_CONNECTOR_METADATA and forces the eager
+        per-layer fx-compiled path (TPOT collapses)."""
         impl = _make_scheduler_impl()
         impl._dsa_dense_threshold = 2048
         req_id = "short-prompt"
@@ -845,6 +853,7 @@ class TestBuildConnectorMetaSparseSyntheticLoadSpec:
             token_ids=list(range(prompt_len)),
             allocated_block_ids=list(range(19)),
             num_saved_tokens=prompt_len,
+            is_decode_phase=True,
         )
         scheduler_output = StubSchedulerOutput(
             finished_req_ids=set(),
@@ -863,6 +872,8 @@ class TestBuildConnectorMetaSparseSyntheticLoadSpec:
         req_meta = meta.requests[0]
         assert not req_meta.is_sparse_decode
         assert req_meta.load_spec is None
+        assert req_meta.save_spec is not None
+        assert not req_meta.save_spec.can_save
 
     def test_long_prompt_beyond_dense_threshold_keeps_sparse_decode(
         self,
