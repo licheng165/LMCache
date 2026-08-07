@@ -830,13 +830,15 @@ class TestBuildConnectorMetaSparseSyntheticLoadSpec:
         """方案 A: requests whose prompt_len is within the dense threshold take
         the dense path (is_sparse_decode=False) instead of the sparse decode.
 
-        Regression: 0806-1. After the prefix transfer the load spec is
-        stripped (load_spec=None) and there is nothing left to load or save;
-        the request must STAY in the connector metadata (is_sparse_decode=False,
-        load_spec=None) so the staged-SFA route classifies the step as
-        DENSE_PREFIX_HIT and replays the captured graph. Returning no meta
-        makes the step MISSING_CONNECTOR_METADATA and forces the eager
-        per-layer fx-compiled path (TPOT collapses)."""
+        Regression: 0806-4. The FIRST compute step (token_ids == prompt_len,
+        is_decode_phase still False, e.g. right after a cold-compact load) must
+        also stay in the connector metadata (is_sparse_decode=False,
+        load_spec=None). Otherwise the step classifies as
+        MISSING_CONNECTOR_METADATA, falls back to the eager path, and the
+        torch_npu fx compiler captures ACL graphs at serving time — which is
+        illegal to overlap with the async cold-compact load thread's
+        synchronized device copies (device error 507057). Keeping every dense
+        step staged means the fx compiler never captures during serving."""
         impl = _make_scheduler_impl()
         impl._dsa_dense_threshold = 2048
         req_id = "short-prompt"
@@ -853,7 +855,7 @@ class TestBuildConnectorMetaSparseSyntheticLoadSpec:
             token_ids=list(range(prompt_len)),
             allocated_block_ids=list(range(19)),
             num_saved_tokens=prompt_len,
-            is_decode_phase=True,
+            is_decode_phase=False,
         )
         scheduler_output = StubSchedulerOutput(
             finished_req_ids=set(),

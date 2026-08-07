@@ -1092,16 +1092,19 @@ class ReqMeta:
                 skip_save = True
 
         if skip_save and load_spec is None:
-            if is_sparse_decode or not tracker.is_decode_phase:
+            if is_sparse_decode or len(tracker.token_ids) < tracker.prompt_len:
                 return None
-            # Dense fast-path (方案 A) steady-state decode: the prefix is
-            # already resident and there is nothing left to load or save, but
-            # the request must stay visible in the connector metadata so the
-            # staged-SFA route classifies it as DENSE_PREFIX_HIT and replays
-            # the captured graph. Without this entry the step looks like
-            # MISSING_CONNECTOR_METADATA, falls back to the eager path, and
-            # runs every layer through a separate fx-compiled subgraph with
-            # no graph capture (TPOT collapses to hundreds of milliseconds).
+            # Dense fast-path (方案 A) decode: the prefix is already resident
+            # and there is nothing left to load or save, but the request must
+            # stay visible in the connector metadata so the staged-SFA route
+            # classifies it as DENSE_PREFIX_HIT and replays the captured
+            # graph. This covers both the steady state (token_ids > prompt_len)
+            # and the FIRST compute step (token_ids == prompt_len, e.g. right
+            # after a cold-compact load): without the entry the step looks
+            # like MISSING_CONNECTOR_METADATA, falls back to the eager path,
+            # and the torch_npu fx compiler captures ACL graphs at serving
+            # time — which is illegal to overlap with the async cold-compact
+            # load thread's synchronized device copies (device error 507057).
             return ReqMeta(
                 req_id=tracker.req_id,
                 token_ids=[],
