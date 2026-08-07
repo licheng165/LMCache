@@ -348,6 +348,13 @@ class TestCacheEngineKey:
             assert layer_key.layer_id == i
             assert layer_key.model_name == "test_model"
 
+    def test_split_layers_reuses_normalized_metadata(self, key_with_tags):
+        layers = key_with_tags.split_layers(3)
+
+        assert all(key.tags is key_with_tags.tags for key in layers)
+        assert all(key._dtype_str == key_with_tags._dtype_str for key in layers)
+        assert [key.layer_id for key in layers] == [0, 1, 2]
+
     def test_get_first_layer(self, basic_key):
         first = basic_key.get_first_layer()
         assert isinstance(first, LayerCacheEngineKey)
@@ -520,6 +527,15 @@ class TestLayerCacheEngineKey:
         assert len(layers) == 4
         for i, lk in enumerate(layers):
             assert lk.layer_id == i
+
+    def test_layer_identity_conversions(self, layer_key):
+        base = layer_key.without_layer()
+        moved = layer_key.with_new_worker_id(7)
+
+        assert type(base) is CacheEngineKey
+        assert base.chunk_hash == layer_key.chunk_hash
+        assert isinstance(moved, LayerCacheEngineKey)
+        assert moved.worker_id == 7 and moved.layer_id == layer_key.layer_id
 
 
 # ============================================================

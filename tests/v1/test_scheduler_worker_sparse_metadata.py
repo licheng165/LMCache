@@ -291,7 +291,9 @@ def test_dsa_cold_compact_worker_retains_sources_when_stream_sync_fails() -> Non
     impl._release_shared_worker_retrieve_state.assert_not_called()
 
 
-def test_dsa_cold_compact_finished_signal_waits_for_future() -> None:
+def test_dsa_cold_compact_finished_signal_waits_for_future(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     impl = LMCacheConnectorV1Impl.__new__(LMCacheConnectorV1Impl)
     future = Future()
     request = SimpleNamespace(
@@ -302,11 +304,19 @@ def test_dsa_cold_compact_finished_signal_waits_for_future() -> None:
     )
     state = WorkerRetrieveState(req_id="cold-future")
     state.location = "LocalCPUBackend"
+    state._dsa_cold_load_completed_at = 2.0
     impl._dsa_cold_load_futures = {
         "cold-future": (1, future, request, {100, 101}, 0.0)
     }
     impl._publish_worker_retrieve_state = MagicMock()
     impl._invalid_block_ids = set()
+    events = []
+    monkeypatch.setattr(
+        adapter_module,
+        "cold_start_perf_log",
+        lambda _logger, event, **fields: events.append((event, fields)),
+    )
+    monkeypatch.setattr(adapter_module, "cold_start_perf_now", lambda: 3.0)
 
     assert impl._drain_dsa_cold_load_futures() is None
     assert "cold-future" in impl._dsa_cold_load_futures
@@ -315,6 +325,11 @@ def test_dsa_cold_compact_finished_signal_waits_for_future() -> None:
     assert impl._drain_dsa_cold_load_futures() == {"cold-future"}
     impl._publish_worker_retrieve_state.assert_called_once()
     assert getattr(state, "_dsa_cold_prune_protected")
+    event, fields = events[-1]
+    assert event == "worker_load_complete"
+    assert fields["mode"] == "dsa_cold_compact"
+    assert fields["background_ms"] == 2000.0
+    assert fields["scheduler_poll_ms"] == 1000.0
 
 
 def test_dsa_cold_compact_generation_mismatch_releases_returned_state() -> None:

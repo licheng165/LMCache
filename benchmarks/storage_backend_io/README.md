@@ -1,5 +1,90 @@
 # Storage Backend I/O Benchmark
 
+## CPU-only Mooncake page lookup repro
+
+`mooncake_page_lookup_repro.py` starts independent producer and consumer
+processes against an already-running Mooncake master. The producer publishes
+the same layer-merged, page-first keys used by layerwise MLA serving and remains
+alive while an independent consumer checks them. The consumer exercises both
+the worker connector lookup and vLLM's `MooncakeLookupClient` key-generation
+logic through its existing Mooncake store. It does not retrieve page payloads
+unless `--verify-transfer` is specified. The producer still performs the real
+page-first LMCache put so storage-side key construction is covered. The
+benchmark launches no NPU kernels or tensors. Mooncake 0.3.8 Ascend builds
+nevertheless require a
+visible device and initialized runtime context while creating their transfer
+engine. The clients use the same Ascend pinned-host allocator installed by the
+serving plugin; ordinary pageable `torch.empty(..., device="cpu")` buffers are
+not registrable by AscendDirect.
+
+```bash
+cd /workspace/qzy/LMCache
+
+PYTHONHASHSEED=0 \
+python3 benchmarks/storage_backend_io/mooncake_page_lookup_repro.py \
+  --config /workspace/qzy/lmcache_config.yaml \
+  --model /workspace/models/GLM-5.1-w4a8 \
+  --num-layers 36 \
+  --world-size 4 \
+  --chunks 2 \
+  --mooncake-device 0 \
+  --consumer-mooncake-device 1 \
+  --consumer-delay 5 \
+  --output-json /workspace/qzy/mooncake-page-lookup-repro.json
+```
+
+The default `--client-global-segment-size 0` makes both diagnostic clients use
+the existing Mooncake pool instead of each requesting the 100 GB segment from
+the serving config. `mooncake_prefer_local_alloc` is disabled for the same
+reason. Protocol `auto` selects `ascend` when `--mooncake-device` is visible,
+because Mooncake 0.3.8 must allocate client-owned segments with
+`aclrtMallocHost`; its TCP allocator produces pageable memory that
+AscendDirect cannot register. Only the producer contributes a requested
+segment. The child initializes the NPU runtime but keeps benchmark payloads in
+pinned CPU memory. A newer Mooncake build that disables AscendDirect before
+allocation can run with `--mooncake-device none`, which selects TCP.
+On one Ascend host, producer and consumer use different physical devices. This
+matches separate serving workers and avoids the same-device ADXL failure seen in
+this Mooncake build. Reusing the consumer's store for the scheduler lookup avoids
+initializing an unrelated second transfer engine in the same process.
+The output verdict is one of:
+
+- `ok`: producer and consumer see all expected page/layer keys; when enabled,
+  transfer verification also succeeds.
+- `producer_put_not_visible`: the producer cannot see its completed put.
+- `cross_process_visibility_failure`: producer sees the pages but consumer does
+  not, reproducing the serving lookup failure.
+- `scheduler_lookup_client_failure`: worker lookups see the pages, but vLLM's
+  scheduler key-generation lookup does not.
+- `scheduler_lookup_client_error`: scheduler lookup logic cannot query the
+  consumer's Mooncake store.
+- `lookup_visible_get_failed` or `payload_mismatch`: with `--verify-transfer`,
+  metadata lookup succeeds but retrieval is incomplete or returns wrong bytes.
+
+Use `--fail-on-visibility-error` when a non-`ok` verdict should produce exit
+status 2. Infrastructure/setup errors always produce exit status 1.
+Each run uses a unique LMCache tag, so it cannot hit stale diagnostic data or
+collide with serving keys. The small diagnostic pages remain in Mooncake until
+normal eviction or master restart.
+
+If the zero-segment run is `ok`, repeat with a small producer-owned segment and
+the production placement preference. For two chunks and 36 layers, 64 MiB is
+sufficient:
+
+```bash
+PYTHONHASHSEED=0 \
+python3 benchmarks/storage_backend_io/mooncake_page_lookup_repro.py \
+  --config /workspace/qzy/lmcache_config.yaml \
+  --num-layers 36 --world-size 4 --chunks 2 \
+  --mooncake-device 0 --consumer-mooncake-device 1 \
+  --client-global-segment-size 67108864 \
+  --prefer-local-alloc
+```
+
+Add `--verify-transfer` only when testing Mooncake's data plane as well. That
+mode performs real consumer page transfers and payload comparisons; it is not
+needed to reproduce scheduler or worker lookup failures.
+
 This microbenchmark compares **LocalDiskBackend** vs **RustRawBlockBackend** under high write-concurrency.
 
 ## What It Measures
@@ -97,3 +182,27 @@ PY
 ## Output
 
 The script prints a summary and optionally writes JSON results if `--output-json` is provided.
+
+## Mooncake exact-key tracing
+
+Set `LMCACHE_MOONCAKE_KEY_TRACE_FILE` before starting vLLM to record every
+physical Mooncake key submitted by LMCache put and existence-lookup calls. Use
+`{pid}` to keep concurrent process output in separate valid JSONL files:
+
+```bash
+LMCACHE_MOONCAKE_KEY_TRACE_FILE='/workspace/qzy/mooncake-keys-{pid}.jsonl' \
+vllm serve ...
+```
+
+Each record contains a UTC timestamp, PID, call ID, operation, exact key and
+Mooncake result. This diagnostic is intentionally verbose and should not be
+enabled for normal serving.
+
+Query a recorded physical key without retrieving its payload:
+
+```bash
+python3 benchmarks/storage_backend_io/mooncake_key_lookup.py \
+  --config /workspace/qzy/lmcache_config.yaml \
+  --mooncake-device 0 \
+  '__lmcache_page_v1__@36@...'
+```
