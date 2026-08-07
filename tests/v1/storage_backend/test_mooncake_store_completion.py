@@ -227,6 +227,86 @@ def test_mooncake_requires_put_completion() -> None:
     assert connector.requires_put_completion()
 
 
+def test_mooncake_direct_pages_use_existing_page_keys() -> None:
+    calls = []
+
+    class _Store:
+        @staticmethod
+        def register_buffer(ptr, size):
+            calls.append(("register", ptr, size))
+            return 0
+
+        @staticmethod
+        def batch_put_from_multi_buffers(keys, ptrs, sizes, replica):
+            calls.append(("put", keys, ptrs, sizes))
+            return [0] * len(keys)
+
+        @staticmethod
+        def batch_is_exist(keys):
+            calls.append(("exists", keys))
+            return [1] * len(keys)
+
+    class _Event:
+        waited = False
+
+        def synchronize(self):
+            self.waited = True
+
+    connector = object.__new__(MooncakestoreConnector)
+    connector.save_chunk_meta = False
+    connector._page_first_multi_buffer = True
+    connector._page_num_layers = 2
+    connector._external_put_lock = asyncio.Lock()
+    connector._external_buffers = {}
+    connector._inflight_put_tasks = set()
+    connector.store = _Store()
+    connector.replica_config = object()
+    connector.config = SimpleNamespace(transfer_timeout=5)
+    owner = torch.empty(16, dtype=torch.uint8)
+    event = _Event()
+
+    asyncio.run(
+        connector.batched_put_external_pages(
+            [_key(7)],
+            [[owner.data_ptr()]],
+            [[owner.numel()]],
+            (owner,),
+            event,
+            "request",
+        )
+    )
+
+    assert event.waited
+    put = next(call for call in calls if call[0] == "put")
+    assert put[1] == ["__lmcache_page_v1__@2@test@1@0@7@float16@0"]
+    assert put[2:] == ([[owner.data_ptr()]], [[owner.numel()]])
+    assert connector.batched_external_pages_exist([_key(7)]) == [True]
+    exists = next(call for call in calls if call[0] == "exists")
+    assert exists[1] == ["__lmcache_page_v1__@2@test@1@0@7@float16@0"]
+
+
+def test_instrumented_connector_delegates_direct_pages() -> None:
+    recorded = []
+
+    class _DirectConnector:
+        @staticmethod
+        async def batched_put_external_pages(*args) -> None:
+            recorded.append(args)
+
+    connector = object.__new__(InstrumentedRemoteConnector)
+    connector._connector = _DirectConnector()
+    connector._stats_monitor = SimpleNamespace(
+        update_interval_remote_time_to_put=lambda value: None,
+        update_interval_remote_write_metrics=lambda value: None,
+    )
+    asyncio.run(
+        connector.batched_put_external_pages(
+            [_key(1)], [[1]], [[2]], (), None, "request"
+        )
+    )
+    assert recorded and recorded[0][-1] == "request"
+
+
 def test_mooncake_zero_copy_metadata_reuses_homogeneous_group() -> None:
     def metadata_for_key(
         key: CacheEngineKey,

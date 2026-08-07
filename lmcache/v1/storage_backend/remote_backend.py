@@ -364,6 +364,45 @@ class RemoteBackend(StorageBackendInterface):
                 )
             return futures if self.requires_put_completion() else None
 
+    def batched_submit_external_pages(
+        self,
+        keys: Sequence[CacheEngineKey],
+        buffer_ptrs: List[List[int]],
+        buffer_sizes: List[List[int]],
+        owners: tuple[Any, ...],
+        ready_event: Any,
+        req_id: str,
+    ) -> Future:
+        """Submit registered external page buffers to the remote connector."""
+        if self.connection is None:
+            raise RuntimeError("Remote connection is unavailable")
+        if self._mla_worker_id_as0_mode:
+            raise RuntimeError("External page puts are only valid on the saving rank")
+        normalized = list(keys)
+        future = asyncio.run_coroutine_threadsafe(
+            self.connection.batched_put_external_pages(
+                normalized,
+                buffer_ptrs,
+                buffer_sizes,
+                owners,
+                ready_event,
+                req_id,
+            ),
+            self.loop,
+        )
+        return future
+
+    def batched_external_pages_exist(
+        self, keys: Sequence[CacheEngineKey]
+    ) -> List[bool]:
+        """Check arbitrary Mooncake pages through the storage event loop."""
+        if self.connection is None:
+            return [False] * len(keys)
+        normalized = list(keys)
+        if self._mla_worker_id_as0_mode:
+            normalized = [key.with_new_worker_id(0) for key in normalized]
+        return self.connection.batched_external_pages_exist(normalized)
+
     @_lmcache_nvtx_annotate
     def get_blocking(
         self,

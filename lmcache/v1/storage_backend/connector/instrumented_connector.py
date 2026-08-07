@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # Standard
-from typing import List, Optional
+from typing import Any, List, Optional
 import time
 
 # First Party
@@ -209,6 +209,36 @@ class InstrumentedRemoteConnector(RemoteConnector):
             total_size / 1e6,
             (end - begin) * 1000,
         )
+
+    async def batched_put_external_pages(
+        self,
+        keys: List[CacheEngineKey],
+        buffer_ptrs: List[List[int]],
+        buffer_sizes: List[List[int]],
+        owners: tuple[Any, ...],
+        ready_event: Any,
+        req_id: str,
+    ) -> None:
+        """Delegate direct page buffers while retaining instrumentation."""
+        begin = time.perf_counter()
+        await self._connector.batched_put_external_pages(
+            keys,
+            buffer_ptrs,
+            buffer_sizes,
+            owners,
+            ready_event,
+            req_id,
+        )
+        elapsed = time.perf_counter() - begin
+        total_size = sum(map(sum, buffer_sizes))
+        self._stats_monitor.update_interval_remote_time_to_put(elapsed * 1000)
+        self._stats_monitor.update_interval_remote_write_metrics(total_size)
+
+    def batched_external_pages_exist(
+        self, keys: List[CacheEngineKey]
+    ) -> List[bool]:
+        """Delegate arbitrary direct-page existence checks."""
+        return self._connector.batched_external_pages_exist(keys)
 
     def remove_sync(self, key: CacheEngineKey) -> bool:
         return self._connector.remove_sync(key)

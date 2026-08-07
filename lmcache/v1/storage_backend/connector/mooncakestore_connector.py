@@ -289,6 +289,8 @@ class MooncakestoreConnector(RemoteConnector):
         self.loop = loop
         self.local_cpu_backend = local_cpu_backend
         self.registered_buffer_ptr = None
+        self._external_buffers: dict[int, int] = {}
+        self._external_put_lock = asyncio.Lock()
         self._inflight_put_tasks: set[asyncio.Task[Any]] = set()
         # Initialize ReplicateConfig
         self.replica_config = ReplicateConfig()
@@ -560,6 +562,29 @@ class MooncakestoreConnector(RemoteConnector):
             else:
                 logger.warning(f"Buffer unregistration failed: error={result}")
             self.registered_buffer_ptr = None
+
+    def _register_external_owners(self, owners: tuple[Any, ...]) -> None:
+        """Register tensor storages once in this Mooncake transport context."""
+        active: dict[int, int] = {}
+        for owner in owners:
+            storage = owner.untyped_storage()
+            ptr, size = int(storage.data_ptr()), int(storage.nbytes())
+            active[ptr] = size
+        for ptr in self._external_buffers.keys() - active.keys():
+            self.store.unregister_buffer(ptr)
+            self._external_buffers.pop(ptr, None)
+        for ptr, size in active.items():
+            if self._external_buffers.get(ptr) == size:
+                continue
+            if ptr in self._external_buffers:
+                self.store.unregister_buffer(ptr)
+            status = self.store.register_buffer(ptr, size)
+            if status not in (None, 0):
+                raise RuntimeError(
+                    f"Mooncake NPU buffer registration failed: ptr={ptr:#x} "
+                    f"size={size} status={status}"
+                )
+            self._external_buffers[ptr] = size
 
     def _page_keys_for(self, keys: List[CacheEngineKey]) -> list[Optional[str]]:
         """Resolve one serialized page key per unique layer-key identity."""
@@ -1574,6 +1599,118 @@ class MooncakestoreConnector(RemoteConnector):
         else:
             await self._batched_put_zero_copy(keys, memory_objs)
 
+    async def batched_put_external_pages(
+        self,
+        keys: List[CacheEngineKey],
+        buffer_ptrs: List[List[int]],
+        buffer_sizes: List[List[int]],
+        owners: tuple[Any, ...],
+        ready_event: Any,
+        req_id: str,
+    ) -> None:
+        """Write registered accelerator buffers as existing Mooncake pages."""
+        if self.save_chunk_meta or not self._page_first_multi_buffer:
+            raise RuntimeError("Direct page store requires metadata-free page mode")
+        if not (len(keys) == len(buffer_ptrs) == len(buffer_sizes)):
+            raise ValueError("Direct page keys and buffers have different lengths")
+        page_keys = [mooncake_page_key(key, self._page_num_layers) for key in keys]
+        started = cold_start_perf_now() if cold_start_perf_enabled() else None
+
+        def put() -> Any:
+            if owners and owners[0].device.type == "npu":
+                torch.npu.set_device(owners[0].device)
+            wait_started = cold_start_perf_now() if started is not None else None
+            if ready_event is not None:
+                ready_event.synchronize()
+            wait_ms = (
+                (cold_start_perf_now() - wait_started) * 1000
+                if wait_started is not None
+                else 0.0
+            )
+            self._register_external_owners(owners)
+            transfer_started = cold_start_perf_now() if started is not None else None
+            statuses = self.store.batch_put_from_multi_buffers(
+                page_keys, buffer_ptrs, buffer_sizes, self.replica_config
+            )
+            transfer_ms = (
+                (cold_start_perf_now() - transfer_started) * 1000
+                if transfer_started is not None
+                else 0.0
+            )
+            return statuses, wait_ms, transfer_ms
+
+        async with self._external_put_lock:
+            task = asyncio.create_task(asyncio.to_thread(put))
+            self._inflight_put_tasks.add(task)
+            task.add_done_callback(self._inflight_put_tasks.discard)
+            try:
+                statuses, wait_ms, transfer_ms = await asyncio.wait_for(
+                    asyncio.shield(task), timeout=self.config.transfer_timeout
+                )
+            except asyncio.TimeoutError:
+                logger.error(
+                    "Mooncake direct page put exceeded %ss; waiting for the "
+                    "uncancellable native read before releasing NPU blocks",
+                    self.config.transfer_timeout,
+                )
+                try:
+                    statuses, wait_ms, transfer_ms = await task
+                except BaseException as native_error:
+                    raise TimeoutError(
+                        "Mooncake direct page put failed after timing out"
+                    ) from native_error
+        trace_mooncake_keys(
+            "put",
+            page_keys,
+            statuses if statuses is not None else 0,
+            api="connector.direct_npu_page_put",
+        )
+        if statuses is not None:
+            if len(statuses) != len(page_keys):
+                raise RuntimeError(
+                    "Mooncake direct page put returned invalid status count"
+                )
+            failed = [
+                page_key
+                for page_key, status in zip(page_keys, statuses, strict=True)
+                if status != 0
+            ]
+            if failed:
+                error = RuntimeError(
+                    f"Mooncake direct page put failed: {failed[:4]}"
+                )
+                error.failed_pages = failed  # type: ignore[attr-defined]
+                raise error
+        if started is not None:
+            cold_start_perf_log(
+                logger,
+                "direct_npu_page_put",
+                started=started,
+                req_id=req_id,
+                pages=len(page_keys),
+                buffers=sum(map(len, buffer_ptrs)),
+                bytes=sum(map(sum, buffer_sizes)),
+                event_wait_ms=wait_ms,
+                transfer_ms=transfer_ms,
+                status="ok",
+            )
+
+    def batched_external_pages_exist(
+        self, keys: List[CacheEngineKey]
+    ) -> List[bool]:
+        """Check arbitrary existing-format page keys in one Mooncake call."""
+        page_keys = [mooncake_page_key(key, self._page_num_layers) for key in keys]
+        results = self.store.batch_is_exist(page_keys)
+        trace_mooncake_keys(
+            "lookup",
+            page_keys,
+            results,
+            api="connector.direct_npu_page_exists",
+        )
+        if results is None or len(results) != len(keys):
+            raise RuntimeError("Mooncake direct page lookup returned invalid results")
+        return [result == 1 for result in results]
+
     async def _batched_put_zero_copy(
         self,
         keys: List[CacheEngineKey],
@@ -1791,6 +1928,9 @@ class MooncakestoreConnector(RemoteConnector):
 
         # Unregister buffer before closing the store
         self._unregister_cpu_buffer()
+        for ptr in tuple(self._external_buffers):
+            self.store.unregister_buffer(ptr)
+        self._external_buffers.clear()
 
         self.store.close()
         logger.info("Closed the mooncake store connection")

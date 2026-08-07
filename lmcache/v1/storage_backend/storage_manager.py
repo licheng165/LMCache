@@ -44,6 +44,7 @@ from lmcache.v1.storage_backend.abstract_backend import (
     StorageBackendInterface,
 )
 from lmcache.v1.storage_backend.local_cpu_backend import LocalCPUBackend
+from lmcache.v1.storage_backend.remote_backend import RemoteBackend
 
 if TYPE_CHECKING:
     # First Party
@@ -442,6 +443,43 @@ class StorageManager:
                 memory_obj.ref_count_down()
 
         return required_futures
+
+    def batched_put_external_pages(
+        self,
+        keys: Sequence[CacheEngineKey],
+        buffer_ptrs: List[List[int]],
+        buffer_sizes: List[List[int]],
+        owners: tuple[Any, ...],
+        ready_event: Any,
+        req_id: str,
+    ) -> Future:
+        """Forward registered external page buffers to RemoteBackend."""
+        backend = self.storage_backends.get("RemoteBackend")
+        if not isinstance(backend, RemoteBackend):
+            raise RuntimeError("Direct page store requires RemoteBackend")
+        with self._bypass_lock:
+            if "RemoteBackend" in self._bypassed_backends:
+                raise RuntimeError("RemoteBackend is bypassed")
+        return backend.batched_submit_external_pages(
+            keys,
+            buffer_ptrs,
+            buffer_sizes,
+            owners,
+            ready_event,
+            req_id,
+        )
+
+    def batched_external_pages_exist(
+        self, keys: Sequence[CacheEngineKey]
+    ) -> List[bool]:
+        """Check arbitrary remote page keys without consulting LocalCPU."""
+        backend = self.storage_backends.get("RemoteBackend")
+        if not isinstance(backend, RemoteBackend):
+            return [False] * len(keys)
+        with self._bypass_lock:
+            if "RemoteBackend" in self._bypassed_backends:
+                return [False] * len(keys)
+        return backend.batched_external_pages_exist(keys)
 
     def get(
         self,

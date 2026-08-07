@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # Standard
-from typing import List, Optional
+from typing import Any, List, Optional
 import abc
 import asyncio
 
@@ -294,6 +294,24 @@ class RemoteConnector(metaclass=abc.ABCMeta):
             keys: the keys of the corresponding objects
             memory_objs: the memory_objs of the corresponding keys
         """
+        raise NotImplementedError
+
+    async def batched_put_external_pages(
+        self,
+        keys: List[CacheEngineKey],
+        buffer_ptrs: List[List[int]],
+        buffer_sizes: List[List[int]],
+        owners: tuple[Any, ...],
+        ready_event: Any,
+        req_id: str,
+    ) -> None:
+        """Persist externally owned buffers in the connector's page format."""
+        raise NotImplementedError
+
+    def batched_external_pages_exist(
+        self, keys: List[CacheEngineKey]
+    ) -> List[bool]:
+        """Check arbitrary page keys in one native operation."""
         raise NotImplementedError
 
     def support_batched_async_contains(self) -> bool:
