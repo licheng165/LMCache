@@ -1123,9 +1123,9 @@ def test_sampled_lookup_recognizes_remote_pages_without_local_page_objects():
     assert engine.storage_manager.calls == []
     assert page_calls
     assert all(
-        len(keys) == 1 and search_range == ["RemoteBackend"]
-        for keys, search_range, _ in page_calls
+        search_range == ["RemoteBackend"] for _, search_range, _ in page_calls
     )
+    assert any(len(keys) == 2 for keys, _, _ in page_calls)
 
 
 def test_sampled_lookup_batches_local_page_pins_by_group():
@@ -1219,6 +1219,47 @@ def test_sampled_lookup_combines_local_and_remote_keys() -> None:
     assert engine.lookup_pins["req"]["RemoteBackend"] == []
 
 
+def test_sampled_lookup_pins_remote_prefix_and_local_suffix() -> None:
+    token_db = _FakeMultiChunkLookupTokenDatabase()
+    remote_prefix = _sampled_keys_for_chunk(token_db, 0)
+    local_pages = [
+        token_db._make_key_by_hash(
+            0x100 + chunk, kv_group=group
+        ).get_first_layer()
+        for chunk in range(1, 4)
+        for group in (0, 1)
+    ]
+    engine = _make_sampled_lookup_engine(
+        remote_prefix,
+        pin_present=remote_prefix,
+    )
+    engine.config.chunk_size = 4
+    engine.config.extra_config = {
+        "mooncake_page_first_multi_buffer": True,
+        "mooncake_layer_merged_page_objects": True,
+    }
+
+    def contains_pages(keys, search_range=None, pin=False):
+        keys = list(keys)
+        local = search_range == ["LocalCPUBackend"]
+        hits = next(
+            (
+                index
+                for index, key in enumerate(keys)
+                if (key.chunk_hash != 0x100) != local
+            ),
+            len(keys),
+        )
+        location = "LocalCPUBackend" if local else "RemoteBackend"
+        return hits, {location: keys[:hits]} if hits else {}
+
+    engine.storage_manager.batched_contains_layer_pages = contains_pages
+
+    assert engine.lookup(list(range(14)), lookup_id="req", pin=True) == 14
+    assert engine.lookup_pins["req"]["LocalCPUBackend"] == local_pages
+    assert engine.lookup_pins["req"]["RemoteBackend"] == []
+
+
 def test_sampled_lookup_avoids_remote_when_samples_are_local() -> None:
     token_db = _FakeMultiChunkLookupTokenDatabase()
     local_keys = [
@@ -1261,7 +1302,7 @@ def test_sampled_lookup_rejects_local_prefix_holes() -> None:
     assert engine.lookup(list(range(14)), lookup_id="req", pin=True) == 0
     assert engine.lookup_pins["req"] == {}
     assert engine.storage_manager.unpinned == [
-        (first, ["LocalCPUBackend"]),
+        ([*first, *tail], ["LocalCPUBackend"]),
     ]
 
 

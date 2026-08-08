@@ -1554,7 +1554,7 @@ class LMCacheEngine:
             base_keys: list[CacheEngineKey],
             *,
             pin: bool = False,
-            local_through: Optional[set[int]] = None,
+            local_tail_groups: Optional[set[int]] = None,
         ) -> Optional[dict[str, list[CacheEngineKey]]]:
             if not base_keys:
                 return None
@@ -1565,7 +1565,7 @@ class LMCacheEngine:
             local_page_lookup = mooncake_layer_pages_enabled(self.config)
             remote_page_lookup = mooncake_page_layout_enabled(self.config)
             remote_groups: set[int] = set()
-            required_local = local_through or set()
+            verify_mixed_groups = local_tail_groups or set()
 
             def rollback() -> None:
                 if pin:
@@ -1664,15 +1664,22 @@ class LMCacheEngine:
                         if self.storage_manager.contains(
                             sampled[0], ["LocalCPUBackend"], False
                         ) is None:
-                            if pin and kv_group in required_local:
-                                rollback()
-                                return None
                             if pin:
-                                # Sampling already proved the remote prefix;
-                                # remote pin/unpin are no-ops. Keep only the
-                                # location marker needed by retrieval routing.
-                                mapping.setdefault("RemoteBackend", [])
-                                remote_groups.add(kv_group)
+                                if kv_group in verify_mixed_groups:
+                                    # The sampled winner is local, so this is a
+                                    # remote-first/local-suffix prefix. Verify
+                                    # this page and continue locating later
+                                    # pages instead of imposing local-prefix
+                                    # ordering.
+                                    if remote_page_lookup:
+                                        remote_pages.append((page_key, sampled))
+                                    else:
+                                        remote_keys.extend(sampled)
+                                else:
+                                    # Sampling already proved the remote
+                                    # prefix. Remote pin/unpin are no-ops.
+                                    mapping.setdefault("RemoteBackend", [])
+                                    remote_groups.add(kv_group)
                             elif remote_page_lookup:
                                 remote_pages.append((page_key, sampled))
                             else:
@@ -1691,14 +1698,12 @@ class LMCacheEngine:
                                 continue
                             for location, keys in pinned.items():
                                 self.storage_manager.batched_unpin(keys, [location])
-                            if kv_group in required_local:
-                                rollback()
-                                return None
                             if remote_page_lookup:
                                 remote_pages.append((page_key, sampled))
                             else:
                                 remote_keys.extend(sampled)
-                            remote_groups.add(kv_group)
+                            if kv_group not in verify_mixed_groups:
+                                remote_groups.add(kv_group)
                             continue
                         hits, _ = self.storage_manager.batched_contains(
                             layer_keys,
@@ -1716,16 +1721,28 @@ class LMCacheEngine:
                         break
 
                 if remote_pages:
-                    for page_key, sampled in remote_pages:
-                        page_hits, _ = (
-                            self.storage_manager.batched_contains_layer_pages(
-                                [page_key], ["RemoteBackend"], False
-                            )
+                    page_hits, _ = (
+                        self.storage_manager.batched_contains_layer_pages(
+                            [page_key for page_key, _ in remote_pages],
+                            ["RemoteBackend"],
+                            False,
                         )
-                        if page_hits:
-                            mapping.setdefault("RemoteBackend", [])
-                        else:
-                            remote_keys.extend(sampled)
+                    )
+                    if page_hits == len(remote_pages):
+                        mapping.setdefault("RemoteBackend", [])
+                    else:
+                        # Preserve page/legacy mixtures on the uncommon
+                        # partial-batch path.
+                        for page_key, sampled in remote_pages:
+                            page_hits, _ = (
+                                self.storage_manager.batched_contains_layer_pages(
+                                    [page_key], ["RemoteBackend"], False
+                                )
+                            )
+                            if page_hits:
+                                mapping.setdefault("RemoteBackend", [])
+                            else:
+                                remote_keys.extend(sampled)
                 if remote_keys:
                     hits, remote = self.storage_manager.batched_contains(
                         remote_keys,
@@ -1834,7 +1851,7 @@ class LMCacheEngine:
             block_mapping = tiered_locations(
                 pin_chunks,
                 pin=True,
-                local_through=local_groups_by_chunk[winner_index],
+                local_tail_groups=local_groups_by_chunk[winner_index],
             )
             if block_mapping is None:
                 return 0
