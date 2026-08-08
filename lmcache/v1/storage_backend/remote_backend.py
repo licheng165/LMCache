@@ -373,7 +373,7 @@ class RemoteBackend(StorageBackendInterface):
         ready_event: Any,
         req_id: str,
     ) -> Future:
-        """Submit registered external page buffers to the remote connector."""
+        """Submit registered external buffers to the remote connector."""
         if self.connection is None:
             raise RuntimeError("Remote connection is unavailable")
         if self._mla_worker_id_as0_mode:

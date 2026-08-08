@@ -453,7 +453,7 @@ class StorageManager:
         ready_event: Any,
         req_id: str,
     ) -> Future:
-        """Forward registered external page buffers to RemoteBackend."""
+        """Forward registered external page or legacy buffers to RemoteBackend."""
         backend = self.storage_backends.get("RemoteBackend")
         if not isinstance(backend, RemoteBackend):
             raise RuntimeError("Direct page store requires RemoteBackend")

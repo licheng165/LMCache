@@ -280,6 +280,20 @@ def test_mooncake_direct_pages_use_existing_page_keys() -> None:
     put = next(call for call in calls if call[0] == "put")
     assert put[1] == ["__lmcache_page_v1__@2@test@1@0@7@float16@0"]
     assert put[2:] == ([[owner.data_ptr()]], [[owner.numel()]])
+    layer_key = _key(8).get_layer(1)
+    asyncio.run(
+        connector.batched_put_external_pages(
+            [layer_key],
+            [[owner.data_ptr()]],
+            [[owner.numel()]],
+            (owner,),
+            event,
+            "request",
+        )
+    )
+    assert [call for call in calls if call[0] == "put"][-1][1] == [
+        layer_key.to_string()
+    ]
     assert connector.batched_external_pages_exist([_key(7)]) == [True]
     exists = next(call for call in calls if call[0] == "exists")
     assert exists[1] == ["__lmcache_page_v1__@2@test@1@0@7@float16@0"]

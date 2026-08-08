@@ -1608,12 +1608,25 @@ class MooncakestoreConnector(RemoteConnector):
         ready_event: Any,
         req_id: str,
     ) -> None:
-        """Write registered accelerator buffers as existing Mooncake pages."""
+        """Write registered accelerator buffers with page or legacy keys."""
         if self.save_chunk_meta or not self._page_first_multi_buffer:
             raise RuntimeError("Direct page store requires metadata-free page mode")
+        if not keys:
+            return
         if not (len(keys) == len(buffer_ptrs) == len(buffer_sizes)):
             raise ValueError("Direct page keys and buffers have different lengths")
-        page_keys = [mooncake_page_key(key, self._page_num_layers) for key in keys]
+        if any(
+            len(ptrs) != len(sizes)
+            for ptrs, sizes in zip(buffer_ptrs, buffer_sizes, strict=True)
+        ):
+            raise ValueError("Direct page pointer and size counts differ")
+        legacy_objects = sum(isinstance(key, LayerCacheEngineKey) for key in keys)
+        page_keys = [
+            key.to_string()
+            if isinstance(key, LayerCacheEngineKey)
+            else mooncake_page_key(key, self._page_num_layers)
+            for key in keys
+        ]
         started = cold_start_perf_now() if cold_start_perf_enabled() else None
 
         def put() -> Any:
@@ -1687,9 +1700,15 @@ class MooncakestoreConnector(RemoteConnector):
                 "direct_npu_page_put",
                 started=started,
                 req_id=req_id,
-                pages=len(page_keys),
+                pages=len(page_keys) - legacy_objects,
+                legacy_objects=legacy_objects,
                 buffers=sum(map(len, buffer_ptrs)),
                 bytes=sum(map(sum, buffer_sizes)),
+                format=(
+                    "legacy_tail"
+                    if legacy_objects == len(keys)
+                    else "mixed" if legacy_objects else "page"
+                ),
                 event_wait_ms=wait_ms,
                 transfer_ms=transfer_ms,
                 status="ok",
