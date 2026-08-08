@@ -87,14 +87,25 @@ def permute_to_contiguous(tensor: torch.Tensor) -> torch.Tensor:
     return result
 
 
-def permute_kv_caches_to_contiguous(
-    kv_caches: List[torch.Tensor],
-) -> List[torch.Tensor]:
-    """Apply :func:`permute_to_contiguous` to each tensor in *kv_caches*.
+_KVCacheEntry = Union[
+    torch.Tensor, List[torch.Tensor], Tuple[torch.Tensor, ...]
+]
 
-    The returned list shares the same underlying storage as the input.
+
+def permute_kv_caches_to_contiguous(
+    kv_caches: List[_KVCacheEntry],
+) -> List[_KVCacheEntry]:
+    """Apply :func:`permute_to_contiguous` to every tensor in *kv_caches*.
+
+    Layerwise MLA/DSA caches contain tuples of planes. Preserve that nesting;
+    all returned tensors share the same underlying storage as the input.
     """
-    return [permute_to_contiguous(t) for t in kv_caches]
+    return [
+        type(value)(permute_to_contiguous(tensor) for tensor in value)
+        if isinstance(value, (list, tuple))
+        else permute_to_contiguous(value)
+        for value in kv_caches
+    ]
 
 
 def assert_contiguous(tensor: torch.Tensor) -> None:

@@ -17,7 +17,10 @@ from lmcache.v1.gpu_connector.gpu_connectors import (
     VLLMPagedMemGPUConnectorV3,
     VLLMPagedMemLayerwiseGPUConnector,
 )
-from lmcache.v1.gpu_connector.utils import get_dtype
+from lmcache.v1.gpu_connector.utils import (
+    get_dtype,
+    permute_kv_caches_to_contiguous,
+)
 from lmcache.v1.memory_management import (
     GPUMemoryAllocator,
     MemoryFormat,
@@ -58,6 +61,18 @@ from .utils import (
     generate_sglang_kv_cache_paged_list_tensors,
     recover_gpu_connector_states,
 )
+
+
+def test_permute_nested_layerwise_kv_caches_to_contiguous() -> None:
+    first = torch.arange(24).reshape(2, 3, 4).transpose(0, 1)
+    second = torch.arange(12).reshape(3, 4)
+
+    result = permute_kv_caches_to_contiguous([(first, second), [second]])
+
+    assert isinstance(result[0], tuple)
+    assert isinstance(result[1], list)
+    assert all(tensor.is_contiguous() for layer in result for tensor in layer)
+    assert result[0][0].data_ptr() == first.data_ptr()
 
 
 @pytest.fixture(autouse=True, scope="module")
