@@ -95,6 +95,11 @@ from lmcache.v1.token_database import (
 
 logger = init_logger(__name__)
 
+# Private generator controls used by the vLLM adapter to keep the two shared
+# sparse-cache groups on one deterministic collective order.
+_SHARED_SPARSE_PREPARE_ONLY = "_lmcache_shared_sparse_prepare_only"
+_SHARED_SPARSE_DEFER_COMMIT = "_lmcache_shared_sparse_defer_commit"
+
 # Type aliases for processed chunks
 # (cache_key, memory_obj, start_index, end_index)
 ProcessedChunk = Tuple[CacheEngineKey, MemoryObj, int, int]

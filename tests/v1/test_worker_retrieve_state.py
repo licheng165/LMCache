@@ -22,7 +22,11 @@ from lmcache.integration.vllm.vllm_v1_adapter import (
     SaveSpec,
     WorkerRetrieveState,
 )
-from lmcache.v1.cache_engine import LayerwiseStoreResult, LMCacheEngine
+from lmcache.v1.cache_engine import (
+    _SHARED_SPARSE_PREPARE_ONLY,
+    LayerwiseStoreResult,
+    LMCacheEngine,
+)
 from lmcache.v1.gpu_connector.sparse import PreparedSparseSource
 from lmcache.v1.kv_layer_groups import KVLayerGroupsManager
 from tests.v1.connector_test_utils import (
@@ -2294,6 +2298,55 @@ class TestWorkerRetrieveState:
         assert torch.equal(selected_payload, selected_tokens[0])
         assert torch.equal(target_payload, target_slot_mapping[0])
         assert impl.current_layer == 1
+
+    def test_shared_sparse_indexer_first_defers_final_commit(self):
+        req = make_sparse_req_meta("req-1", token_count=4)
+        impl, _, _ = make_worker_connector([req], use_layerwise=True)
+        impl.config.dsa_two_groups = True
+        impl._indexer_layer_names = ["model.layers.0.self_attn.indexer.k_cache"]
+        impl.current_layer = 0
+        impl.num_layers = 1
+        impl._layerwise_retriever_is_sparse = [True]
+        impl._layerwise_sparse_req_ids = ["req-1"]
+        impl._layerwise_sparse_shared_ordered = [True]
+        impl._finalize_worker_retrieve_state_from_metadata = MagicMock()
+        impl._drain_layerwise_retrievers = MagicMock()
+
+        captured = []
+
+        def _latent():
+            payload = yield None
+            captured.append(("latent-prepare", payload))
+            payload = yield None
+            captured.append(("latent-commit", payload))
+            yield torch.ones(4, dtype=torch.bool)
+
+        def _indexer():
+            payload = yield None
+            captured.append(("indexer-data", payload))
+            yield torch.ones(4, dtype=torch.bool)
+            captured.append(("indexer-commit", None))
+            yield torch.ones(4, dtype=torch.bool)
+
+        latent, indexer = _latent(), _indexer()
+        next(latent)
+        next(indexer)
+        impl.layerwise_retrievers = [(latent, indexer)]
+
+        impl.wait_for_layer_load("model.layers.0.self_attn.indexer.k_cache")
+        impl.wait_for_layer_load(
+            "model.layers.0.self_attn.attn",
+            selected_tokens=torch.tensor([[10, 11, 12, 13]], dtype=torch.int32),
+            request_ids=["req-1"],
+        )
+
+        assert [label for label, _ in captured] == [
+            "latent-prepare",
+            "indexer-data",
+            "latent-commit",
+            "indexer-commit",
+        ]
+        assert captured[0][1] == {_SHARED_SPARSE_PREPARE_ONLY: True}
 
     def test_sparse_decode_resident_indexer_wait_is_noop(self):
         req = make_sparse_req_meta("req-1", token_count=4)

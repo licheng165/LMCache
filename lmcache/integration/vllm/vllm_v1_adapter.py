@@ -48,7 +48,12 @@ from lmcache.integration.vllm.vllm_service_factory import VllmServiceFactory
 from lmcache.logging import init_logger
 from lmcache.observability import LMCStatsMonitor, PrometheusLogger
 from lmcache.utils import CacheStoreEvent, _lmcache_nvtx_annotate, cdiv
-from lmcache.v1.cache_engine import LayerwiseStoreResult, LMCacheEngine
+from lmcache.v1.cache_engine import (
+    _SHARED_SPARSE_DEFER_COMMIT,
+    _SHARED_SPARSE_PREPARE_ONLY,
+    LayerwiseStoreResult,
+    LMCacheEngine,
+)
 from lmcache.v1.cold_start_perf import (
     cold_start_perf_enabled,
     cold_start_perf_log,
@@ -1516,6 +1521,7 @@ class LMCacheConnectorV1Impl:
         self._layerwise_sparse_row_groups: Optional[dict[str, list[int]]] = None
         self._layerwise_waited_groups: set[int] = set()
         self._layerwise_sparse_indexer_sent_layers: set[tuple[str, int]] = set()
+        self._layerwise_sparse_shared_ordered: list[bool] = []
         self._layerwise_required_wait_groups_cache: Optional[set[int]] = None
         self._layerwise_save_storers: dict[
             LayerwiseSaveKey, Generator[Optional[LayerwiseStoreResult], None, None]
@@ -2863,6 +2869,8 @@ class LMCacheConnectorV1Impl:
             if hasattr(self, "_layerwise_requests"):
                 self._layerwise_requests.clear()
             self._layerwise_retriever_is_sparse.clear()
+            if hasattr(self, "_layerwise_sparse_shared_ordered"):
+                self._layerwise_sparse_shared_ordered.clear()
             if hasattr(self, "_layerwise_sparse_req_ids"):
                 self._layerwise_sparse_req_ids.clear()
             self._layerwise_sparse_row_groups_key = None
@@ -6078,6 +6086,7 @@ class LMCacheConnectorV1Impl:
                     self._layerwise_requests.append(request)
                     self._layerwise_retriever_is_sparse.append(True)
                     self._layerwise_sparse_req_ids.append(request.req_id)
+                    self._layerwise_sparse_shared_ordered.append(False)
                     # NOTE: retrieve layers one by one with cpu prefetch
                     prime_started = (
                         cold_start_perf_now() if cold_perf_active else 0.0
@@ -6192,7 +6201,7 @@ class LMCacheConnectorV1Impl:
                             (
                                 indexer_kwargs,
                                 shared_cpu_preflight_state,
-                                _,
+                                indexer_prepared,
                             ) = self._sparse_retrieve_kwargs(
                                 request,
                                 retrieve_state,
@@ -6221,6 +6230,21 @@ class LMCacheConnectorV1Impl:
                             self.layerwise_retrievers[-1] = (
                                 layerwise_retriever,
                                 indexer_retriever,
+                            )
+                            shared_group_retrieve = getattr(
+                                self.lmcache_engine,
+                                "_should_use_shared_layerwise_retrieve",
+                                None,
+                            )
+                            self._layerwise_sparse_shared_ordered[-1] = bool(
+                                shared_cpu_enabled
+                                and latent_prepared is None
+                                and indexer_prepared is None
+                                and callable(shared_group_retrieve)
+                                and all(
+                                    shared_group_retrieve(group)
+                                    for group in (0, 1)
+                                )
                             )
                             if indexer_mode == INDEXER_RETRIEVE_FULL:
                                 retrieve_state.indexer_npu_materialization_pending = (
@@ -6388,6 +6412,7 @@ class LMCacheConnectorV1Impl:
                     )
                     self._layerwise_requests.append(request)
                     self._layerwise_retriever_is_sparse.append(False)
+                    self._layerwise_sparse_shared_ordered.append(False)
 
                     # Two-group DSA: also retrieve the indexer group (kv_group=1)
                     # for the same latent hit token count, scattering into vLLM's
@@ -6772,6 +6797,13 @@ class LMCacheConnectorV1Impl:
                     )
                     break
                 layerwise_retriever, indexer_retriever = self.layerwise_retrievers[idx]
+                shared_ordered_retrievers = getattr(
+                    self, "_layerwise_sparse_shared_ordered", ()
+                )
+                shared_ordered = bool(
+                    idx < len(shared_ordered_retrievers)
+                    and shared_ordered_retrievers[idx]
+                )
                 if request.is_sparse_decode:
                     payload = None
                     rows = None
@@ -6944,7 +6976,23 @@ class LMCacheConnectorV1Impl:
                             )
                             and indexer_sent_key not in sparse_indexer_sent_layers
                         ):
-                            indexer_retriever.send((None, 0))
+                            if shared_ordered:
+                                layerwise_retriever.send(
+                                    {_SHARED_SPARSE_PREPARE_ONLY: True}
+                                )
+                            indexer_retriever.send(
+                                {
+                                    "selected_token_ids": None,
+                                    "token_start_index": 0,
+                                    _SHARED_SPARSE_DEFER_COMMIT: (
+                                        shared_ordered
+                                        and self.current_layer
+                                        == self.num_layers - 1
+                                    ),
+                                }
+                                if shared_ordered
+                                else (None, 0)
+                            )
                             sparse_indexer_sent_layers.add(indexer_sent_key)
                     else:
                         ret_token_mask = layerwise_retriever.send(sparse_payload)
@@ -6955,6 +7003,15 @@ class LMCacheConnectorV1Impl:
                         ):
                             indexer_ret_mask = indexer_retriever.send((None, 0))
                             sparse_indexer_sent_layers.add(indexer_sent_key)
+                            if ret_token_mask is None:
+                                ret_token_mask = indexer_ret_mask
+                        elif (
+                            indexer_retriever is not None
+                            and shared_ordered
+                            and self.current_layer == self.num_layers - 1
+                            and indexer_sent_key in sparse_indexer_sent_layers
+                        ):
+                            indexer_ret_mask = next(indexer_retriever)
                             if ret_token_mask is None:
                                 ret_token_mask = indexer_ret_mask
                     decode_row += row_count
