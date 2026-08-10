@@ -25,6 +25,11 @@ from lmcache.logging import init_logger
 from lmcache.utils import CacheEngineKey, _lmcache_nvtx_annotate
 from lmcache.v1.config import LMCacheEngineConfig
 from lmcache.v1.metadata import LMCacheMetadata
+from lmcache.v1.mooncake_layout import (
+    MOONCAKE_PAYLOAD_LAYOUT_TAG,
+    mooncake_page_layout_enabled,
+    mooncake_payload_layout,
+)
 
 logger = init_logger(__name__)
 
@@ -84,8 +89,26 @@ class TokenDatabase(metaclass=abc.ABCMeta):
             NONE_HASH = 0
             logger.info("Using default NONE_HASH=0 (vLLM not available)")
 
-        logger.info(f"Using hash algorithm: {hash_algorithm}")
         self.metadata = metadata
+        self.mooncake_payload_layout = None
+        if (
+            config is not None
+            and metadata is not None
+            and mooncake_page_layout_enabled(config)
+        ):
+            signature, descriptor = mooncake_payload_layout(config, metadata)
+            self.mooncake_payload_layout = signature
+            logger.info(
+                "Using hash algorithm=%s; Mooncake payload layout: "
+                "signature=%s role=%s rank=%s schema=%s",
+                hash_algorithm,
+                signature,
+                metadata.role,
+                metadata.worker_id,
+                descriptor,
+            )
+        else:
+            logger.info("Using hash algorithm: %s", hash_algorithm)
         # Whether only the first rank should save cache. This flag is also used
         # to control the logical world_size embedded into CacheEngineKey.
         self.save_only_first_rank = False
@@ -223,6 +246,11 @@ class TokenDatabase(metaclass=abc.ABCMeta):
             raise ValueError(
                 "KV group dtype metadata is unavailable for cache key: "
                 f"kv_group={kv_group}, num_dtypes={len(dtypes)}"
+            )
+        if self.mooncake_payload_layout is not None:
+            request_configs = dict(request_configs or {})
+            request_configs[MOONCAKE_PAYLOAD_LAYOUT_TAG] = (
+                self.mooncake_payload_layout
             )
         if kv_group == 1 and bool(getattr(config, "dsa_two_groups", False)):
             request_configs = dict(request_configs or {})

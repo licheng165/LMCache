@@ -64,6 +64,34 @@ def test_chunked_token_database(chunk_length, save_unfull_chunk):
             assert ed == original_results[j + i][1]
 
 
+def test_mooncake_page_keys_include_payload_layout_signature(monkeypatch):
+    cfg = LMCacheEngineConfig.from_legacy(chunk_size=256, backend="cpu")
+    cfg.extra_config = {"mooncake_page_first_multi_buffer": True}
+    db = ChunkedTokenDatabase(cfg, dumb_metadata())
+
+    key = next(iter(db.process_tokens(tokens=generate_tokens(256, "cpu"))))[2]
+
+    assert dict(key.tags or ())["payload_v2"] == db.mooncake_payload_layout
+
+    monkeypatch.setenv("LMCACHE_ASCEND_SPARSE_TRANSFER_TOPK", "2048")
+    monkeypatch.setenv("VLLM_ASCEND_DSA_SHRINK_LATENT", "2")
+    assert (
+        ChunkedTokenDatabase(cfg, dumb_metadata()).mooncake_payload_layout
+        == db.mooncake_payload_layout
+    )
+
+    other = LMCacheEngineConfig.from_legacy(chunk_size=512, backend="cpu")
+    other.extra_config = {"mooncake_page_first_multi_buffer": True}
+    other_db = ChunkedTokenDatabase(other, dumb_metadata())
+    assert other_db.mooncake_payload_layout != db.mooncake_payload_layout
+
+    cfg.extra_config["save_chunk_meta"] = False
+    assert (
+        ChunkedTokenDatabase(cfg, dumb_metadata()).mooncake_payload_layout
+        != db.mooncake_payload_layout
+    )
+
+
 @pytest.mark.parametrize("kv_group", [0, 1])
 def test_chunked_token_database_processes_only_incremental_suffix(kv_group):
     chunk_length = 256

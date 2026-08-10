@@ -23,7 +23,12 @@ def find_last_sampled_hit(
     sample_count: int,
     exists_at: Callable[[int], bool],
 ) -> Optional[int]:
-    """Require the first sample, then probe candidates from the tail."""
+    """Return a candidate tail hit under a contiguous-prefix assumption.
+
+    This helper is advisory: it does not inspect intermediate samples. An
+    authoritative caller must revalidate every chunk through the candidate,
+    as the production pinned lookup path does.
+    """
     if sample_count <= 0 or not exists_at(0):
         return None
     for index in range(sample_count - 1, 0, -1):

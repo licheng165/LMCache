@@ -6,7 +6,6 @@ from typing import Optional, Union
 import torch
 
 # First Party
-from lmcache.logging import init_logger
 from lmcache.utils import CacheEngineKey
 from lmcache.v1.config import LMCacheEngineConfig
 from lmcache.v1.lookup_client.abstract_client import LookupClientInterface
@@ -20,9 +19,6 @@ from lmcache.v1.sampled_lookup import (
     find_last_sampled_hit,
     first_last_layer_keys,
 )
-
-logger = init_logger(__name__)
-
 
 class MooncakeLookupClient(LookupClientInterface):
     def __init__(
@@ -69,6 +65,12 @@ class MooncakeLookupClient(LookupClientInterface):
         lookup_id: Optional[str] = None,
         request_configs: Optional[dict] = None,
     ) -> Optional[int]:
+        """Return the cached prefix length.
+
+        In experimental sampled mode the result is only a candidate under the
+        contiguous-prefix contract. Unlike the production lookup-server path,
+        this standalone client does not pin and revalidate intermediate chunks.
+        """
         # process token_ids to cacheengine keys
         ends = []
         chunk_keys_by_chunk: list[list[str]] = []
