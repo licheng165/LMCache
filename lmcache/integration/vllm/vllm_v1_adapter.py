@@ -8097,6 +8097,14 @@ class LMCacheConnectorV1Impl:
             # route (frontier_too_short FATAL). Such prompts take the normal
             # dense-prefix load path instead (short-context dense fast-path).
             and num_external_hit_tokens - 1 >= self._dsa_scratch_capacity
+            # Short-context dense fast-path (方案 A): a prompt within the
+            # dense threshold is served densely from the main blocks, so the
+            # compact KV load is pure overhead — and its async thread races
+            # serving-time graph captures on the device. Skip cold compact
+            # entirely for these prompts (normal dense-prefix load instead).
+            and num_external_hit_tokens > getattr(
+                self, "_dsa_dense_threshold", 0
+            )
         )
         below_min_retrieve = (
             not dsa_prefix_hit

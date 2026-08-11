@@ -207,6 +207,60 @@ def test_dsa_cold_compact_is_skipped_when_frontier_below_scratch_capacity() -> N
     )
 
 
+def test_dsa_cold_compact_is_skipped_within_dense_threshold() -> None:
+    """Regression: 0808-2 (方案 A threshold gate). A prompt within the dense
+    fast-path threshold is served densely from the main blocks, so cold
+    compact (compact KV materialized in indexer blocks) is pure overhead — and
+    its async load thread races serving-time graph captures on the device
+    (device error 507057). Such prompts take the normal dense-prefix load path
+    instead; only prompts beyond the threshold keep the compact load."""
+    impl = _make_scheduler_impl()
+    impl.config.enable_dsa_cold_compact_load = True
+    impl.config.dsa_two_groups = True
+    impl.config.enable_shared_cpu_cache = True
+    impl.config.min_retrieve_tokens = 0
+    impl._dsa_dense_threshold = 10000
+    lookup_client = MagicMock()
+    impl._manager = SimpleNamespace(lookup_client=lookup_client)
+
+    # Within threshold, with a cold-compact frontier that would satisfy the
+    # scratch-capacity gate: the threshold gate must skip cold compact.
+    lookup_client.lookup_cache.return_value = 8378
+    short = SimpleNamespace(
+        request_id="short-within-threshold", num_tokens=8378
+    )
+    assert impl.get_num_new_matched_tokens(short, 0) == 8377
+    assert not impl.should_load_kv_async(short.request_id)
+    short_spec = impl.load_specs[short.request_id]
+    assert not hasattr(short_spec, "dsa_cold_compact_load")
+    assert not hasattr(short_spec, "dsa_release_frontier")
+    assert short_spec.dsa_committed_end == 8378 // 256 * 256
+
+    # Beyond threshold: the compact load still engages.
+    lookup_client.lookup_cache.return_value = 12000
+    long = SimpleNamespace(
+        request_id="long-beyond-threshold", num_tokens=12000
+    )
+    assert impl.get_num_new_matched_tokens(long, 0) == 11999
+    assert impl.should_load_kv_async(long.request_id)
+    assert getattr(
+        impl.load_specs[long.request_id], "dsa_cold_compact_load"
+    )
+
+    # Threshold disabled (0): the same prompt engages the compact load again
+    # (baseline behavior preserved when the dense fast-path is off).
+    impl._dsa_dense_threshold = 0
+    lookup_client.lookup_cache.return_value = 8378
+    control = SimpleNamespace(
+        request_id="threshold-disabled", num_tokens=8378
+    )
+    assert impl.get_num_new_matched_tokens(control, 0) == 8377
+    assert impl.should_load_kv_async(control.request_id)
+    assert getattr(
+        impl.load_specs[control.request_id], "dsa_cold_compact_load"
+    )
+
+
 def test_dsa_cold_compact_is_disabled_with_vllm_prefix_caching() -> None:
     impl = _make_scheduler_impl()
     impl.config.enable_dsa_cold_compact_load = True
