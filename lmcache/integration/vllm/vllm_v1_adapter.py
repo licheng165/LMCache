@@ -8973,10 +8973,15 @@ class LMCacheConnectorV1Impl:
             )
 
             self._add_decode_window_save_metas(meta, request_tracker)
+            # Dense fast-path (方案 A): the path decision follows the CURRENT
+            # context length, not the initial prompt_len. A short prompt that
+            # grows past the threshold during decode switches to the sparse
+            # path (window save frontier / release gating), so long-running
+            # generations get the same sparse behavior as long prompts.
             is_sparse_decode = (
                 self.enable_sparse_attention
                 and request.num_computed_tokens >= request_tracker.prompt_len
-                and request_tracker.prompt_len
+                and len(request_tracker.token_ids)
                 > getattr(self, "_dsa_dense_threshold", 0)
             )
             if self._dsa_dense_path_log:

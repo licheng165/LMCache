@@ -944,7 +944,6 @@ class TestBuildConnectorMetaSparseSyntheticLoadSpec:
         vllm_req = _make_vllm_request(
             req_id, prompt_len, prompt_len, decode_token
         )
-
         impl._unfinished_requests[req_id] = vllm_req
         impl._request_trackers[req_id] = RequestTracker(
             req_id=req_id,
@@ -971,6 +970,56 @@ class TestBuildConnectorMetaSparseSyntheticLoadSpec:
         assert req_meta.is_sparse_decode
         assert req_meta.load_spec is not None
         assert req_meta.load_spec.lmcache_cached_tokens == prompt_len
+
+    def test_short_prompt_growing_past_threshold_switches_to_sparse(
+        self,
+    ) -> None:
+        """方案 A: the dense/sparse path decision follows the CURRENT context
+        length. A short prompt that grows past the dense threshold during
+        generation switches back to the sparse decode path (window save
+        frontier / release gating), so long-running generations get the same
+        sparse behavior as long prompts."""
+        impl = _make_scheduler_impl()
+        impl._dsa_dense_threshold = 2048
+        impl._decode_window_save_window_size = 256
+        req_id = "grown-prompt"
+        prompt_len = 300
+        context_len = 5000
+        decode_token = 999
+        vllm_req = _make_vllm_request(
+            req_id, prompt_len, context_len, decode_token
+        )
+
+        impl._unfinished_requests[req_id] = vllm_req
+        impl._request_trackers[req_id] = RequestTracker(
+            req_id=req_id,
+            prompt_len=prompt_len,
+            token_ids=list(range(context_len)),
+            allocated_block_ids=list(range(313)),
+            num_saved_tokens=prompt_len,
+        )
+        scheduler_output = StubSchedulerOutput(
+            finished_req_ids=set(),
+            scheduled_new_reqs=[],
+            scheduled_cached_reqs=StubCachedRequestData(
+                req_ids=[req_id],
+                new_token_ids=[[decode_token]],
+                new_block_ids=[[]],
+            ),
+            num_scheduled_tokens={req_id: 1},
+        )
+
+        meta = impl.build_connector_meta(scheduler_output)
+
+        assert len(meta.requests) >= 1
+        req_meta = next(
+            request
+            for request in meta.requests
+            if not getattr(request, "is_decode_window_save", False)
+        )
+        assert req_meta.is_sparse_decode
+        assert req_meta.load_spec is not None
+        assert req_meta.load_spec.can_load
 
     def test_first_decode_step_keeps_short_prompt_resident(self) -> None:
         impl = _make_scheduler_impl()
@@ -1016,7 +1065,6 @@ class TestBuildConnectorMetaSparseSyntheticLoadSpec:
         req_id = "sparse-req"
         prompt_len = 256
         vllm_req = _make_vllm_request(req_id, prompt_len, prompt_len + 1, 999)
-
         impl._unfinished_requests[req_id] = vllm_req
         tracker = RequestTracker(
             req_id=req_id,
