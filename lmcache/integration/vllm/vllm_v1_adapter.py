@@ -86,6 +86,7 @@ DECODE_WINDOW_SAVE_COMMIT_DELAY_WINDOWS_ENV = (
 RETRIEVE_STATS_INTERVAL_SECONDS_ENV = (
     "VLLM_ASCEND_LMCACHE_RETRIEVE_STATS_INTERVAL_SECONDS"
 )
+STAGED_SFA_FRONTIER_CONTRACT_VERSION = 2
 LayerwiseSaveKey = tuple[str, str, int, int, int]
 
 
@@ -433,6 +434,10 @@ class LoadSpec:
     dsa_committed_end: Optional[int] = None
     # Fixed resident prefix capacity used by DSA MTP union scratch.
     dsa_scratch_capacity: Optional[int] = None
+    # Frontier authorized for scheduler-side latent block release this step.
+    dsa_release_frontier: Optional[int] = None
+    # Frontier released from the current vLLM block table (not request history).
+    dsa_released_frontier: int = 0
 
 
 @dataclass
@@ -559,6 +564,13 @@ class RequestTracker:
     # Decode window save only: highest token boundary confirmed readable from
     # LMCache by worker-side completion output.
     decode_window_save_committed_end: int = field(default=0, repr=False)
+    # Highest frontier ever authorized for scheduler-side block release. This
+    # is sticky physical-residency provenance and survives rollback/preemption.
+    dsa_released_frontier: int = field(default=0, repr=False)
+    # Released frontier for the CURRENT vLLM block table. Preemption allocates
+    # a fresh table, so this resets to zero while the sticky high-water mark
+    # above remains available to recover sparse state from LMCache.
+    dsa_current_released_frontier: int = field(default=0, repr=False)
     # Scheduler-side completions acknowledged to unblock subsequent saves but
     # intentionally withheld from committed_end and local-block release.
     decode_window_save_pending_commits: deque[int] = field(
@@ -663,11 +675,15 @@ class RequestTracker:
             # reset the number of saved tokens
             self.num_saved_tokens = lmcache_cached_tokens
             self.num_lmcache_cached_tokens = lmcache_cached_tokens
-            self.decode_window_save_committed_end = lmcache_cached_tokens
+            self.decode_window_save_committed_end = max(
+                lmcache_cached_tokens,
+                self.dsa_released_frontier,
+            )
             self.decode_window_save_next_start = None
             self.decode_window_save_anchor = None
             self.decode_window_save_inflight_end = None
             self.decode_window_save_pending_commits.clear()
+            self.dsa_current_released_frontier = 0
             num_computed_tokens = max(lmcache_cached_tokens, vllm_cached_tokens)
 
             # FIX: For preempted requests, restore token_ids from the full
@@ -834,6 +850,13 @@ class ReqMeta:
 
     # Whether is sparse attention and decode or not
     is_sparse_decode: bool = False
+    # Effective frontier whose latent blocks are not resident in the main
+    # block table for this request step. Zero explicitly proves residence.
+    dsa_released_frontier: int = 0
+    # Sticky request-lifetime release high-water mark. This distinguishes a
+    # never-released sparse transition from a fresh/preempted block table that
+    # still needs recovery from LMCache.
+    dsa_release_history_frontier: int = 0
     # Warm sparse decode reuses request-owned worker state and omits
     # sequence-length metadata from SchedulerOutput.
     sparse_warm_ref: bool = False
@@ -1014,6 +1037,12 @@ class ReqMeta:
             elif len(tracker.sparse_token_ids) > sparse_token_count:
                 input_token_ids = tracker.sparse_token_ids[:sparse_token_count]
         input_token_len = len(input_token_ids)
+        metadata_released_frontier = tracker.dsa_current_released_frontier
+        if is_sparse_decode and load_spec is not None:
+            metadata_released_frontier = min(
+                metadata_released_frontier,
+                int(load_spec.dsa_released_frontier),
+            )
 
         is_last_prefill = False
         if input_token_len >= tracker.prompt_len:
@@ -1110,6 +1139,8 @@ class ReqMeta:
                 token_ids=[],
                 is_last_prefill=True,
                 is_sparse_decode=False,
+                dsa_released_frontier=metadata_released_frontier,
+                dsa_release_history_frontier=tracker.dsa_released_frontier,
                 save_spec=SaveSpec(
                     skip_leading_tokens,
                     False,
@@ -1170,6 +1201,10 @@ class ReqMeta:
                     token_ids=[],
                     is_last_prefill=True,
                     is_sparse_decode=True,
+                    dsa_released_frontier=metadata_released_frontier,
+                    dsa_release_history_frontier=(
+                        tracker.dsa_released_frontier
+                    ),
                     sparse_warm_ref=True,
                     save_spec=save_spec,
                     load_spec=load_spec,
@@ -1387,6 +1422,8 @@ class ReqMeta:
             windowed_sparse_save=windowed_sparse_save,
             is_last_prefill=is_last_prefill,
             is_sparse_decode=is_sparse_decode,
+            dsa_released_frontier=metadata_released_frontier,
+            dsa_release_history_frontier=tracker.dsa_released_frontier,
             save_spec=save_spec,
             load_spec=load_spec,
             disagg_spec=tracker.disagg_spec,
@@ -1412,6 +1449,9 @@ class ReqMeta:
 @dataclass
 class LMCacheConnectorMetadata(KVConnectorMetadata):
     requests: list[ReqMeta] = field(default_factory=list)
+    staged_sfa_frontier_contract_version: int = (
+        STAGED_SFA_FRONTIER_CONTRACT_VERSION
+    )
 
     @_lmcache_nvtx_annotate
     def add_request(self, req_meta: ReqMeta) -> None:
@@ -3429,22 +3469,31 @@ class LMCacheConnectorV1Impl:
         """Publish the cache-hit frontier after the first sparse step completes."""
         if not request.is_sparse_decode or request.load_spec is None:
             return
-        committed_end = (
-            getattr(request.load_spec, "dsa_release_frontier", None)
-            if getattr(request.load_spec, "dsa_release_frontier", None)
-            is not None
-            else request.load_spec.dsa_committed_end
-        )
+        committed_end = request.load_spec.dsa_release_frontier
         if committed_end is None or committed_end <= 0:
             return
         published = getattr(self, "_initial_sparse_release_published", None)
         if published is None:
             published = set()
             self._initial_sparse_release_published = published
+        if request.resumed_from_preemption and not getattr(
+            request,
+            "_initial_sparse_release_rearmed",
+            False,
+        ):
+            # The request ID is unchanged, but vLLM allocated a new block
+            # table. Re-arm the one-shot release after its sparse recovery
+            # load completes.
+            published.discard(request.req_id)
+            request._initial_sparse_release_rearmed = True
         if request.req_id in published:
             return
         completed = getattr(self, "_completed_decode_window_saves", None)
-        if completed is None:
+        if (
+            completed is None
+            or committed_end <= request.dsa_released_frontier
+            or committed_end <= request.load_spec.dsa_released_frontier
+        ):
             return
         completed[request.req_id] = max(
             completed.get(request.req_id, 0), int(committed_end)
@@ -3537,7 +3586,21 @@ class LMCacheConnectorV1Impl:
                 # The first sparse step confirms that the externally loaded
                 # prefix can be released. It may arrive after decode-window
                 # tracking has already advanced to the full appended prompt.
-                published[req_id] = committed_end
+                tracker.decode_window_save_committed_end = max(
+                    tracker.decode_window_save_committed_end,
+                    committed_end,
+                )
+                release_end = self._eligible_dsa_release_frontier(
+                    tracker,
+                    committed_end,
+                )
+                if release_end > tracker.dsa_current_released_frontier:
+                    tracker.dsa_current_released_frontier = release_end
+                    tracker.dsa_released_frontier = max(
+                        tracker.dsa_released_frontier,
+                        release_end,
+                    )
+                    published[req_id] = release_end
                 continue
             if (
                 tracker.decode_window_save_next_start is not None
@@ -3616,7 +3679,17 @@ class LMCacheConnectorV1Impl:
             tracker.decode_window_save_committed_end = max(
                 committed_before, publish_end
             )
-            published[req_id] = publish_end
+            release_end = self._eligible_dsa_release_frontier(
+                tracker,
+                publish_end,
+            )
+            if release_end > tracker.dsa_current_released_frontier:
+                tracker.dsa_current_released_frontier = release_end
+                tracker.dsa_released_frontier = max(
+                    tracker.dsa_released_frontier,
+                    release_end,
+                )
+                published[req_id] = release_end
             _mtp_dw_event(
                 "commit",
                 req=req_id,
@@ -3646,6 +3719,22 @@ class LMCacheConnectorV1Impl:
         # frontiers keeps release and split_boundary on the same commit point.
         completed.clear()
         completed.update(published)
+
+    def _eligible_dsa_release_frontier(
+        self,
+        tracker: RequestTracker,
+        committed_end: int,
+    ) -> int:
+        """Return a safe release authorization for a persisted frontier."""
+        dense_threshold = int(getattr(self, "_dsa_dense_threshold", 0) or 0)
+        release_gate = max(self._dsa_scratch_capacity, dense_threshold)
+        sparse_active = bool(
+            tracker.dsa_released_frontier > 0
+            or len(tracker.token_ids) > dense_threshold
+        )
+        if not sparse_active or committed_end <= release_gate:
+            return 0
+        return int(committed_end)
 
     def _mark_worker_retrieve_registry_changed(self) -> None:
         self._worker_retrieve_registry_version = (
@@ -8139,6 +8228,7 @@ class LMCacheConnectorV1Impl:
             vllm_cached_tokens=num_computed_tokens,
             lmcache_cached_tokens=num_external_hit_tokens,
             can_load=False,
+            dsa_released_frontier=0,
         )
         if dsa_cold_compact_load:
             setattr(self.load_specs[req_id], "dsa_cold_compact_load", True)
@@ -8156,11 +8246,7 @@ class LMCacheConnectorV1Impl:
             )
             if dsa_cold_compact_load:
                 self.load_specs[req_id].dsa_committed_end = remap_frontier
-                setattr(
-                    self.load_specs[req_id],
-                    "dsa_release_frontier",
-                    release_frontier,
-                )
+                self.load_specs[req_id].dsa_release_frontier = release_frontier
             else:
                 self.load_specs[req_id].dsa_committed_end = release_frontier
             self.load_specs[req_id].dsa_scratch_capacity = (
@@ -8427,17 +8513,19 @@ class LMCacheConnectorV1Impl:
     def _init_decode_window_save_start(self, tracker: RequestTracker) -> int:
         if tracker.decode_window_save_next_start is not None:
             return tracker.decode_window_save_next_start
-        start = (
+        prompt_start = (
             tracker.prompt_len
             // self._lmcache_chunk_size
             * self._lmcache_chunk_size
         )
+        start = max(prompt_start, tracker.dsa_released_frontier)
         tracker.decode_window_save_anchor = start
         tracker.decode_window_save_next_start = start
-        tracker.decode_window_save_committed_end = (
+        tracker.decode_window_save_committed_end = max(
+            tracker.dsa_released_frontier,
             min(tracker.decode_window_save_committed_end, start)
             // self._lmcache_chunk_size
-            * self._lmcache_chunk_size
+            * self._lmcache_chunk_size,
         )
         return start
 
@@ -8685,6 +8773,7 @@ class LMCacheConnectorV1Impl:
 
         for finished_req_id in scheduler_output.finished_req_ids:
             tracker = self._request_trackers.pop(finished_req_id, None)
+            self._dsa_dense_path_states.pop(finished_req_id, None)
             if tracker is not None:
                 self._trace_decode_window_decision(
                     tracker, decision="request_finish", reason="request_finished"
@@ -8777,13 +8866,17 @@ class LMCacheConnectorV1Impl:
                 ),
             )
             if load_spec is not None and load_spec.dsa_committed_end is not None:
-                release_frontier = getattr(
-                    load_spec, "dsa_release_frontier", None
-                )
+                release_frontier = load_spec.dsa_release_frontier
                 request_tracker.decode_window_save_committed_end = int(
                     release_frontier
                     if release_frontier is not None
                     else load_spec.dsa_committed_end
+                )
+                request_tracker.dsa_released_frontier = int(
+                    load_spec.dsa_released_frontier
+                )
+                request_tracker.dsa_current_released_frontier = int(
+                    load_spec.dsa_released_frontier
                 )
             if cold_compact_resume:
                 setattr(
@@ -8947,16 +9040,29 @@ class LMCacheConnectorV1Impl:
                 request_tracker.num_saved_tokens = min(
                     request_tracker.num_saved_tokens, tokens_to_keep
                 )
-                request_tracker.decode_window_save_committed_end = min(
-                    request_tracker.decode_window_save_committed_end,
-                    tokens_to_keep,
+                request_tracker.decode_window_save_committed_end = max(
+                    min(
+                        request_tracker.decode_window_save_committed_end,
+                        tokens_to_keep,
+                    ),
+                    request_tracker.dsa_released_frontier,
                 )
                 request_tracker.decode_window_save_next_start = None
                 request_tracker.decode_window_save_anchor = None
                 request_tracker.decode_window_save_inflight_end = None
                 request_tracker.decode_window_save_pending_commits.clear()
                 request_tracker.sparse_meta_frontier = None
-                if hasattr(request_tracker, "sparse_remap_frontier"):
+                # Physical block release is not rolled back with logical token
+                # progress. Keep both the sticky released provenance and the
+                # sparse route; a later main metadata entry must either prove
+                # a loadable frontier or fail closed in vLLM-Ascend.
+                if request_tracker.dsa_released_frontier > 0:
+                    setattr(
+                        request_tracker,
+                        "sparse_remap_frontier",
+                        request_tracker.dsa_released_frontier,
+                    )
+                elif hasattr(request_tracker, "sparse_remap_frontier"):
                     delattr(request_tracker, "sparse_remap_frontier")
 
             # Pass all_token_ids for preempted requests to restore
@@ -8971,7 +9077,6 @@ class LMCacheConnectorV1Impl:
                 vllm_cached_tokens=vllm_cached_tokens,
                 all_token_ids=all_token_ids,
             )
-
             self._add_decode_window_save_metas(meta, request_tracker)
             # Dense fast-path (方案 A): the path decision follows the CURRENT
             # context length, not the initial prompt_len. A short prompt that
@@ -8980,9 +9085,15 @@ class LMCacheConnectorV1Impl:
             # generations get the same sparse behavior as long prompts.
             is_sparse_decode = (
                 self.enable_sparse_attention
-                and request.num_computed_tokens >= request_tracker.prompt_len
-                and len(request_tracker.token_ids)
-                > getattr(self, "_dsa_dense_threshold", 0)
+                and (
+                    (
+                        request.num_computed_tokens
+                        >= request_tracker.prompt_len
+                        and len(request_tracker.token_ids)
+                        > getattr(self, "_dsa_dense_threshold", 0)
+                    )
+                    or request_tracker.dsa_released_frontier > 0
+                )
             )
             if self._dsa_dense_path_log:
                 self._log_dsa_dense_path(
@@ -9014,6 +9125,10 @@ class LMCacheConnectorV1Impl:
                         save_frontier,
                         token_len,
                     )
+                lmcache_cached_for_sparse = max(
+                    lmcache_cached_for_sparse,
+                    request_tracker.dsa_released_frontier,
+                )
                 committed_end = (
                     lmcache_cached_for_sparse
                     // self._lmcache_chunk_size
@@ -9053,7 +9168,15 @@ class LMCacheConnectorV1Impl:
                     # complete prompt source, so shrinking this frontier would
                     # discard the prepared worker state and reload both groups.
                     lmcache_cached_for_sparse = max(
-                        lmcache_cached_for_sparse, request_tracker.prompt_len
+                        lmcache_cached_for_sparse,
+                        request_tracker.prompt_len,
+                        int(dsa_remap_frontier),
+                    )
+                if len(request.all_token_ids) < lmcache_cached_for_sparse:
+                    raise RuntimeError(
+                        "Sparse frontier exceeds available request tokens: "
+                        f"req_id={req_id} frontier={lmcache_cached_for_sparse} "
+                        f"tokens={len(request.all_token_ids)}"
                     )
                 if (
                     len(request_tracker.sparse_token_ids)
@@ -9069,13 +9192,15 @@ class LMCacheConnectorV1Impl:
                     can_load=lmcache_cached_for_sparse > 0,
                     dsa_committed_end=dsa_remap_frontier,
                     dsa_scratch_capacity=self._dsa_scratch_capacity,
+                    dsa_release_frontier=(
+                        dsa_release_frontier
+                        if dsa_release_frontier > 0
+                        else None
+                    ),
+                    dsa_released_frontier=(
+                        request_tracker.dsa_current_released_frontier
+                    ),
                 )
-                if hasattr(request_tracker, "sparse_remap_frontier"):
-                    setattr(
-                        load_spec,
-                        "dsa_release_frontier",
-                        dsa_release_frontier,
-                    )
 
             req_meta = self._build_request_meta(
                 request_tracker,
@@ -9097,6 +9222,7 @@ class LMCacheConnectorV1Impl:
         # This callback runs in the scheduler process. Worker-owned state is
         # released when the same request ID reaches worker-side get_finished().
         self._cold_perf_lookup_started.pop(request.request_id, None)
+        self._dsa_dense_path_states.pop(request.request_id, None)
         self._release_request_lookup_pins(request.request_id)
         # Layerwise save uses request-scoped generators. If request finishes
         # without entering wait_for_save (abort/error/evict path), make sure
