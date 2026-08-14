@@ -59,9 +59,9 @@ def _make_scheduler_impl() -> LMCacheConnectorV1Impl:
     impl._decode_window_save_window_size = 0
     impl._decode_window_save_commit_delay_windows = 0
     impl._dsa_scratch_capacity = 4096
-    impl._dsa_dense_threshold = 0
-    impl._dsa_dense_path_log = False
-    impl._dsa_dense_path_states = {}
+    impl._dsa_kv_policy_threshold = 0
+    impl._dsa_kv_policy_log = False
+    impl._dsa_kv_policy_states = {}
     impl._cold_perf_lookup_started = {}
     impl._discard_partial_chunks = True
     impl._request_trackers = {}
@@ -85,6 +85,34 @@ def _make_vllm_request(
         num_computed_tokens=num_computed,
         all_token_ids=prompt + [decode_token],
     )
+
+
+def test_dsa_kv_policy_log_uses_storage_semantics(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    impl = _make_scheduler_impl()
+    impl._dsa_kv_policy_log = True
+    log = MagicMock()
+    monkeypatch.setattr(adapter_module, "logger", log)
+
+    impl._log_dsa_kv_policy("req-1", False, 1024, 1025)
+    impl._log_dsa_kv_policy("req-1", False, 1024, 1026)
+    impl._log_dsa_kv_policy("req-1", True, 1024, 1027)
+
+    assert log.info.call_count == 2
+    first = log.info.call_args_list[0].args
+    assert first[:4] == (
+        "[DSA_KV_POLICY] req=%s kv_policy=%s%s prompt_len=%d computed=%d threshold=%d",
+        "req-1",
+        "full_resident",
+        " (first)",
+    )
+    second = log.info.call_args_list[1].args
+    assert second[2:4] == (
+        "sparse_managed",
+        " (switched from full_resident)",
+    )
+    assert "path=dense" not in first[0]
 
 
 @pytest.mark.parametrize("kv_role", ["kv_consumer", "kv_both"])
@@ -207,19 +235,18 @@ def test_dsa_cold_compact_is_skipped_when_frontier_below_scratch_capacity() -> N
     assert impl.load_specs[long.request_id].dsa_cold_compact_load
 
 
-def test_dsa_cold_compact_is_skipped_within_dense_threshold() -> None:
-    """Regression: 0808-2 (方案 A threshold gate). A prompt within the dense
-    fast-path threshold is served densely from the main blocks, so cold
-    compact (compact KV materialized in indexer blocks) is pure overhead — and
-    its async load thread races serving-time graph captures on the device
-    (device error 507057). Such prompts take the normal dense-prefix load path
-    instead; only prompts beyond the threshold keep the compact load."""
+def test_dsa_cold_compact_is_skipped_within_kv_policy_threshold() -> None:
+    """Regression: 0808-2 (方案 A threshold gate). A prompt within the KV-policy
+    threshold uses resident main blocks, so cold compact (compact KV
+    materialized in indexer blocks) is pure overhead. Such prompts take the
+    normal dense-prefix load path; only prompts beyond the threshold keep the
+    compact load."""
     impl = _make_scheduler_impl()
     impl.config.enable_dsa_cold_compact_load = True
     impl.config.dsa_two_groups = True
     impl.config.enable_shared_cpu_cache = True
     impl.config.min_retrieve_tokens = 0
-    impl._dsa_dense_threshold = 10000
+    impl._dsa_kv_policy_threshold = 10000
     lookup_client = MagicMock()
     impl._manager = SimpleNamespace(lookup_client=lookup_client)
 
@@ -247,7 +274,7 @@ def test_dsa_cold_compact_is_skipped_within_dense_threshold() -> None:
 
     # Threshold disabled (0): the same prompt engages the compact load again
     # (baseline behavior preserved when the dense fast-path is off).
-    impl._dsa_dense_threshold = 0
+    impl._dsa_kv_policy_threshold = 0
     lookup_client.lookup_cache.return_value = 8378
     control = SimpleNamespace(
         request_id="threshold-disabled", num_tokens=8378
@@ -284,7 +311,7 @@ def test_dsa_cold_compact_threshold_alignment_boundaries(
     impl.config.enable_shared_cpu_cache = True
     impl.config.min_retrieve_tokens = 0
     impl._block_size = 128
-    impl._dsa_dense_threshold = 10_000
+    impl._dsa_kv_policy_threshold = 10_000
     lookup_client = MagicMock()
     lookup_client.lookup_cache.return_value = prompt_len
     impl._manager = SimpleNamespace(lookup_client=lookup_client)
@@ -310,7 +337,7 @@ def test_cold_compact_nonresident_frontier_survives_threshold_rollback(
     """Cold compact omits main latent KV even before any block release."""
     impl = _make_scheduler_impl()
     impl.config.dsa_two_groups = True
-    impl._dsa_dense_threshold = 10_000
+    impl._dsa_kv_policy_threshold = 10_000
     req_id = f"cold-rollback-{prompt_len}"
     committed = prompt_len - 1
     release = committed // impl._lmcache_chunk_size * impl._lmcache_chunk_size
@@ -375,7 +402,7 @@ def test_cold_compact_nonresident_frontier_survives_threshold_rollback(
     )
 
     rollback_meta = impl.build_connector_meta(rollback_output).requests[0]
-    assert len(tracker.token_ids) <= impl._dsa_dense_threshold
+    assert len(tracker.token_ids) <= impl._dsa_kv_policy_threshold
     assert tracker.dsa_nonresident_frontier == committed
     assert tracker.dsa_current_released_frontier == 0
     assert rollback_meta.is_sparse_decode
@@ -984,7 +1011,7 @@ class TestBuildConnectorMetaSparseSyntheticLoadSpec:
         """方案 A: with the default threshold 0 (unset or '0') the dense
         fast-path is disabled, so even short prompts keep sparse decode."""
         impl = _make_scheduler_impl()
-        impl._dsa_dense_threshold = 0
+        impl._dsa_kv_policy_threshold = 0
         req_id = "zero-threshold"
         prompt_len = 300
         decode_token = 999
@@ -1018,11 +1045,11 @@ class TestBuildConnectorMetaSparseSyntheticLoadSpec:
         assert req_meta.is_sparse_decode
         assert req_meta.load_spec is not None
 
-    def test_short_prompt_within_dense_threshold_skips_sparse_decode(
+    def test_short_prompt_within_kv_policy_threshold_is_full_resident(
         self,
     ) -> None:
-        """方案 A: requests whose prompt_len is within the dense threshold take
-        the dense path (is_sparse_decode=False) instead of the sparse decode.
+        """方案 A: requests within the KV-policy threshold use the
+        full-resident policy (is_sparse_decode=False).
 
         Regression: 0806-4. The FIRST compute step (token_ids == prompt_len,
         is_decode_phase still False, e.g. right after a cold-compact load) must
@@ -1031,10 +1058,10 @@ class TestBuildConnectorMetaSparseSyntheticLoadSpec:
         MISSING_CONNECTOR_METADATA, falls back to the eager path, and the
         torch_npu fx compiler captures ACL graphs at serving time — which is
         illegal to overlap with the async cold-compact load thread's
-        synchronized device copies (device error 507057). Keeping every dense
-        step staged means the fx compiler never captures during serving."""
+        synchronized device copies (device error 507057). Keeping every
+        full-resident step staged prevents serving-time graph capture."""
         impl = _make_scheduler_impl()
-        impl._dsa_dense_threshold = 2048
+        impl._dsa_kv_policy_threshold = 2048
         req_id = "short-prompt"
         prompt_len = 300
         decode_token = 999
@@ -1071,13 +1098,13 @@ class TestBuildConnectorMetaSparseSyntheticLoadSpec:
         assert req_meta.save_spec is not None
         assert not req_meta.save_spec.can_save
 
-    def test_long_prompt_beyond_dense_threshold_keeps_sparse_decode(
+    def test_long_prompt_beyond_kv_policy_threshold_is_sparse_managed(
         self,
     ) -> None:
-        """方案 A: requests whose prompt_len exceeds the dense threshold keep
-        the sparse decode path unchanged."""
+        """方案 A: requests beyond the KV-policy threshold keep the
+        sparse-managed behavior."""
         impl = _make_scheduler_impl()
-        impl._dsa_dense_threshold = 2048
+        impl._dsa_kv_policy_threshold = 2048
         req_id = "long-prompt"
         prompt_len = 4096
         decode_token = 999
@@ -1114,13 +1141,11 @@ class TestBuildConnectorMetaSparseSyntheticLoadSpec:
     def test_short_prompt_growing_past_threshold_switches_to_sparse(
         self,
     ) -> None:
-        """方案 A: the dense/sparse path decision follows the CURRENT context
-        length. A short prompt that grows past the dense threshold during
-        generation switches back to the sparse decode path (window save
-        frontier / release gating), so long-running generations get the same
-        sparse behavior as long prompts."""
+        """方案 A: the KV-policy decision follows the CURRENT context length. A
+        short prompt that grows past the threshold switches from full-resident
+        to sparse-managed loading/release behavior."""
         impl = _make_scheduler_impl()
-        impl._dsa_dense_threshold = 2048
+        impl._dsa_kv_policy_threshold = 2048
         impl._decode_window_save_window_size = 256
         req_id = "grown-prompt"
         prompt_len = 300
@@ -1919,7 +1944,7 @@ class TestZombieRequestInMetadata:
             allocated_block_ids=[0],
         )
         impl._unfinished_requests[req_id] = SimpleNamespace(request_id=req_id)
-        impl._dsa_dense_path_states[req_id] = "sparse"
+        impl._dsa_kv_policy_states[req_id] = "sparse_managed"
 
         scheduler_output = StubSchedulerOutput(
             finished_req_ids={req_id},
@@ -1935,7 +1960,7 @@ class TestZombieRequestInMetadata:
         impl.build_connector_meta(scheduler_output)
         assert req_id not in impl._request_trackers
         assert req_id not in impl._unfinished_requests
-        assert req_id not in impl._dsa_dense_path_states
+        assert req_id not in impl._dsa_kv_policy_states
 
 
 class TestDecodeWindowSaveMetadata:
@@ -2237,10 +2262,10 @@ class TestDecodeWindowSaveMetadata:
         assert tracker.dsa_current_released_frontier == 0
         assert tracker.sparse_remap_frontier == 10_000
 
-    def test_decode_window_release_is_gated_by_dense_threshold(self) -> None:
+    def test_decode_window_release_is_gated_by_kv_policy_threshold(self) -> None:
         impl = _make_scheduler_impl()
         impl._decode_window_save_window_size = 256
-        impl._dsa_dense_threshold = 10000
+        impl._dsa_kv_policy_threshold = 10000
         tracker = RequestTracker(
             req_id="threshold-gate",
             prompt_len=5120,
@@ -2278,7 +2303,7 @@ class TestDecodeWindowSaveMetadata:
 
     def test_preempted_block_table_can_republish_sticky_frontier(self) -> None:
         impl = _make_scheduler_impl()
-        impl._dsa_dense_threshold = 10000
+        impl._dsa_kv_policy_threshold = 10000
         tracker = RequestTracker(
             req_id="preempted-release",
             prompt_len=12000,

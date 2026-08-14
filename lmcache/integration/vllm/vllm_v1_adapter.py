@@ -1124,7 +1124,7 @@ class ReqMeta:
         if skip_save and load_spec is None:
             if is_sparse_decode or len(tracker.token_ids) < tracker.prompt_len:
                 return None
-            # Dense fast-path (方案 A) decode: the prefix is already resident
+            # Full-resident KV policy (方案 A): the prefix is already resident
             # and there is nothing left to load or save, but the request must
             # stay visible in the connector metadata so the staged-SFA route
             # classifies it as DENSE_PREFIX_HIT and replays the captured
@@ -1641,34 +1641,32 @@ class LMCacheConnectorV1Impl:
             (1 + max(int(getattr(vllm_config, "num_speculative_tokens", 0)), 0))
             * dsa_topk
         )
-        # Short-context dense fast-path threshold (tokens). Requests whose prompt
-        # length does not exceed this threshold skip the DSA sparse machinery and
-        # take the existing dense load path, since sparse selection over a context
-        # no longer than index_topk is mathematically identical to dense attention.
-        # 0 (default, unset or "0") disables the dense fast-path entirely (pure
-        # sparse path); a positive value is used as-is (no cap), so a value larger
-        # than index_topk forces the dense load path for longer prompts too.
-        raw_dense_threshold = os.environ.get("VLLM_ASCEND_DSA_DENSE_THRESHOLD")
-        if raw_dense_threshold is None:
-            self._dsa_dense_threshold = 0
+        # This threshold only selects the connector's KV loading/residency
+        # policy. It does not select the attention kernel: SFA attention remains
+        # sparse for both policies. 0 (default, unset or "0") disables the
+        # short-context full-resident policy; a positive value is used as-is.
+        raw_policy_threshold = os.environ.get(
+            "LMCACHE_DSA_KV_POLICY_THRESHOLD"
+        )
+        if raw_policy_threshold is None:
+            self._dsa_kv_policy_threshold = 0
         else:
             try:
-                parsed_threshold = int(raw_dense_threshold)
+                parsed_threshold = int(raw_policy_threshold)
             except (TypeError, ValueError):
                 parsed_threshold = 0
-            self._dsa_dense_threshold = (
+            self._dsa_kv_policy_threshold = (
                 parsed_threshold if parsed_threshold > 0 else 0
             )
         self.load_specs: dict[str, LoadSpec] = {}
         self._request_trackers: dict[str, RequestTracker] = {}
-        # Per-request dense-vs-sparse path state for diagnostics
-        # (VLLM_ASCEND_DSA_DENSE_PATH_LOG). Maps req_id -> "dense"/"sparse"
-        # for the last scheduled step; used to log path (re)entries/switches
-        # exactly once per transition.
-        self._dsa_dense_path_log = os.environ.get(
-            "VLLM_ASCEND_DSA_DENSE_PATH_LOG", "0"
+        # Per-request KV policy state for diagnostics. This is intentionally
+        # named independently of the attention path: both policies use sparse
+        # attention. Log policy (re)entries/switches once per transition.
+        self._dsa_kv_policy_log = os.environ.get(
+            "LMCACHE_DSA_KV_POLICY_LOG", "0"
         ).lower() in ("1", "true", "yes", "on")
-        self._dsa_dense_path_states: dict[str, str] = {}
+        self._dsa_kv_policy_states: dict[str, str] = {}
 
         self._discard_partial_chunks = (
             vllm_config.kv_transfer_config.get_from_extra_config(
@@ -3722,11 +3720,13 @@ class LMCacheConnectorV1Impl:
         committed_end: int,
     ) -> int:
         """Return a safe release authorization for a persisted frontier."""
-        dense_threshold = int(getattr(self, "_dsa_dense_threshold", 0) or 0)
-        release_gate = max(self._dsa_scratch_capacity, dense_threshold)
+        policy_threshold = int(
+            getattr(self, "_dsa_kv_policy_threshold", 0) or 0
+        )
+        release_gate = max(self._dsa_scratch_capacity, policy_threshold)
         sparse_active = bool(
             tracker.dsa_nonresident_frontier > 0
-            or len(tracker.token_ids) > dense_threshold
+            or len(tracker.token_ids) > policy_threshold
         )
         if not sparse_active or committed_end <= release_gate:
             return 0
@@ -8180,15 +8180,14 @@ class LMCacheConnectorV1Impl:
             # requires a frontier of zero or >= scratch_capacity; a smaller
             # frontier (e.g. a short prompt) is rejected by the staged-SFA
             # route (frontier_too_short FATAL). Such prompts take the normal
-            # dense-prefix load path instead (short-context dense fast-path).
+            # dense-prefix load path instead (short-context full-resident
+            # policy).
             and num_external_hit_tokens - 1 >= self._dsa_scratch_capacity
-            # Short-context dense fast-path (方案 A): a prompt within the
-            # dense threshold is served densely from the main blocks, so the
-            # compact KV load is pure overhead — and its async thread races
-            # serving-time graph captures on the device. Skip cold compact
-            # entirely for these prompts (normal dense-prefix load instead).
+            # Short-context full-resident policy (方案 A): a prompt within the
+            # threshold is served from resident main blocks, so compact KV load
+            # is pure overhead. Skip it in favor of normal dense-prefix load.
             and num_external_hit_tokens > getattr(
-                self, "_dsa_dense_threshold", 0
+                self, "_dsa_kv_policy_threshold", 0
             )
         )
         below_min_retrieve = (
@@ -8533,34 +8532,34 @@ class LMCacheConnectorV1Impl:
         )
         return start
 
-    def _log_dsa_dense_path(
+    def _log_dsa_kv_policy(
         self,
         req_id: str,
         is_sparse_decode: bool,
         prompt_len: int,
         num_computed_tokens: int,
     ) -> None:
-        """Log the dense-vs-sparse decode path for one request, once per
-        transition (or on first appearance).
+        """Log the connector KV policy once per request transition.
 
-        "dense"  = the DSA dense fast-path (short-context dense load);
-        "sparse" = the DSA sparse decode path. Controlled by
-        VLLM_ASCEND_DSA_DENSE_PATH_LOG=1.
+        ``full_resident`` uses full-prefix loading and keeps the main latent
+        resident. ``sparse_managed`` enables sparse loading/offload lifecycle
+        management. Both policies continue to use sparse attention. Controlled
+        by ``LMCACHE_DSA_KV_POLICY_LOG=1``.
         """
-        path = "sparse" if is_sparse_decode else "dense"
-        prev = self._dsa_dense_path_states.get(req_id)
-        if prev == path:
+        policy = "sparse_managed" if is_sparse_decode else "full_resident"
+        prev = self._dsa_kv_policy_states.get(req_id)
+        if prev == policy:
             return
-        self._dsa_dense_path_states[req_id] = path
+        self._dsa_kv_policy_states[req_id] = policy
         logger.info(
-            "[DSA_DENSE_PATH] req=%s path=%s%s prompt_len=%d computed=%d "
+            "[DSA_KV_POLICY] req=%s kv_policy=%s%s prompt_len=%d computed=%d "
             "threshold=%d",
             req_id,
-            path,
+            policy,
             f" (switched from {prev})" if prev is not None else " (first)",
             prompt_len,
             num_computed_tokens,
-            getattr(self, "_dsa_dense_threshold", 0),
+            getattr(self, "_dsa_kv_policy_threshold", 0),
         )
 
     def _build_request_meta(
@@ -8777,7 +8776,7 @@ class LMCacheConnectorV1Impl:
 
         for finished_req_id in scheduler_output.finished_req_ids:
             tracker = self._request_trackers.pop(finished_req_id, None)
-            self._dsa_dense_path_states.pop(finished_req_id, None)
+            self._dsa_kv_policy_states.pop(finished_req_id, None)
             if tracker is not None:
                 self._trace_decode_window_decision(
                     tracker, decision="request_finish", reason="request_finished"
@@ -9078,11 +9077,10 @@ class LMCacheConnectorV1Impl:
                 all_token_ids=all_token_ids,
             )
             self._add_decode_window_save_metas(meta, request_tracker)
-            # Dense fast-path (方案 A): the path decision follows the CURRENT
-            # context length, not the initial prompt_len. A short prompt that
-            # grows past the threshold during decode switches to the sparse
-            # path (window save frontier / release gating), so long-running
-            # generations get the same sparse behavior as long prompts.
+            # KV policy (方案 A) follows the CURRENT context length, not the
+            # initial prompt_len. A short prompt that grows past the threshold
+            # switches from full-resident to sparse-managed loading/release;
+            # attention remains sparse under both policies.
             is_sparse_decode = (
                 self.enable_sparse_attention
                 and (
@@ -9090,13 +9088,13 @@ class LMCacheConnectorV1Impl:
                         request.num_computed_tokens
                         >= request_tracker.prompt_len
                         and len(request_tracker.token_ids)
-                        > getattr(self, "_dsa_dense_threshold", 0)
+                        > getattr(self, "_dsa_kv_policy_threshold", 0)
                     )
                     or request_tracker.dsa_nonresident_frontier > 0
                 )
             )
-            if self._dsa_dense_path_log:
-                self._log_dsa_dense_path(
+            if self._dsa_kv_policy_log:
+                self._log_dsa_kv_policy(
                     req_id,
                     is_sparse_decode,
                     request_tracker.prompt_len,
@@ -9139,7 +9137,7 @@ class LMCacheConnectorV1Impl:
                     if committed_end
                     > max(
                         self._dsa_scratch_capacity,
-                        getattr(self, "_dsa_dense_threshold", 0),
+                        getattr(self, "_dsa_kv_policy_threshold", 0),
                     )
                     else 0
                 )
@@ -9220,7 +9218,7 @@ class LMCacheConnectorV1Impl:
         # This callback runs in the scheduler process. Worker-owned state is
         # released when the same request ID reaches worker-side get_finished().
         self._cold_perf_lookup_started.pop(request.request_id, None)
-        self._dsa_dense_path_states.pop(request.request_id, None)
+        self._dsa_kv_policy_states.pop(request.request_id, None)
         self._release_request_lookup_pins(request.request_id)
         # Layerwise save uses request-scoped generators. If request finishes
         # without entering wait_for_save (abort/error/evict path), make sure

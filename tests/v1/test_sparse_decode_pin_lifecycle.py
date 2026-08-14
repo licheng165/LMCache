@@ -52,11 +52,11 @@ class TestSparseDecodePinLifecycle:
         connector._drop_layerwise_save_storers = MagicMock()
         connector._drop_worker_retrieve_state = MagicMock()
         connector._cold_perf_lookup_started = {}
-        connector._dsa_dense_path_states = {"req-finish": "sparse"}
+        connector._dsa_kv_policy_states = {"req-finish": "sparse_managed"}
 
         connector.request_finished(make_stub_request("req-finish"), [])
         assert engine.unpinned == ["req-finish"]
-        assert connector._dsa_dense_path_states == {}
+        assert connector._dsa_kv_policy_states == {}
         connector._drop_layerwise_save_storers.assert_not_called()
         connector._drop_worker_retrieve_state.assert_called_once_with("req-finish")
 
