@@ -117,12 +117,6 @@ def test_dsa_prefix_hit_uses_full_allocation_and_chunk_aligned_committed_end(
     assert not hasattr(request, "dsa_external_tail_chunk_start")
 
 
-def test_frontier_contract_metadata_is_versioned() -> None:
-    metadata = adapter_module.LMCacheConnectorMetadata()
-
-    assert metadata.staged_sfa_frontier_contract_version == 2
-
-
 def test_dsa_cold_compact_async_requires_complete_prompt_hit() -> None:
     impl = _make_scheduler_impl()
     impl.config.enable_dsa_cold_compact_load = True
@@ -136,12 +130,10 @@ def test_dsa_cold_compact_async_requires_complete_prompt_hit() -> None:
 
     assert impl.get_num_new_matched_tokens(request, 0) == 8191
     assert impl.should_load_kv_async(request.request_id)
-    assert getattr(
-        impl.load_specs[request.request_id], "dsa_cold_compact_load"
-    )
+    assert impl.load_specs[request.request_id].dsa_cold_compact_load
     assert impl.load_specs[request.request_id].dsa_committed_end == 8191
     assert (
-        getattr(impl.load_specs[request.request_id], "dsa_release_frontier")
+        impl.load_specs[request.request_id].dsa_release_frontier
         == 7936
     )
 
@@ -150,7 +142,7 @@ def test_dsa_cold_compact_async_requires_complete_prompt_hit() -> None:
     assert impl.get_num_new_matched_tokens(unaligned, 0) == 8193
     assert impl.load_specs[unaligned.request_id].dsa_committed_end == 8193
     assert (
-        getattr(impl.load_specs[unaligned.request_id], "dsa_release_frontier")
+        impl.load_specs[unaligned.request_id].dsa_release_frontier
         == 8192
     )
 
@@ -212,9 +204,7 @@ def test_dsa_cold_compact_is_skipped_when_frontier_below_scratch_capacity() -> N
     long = SimpleNamespace(request_id="long-prompt", num_tokens=8192)
     assert impl.get_num_new_matched_tokens(long, 0) == 8191
     assert impl.should_load_kv_async(long.request_id)
-    assert getattr(
-        impl.load_specs[long.request_id], "dsa_cold_compact_load"
-    )
+    assert impl.load_specs[long.request_id].dsa_cold_compact_load
 
 
 def test_dsa_cold_compact_is_skipped_within_dense_threshold() -> None:
@@ -253,9 +243,7 @@ def test_dsa_cold_compact_is_skipped_within_dense_threshold() -> None:
     )
     assert impl.get_num_new_matched_tokens(long, 0) == 11999
     assert impl.should_load_kv_async(long.request_id)
-    assert getattr(
-        impl.load_specs[long.request_id], "dsa_cold_compact_load"
-    )
+    assert impl.load_specs[long.request_id].dsa_cold_compact_load
 
     # Threshold disabled (0): the same prompt engages the compact load again
     # (baseline behavior preserved when the dense fast-path is off).
@@ -266,9 +254,136 @@ def test_dsa_cold_compact_is_skipped_within_dense_threshold() -> None:
     )
     assert impl.get_num_new_matched_tokens(control, 0) == 8377
     assert impl.should_load_kv_async(control.request_id)
-    assert getattr(
-        impl.load_specs[control.request_id], "dsa_cold_compact_load"
+    assert impl.load_specs[control.request_id].dsa_cold_compact_load
+
+
+@pytest.mark.parametrize(
+    (
+        "prompt_len",
+        "expect_cold_compact",
+        "expected_committed",
+        "expected_release",
+    ),
+    [
+        (10_000, False, 9_984, None),
+        (10_001, True, 10_000, 9_984),
+        (10_240, True, 10_239, 9_984),
+        (10_241, False, 10_240, None),
+    ],
+)
+def test_dsa_cold_compact_threshold_alignment_boundaries(
+    prompt_len: int,
+    expect_cold_compact: bool,
+    expected_committed: int,
+    expected_release: int | None,
+) -> None:
+    """The compact-load gate and its raw/aligned frontiers are independent."""
+    impl = _make_scheduler_impl()
+    impl.config.enable_dsa_cold_compact_load = True
+    impl.config.dsa_two_groups = True
+    impl.config.enable_shared_cpu_cache = True
+    impl.config.min_retrieve_tokens = 0
+    impl._block_size = 128
+    impl._dsa_dense_threshold = 10_000
+    lookup_client = MagicMock()
+    lookup_client.lookup_cache.return_value = prompt_len
+    impl._manager = SimpleNamespace(lookup_client=lookup_client)
+    request = SimpleNamespace(
+        request_id=f"threshold-{prompt_len}",
+        num_tokens=prompt_len,
     )
+
+    assert impl.get_num_new_matched_tokens(request, 0) == prompt_len - 1
+    load_spec = impl.load_specs[request.request_id]
+    assert (
+        getattr(load_spec, "dsa_cold_compact_load", False)
+        is expect_cold_compact
+    )
+    assert load_spec.dsa_committed_end == expected_committed
+    assert load_spec.dsa_release_frontier == expected_release
+
+
+@pytest.mark.parametrize("prompt_len", [10_001, 10_240])
+def test_cold_compact_nonresident_frontier_survives_threshold_rollback(
+    prompt_len: int,
+) -> None:
+    """Cold compact omits main latent KV even before any block release."""
+    impl = _make_scheduler_impl()
+    impl.config.dsa_two_groups = True
+    impl._dsa_dense_threshold = 10_000
+    req_id = f"cold-rollback-{prompt_len}"
+    committed = prompt_len - 1
+    release = committed // impl._lmcache_chunk_size * impl._lmcache_chunk_size
+    num_blocks = (prompt_len + impl._block_size - 1) // impl._block_size
+    latent_blocks = list(range(num_blocks))
+    indexer_blocks = list(range(10_000, 10_000 + num_blocks))
+    prompt_tokens = list(range(prompt_len))
+    decode_token = prompt_len + 100
+    vllm_request = _make_vllm_request(
+        req_id,
+        prompt_len,
+        prompt_len - 1,
+        decode_token,
+    )
+    impl._unfinished_requests[req_id] = vllm_request
+    load_spec = LoadSpec(
+        vllm_cached_tokens=prompt_len - 1,
+        lmcache_cached_tokens=prompt_len,
+        can_load=True,
+        dsa_committed_end=committed,
+        dsa_scratch_capacity=impl._dsa_scratch_capacity,
+        dsa_release_frontier=release,
+        dsa_current_released_frontier=0,
+    )
+    load_spec.dsa_cold_compact_load = True
+    impl.load_specs[req_id] = load_spec
+    impl._dsa_cold_loaded_req_ids = {req_id}
+    new_request = SimpleNamespace(
+        req_id=req_id,
+        prompt_token_ids=prompt_tokens,
+        block_ids=[latent_blocks, indexer_blocks],
+        num_computed_tokens=prompt_len - 1,
+        sampling_params=SimpleNamespace(extra_args=None),
+    )
+    new_output = StubSchedulerOutput(
+        finished_req_ids=set(),
+        scheduled_new_reqs=[new_request],
+        scheduled_cached_reqs=StubCachedRequestData([], [], []),
+        num_scheduled_tokens={req_id: 1},
+    )
+
+    first_meta = impl.build_connector_meta(new_output).requests[0]
+    tracker = impl._request_trackers[req_id]
+    assert tracker.dsa_nonresident_frontier == committed
+    assert tracker.dsa_current_released_frontier == 0
+    assert first_meta.is_sparse_decode
+    assert first_meta.dsa_nonresident_frontier == committed
+    assert first_meta.dsa_current_released_frontier == 0
+
+    # Simulate invalid-block recovery rolling logical progress back into the
+    # dense-threshold range before any scheduler release was acknowledged.
+    vllm_request.num_computed_tokens = 9_984
+    rollback_output = StubSchedulerOutput(
+        finished_req_ids=set(),
+        scheduled_new_reqs=[],
+        scheduled_cached_reqs=StubCachedRequestData(
+            req_ids=[req_id],
+            new_token_ids=[[vllm_request.all_token_ids[9_984]]],
+            new_block_ids=[[]],
+        ),
+        num_scheduled_tokens={req_id: 1},
+    )
+
+    rollback_meta = impl.build_connector_meta(rollback_output).requests[0]
+    assert len(tracker.token_ids) <= impl._dsa_dense_threshold
+    assert tracker.dsa_nonresident_frontier == committed
+    assert tracker.dsa_current_released_frontier == 0
+    assert rollback_meta.is_sparse_decode
+    assert rollback_meta.dsa_nonresident_frontier == committed
+    assert rollback_meta.load_spec is not None
+    assert rollback_meta.load_spec.can_load
+    assert rollback_meta.load_spec.dsa_committed_end >= committed
+    assert rollback_meta.load_spec.lmcache_cached_tokens >= committed
 
 
 def test_dsa_cold_compact_is_disabled_with_vllm_prefix_caching() -> None:
@@ -298,8 +413,9 @@ def test_dsa_cold_compact_alloc_metadata_has_only_indexer_slots() -> None:
         vllm_cached_tokens=0,
         lmcache_cached_tokens=8192,
         can_load=False,
+        dsa_committed_end=8191,
     )
-    setattr(impl.load_specs[req_id], "dsa_cold_compact_load", True)
+    impl.load_specs[req_id].dsa_cold_compact_load = True
     request = SimpleNamespace(
         request_id=req_id,
         num_tokens=8192,
@@ -319,7 +435,9 @@ def test_dsa_cold_compact_alloc_metadata_has_only_indexer_slots() -> None:
     req_meta = impl._pending_dsa_cold_load_metas[req_id]
     assert req_meta.slot_mapping == []
     assert len(req_meta.indexer_slot_mapping[0]) == 8192
-    assert getattr(req_meta.load_spec, "dsa_cold_load_generation") == 1
+    assert req_meta.dsa_current_released_frontier == 0
+    assert req_meta.dsa_nonresident_frontier == 8191
+    assert req_meta.load_spec.dsa_cold_load_generation == 1
 
 
 def test_dsa_cold_compact_submit_captures_current_npu_device(
@@ -391,7 +509,7 @@ def test_dsa_cold_compact_worker_retains_sources_when_stream_sync_fails() -> Non
         impl._run_dsa_cold_compact_load(request, None)
 
     assert isinstance(
-        getattr(raised.value, "_lmcache_dsa_cold_state"),
+        raised.value._lmcache_dsa_cold_state,
         WorkerRetrieveState,
     )
     impl._release_unadopted_shared_request_objects.assert_not_called()
@@ -421,7 +539,7 @@ def test_dsa_cold_compact_finished_signal_waits_for_future() -> None:
     future.set_result(state)
     assert impl._drain_dsa_cold_load_futures() == {"cold-future"}
     impl._publish_worker_retrieve_state.assert_called_once()
-    assert getattr(state, "_dsa_cold_prune_protected")
+    assert state._dsa_cold_prune_protected
 
 
 def test_dsa_cold_compact_generation_mismatch_releases_returned_state() -> None:
@@ -463,7 +581,7 @@ def test_dsa_cold_compact_failed_state_releases_after_sync_retry() -> None:
     )
     state = WorkerRetrieveState(req_id="cold-sync-retry")
     error = RuntimeError("load failed")
-    setattr(error, "_lmcache_dsa_cold_state", state)
+    error._lmcache_dsa_cold_state = state
     future.set_exception(error)
     impl._dsa_cold_load_futures = {
         "cold-sync-retry": (1, future, request, {100, 101}, 0.0)
@@ -500,7 +618,7 @@ def test_dsa_cold_ready_state_survives_cross_rank_completion_gap() -> None:
         shared_latent_status="present",
         shared_index_status="present",
     )
-    setattr(state, "_dsa_cold_prune_protected", True)
+    state._dsa_cold_prune_protected = True
     impl._worker_retrieve_state = {"cold-ready-gap": state}
     impl._worker_retrieve_registry_version = 1
     impl._release_shared_worker_retrieve_state = MagicMock()
@@ -567,7 +685,7 @@ def test_dsa_cold_compact_failure_does_not_mark_request_ready() -> None:
             lmcache_cached_tokens=8192,
             can_load=True,
         )
-        setattr(impl.load_specs[req_id], "dsa_cold_compact_load", True)
+        impl.load_specs[req_id].dsa_cold_compact_load = True
 
     impl.update_connector_output(
         SimpleNamespace(
@@ -588,11 +706,12 @@ def test_first_sparse_step_publishes_initial_release_frontier_once() -> None:
         req_id="initial-sparse-release",
         is_sparse_decode=True,
         resumed_from_preemption=False,
-        dsa_released_frontier=0,
+        dsa_current_released_frontier=0,
+        dsa_nonresident_frontier=0,
         load_spec=SimpleNamespace(
             dsa_committed_end=8192,
             dsa_release_frontier=8192,
-            dsa_released_frontier=0,
+            dsa_current_released_frontier=0,
         ),
     )
 
@@ -1243,7 +1362,7 @@ class TestBuildConnectorMetaSparseSyntheticLoadSpec:
         tracker.is_decode_phase = True
         tracker.sparse_token_ids = list(range(prompt_len))
         tracker.sparse_meta_frontier = prompt_len
-        setattr(tracker, "sparse_remap_frontier", prompt_len - 1)
+        tracker.sparse_remap_frontier = prompt_len - 1
         impl._request_trackers[req_id] = tracker
 
         scheduler_output = StubSchedulerOutput(
@@ -1264,7 +1383,7 @@ class TestBuildConnectorMetaSparseSyntheticLoadSpec:
         assert req_meta.load_spec.lmcache_cached_tokens == prompt_len
         assert req_meta.load_spec.dsa_committed_end == prompt_len - 1
         assert (
-            getattr(req_meta.load_spec, "dsa_release_frontier")
+            req_meta.load_spec.dsa_release_frontier
             == release_frontier
         )
         assert req_meta.sparse_warm_ref
@@ -1458,7 +1577,7 @@ class TestBuildConnectorMetaSparseSyntheticLoadSpec:
         impl.update_connector_output(output)
 
         assert output.completed_decode_window_saves == {}
-        assert tracker.dsa_released_frontier == 0
+        assert tracker.dsa_nonresident_frontier == 0
         assert tracker.decode_window_save_committed_end == 1024
         assert tracker.decode_window_save_next_start == 1024
 
@@ -1928,7 +2047,8 @@ class TestDecodeWindowSaveMetadata:
             for request in meta.requests
             if not request.is_decode_window_save
         )
-        assert main_meta.dsa_released_frontier == 0
+        assert main_meta.dsa_current_released_frontier == 0
+        assert main_meta.dsa_nonresident_frontier == 0
         assert not main_meta.is_sparse_decode
         assert req_meta.is_decode_window_save is True
         assert req_meta.decode_window_start == 256
@@ -1986,7 +2106,8 @@ class TestDecodeWindowSaveMetadata:
 
         assert len(meta.requests) == 1
         assert not meta.requests[0].is_decode_window_save
-        assert meta.requests[0].dsa_released_frontier == 0
+        assert meta.requests[0].dsa_current_released_frontier == 0
+        assert meta.requests[0].dsa_nonresident_frontier == 0
         assert tracker.num_saved_tokens == 256
         assert tracker.decode_window_save_next_start == 256
 
@@ -2072,7 +2193,7 @@ class TestDecodeWindowSaveMetadata:
             token_ids=list(range(768)),
             allocated_block_ids=list(range(48)),
             num_saved_tokens=768,
-            dsa_released_frontier=768,
+            dsa_nonresident_frontier=768,
             dsa_current_released_frontier=768,
         )
 
@@ -2085,9 +2206,36 @@ class TestDecodeWindowSaveMetadata:
             all_token_ids=list(range(900)),
         )
 
-        assert tracker.dsa_released_frontier == 768
+        assert tracker.dsa_nonresident_frontier == 768
         assert tracker.decode_window_save_committed_end == 768
         assert tracker.dsa_current_released_frontier == 0
+
+    def test_cold_compact_nonresident_survives_preemption_without_release(
+        self,
+    ) -> None:
+        tracker = RequestTracker(
+            req_id="cold-preempted",
+            prompt_len=10_001,
+            token_ids=list(range(10_001)),
+            allocated_block_ids=list(range(80)),
+            num_saved_tokens=10_001,
+            dsa_nonresident_frontier=10_000,
+            dsa_current_released_frontier=0,
+        )
+        tracker.sparse_remap_frontier = 10_000
+
+        tracker.update(
+            new_token_ids=[10_001],
+            new_block_ids=list(range(80, 160)),
+            preempted=True,
+            lmcache_cached_tokens=10_001,
+            vllm_cached_tokens=0,
+            all_token_ids=list(range(10_002)),
+        )
+
+        assert tracker.dsa_nonresident_frontier == 10_000
+        assert tracker.dsa_current_released_frontier == 0
+        assert tracker.sparse_remap_frontier == 10_000
 
     def test_decode_window_release_is_gated_by_dense_threshold(self) -> None:
         impl = _make_scheduler_impl()
@@ -2113,7 +2261,7 @@ class TestDecodeWindowSaveMetadata:
         impl.update_connector_output(output)
 
         assert tracker.decode_window_save_committed_end == 5376
-        assert tracker.dsa_released_frontier == 0
+        assert tracker.dsa_nonresident_frontier == 0
         assert tracker.dsa_current_released_frontier == 0
         assert output.completed_decode_window_saves == {}
 
@@ -2124,7 +2272,7 @@ class TestDecodeWindowSaveMetadata:
 
         impl.update_connector_output(output)
 
-        assert tracker.dsa_released_frontier == 10240
+        assert tracker.dsa_nonresident_frontier == 10240
         assert tracker.dsa_current_released_frontier == 10240
         assert output.completed_decode_window_saves == {tracker.req_id: 10240}
 
@@ -2138,7 +2286,7 @@ class TestDecodeWindowSaveMetadata:
             allocated_block_ids=list(range(768)),
             num_saved_tokens=12288,
             decode_window_save_committed_end=12288,
-            dsa_released_frontier=12288,
+            dsa_nonresident_frontier=12288,
             dsa_current_released_frontier=0,
         )
         impl._request_trackers[tracker.req_id] = tracker
@@ -2148,7 +2296,7 @@ class TestDecodeWindowSaveMetadata:
 
         impl.update_connector_output(output)
 
-        assert tracker.dsa_released_frontier == 12288
+        assert tracker.dsa_nonresident_frontier == 12288
         assert tracker.dsa_current_released_frontier == 12288
         assert output.completed_decode_window_saves == {
             tracker.req_id: 12288
@@ -2269,7 +2417,8 @@ class TestDecodeWindowSaveMetadata:
 
         assert len(meta.requests) == 1
         assert not meta.requests[0].is_decode_window_save
-        assert meta.requests[0].dsa_released_frontier == 0
+        assert meta.requests[0].dsa_current_released_frontier == 0
+        assert meta.requests[0].dsa_nonresident_frontier == 0
         assert tracker.decode_window_save_next_start == 256
         assert not any(
             event.get("event") == "window_group_plan" for event in events
