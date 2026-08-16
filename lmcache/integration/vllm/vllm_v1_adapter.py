@@ -8341,6 +8341,16 @@ class LMCacheConnectorV1Impl:
             return
 
         if num_external_tokens == 0:
+            cold_loaded_ids = getattr(self, "_dsa_cold_loaded_req_ids", None)
+            if (
+                cold_loaded_ids is not None
+                and request.request_id in cold_loaded_ids
+                and getattr(self.load_specs[request.request_id], "dsa_cold_compact_load", False)
+            ):
+                # Async resume has no new lookup result, but the completed cold
+                # load remains the authoritative sparse source for this step.
+                self.load_specs[request.request_id].can_load = True
+                return
             # No need to load anything
             self.load_specs[request.request_id].can_load = False
             return

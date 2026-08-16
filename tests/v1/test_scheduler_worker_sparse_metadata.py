@@ -330,7 +330,7 @@ def test_dsa_cold_compact_threshold_alignment_boundaries(
     assert load_spec.dsa_release_frontier == expected_release
 
 
-@pytest.mark.parametrize("prompt_len", [10_001, 10_240])
+@pytest.mark.parametrize("prompt_len", [10_001, 10_240, 16_457])
 def test_cold_compact_nonresident_frontier_survives_threshold_rollback(
     prompt_len: int,
 ) -> None:
@@ -365,6 +365,13 @@ def test_cold_compact_nonresident_frontier_survives_threshold_rollback(
     load_spec.dsa_cold_compact_load = True
     impl.load_specs[req_id] = load_spec
     impl._dsa_cold_loaded_req_ids = {req_id}
+
+    # vLLM invokes this callback again when an asynchronous cold load resumes,
+    # with zero new external tokens because the lookup already completed.
+    impl._manager = SimpleNamespace(lookup_client=MagicMock())
+    impl.update_state_after_alloc(vllm_request, 0)
+    assert load_spec.can_load
+
     new_request = SimpleNamespace(
         req_id=req_id,
         prompt_token_ids=prompt_tokens,
