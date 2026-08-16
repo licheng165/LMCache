@@ -2199,15 +2199,13 @@ class LMCacheEngine:
         if lock is None or hot_cache is None:
             return None
         local_chunks = len(keys_by_chunk)
-        missed_layers: set[int] = set()
         with lock:
             for chunk_index, chunk in enumerate(keys_by_chunk):
-                for layer_id, key in enumerate(chunk):
-                    if key in hot_cache:
-                        if layer_id in missed_layers:
-                            return None
-                    else:
-                        missed_layers.add(layer_id)
+                for key in chunk:
+                    if key not in hot_cache:
+                        # Ignore later local islands: they cannot extend the
+                        # common prefix, while the remote suffix can still be
+                        # fetched as complete all-layer Mooncake pages.
                         local_chunks = min(local_chunks, chunk_index)
         if local_chunks == len(keys_by_chunk):
             return "LocalCPUBackend"

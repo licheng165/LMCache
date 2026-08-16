@@ -394,8 +394,22 @@ def test_shared_page_first_uniform_location_uses_local_then_one_remote_probe():
         cpu_lock=nullcontext(),
         hot_cache={flat_keys[-1]: object()},
     )
-    assert engine._shared_page_first_uniform_location(keys_by_chunk) is None
-    assert len(calls) == 2
+    assert (
+        engine._shared_page_first_uniform_location(keys_by_chunk)
+        == "RemoteBackend"
+    )
+    assert calls[-1] == (flat_keys, ["RemoteBackend"])
+    assert len(calls) == 3
+    engine._shared_local_cpu_backend = lambda: SimpleNamespace(
+        cpu_lock=nullcontext(),
+        hot_cache=dict.fromkeys([*keys_by_chunk[0], keys_by_chunk[1][-1]]),
+    )
+    assert (
+        engine._shared_page_first_uniform_location(keys_by_chunk)
+        == "RemoteBackend"
+    )
+    assert calls[-1] == (keys_by_chunk[1], ["RemoteBackend"])
+    assert len(calls) == 4
 
 
 @pytest.mark.parametrize(
@@ -446,11 +460,7 @@ def test_shared_page_first_uniform_location_falls_back(
 
     assert engine._shared_page_first_uniform_location(keys_by_chunk) is None
     assert len(calls) == (
-        1
-        if not local_hit
-        and supports_batch
-        and retrieval_backends == ["RemoteBackend"]
-        else 0
+        1 if supports_batch and retrieval_backends == ["RemoteBackend"] else 0
     )
 
 
