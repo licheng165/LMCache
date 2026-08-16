@@ -6,6 +6,7 @@ from contextlib import nullcontext
 from types import SimpleNamespace
 import asyncio
 import sys
+import threading
 
 import pytest
 import torch
@@ -3389,6 +3390,96 @@ def test_receive_shared_envelope_reports_corrupt_payload():
 
     with pytest.raises(ValueError, match="corrupt envelope"):
         engine._receive_shared_envelope()
+
+
+def test_receive_shared_envelope_demultiplexes_concurrent_requests():
+    engine = object.__new__(LMCacheEngine)
+    engine.metadata = SimpleNamespace(first_rank=0)
+    engine.shared_cpu_cache_generation = 9
+    cold_envelope = SharedHandleEnvelope(
+        request_id="cold-req",
+        phase="dsa_cold_compact_latent",
+        request_ordinal=0,
+        layer_id=25,
+        kv_group=0,
+        status="skipped",
+        generation=9,
+        handles=[],
+    ).to_dict()
+    decode_envelope = SharedHandleEnvelope(
+        request_id="decode-req",
+        phase="sparse_decode_bootstrap",
+        request_ordinal=1,
+        layer_id=0,
+        kv_group=1,
+        status="skipped",
+        generation=9,
+        handles=[],
+    ).to_dict()
+    incoming = [cold_envelope]
+    incoming_condition = threading.Condition()
+    cold_received = threading.Event()
+    receive_count = 0
+
+    def receive(_obj, _rank):
+        nonlocal receive_count
+        with incoming_condition:
+            assert incoming_condition.wait_for(lambda: bool(incoming), timeout=2)
+            receive_count += 1
+            envelope = incoming.pop(0)
+        if envelope is cold_envelope:
+            cold_received.set()
+        return envelope
+
+    engine.broadcast_object_fn = receive
+    results = {}
+    errors = []
+
+    def receive_decode():
+        try:
+            results["decode"] = engine._receive_matching_shared_envelope(
+                req_id="decode-req",
+                phase="sparse_decode_bootstrap",
+                request_ordinal=1,
+                layer_id=0,
+                kv_group=1,
+            )
+        except BaseException as exc:
+            errors.append(exc)
+
+    def receive_cold():
+        try:
+            results["cold"] = engine._receive_matching_shared_envelope(
+                req_id="cold-req",
+                phase="dsa_cold_compact_latent",
+                request_ordinal=0,
+                layer_id=25,
+                kv_group=0,
+            )
+        except BaseException as exc:
+            errors.append(exc)
+
+    decode_thread = threading.Thread(target=receive_decode)
+    decode_thread.start()
+    assert cold_received.wait(timeout=2)
+
+    cold_thread = threading.Thread(target=receive_cold)
+    cold_thread.start()
+    cold_thread.join(timeout=2)
+    assert not cold_thread.is_alive()
+    assert results["cold"].request_id == "cold-req"
+
+    with incoming_condition:
+        incoming.append(decode_envelope)
+        incoming_condition.notify_all()
+    decode_thread.join(timeout=2)
+
+    assert not decode_thread.is_alive()
+    assert not errors
+    assert results["decode"].request_id == "decode-req"
+    assert receive_count == 2
+    assert engine._pending_shared_envelopes == {}
+    assert engine._shared_envelope_waiters == {}
 
 
 def test_skipped_index_envelope_round_trips_without_handles():
