@@ -500,6 +500,65 @@ def test_dsa_cold_compact_submit_captures_current_npu_device(
     )
 
 
+def test_staged_sfa_native_barrier_waits_for_cold_compact_loads() -> None:
+    impl = LMCacheConnectorV1Impl.__new__(LMCacheConnectorV1Impl)
+    first = MagicMock(done=MagicMock(return_value=False))
+    second = MagicMock(done=MagicMock(return_value=True))
+    impl._dsa_cold_load_futures = {
+        "cold-pending": (1, first, object(), set(), 0.0),
+        "cold-complete": (1, second, object(), set(), 0.0),
+    }
+
+    impl.synchronize_staged_sfa_capture_unsafe_loads()
+
+    first.result.assert_called_once_with()
+    second.result.assert_called_once_with()
+    assert set(impl._dsa_cold_load_futures) == {
+        "cold-pending",
+        "cold-complete",
+    }
+
+
+def test_staged_sfa_native_barrier_defers_cold_load_failure() -> None:
+    impl = LMCacheConnectorV1Impl.__new__(LMCacheConnectorV1Impl)
+    failed = Future()
+    failed.set_exception(RuntimeError("cold load failed"))
+    request = SimpleNamespace(
+        load_spec=SimpleNamespace(dsa_cold_load_generation=1)
+    )
+    impl._dsa_cold_load_futures = {
+        "cold-failed": (1, failed, request, {100}, 0.0),
+    }
+    impl._synchronize_dsa_cold_dense_load = MagicMock()
+    impl._release_unadopted_shared_request_objects = MagicMock()
+    impl._release_shared_worker_retrieve_state = MagicMock()
+    impl._invalid_block_ids = set()
+    impl.lmcache_engine = object()
+
+    impl.synchronize_staged_sfa_capture_unsafe_loads()
+
+    impl._synchronize_dsa_cold_dense_load.assert_called_once_with()
+    assert "cold-failed" in impl._dsa_cold_load_futures
+    assert impl._drain_dsa_cold_load_futures() == {"cold-failed"}
+    assert impl._invalid_block_ids == {100}
+    assert not hasattr(impl, "_dsa_cold_load_futures")
+
+
+def test_staged_sfa_native_barrier_rejects_active_failed_stream() -> None:
+    impl = LMCacheConnectorV1Impl.__new__(LMCacheConnectorV1Impl)
+    failed = Future()
+    failed.set_exception(RuntimeError("cold load failed"))
+    impl._dsa_cold_load_futures = {
+        "cold-failed": (1, failed, object(), set(), 0.0),
+    }
+    impl._synchronize_dsa_cold_dense_load = MagicMock(
+        side_effect=RuntimeError("stream still active")
+    )
+
+    with pytest.raises(RuntimeError, match="stream still active"):
+        impl.synchronize_staged_sfa_capture_unsafe_loads()
+
+
 def test_dsa_cold_compact_worker_restores_submitted_npu_device(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

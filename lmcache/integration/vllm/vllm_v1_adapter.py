@@ -5663,6 +5663,46 @@ class LMCacheConnectorV1Impl:
             time.monotonic(),
         )
 
+    def synchronize_staged_sfa_capture_unsafe_loads(self) -> None:
+        """Finish background NPU loads before serving-time graph capture.
+
+        Cold compact workers issue synchronous NPU copies and stream waits.
+        Those operations cannot overlap an ACL graph capture in another
+        thread. Completed futures remain queued for ``get_finished`` so their
+        normal publication and scheduler notification semantics are preserved.
+        """
+        futures = getattr(self, "_dsa_cold_load_futures", None)
+        if not futures:
+            return
+        pending_req_ids = [
+            req_id
+            for req_id, entry in futures.items()
+            if not entry[1].done()
+        ]
+        if pending_req_ids:
+            logger.info(
+                "Waiting for capture-unsafe cold compact loads before native "
+                "model execution: requests=%s",
+                pending_req_ids,
+            )
+        failed_req_ids = []
+        for req_id, entry in list(futures.items()):
+            try:
+                entry[1].result()
+            except BaseException:
+                failed_req_ids.append(req_id)
+        if failed_req_ids:
+            # A failed future is reported through get_finished(), which also
+            # publishes invalid blocks to the scheduler. Only prove here that
+            # no capture-unsafe stream work remains before model collectives.
+            self._synchronize_dsa_cold_dense_load()
+            logger.warning(
+                "Cold compact loads failed before native model execution; "
+                "deferring scheduler error publication to get_finished: "
+                "requests=%s",
+                failed_req_ids,
+            )
+
     def _run_dsa_cold_compact_load(
         self, request: ReqMeta, npu_device_id: Optional[int]
     ) -> WorkerRetrieveState:

@@ -78,6 +78,10 @@ class LMCacheConnectorV1Dynamic(KVConnectorBase_V1):
         """
         self._lmcache_engine.start_load_kv(forward_context, **kwargs)
 
+    def synchronize_staged_sfa_capture_unsafe_loads(self) -> None:
+        """Finish background NPU loads before serving-time graph capture."""
+        self._lmcache_engine.synchronize_staged_sfa_capture_unsafe_loads()
+
     def wait_for_layer_load(
         self,
         layer_name: str,
