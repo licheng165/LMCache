@@ -441,6 +441,44 @@ class LMCacheEngine:
             return declared[kv_group]
         return self.num_layers
 
+    def _num_transfer_layers_for_call(
+        self,
+        kv_group: int,
+        kwargs: dict,
+    ) -> int:
+        """Resolve the transfer cardinality for one layerwise call.
+
+        Uses num_layers_for_group(kv_group) and additionally fail-closes
+        against the per-group kvcaches list passed by the serving-engine
+        adapter, when present: the registered runtime buffers are the
+        physical truth of how many layer rows this call transfers.
+
+        Args:
+            kv_group: The KV group index of the call.
+            kwargs: The layerwise call kwargs (may contain ``kvcaches``).
+
+        Returns:
+            The number of layer rows for this call.
+
+        Raises:
+            ValueError: If the passed kvcaches length disagrees with the
+                resolved cardinality.
+        """
+        num_layers = self.num_layers_for_group(kv_group)
+        kvcaches = kwargs.get("kvcaches")
+        if kvcaches is not None:
+            kvcaches_len = len(kvcaches)
+            if kvcaches_len != num_layers:
+                raise ValueError(
+                    "Layerwise transfer cardinality mismatch: kv_group="
+                    f"{kv_group} resolved_layers={num_layers} "
+                    f"kvcaches_layers={kvcaches_len}. The registered KV "
+                    "caches for this group disagree with the resolved "
+                    "group cardinality (check kv_group_layers and the "
+                    "serving-engine group registration)."
+                )
+        return num_layers
+
     @staticmethod
     def _legacy_indexer_policy_configured(config: LMCacheEngineConfig) -> bool:
         extra_config = getattr(config, "extra_config", None) or {}
@@ -1444,12 +1482,15 @@ class LMCacheEngine:
         self,
         memory_objs: list[list[MemoryObj]],
         keys_layer_major: list[list[CacheEngineKey]],
+        *,
+        kv_group: int = 0,
     ) -> Optional[SharedHandleBatch]:
         """Compact a homogeneous all-layer page-first result."""
         started = cold_start_perf_now() if cold_start_perf_enabled() else None
+        num_layers = self.num_layers_for_group(kv_group)
         if (
             getattr(self, "shared_cpu_cache_name", None) is None
-            or len(memory_objs) != self.num_layers
+            or len(memory_objs) != num_layers
             or not memory_objs
             or not memory_objs[0]
         ):
@@ -1457,7 +1498,7 @@ class LMCacheEngine:
         chunks = len(memory_objs[0])
         if (
             any(len(layer) != chunks for layer in memory_objs)
-            or len(keys_layer_major) != self.num_layers
+            or len(keys_layer_major) != num_layers
             or any(len(layer) != chunks for layer in keys_layer_major)
         ):
             return None
@@ -1466,7 +1507,7 @@ class LMCacheEngine:
             page = memory_objs[0][chunk]
             if not isinstance(page, LayerPageMemoryObj):
                 break
-            if page.num_layers != self.num_layers or any(
+            if page.num_layers != num_layers or any(
                 layer[chunk] is not page for layer in memory_objs
             ):
                 return None
@@ -1492,7 +1533,7 @@ class LMCacheEngine:
         batch = SharedHandleBatch(
             shm_name=self.shared_cpu_cache_name,
             producer_rank=self.metadata.worker_id,
-            num_layers=self.num_layers,
+            num_layers=num_layers,
             num_chunks=chunks,
             physical_sizes=physical_sizes,
             chunk_hashes=[
@@ -1512,7 +1553,7 @@ class LMCacheEngine:
             logger,
             "shared_handle_batch_build",
             started=started,
-            layers=self.num_layers,
+            layers=num_layers,
             chunks=chunks,
             offsets=len(batch.offsets),
             pages=page_chunks,
@@ -1543,7 +1584,7 @@ class LMCacheEngine:
             batch,
             expected_shm_name=allocator.shm_name,
             expected_producer_rank=self.metadata.first_rank,
-            expected_num_layers=self.num_layers,
+            expected_num_layers=self.num_layers_for_group(kv_group),
             expected_num_chunks=batch.num_chunks,
             expected_chunk_hashes=[
                 int(key.chunk_hash)
@@ -2333,7 +2374,7 @@ class LMCacheEngine:
         """Estimate one full all-layer page with allocator alignment applied once."""
         logical_bytes = self._estimate_shared_cpu_bytes_per_layer(
             kv_group, int(self.config.chunk_size)
-        ) * self.num_layers
+        ) * self.num_layers_for_group(kv_group)
         try:
             allocator = getattr(
                 self._shared_local_cpu_backend(), "memory_allocator", None
@@ -2453,8 +2494,9 @@ class LMCacheEngine:
         remote_page_fast = (
             layer_pages
             and chunks > 0
-            and len(keys_layer_major) == self.num_layers
-            and len(chunk_locations_layer_major) == self.num_layers
+            and len(keys_layer_major) == self.num_layers_for_group(kv_group)
+            and len(chunk_locations_layer_major)
+            == self.num_layers_for_group(kv_group)
             and all(len(layer) == chunks for layer in keys_layer_major)
             and all(
                 len(locations) == chunks
@@ -2464,7 +2506,7 @@ class LMCacheEngine:
             and not rank0_shared_hot_keys
         )
         if remote_page_fast:
-            missing_chunk_count = chunks * self.num_layers
+            missing_chunk_count = chunks * self.num_layers_for_group(kv_group)
             full_pages = (
                 chunks
                 if chunk_token_lengths is None
@@ -2480,7 +2522,7 @@ class LMCacheEngine:
                     self._shared_cpu_estimated_physical_chunk_bytes(
                         kv_group, num_tokens=int(num_tokens)
                     )
-                    * self.num_layers
+                    * self.num_layers_for_group(kv_group)
                     for num_tokens in chunk_token_lengths[:chunks]
                     if num_tokens != self.config.chunk_size
                 )
@@ -3288,7 +3330,8 @@ class LMCacheEngine:
 
         Supplied prefix results are consumed on both success and failure.
         """
-        if len(keys_layer_major) != self.num_layers or not keys_layer_major:
+        num_layers = self.num_layers_for_group(kv_group)
+        if len(keys_layer_major) != num_layers or not keys_layer_major:
             raise ValueError("Page-first retrieval requires every model layer")
         chunks = len(keys_layer_major[0])
         if any(len(keys) != chunks for keys in keys_layer_major):
@@ -3301,7 +3344,7 @@ class LMCacheEngine:
                 keys_layer_major
             )
         )
-        if len(prefixes) != self.num_layers:
+        if len(prefixes) != num_layers:
             for prefix in prefixes:
                 prefix.release()
             raise ValueError("LocalCPU prefix lookup returned the wrong layer count")
@@ -3339,10 +3382,10 @@ class LMCacheEngine:
                     phase=phase,
                     kv_group=kv_group,
                     keys_layer_major=[keys[local_chunks:] for keys in keys_layer_major],
-                    layers_per_batch=self.num_layers,
+                    layers_per_batch=num_layers,
                 )
                 owned.extend(obj for layer in remote for obj in layer)
-                if len(remote) != self.num_layers or any(
+                if len(remote) != num_layers or any(
                     len(layer) != chunks - local_chunks for layer in remote
                 ):
                     raise ValueError(
@@ -3452,7 +3495,7 @@ class LMCacheEngine:
                 num_tokens=self.config.chunk_size,
             )
             if any(
-                page.num_layers != self.num_layers
+                page.num_layers != self.num_layers_for_group(kv_group)
                 or page.get_shape() != expected_shape
                 for page in pages
             ) or not LayerPageMemoryObj.pin_many(pages):
@@ -3904,11 +3947,12 @@ class LMCacheEngine:
             caches["cached_chunk_dev_ptrs"],
         )
         pointer_rows = caches["cached_chunk_ptrs_npu"]
+        num_layers = self.num_layers_for_group(kv_group)
         if (
             len(ends) != chunks
-            or any(len(values) != self.num_layers for values in layers)
+            or any(len(values) != num_layers for values in layers)
             or any(len(layer) != chunks for values in layers for layer in values)
-            or len(pointer_rows) != self.num_layers
+            or len(pointer_rows) != num_layers
             or any(
                 not isinstance(row, torch.Tensor) or row.numel() != chunks
                 for row in pointer_rows
@@ -3958,7 +4002,7 @@ class LMCacheEngine:
         phase = kwargs.get("shared_cpu_phase", "dense_prefix")
         request_ordinal = int(kwargs.get("shared_cpu_request_ordinal", 0))
         if not keys_layer_major:
-            for layer_id in range(self.num_layers):
+            for layer_id in range(self.num_layers_for_group(kv_group)):
                 self._broadcast_shared_envelope(
                     SharedHandleEnvelope(
                         request_id=req_id,
@@ -4001,7 +4045,7 @@ class LMCacheEngine:
         perf_enabled = cold_start_perf_enabled()
         consume_started = consumer_send_s = consumer_finish_s = 0.0
         try:
-            for layer_id in range(self.num_layers):
+            for layer_id in range(self.num_layers_for_group(kv_group)):
                 try:
                     if page_first_resolve:
                         if pre_resolved_layers is None:
@@ -4053,6 +4097,7 @@ class LMCacheEngine:
                             compact_batch = self._make_shared_handle_batch(
                                 pre_resolved_layers,
                                 keys_layer_major,
+                                kv_group=kv_group,
                             )
                             if layer_page_chunks and compact_batch is None:
                                 raise ValueError(
@@ -4256,7 +4301,7 @@ class LMCacheEngine:
         consume_started = view_build_s = consumer_send_s = consumer_finish_s = 0.0
 
         try:
-            for layer_id in range(self.num_layers):
+            for layer_id in range(self.num_layers_for_group(kv_group)):
                 envelope = None
                 if compact_batch is None:
                     envelope = self._receive_matching_shared_envelope(
@@ -4479,12 +4524,12 @@ class LMCacheEngine:
         """Ordered no-op shared retrieve for intentionally skipped groups."""
         ret_mask = torch.zeros(num_tokens, dtype=torch.bool, device="cpu")
         if not self.enable_shared_cpu_cache or self.metadata.world_size <= 1:
-            for _ in range(self.num_layers):
+            for _ in range(self.num_layers_for_group(kv_group)):
                 yield ret_mask
             yield ret_mask
             return
 
-        for layer_id in range(self.num_layers):
+        for layer_id in range(self.num_layers_for_group(kv_group)):
             yield ret_mask
             if self.metadata.is_first_rank():
                 self._broadcast_shared_envelope(
@@ -4933,6 +4978,8 @@ class LMCacheEngine:
             request_id=str(kwargs.get("req_id", "unspecified")),
             kv_group=int(kwargs.get("kv_group", 0) or 0),
         )
+        kv_group = store_result.kv_group
+        num_layers = self._num_transfer_layers_for_call(kv_group, kwargs)
 
         # Health check: block operation if LMCache is unhealthy
         if not self.is_healthy():
@@ -4947,7 +4994,7 @@ class LMCacheEngine:
             logger.debug(
                 "Passive rank (save_only_first_rank), skipping store_layer"
             )
-            for layer_id in range(self.num_layers):
+            for layer_id in range(num_layers):
                 yield
             # Extra yield consumed by wait_for_save() after the last layer.
             yield store_result
@@ -4984,7 +5031,7 @@ class LMCacheEngine:
                 num_to_store_tokens,
             )
             # Still need to yield to avoid StopIteration
-            for layer_id in range(self.num_layers):
+            for layer_id in range(num_layers):
                 yield
             yield store_result
             return
@@ -5001,7 +5048,6 @@ class LMCacheEngine:
             assert isinstance(request_configs, dict)
 
         prev_key = 0
-        kv_group = kwargs.get("kv_group", 0)
         kv_dtype = self._shared_cpu_dtype_for_kv_group(kv_group)
         store_fmt = self._memory_format_for_kv_group(kv_group)
         for start, end, key in self.token_database.process_tokens(
@@ -5011,7 +5057,7 @@ class LMCacheEngine:
             assert isinstance(key, CacheEngineKey)
             requested_end = end
 
-            keys_multi_layer = key.split_layers(self.num_layers)
+            keys_multi_layer = key.split_layers(num_layers)
             if self._layerwise_chunk_fully_stored(
                 keys_multi_layer,
                 req_id=req_id,
@@ -5040,7 +5086,7 @@ class LMCacheEngine:
             memory_objs_multi_layer = self.storage_manager.batched_allocate(
                 kv_shape_single_layer,
                 kv_dtype,
-                batch_size=self.num_layers,
+                batch_size=num_layers,
                 fmt=store_fmt,
                 busy_loop=self.config.get_extra_config_value("force_store_wait", False),
             )
@@ -5114,7 +5160,7 @@ class LMCacheEngine:
 
                 next(mem_obj_generator)
 
-                for layer_id in range(self.num_layers):
+                for layer_id in range(num_layers):
                     yield
                     next(mem_obj_generator)
                     self.storage_manager.batched_put(
@@ -5152,7 +5198,7 @@ class LMCacheEngine:
         else:
             # If no cache are found, we still need to yield to avoid
             # `StopIteration`
-            for layer_id in range(self.num_layers):
+            for layer_id in range(num_layers):
                 yield
 
         self.stats_monitor.on_store_finished(monitor_req_id, tot_token_num)
@@ -5347,6 +5393,7 @@ class LMCacheEngine:
             return
 
         kv_group = kwargs.get("kv_group", 0)
+        num_layers = self._num_transfer_layers_for_call(kv_group, kwargs)
         shared_layerwise_retrieve = self._should_use_shared_layerwise_retrieve(
             kv_group
         )
@@ -5391,7 +5438,7 @@ class LMCacheEngine:
                 assert isinstance(key, CacheEngineKey)
                 starts.append(start)
                 ends.append(end)
-                keys.append(key.split_layers(self.num_layers))
+                keys.append(key.split_layers(num_layers))
 
             yield from self._retrieve_layer_shared_passive(
                 starts_all=starts,
@@ -5444,7 +5491,7 @@ class LMCacheEngine:
                         [
                             [item[2].get_first_layer()]
                             if layer_pages
-                            else item[2].split_layers(self.num_layers)
+                            else item[2].split_layers(num_layers)
                             for item in page_candidates
                         ]
                     )
@@ -5453,7 +5500,7 @@ class LMCacheEngine:
                     and len(page_candidates) < len(candidates)
                 ):
                     tail_keys = candidates[len(page_candidates)][2].split_layers(
-                        self.num_layers
+                        num_layers
                     )
                     hits, mapping = self.storage_manager.batched_contains(
                         tail_keys, self.retrieve_locations
@@ -5473,7 +5520,8 @@ class LMCacheEngine:
                         else:
                             tail_plan = tail_locations
             for start, end, key in candidates:
-                keys_multi_layer = key.split_layers(self.num_layers)
+                assert isinstance(key, CacheEngineKey)
+                keys_multi_layer = key.split_layers(num_layers)
                 missing_layer = False
                 planned = batch_plan is not None and len(keys) < len(batch_plan)
                 locations_multi_layer: list[str] = (
@@ -5606,7 +5654,7 @@ class LMCacheEngine:
         ):
             assert isinstance(key, CacheEngineKey)
 
-            keys_multi_layer = key.split_layers(self.num_layers)
+            keys_multi_layer = key.split_layers(num_layers)
 
             # NOTE: Only check the first layer
             if current_location := self.storage_manager.contains(
@@ -5664,7 +5712,7 @@ class LMCacheEngine:
 
             to_count_down = []
             retrieved_by_location: dict[str, list[MemoryObj]] = defaultdict(list)
-            for layer_id in range(self.num_layers):
+            for layer_id in range(num_layers):
                 tasks = [next(get_generator) for get_generator in get_generators]
                 for task in tasks:
                     assert task is not None
@@ -5695,7 +5743,7 @@ class LMCacheEngine:
         else:
             # If no cache are found, we still need to yield to avoid
             # `StopIteration`
-            for layer_id in range(self.num_layers):
+            for layer_id in range(num_layers):
                 yield None
 
         yield None

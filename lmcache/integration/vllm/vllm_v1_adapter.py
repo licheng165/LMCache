@@ -5785,11 +5785,10 @@ class LMCacheConnectorV1Impl:
         assert self.lmcache_engine is not None
         latent_layers = self._num_layers_for_group(0)
         indexer_layers = self._num_layers_for_group(1)
-        if latent_layers != self.num_layers or indexer_layers != self.num_layers:
+        if indexer_layers <= 0:
             raise RuntimeError(
-                "Cold compact load requires matching latent/indexer layer counts: "
-                f"expected={self.num_layers}, latent={latent_layers}, "
-                f"indexer={indexer_layers}"
+                "Cold compact load requires a registered indexer group with "
+                f"at least one layer, got indexer_layers={indexer_layers}"
             )
         token_count = request.load_spec.lmcache_cached_tokens
         tokens = request.token_ids[:token_count]
@@ -5843,8 +5842,13 @@ class LMCacheConnectorV1Impl:
                 next(indexer_retriever)
                 next(indexer_retriever)
                 indexer_result = None
-                for _ in range(self.num_layers):
+                # Shared-indexer groups advance at their own cardinality:
+                # the latent generator yields one row per model layer while
+                # the indexer generator yields one row per registered physical
+                # indexer layer (e.g. 79 vs 22 on GLM-5.2).
+                for _ in range(latent_layers):
                     latent_result = latent_retriever.send(None)
+                for _ in range(indexer_layers):
                     indexer_result = next(indexer_retriever)
             finally:
                 latent_retriever.close()
