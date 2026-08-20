@@ -92,7 +92,11 @@ class MooncakeLookupClient(LookupClientInterface):
             getattr(getattr(self, "metadata", None), "kv_shape", (1,))[0]
         )
         registered_groups = getattr(
-            getattr(self.metadata, "kv_layer_groups_manager", None),
+            getattr(
+                getattr(self, "metadata", None),
+                "kv_layer_groups_manager",
+                None,
+            ),
             "kv_layer_groups",
             None,
         ) or []
@@ -103,7 +107,7 @@ class MooncakeLookupClient(LookupClientInterface):
                 dsa_two_groups=dsa_two_groups,
                 model_num_layers=num_layers,
                 registered_groups=registered_groups,
-                declared=self.declared_kv_group_layers,
+                declared=getattr(self, "declared_kv_group_layers", None),
             )
 
         sampled_lookup = bool(

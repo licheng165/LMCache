@@ -401,17 +401,24 @@ class LMCacheEngine:
             ValueError: If kv_group is out of range, or the registered and
                 declared cardinalities disagree.
         """
+        # getattr keeps lightweight/mock engine instances (built via
+        # __new__ in tests and connectors) working with the legacy global
+        # cardinality.
         groups = getattr(
-            getattr(self.metadata, "kv_layer_groups_manager", None),
+            getattr(
+                getattr(self, "metadata", None),
+                "kv_layer_groups_manager",
+                None,
+            ),
             "kv_layer_groups",
             None,
         ) or []
         return resolve_kv_group_num_layers(
             kv_group=kv_group,
-            dsa_two_groups=self.dsa_two_groups,
+            dsa_two_groups=getattr(self, "dsa_two_groups", False),
             model_num_layers=self.num_layers,
             registered_groups=groups,
-            declared=self._kv_group_layers_declared,
+            declared=getattr(self, "_kv_group_layers_declared", None),
         )
 
     def _num_transfer_layers_for_call(
