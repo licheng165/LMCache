@@ -8,6 +8,10 @@ import torch
 # First Party
 from lmcache.utils import CacheEngineKey
 from lmcache.v1.config import LMCacheEngineConfig
+from lmcache.v1.kv_layer_groups import (
+    parse_declared_kv_group_layers,
+    resolve_kv_group_num_layers,
+)
 from lmcache.v1.lookup_client.abstract_client import LookupClientInterface
 from lmcache.v1.metadata import LMCacheMetadata
 from lmcache.v1.mooncake_key_trace import trace_mooncake_keys
@@ -32,6 +36,10 @@ class MooncakeLookupClient(LookupClientInterface):
 
         self.config = config
         self.metadata = metadata
+        extra_config = getattr(config, "extra_config", None) or {}
+        self.declared_kv_group_layers = parse_declared_kv_group_layers(
+            extra_config.get("kv_group_layers", None)
+        )
         self.store = MooncakeDistributedStore()
         status = self.store.setup(
             "localhost",
@@ -83,6 +91,21 @@ class MooncakeLookupClient(LookupClientInterface):
         num_layers = int(
             getattr(getattr(self, "metadata", None), "kv_shape", (1,))[0]
         )
+        registered_groups = getattr(
+            getattr(self.metadata, "kv_layer_groups_manager", None),
+            "kv_layer_groups",
+            None,
+        ) or []
+
+        def num_layers_for(group_key: CacheEngineKey) -> int:
+            return resolve_kv_group_num_layers(
+                kv_group=int(getattr(group_key, "kv_group", 0) or 0),
+                dsa_two_groups=dsa_two_groups,
+                model_num_layers=num_layers,
+                registered_groups=registered_groups,
+                declared=self.declared_kv_group_layers,
+            )
+
         sampled_lookup = bool(
             use_layerwise
             and getattr(self.config, "experimental_sampled_layerwise_lookup", False)
@@ -105,19 +128,27 @@ class MooncakeLookupClient(LookupClientInterface):
 
             if page_first and end - start == self.config.chunk_size:
                 chunk_keys = [
-                    mooncake_page_key(group_key, num_layers)
+                    mooncake_page_key(group_key, num_layers_for(group_key))
                     for group_key in group_keys
                 ]
             elif sampled_lookup:
+                sampled_keys = []
+                for group_key in group_keys:
+                    sampled_keys.extend(
+                        first_last_layer_keys(
+                            [group_key], num_layers_for(group_key)
+                        )
+                    )
                 chunk_keys = [
-                    key.to_string()
-                    for key in first_last_layer_keys(group_keys, num_layers)
+                    key.to_string() for key in sampled_keys
                 ]
             elif use_layerwise:
                 chunk_keys = [
                     layer_key.to_string()
                     for group_key in group_keys
-                    for layer_key in group_key.split_layers(num_layers)
+                    for layer_key in group_key.split_layers(
+                        num_layers_for(group_key)
+                    )
                 ]
             else:
                 chunk_keys = [group_key.to_string() for group_key in group_keys]

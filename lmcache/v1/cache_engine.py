@@ -73,6 +73,10 @@ from lmcache.v1.mooncake_layout import (
     mooncake_page_key,
 )
 from lmcache.v1.pin_monitor import PinMonitor
+from lmcache.v1.kv_layer_groups import (
+    parse_declared_kv_group_layers,
+    resolve_kv_group_num_layers,
+)
 from lmcache.v1.sampled_lookup import (
     find_last_sampled_hit,
     first_last_layer_keys,
@@ -359,19 +363,8 @@ class LMCacheEngine:
             ValueError: If the declaration is not a non-empty list of
                 positive ints.
         """
-        raw = self._get_shared_config_value("kv_group_layers", None)
-        if raw is None:
-            return None
-        if isinstance(raw, (list, tuple)) and raw and all(
-            isinstance(value, int)
-            and not isinstance(value, bool)
-            and value > 0
-            for value in raw
-        ):
-            return tuple(int(value) for value in raw)
-        raise ValueError(
-            "kv_group_layers must be a non-empty list of positive ints, got: "
-            f"{raw!r}"
+        return parse_declared_kv_group_layers(
+            self._get_shared_config_value("kv_group_layers", None)
         )
 
     @property
@@ -408,38 +401,18 @@ class LMCacheEngine:
             ValueError: If kv_group is out of range, or the registered and
                 declared cardinalities disagree.
         """
-        if not self.dsa_two_groups:
-            return self.num_layers
         groups = getattr(
             getattr(self.metadata, "kv_layer_groups_manager", None),
             "kv_layer_groups",
             None,
         ) or []
-        declared = self._kv_group_layers_declared
-        if len(groups) > 1:
-            if kv_group < 0 or kv_group >= len(groups):
-                raise ValueError(
-                    "KV group is out of range for registered layer groups: "
-                    f"kv_group={kv_group}, num_groups={len(groups)}"
-                )
-            registered = [group.num_layers for group in groups]
-            if declared is not None and tuple(registered) != declared:
-                raise ValueError(
-                    "Declared kv_group_layers disagrees with the registered "
-                    f"KV layer groups: declared={list(declared)}, "
-                    f"registered={registered}. Fix the kv_group_layers extra "
-                    "config or remove it so the registered groups are the "
-                    "only cardinality source."
-                )
-            return registered[kv_group]
-        if declared is not None:
-            if kv_group < 0 or kv_group >= len(declared):
-                raise ValueError(
-                    "KV group is out of range for declared kv_group_layers: "
-                    f"kv_group={kv_group}, declared={list(declared)}"
-                )
-            return declared[kv_group]
-        return self.num_layers
+        return resolve_kv_group_num_layers(
+            kv_group=kv_group,
+            dsa_two_groups=self.dsa_two_groups,
+            model_num_layers=self.num_layers,
+            registered_groups=groups,
+            declared=self._kv_group_layers_declared,
+        )
 
     def _num_transfer_layers_for_call(
         self,
@@ -1894,7 +1867,7 @@ class LMCacheEngine:
                                 key,
                                 kv_group=kv_group,
                                 request_configs=request_configs,
-                            ).split_layers(self.num_layers)
+                            ).split_layers(self.num_layers_for_group(kv_group))
                         ]
                         if tail_keys:
                             hits, tail = self.storage_manager.batched_contains(
@@ -1922,7 +1895,7 @@ class LMCacheEngine:
                             request_configs=request_configs,
                         )
                         sampled = first_last_layer_keys(
-                            [group_key], self.num_layers
+                            [group_key], self.num_layers_for_group(kv_group)
                         )
                         page_key = group_key.split_layers(1)[0]
                         if local_page_lookup:
@@ -1959,14 +1932,16 @@ class LMCacheEngine:
                             else:
                                 remote_keys.extend(sampled)
                             continue
-                        layer_keys = group_key.split_layers(self.num_layers)
+                        layer_keys = group_key.split_layers(
+                            self.num_layers_for_group(kv_group)
+                        )
                         if pin:
                             hits, pinned = self.storage_manager.batched_contains(
                                 layer_keys,
                                 ["LocalCPUBackend"],
                                 True,
                             )
-                            if hits == self.num_layers:
+                            if hits == self.num_layers_for_group(kv_group):
                                 for location, keys in pinned.items():
                                     mapping[location].extend(keys)
                                 continue
@@ -1984,7 +1959,7 @@ class LMCacheEngine:
                             ["LocalCPUBackend"],
                             False,
                         )
-                        if hits != self.num_layers:
+                        if hits != self.num_layers_for_group(kv_group):
                             if remote_page_lookup:
                                 remote_pages.append((page_key, sampled))
                             else:
@@ -2040,13 +2015,14 @@ class LMCacheEngine:
             details = []
             page_layout = mooncake_page_layout_enabled(self.config)
             for kv_group in self._layerwise_lookup_kv_groups():
+                num_layers = self.num_layers_for_group(kv_group)
                 group_key = self._lookup_key_for_kv_group(
                     base_key,
                     kv_group=kv_group,
                     request_configs=request_configs,
                 )
-                layer_keys = group_key.split_layers(self.num_layers)
-                sampled = first_last_layer_keys([group_key], self.num_layers)
+                layer_keys = group_key.split_layers(num_layers)
+                sampled = first_last_layer_keys([group_key], num_layers)
                 remote_page_hits = (
                     self.storage_manager.batched_contains_layer_pages(
                         layer_keys[:1], ["RemoteBackend"], False
@@ -2054,14 +2030,16 @@ class LMCacheEngine:
                     if page_layout
                     else 0
                 )
-                remote_legacy_hits = self.storage_manager.batched_contains(
-                    sampled, ["RemoteBackend"], False
-                )[0]
+                remote_legacy_hits = (
+                    self.storage_manager.batched_contains(
+                        sampled, ["RemoteBackend"], False
+                    )[0]
+                )
                 details.append(
                     {
                         "kv_group": kv_group,
                         "page_key": (
-                            mooncake_page_key(layer_keys[0], self.num_layers)
+                            mooncake_page_key(layer_keys[0], num_layers)
                             if page_layout
                             else None
                         ),
@@ -5878,15 +5856,16 @@ class LMCacheEngine:
                             request_configs=request_configs,
                         )
                         page = page_lookup and end - start == self.config.chunk_size
+                        group_num_layers = self.num_layers_for_group(kv_group)
                         group_keys: list[CacheEngineKey] = group_key.split_layers(
-                            1 if page else self.num_layers
+                            1 if page else group_num_layers
                         )
                         hit_chunks, block_mapping = contains_group(
                             group_keys, page, False
                         )
                         if page and (hit_chunks != 1 or len(block_mapping) != 1):
                             page = False
-                            group_keys = group_key.split_layers(self.num_layers)
+                            group_keys = group_key.split_layers(group_num_layers)
                             hit_chunks, block_mapping = contains_group(
                                 group_keys, page, False
                             )
