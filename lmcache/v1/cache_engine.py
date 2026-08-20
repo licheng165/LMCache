@@ -298,6 +298,9 @@ class LMCacheEngine:
         self.retrieve_locations = config.retrieve_locations
 
         self.num_layers = metadata.kv_shape[0]
+        self._kv_group_layers_declared: Optional[tuple[int, ...]] = (
+            self._parse_declared_kv_group_layers()
+        )
         self.fmt = None
         if self.use_layerwise:
             if metadata.use_mla:
@@ -344,6 +347,99 @@ class LMCacheEngine:
         if value is not None:
             return value
         return getattr(self.config, key, default)
+
+    def _parse_declared_kv_group_layers(self) -> Optional[tuple[int, ...]]:
+        """Parse the explicit kv_group_layers extra-config declaration.
+
+        Returns:
+            A tuple of positive per-group layer counts (e.g. (79, 22)),
+            or None when nothing is declared.
+
+        Raises:
+            ValueError: If the declaration is not a non-empty list of
+                positive ints.
+        """
+        raw = self._get_shared_config_value("kv_group_layers", None)
+        if raw is None:
+            return None
+        if isinstance(raw, (list, tuple)) and raw and all(
+            isinstance(value, int)
+            and not isinstance(value, bool)
+            and value > 0
+            for value in raw
+        ):
+            return tuple(int(value) for value in raw)
+        raise ValueError(
+            "kv_group_layers must be a non-empty list of positive ints, got: "
+            f"{raw!r}"
+        )
+
+    @property
+    def declared_kv_group_layers(self) -> Optional[tuple[int, ...]]:
+        """Return the declared kv_group_layers extra-config tuple or None."""
+        return self._kv_group_layers_declared
+
+    def num_layers_for_group(self, kv_group: int = 0) -> int:
+        """Return the authoritative transfer cardinality of a KV group.
+
+        The cardinality is the number of layer rows transferred per token
+        chunk for kv_group. It is distinct from the model forward count
+        (self.num_layers): under DSA two-groups with a shared indexer (e.g.
+        GLM-5.2 79 latent / 22 indexer) only the registered layers of the
+        group are stored, retrieved, or keyed.
+
+        Resolution order (fail-closed on disagreement):
+
+        1. Registered layer groups (metadata.kv_layer_groups_manager, built
+           by the serving-engine adapter from the live KV caches) - the
+           authoritative runtime truth on workers.
+        2. The explicit kv_group_layers extra-config declaration - required
+           on schedulers/lookup servers, where no KV cache is registered.
+        3. Fallback: the global model layer count (legacy equal-group
+           contract, e.g. GLM-5.1).
+
+        Args:
+            kv_group: The KV group index (0 = latent, 1 = indexer).
+
+        Returns:
+            The number of layers in the group.
+
+        Raises:
+            ValueError: If kv_group is out of range, or the registered and
+                declared cardinalities disagree.
+        """
+        if not self.dsa_two_groups:
+            return self.num_layers
+        groups = getattr(
+            getattr(self.metadata, "kv_layer_groups_manager", None),
+            "kv_layer_groups",
+            None,
+        ) or []
+        declared = self._kv_group_layers_declared
+        if len(groups) > 1:
+            if kv_group < 0 or kv_group >= len(groups):
+                raise ValueError(
+                    "KV group is out of range for registered layer groups: "
+                    f"kv_group={kv_group}, num_groups={len(groups)}"
+                )
+            registered = [group.num_layers for group in groups]
+            if declared is not None and tuple(registered) != declared:
+                raise ValueError(
+                    "Declared kv_group_layers disagrees with the registered "
+                    f"KV layer groups: declared={list(declared)}, "
+                    f"registered={registered}. Fix the kv_group_layers extra "
+                    "config or remove it so the registered groups are the "
+                    "only cardinality source."
+                )
+            return registered[kv_group]
+        if declared is not None:
+            if kv_group < 0 or kv_group >= len(declared):
+                raise ValueError(
+                    "KV group is out of range for declared kv_group_layers: "
+                    f"kv_group={kv_group}, declared={list(declared)}"
+                )
+            return declared[kv_group]
+        return self.num_layers
 
     @staticmethod
     def _legacy_indexer_policy_configured(config: LMCacheEngineConfig) -> bool:
@@ -617,18 +713,24 @@ class LMCacheEngine:
             )
         return shapes[kv_group], dtypes[kv_group]
 
-    def _shape_numel_without_layer_dim(self, shape: torch.Size) -> int:
+    def _shape_numel_without_layer_dim(
+        self,
+        shape: torch.Size,
+        num_layers: Optional[int] = None,
+    ) -> int:
+        if num_layers is None:
+            num_layers = self.num_layers
         dims = [int(dim) for dim in shape]
         if (
             len(dims) >= 3
-            and self.num_layers > 0
-            and dims[1] == self.num_layers
+            and num_layers > 0
+            and dims[1] == num_layers
         ):
             dims = dims[:1] + dims[2:]
         elif (
             len(dims) >= 3
-            and self.num_layers > 0
-            and dims[0] == self.num_layers
+            and num_layers > 0
+            and dims[0] == num_layers
         ):
             dims = dims[1:]
         numel = 1
@@ -682,7 +784,10 @@ class LMCacheEngine:
                 )
 
         dtype = self._shared_cpu_dtype_for_kv_group(kv_group)
-        return self._shape_numel_without_layer_dim(shape) * dtype.itemsize
+        return self._shape_numel_without_layer_dim(
+            shape,
+            self.num_layers_for_group(kv_group),
+        ) * dtype.itemsize
 
     def _expected_shared_cpu_chunk_metadata(
         self,
@@ -758,7 +863,7 @@ class LMCacheEngine:
 
         bytes_per_chunk_all_layers = sum(
             self._estimate_shared_cpu_chunk_bytes_per_layer(kv_group)
-            * self.num_layers
+            * self.num_layers_for_group(kv_group)
             for kv_group in kv_groups
         )
         one_request_bytes = bytes_per_chunk_all_layers * chunks_per_seq

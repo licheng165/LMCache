@@ -1985,6 +1985,24 @@ class LMCacheConnectorV1Impl:
             )
             kv_layer_groups_manager.build_kv_layer_groups(self.kv_caches)
             self._normalize_dsa_kv_layer_groups()
+            if self._is_dsa_two_groups():
+                engine = self.lmcache_engine
+                num_layers_for_group = getattr(
+                    engine, "num_layers_for_group", None
+                )
+                if callable(num_layers_for_group):
+                    logger.info(
+                        "LMCache KV group cardinality: latent=%d indexer=%d "
+                        "model_forward=%d declared=%s (mismatch between "
+                        "declared kv_group_layers and registered groups "
+                        "fails closed)",
+                        num_layers_for_group(0),
+                        num_layers_for_group(1),
+                        self.num_layers,
+                        list(engine.declared_kv_group_layers)
+                        if engine.declared_kv_group_layers is not None
+                        else None,
+                    )
 
     def _normalize_dsa_kv_layer_groups(self) -> None:
         """Keep metadata group index aligned with the DSA kv_group contract."""
