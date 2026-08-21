@@ -899,6 +899,53 @@ class TestWorkerRetrieveState:
             },
         )
 
+    def test_record_shared_state_uses_physical_indexer_cardinality(self):
+        impl = _make_impl()
+        impl.num_layers = 79
+        impl.config = SimpleNamespace(dsa_two_groups=True)
+        impl.kv_role = "kv_both"
+        impl._latent_kvcaches = [object()] * 79
+        impl._indexer_kvcaches = [object()] * 22
+        register = MagicMock()
+        impl.lmcache_engine = SimpleNamespace(
+            enable_shared_cpu_cache=True,
+            shared_cpu_cache_generation=7,
+            shared_cpu_materialize_index_on_decode_cold=True,
+            register_shared_cpu_sparse_request=register,
+        )
+        request = _make_request()
+        state = WorkerRetrieveState(
+            cached_starts=[0],
+            cached_ends=[3],
+            cached_memory_objs=[[f"latent-{layer}"] for layer in range(79)],
+            cached_chunk_ptrs_npu=[f"latent-ptr-{layer}" for layer in range(79)],
+            cached_shared_handles=[
+                [f"latent-handle-{layer}"] for layer in range(79)
+            ],
+            cached_starts_indexer=[0],
+            cached_ends_indexer=[3],
+            cached_memory_objs_indexer=[
+                [f"index-{layer}"] for layer in range(22)
+            ],
+            cached_chunk_ptrs_npu_indexer=[
+                f"index-ptr-{layer}" for layer in range(22)
+            ],
+            cached_shared_handles_indexer=[
+                [f"index-handle-{layer}"] for layer in range(22)
+            ],
+        )
+
+        impl._record_shared_worker_retrieve_state(state, request)
+
+        assert state.shared_index_status == "present"
+        register.assert_called_once_with(
+            "req-1",
+            owned_groups={
+                0: state.cached_memory_objs,
+                1: state.cached_memory_objs_indexer,
+            },
+        )
+
     def test_record_shared_state_rejects_short_latent_pointer_tensor(self):
         impl = _make_impl()
         impl.num_layers = 1

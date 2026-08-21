@@ -2524,7 +2524,9 @@ class LMCacheConnectorV1Impl:
                 f"token_count={validated_token_count}, "
                 f"cached_ranges={cached_ranges}"
             )
-        expected_layers = int(getattr(self, "num_layers", 0) or 0)
+        expected_latent_layers = self._num_layers_for_group(0)
+        if expected_latent_layers <= 0:
+            expected_latent_layers = int(getattr(self, "num_layers", 0) or 0)
         required_latent_chunks = self._shared_required_chunk_count(
             state.cached_starts,
             state.cached_ends,
@@ -2532,7 +2534,7 @@ class LMCacheConnectorV1Impl:
         )
         missing_latent_layers = self._missing_shared_layer_cache_coverage(
             state.cached_memory_objs,
-            expected_layers,
+            expected_latent_layers,
             required_latent_chunks,
         )
         if missing_latent_layers:
@@ -3288,7 +3290,9 @@ class LMCacheConnectorV1Impl:
         )
         if required_chunks <= 0:
             return False
-        expected_layers = int(getattr(self, "num_layers", 0) or 0)
+        expected_layers = self._num_layers_for_group(kv_group)
+        if expected_layers <= 0:
+            expected_layers = int(getattr(self, "num_layers", 0) or 0)
         if expected_layers <= 0:
             expected_layers = len(memory_objs or [])
         if expected_layers <= 0:
@@ -4100,7 +4104,9 @@ class LMCacheConnectorV1Impl:
             self._is_dsa_two_groups()
             and self._sparse_decode_requires_index_materialization(request, True)
         ):
-            expected_index_layers = int(getattr(self, "num_layers", 0) or 0)
+            expected_index_layers = self._num_layers_for_group(1)
+            if expected_index_layers <= 0:
+                expected_index_layers = int(getattr(self, "num_layers", 0) or 0)
             if expected_index_layers <= 0:
                 expected_index_layers = len(state.cached_memory_objs_indexer or [])
             required_index_chunks = max(
@@ -4244,7 +4250,9 @@ class LMCacheConnectorV1Impl:
             return bool(layers and any(layers))
 
         generation = int(getattr(engine, "shared_cpu_cache_generation", 0) or 0)
-        expected_layers = int(getattr(self, "num_layers", 0) or 0)
+        expected_latent_layers = self._num_layers_for_group(0)
+        if expected_latent_layers <= 0:
+            expected_latent_layers = int(getattr(self, "num_layers", 0) or 0)
         cold_compact = bool(
             request.load_spec is not None
             and getattr(request.load_spec, "dsa_cold_compact_load", False)
@@ -4262,7 +4270,7 @@ class LMCacheConnectorV1Impl:
         )
         missing_latent_layers = self._missing_shared_layer_cache_coverage(
             state.cached_memory_objs,
-            expected_layers,
+            expected_latent_layers,
             required_latent_chunks,
         )
         if missing_latent_layers:
@@ -4281,9 +4289,14 @@ class LMCacheConnectorV1Impl:
                 state.cached_memory_objs_indexer,
             ),
         )
+        expected_index_layers = self._num_layers_for_group(1)
+        if expected_index_layers <= 0:
+            expected_index_layers = int(getattr(self, "num_layers", 0) or 0)
+        if expected_index_layers <= 0:
+            expected_index_layers = len(state.cached_memory_objs_indexer or [])
         missing_index_layers = self._missing_shared_layer_cache_coverage(
             state.cached_memory_objs_indexer,
-            expected_layers,
+            expected_index_layers,
             required_index_chunks,
         )
         if materialize_index and missing_index_layers:
