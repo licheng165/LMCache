@@ -2209,6 +2209,17 @@ class LMCacheConnectorV1Impl:
             return None
         return int(layer_name[start:end])
 
+    def _layerwise_has_indexer_model_layer(
+        self, layer_id: Optional[int]
+    ) -> bool:
+        """Return whether a model layer owns a physical DSA indexer cache."""
+        if layer_id is None:
+            return False
+        return any(
+            self._layerwise_layer_id_from_name(indexer_name) == layer_id
+            for indexer_name in getattr(self, "_indexer_layer_names", ())
+        )
+
     def _layerwise_required_wait_groups(self) -> set[int]:
         cached = getattr(self, "_layerwise_required_wait_groups_cache", None)
         if cached is not None:
@@ -7165,6 +7176,13 @@ class LMCacheConnectorV1Impl:
                                 self._layerwise_sparse_indexer_sent_layers = (
                                     sparse_indexer_sent_layers
                                 )
+                        has_indexer_model_layer = (
+                            parsed_layer_id is not None
+                            and parsed_layer_id == self.current_layer
+                            and self._layerwise_has_indexer_model_layer(
+                                parsed_layer_id
+                            )
+                        )
                     if wait_group == 1:
                         ret_token_mask = None
                         if (
@@ -7200,6 +7218,7 @@ class LMCacheConnectorV1Impl:
                             indexer_retriever is not None
                             and sparse_indexer_sent_layers is not None
                             and indexer_sent_key not in sparse_indexer_sent_layers
+                            and has_indexer_model_layer
                         ):
                             indexer_ret_mask = indexer_retriever.send((None, 0))
                             sparse_indexer_sent_layers.add(indexer_sent_key)
