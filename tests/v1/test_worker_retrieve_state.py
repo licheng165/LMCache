@@ -45,6 +45,7 @@ def _make_impl() -> LMCacheConnectorV1Impl:
     impl._cold_perf_load_started = {}
     impl._cold_perf_dense_load_started = {}
     impl._cold_perf_dense_load_completed = {}
+    impl._layerwise_sparse_shared_ordered = []
     impl.kv_role = "kv_both"
     impl._late_finished_sending = set()
     return impl
@@ -717,8 +718,11 @@ class TestWorkerRetrieveState:
 
     def test_record_shared_state_rejects_skipped_index_with_index_objs(self):
         impl = _make_impl()
+        impl.num_layers = 1
         impl.config = SimpleNamespace(dsa_two_groups=True)
         impl.kv_role = "kv_both"
+        impl._latent_kvcaches = [object()]
+        impl._indexer_kvcaches = [object()]
         impl.lmcache_engine = SimpleNamespace(
             enable_shared_cpu_cache=True,
             shared_cpu_cache_generation=7,
@@ -742,6 +746,8 @@ class TestWorkerRetrieveState:
         impl.num_layers = 2
         impl.config = SimpleNamespace(dsa_two_groups=True)
         impl.kv_role = "kv_both"
+        impl._latent_kvcaches = [object(), object()]
+        impl._indexer_kvcaches = [object(), object()]
         impl.lmcache_engine = SimpleNamespace(
             enable_shared_cpu_cache=True,
             shared_cpu_cache_generation=7,
@@ -818,6 +824,8 @@ class TestWorkerRetrieveState:
         impl.num_layers = 2
         impl.config = SimpleNamespace(dsa_two_groups=True)
         impl.kv_role = "kv_both"
+        impl._latent_kvcaches = [object(), object()]
+        impl._indexer_kvcaches = [object(), object()]
         impl.lmcache_engine = SimpleNamespace(
             enable_shared_cpu_cache=True,
             shared_cpu_cache_generation=7,
@@ -850,6 +858,8 @@ class TestWorkerRetrieveState:
         impl.num_layers = 2
         impl.config = SimpleNamespace(dsa_two_groups=True)
         impl.kv_role = "kv_both"
+        impl._latent_kvcaches = [object(), object()]
+        impl._indexer_kvcaches = [object(), object()]
         register = MagicMock()
         impl.lmcache_engine = SimpleNamespace(
             enable_shared_cpu_cache=True,
@@ -972,6 +982,8 @@ class TestWorkerRetrieveState:
         impl.num_layers = 1
         impl.config = SimpleNamespace(dsa_two_groups=True)
         impl.kv_role = "kv_both"
+        impl._latent_kvcaches = [object()]
+        impl._indexer_kvcaches = [object()]
         impl.lmcache_engine = SimpleNamespace(
             enable_shared_cpu_cache=True,
             shared_cpu_cache_generation=7,
@@ -2486,6 +2498,68 @@ class TestWorkerRetrieveState:
         assert captured == ["indexer", "latent", "indexer"]
         assert impl.current_layer == 1
 
+    @pytest.mark.parametrize(
+        "physical_group_order",
+        [
+            ("latent", "indexer"),
+            ("indexer", "latent"),
+        ],
+    )
+    def test_dense_79_22_waits_only_on_physical_indexer_layers(
+        self, physical_group_order
+    ):
+        req = ReqMeta(
+            req_id="req-1",
+            token_ids=[1, 2, 3, 4],
+            load_spec=LoadSpec(
+                vllm_cached_tokens=0,
+                lmcache_cached_tokens=4,
+                can_load=True,
+            ),
+            is_sparse_decode=False,
+        )
+        impl, _, _ = make_worker_connector([req], use_layerwise=True)
+        impl.config.dsa_two_groups = True
+        indexer_layers = [0, 1, 2] + list(range(6, 79, 4))
+        impl._indexer_layer_names = [
+            f"model.layers.{layer}.self_attn.indexer.k_cache"
+            for layer in indexer_layers
+        ]
+        assert len(impl._indexer_layer_names) == 22
+        impl.current_layer = 5
+        impl.num_layers = 79
+        impl._layerwise_requests = [req]
+        impl._layerwise_retriever_is_sparse = [False]
+
+        captured = []
+
+        def _retriever(label):
+            while True:
+                captured.append(label)
+                yield torch.ones(4, dtype=torch.bool)
+
+        impl.layerwise_retrievers = [
+            (_retriever("latent"), _retriever("indexer"))
+        ]
+
+        impl.wait_for_layer_load("model.layers.5.self_attn.attn")
+
+        assert captured == ["latent"]
+        assert impl.current_layer == 6
+
+        for group in physical_group_order:
+            layer_name = (
+                "model.layers.6.self_attn.indexer.k_cache"
+                if group == "indexer"
+                else "model.layers.6.self_attn.attn"
+            )
+            impl.wait_for_layer_load(layer_name)
+            if group == physical_group_order[0]:
+                assert impl.current_layer == 6
+
+        assert captured == ["latent", *physical_group_order]
+        assert impl.current_layer == 7
+
     def test_mixed_dense_sparse_wait_supports_staged_graph_order(self):
         dense = ReqMeta(
             req_id="dense",
@@ -2831,6 +2905,107 @@ class TestWorkerRetrieveState:
         with pytest.raises(RuntimeError, match="incomplete MLA latent"):
             _bind_worker_state(impl, request)
 
+    def test_bind_dsa_rejects_missing_registered_latent_topology(self):
+        impl = _make_impl()
+        impl.num_layers = 2
+        impl.config = SimpleNamespace(dsa_two_groups=True)
+        impl.lmcache_engine = SimpleNamespace(
+            enable_shared_cpu_cache=True,
+            shared_cpu_cache_generation=2,
+        )
+        impl._num_layers_for_group = lambda _kv_group: 0
+        impl._sparse_decode_requires_index_materialization = lambda *_args: False
+        request = _make_request()
+        impl._worker_retrieve_state["req-1"] = WorkerRetrieveState(
+            cached_keys=[["layer0-key"]],
+            cached_starts=[0],
+            cached_ends=[3],
+            cached_memory_objs=[["latent-view"]],
+            cached_chunk_ptrs_npu=[torch.tensor([111], dtype=torch.long)],
+            metadata_warm=True,
+            shared_latent_status="present",
+            shared_index_status="skipped",
+            shared_generation=2,
+            pointer_cache_generation=2,
+            shared_request_active=True,
+            request_scope_token="req-1:2:3",
+        )
+
+        with pytest.raises(RuntimeError, match="group topology is registered"):
+            _bind_worker_state(impl, request)
+
+    def test_publish_dsa_state_rejects_missing_registered_topology(self):
+        impl = _make_impl()
+        impl.config = SimpleNamespace(dsa_two_groups=True)
+        impl._num_layers_for_group = lambda _kv_group: 0
+        impl.lmcache_engine = SimpleNamespace(
+            enable_shared_cpu_cache=True,
+            shared_cpu_cache_generation=2,
+        )
+
+        with pytest.raises(RuntimeError, match="topology is registered"):
+            impl._record_shared_worker_retrieve_state(
+                WorkerRetrieveState(), _make_request()
+            )
+
+    def test_promote_dsa_store_rejects_missing_registered_topology(self):
+        impl = _make_impl()
+        impl.config = SimpleNamespace(dsa_two_groups=True)
+        impl._num_layers_for_group = lambda _kv_group: 0
+        request, result = _make_store_request(
+            impl,
+            token_count=3,
+            start=0,
+            end=3,
+            key="k0",
+            tensor="t0",
+        )
+
+        with pytest.raises(RuntimeError, match="topology is registered"):
+            impl._promote_layerwise_store_result(request, result)
+
+    def test_dsa_retrieve_state_rejects_missing_registered_topology(self):
+        impl = _make_impl()
+        impl.config = SimpleNamespace(dsa_two_groups=True)
+        impl._num_layers_for_group = lambda _kv_group: 0
+
+        with pytest.raises(RuntimeError, match="topology is registered"):
+            impl._state_has_retrieve_tensor_cache(
+                WorkerRetrieveState(cached_memory_objs=[[object()]])
+            )
+
+    def test_decode_window_pointer_ready_rejects_missing_dsa_topology(self):
+        impl = _make_impl()
+        impl.config = SimpleNamespace(dsa_two_groups=True)
+        impl._num_layers_for_group = lambda _kv_group: 0
+        request = _make_request()
+        result = LayerwiseStoreResult(
+            request_id=request.req_id,
+            kv_group=1,
+            starts=[0],
+            ends=[3],
+            memory_objs=[[object()]],
+            chunk_ptrs=[torch.tensor([111], dtype=torch.long)],
+        )
+
+        assert not impl._decode_window_save_group_pointer_ready(request, 1, result)
+
+    def test_decode_save_validation_rejects_missing_dsa_index_topology(self):
+        impl = _make_impl()
+        impl.config = SimpleNamespace(dsa_two_groups=True)
+        impl._num_layers_for_group = lambda kv_group: 1 if kv_group == 0 else 0
+        impl._sparse_decode_requires_index_materialization = lambda *_args: True
+        request = _make_request()
+        state = WorkerRetrieveState(
+            cached_starts=[0],
+            cached_ends=[3],
+            cached_memory_objs=[[object()]],
+            cached_chunk_ptrs_npu=[torch.tensor([111], dtype=torch.long)],
+        )
+
+        with pytest.raises(RuntimeError, match="group topology is registered"):
+            impl._validate_decode_save_shared_pointer_cache(state, request)
+
     def test_bind_rejects_missing_strict_shared_index(self):
         impl = _make_impl()
         impl.config = SimpleNamespace(dsa_two_groups=True)
@@ -2860,6 +3035,8 @@ class TestWorkerRetrieveState:
         impl.num_layers = 2
         impl.config = SimpleNamespace(dsa_two_groups=True)
         impl.kv_role = "kv_both"
+        impl._latent_kvcaches = [object(), object()]
+        impl._indexer_kvcaches = [object(), object()]
         impl.lmcache_engine = SimpleNamespace(
             enable_shared_cpu_cache=True,
             shared_cpu_cache_generation=3,
@@ -3496,7 +3673,6 @@ class TestWorkerRetrieveState:
         impl._layerwise_sparse_req_ids = ["req-1"]
         impl._layerwise_waited_groups = {0}
         impl._layerwise_sparse_indexer_sent_layers = {0}
-        impl._layerwise_required_wait_groups_cache = (0,)
 
         with pytest.raises(RuntimeError, match="drain failed"):
             impl._drain_layerwise_retrievers()
@@ -3508,7 +3684,6 @@ class TestWorkerRetrieveState:
         assert impl._layerwise_sparse_req_ids == []
         assert impl._layerwise_waited_groups == set()
         assert impl._layerwise_sparse_indexer_sent_layers == set()
-        assert impl._layerwise_required_wait_groups_cache is None
 
     def test_sparse_retrieve_failure_drops_partially_extended_state(self):
         impl = _make_impl()
@@ -4029,6 +4204,8 @@ class TestWorkerRetrieveState:
         impl.config = SimpleNamespace(dsa_two_groups=True)
         impl.num_layers = 1
         impl.kv_role = "kv_both"
+        impl._latent_kvcaches = [object()]
+        impl._indexer_kvcaches = [object()]
         impl._completed_decode_window_saves = {}
         impl._decode_window_save_completed_groups = set()
         impl._decode_window_save_expected_start = {}
@@ -4402,6 +4579,8 @@ class TestWorkerRetrieveState:
         impl.config = SimpleNamespace(dsa_two_groups=True)
         impl.num_layers = 1
         impl.kv_role = "kv_both"
+        impl._latent_kvcaches = [object()]
+        impl._indexer_kvcaches = [object()]
         impl.lmcache_engine = SimpleNamespace(
             enable_shared_cpu_cache=True,
             shared_cpu_cache_generation=5,
@@ -4560,6 +4739,8 @@ class TestWorkerRetrieveState:
         impl.config = SimpleNamespace(dsa_two_groups=True)
         impl.num_layers = 1
         impl.kv_role = "kv_both"
+        impl._latent_kvcaches = [object()]
+        impl._indexer_kvcaches = [object()]
         impl.lmcache_engine = SimpleNamespace(
             enable_shared_cpu_cache=True,
             shared_cpu_cache_generation=5,

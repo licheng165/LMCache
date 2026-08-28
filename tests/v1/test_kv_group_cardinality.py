@@ -2,9 +2,8 @@
 """Per-group cardinality tests for DSA two-group (shared-indexer) models.
 
 Covers the GLM-5.2 contract (79 LATENT / 22 INDEXER):
-- resolve_kv_group_num_layers/parse_declared_kv_group_layers resolution
-  order and fail-closed behavior.
-- LMCacheEngine.num_layers_for_group over registered/declared sources.
+- Runtime and registered cardinality resolution with fail-closed behavior.
+- LMCacheEngine.num_layers_for_group over registered/runtime sources.
 - store_layer transfers exactly the group's layer rows (allocation batch
   size, key range 0..N-1, generator cadence) and fail-closes against a
   mismatched kvcaches list.
@@ -27,7 +26,6 @@ from lmcache.v1.cache_engine import LMCacheEngine
 from lmcache.v1.kv_layer_groups import (
     KVLayerGroupInfo,
     KVLayerGroupsManager,
-    parse_declared_kv_group_layers,
     resolve_kv_group_num_layers,
 )
 from lmcache.v1.metadata import LMCacheMetadata
@@ -65,7 +63,6 @@ class TestResolveKvGroupNumLayers:
                 dsa_two_groups=False,
                 model_num_layers=79,
                 registered_groups=[],
-                declared=None,
             )
             == 79
         )
@@ -78,7 +75,7 @@ class TestResolveKvGroupNumLayers:
                 dsa_two_groups=True,
                 model_num_layers=79,
                 registered_groups=groups,
-                declared=None,
+                runtime=(79, 22),
             )
             == 79
         )
@@ -88,58 +85,65 @@ class TestResolveKvGroupNumLayers:
                 dsa_two_groups=True,
                 model_num_layers=79,
                 registered_groups=groups,
-                declared=None,
+                runtime=(79, 22),
             )
             == 22
         )
 
-    def test_registered_and_declared_agree(self):
-        groups = _two_group_manager(79, 22).kv_layer_groups
-        assert (
-            resolve_kv_group_num_layers(
-                kv_group=1,
-                dsa_two_groups=True,
-                model_num_layers=79,
-                registered_groups=groups,
-                declared=(79, 22),
-            )
-            == 22
-        )
-
-    def test_registered_and_declared_disagree_fail_closed(self):
-        groups = _two_group_manager(79, 22).kv_layer_groups
-        with pytest.raises(ValueError, match="disagrees"):
-            resolve_kv_group_num_layers(
-                kv_group=1,
-                dsa_two_groups=True,
-                model_num_layers=79,
-                registered_groups=groups,
-                declared=(79, 79),
-            )
-
-    def test_declared_only_serves_scheduler(self):
+    def test_equal_runtime_groups_support_glm51(self):
         assert (
             resolve_kv_group_num_layers(
                 kv_group=1,
                 dsa_two_groups=True,
                 model_num_layers=79,
                 registered_groups=[],
-                declared=(79, 22),
-            )
-            == 22
-        )
-
-    def test_fallback_is_legacy_equal_group(self):
-        assert (
-            resolve_kv_group_num_layers(
-                kv_group=1,
-                dsa_two_groups=True,
-                model_num_layers=79,
-                registered_groups=[],
-                declared=None,
+                runtime=(79, 79),
             )
             == 79
         )
+
+    def test_runtime_metadata_serves_scheduler(self):
+        assert (
+            resolve_kv_group_num_layers(
+                kv_group=1,
+                dsa_two_groups=True,
+                model_num_layers=79,
+                registered_groups=[],
+                runtime=(79, 22),
+            )
+            == 22
+        )
+
+    def test_registered_and_runtime_disagree_fail_closed(self):
+        groups = _two_group_manager(79, 22).kv_layer_groups
+        with pytest.raises(ValueError, match="KV group metadata"):
+            resolve_kv_group_num_layers(
+                kv_group=1,
+                dsa_two_groups=True,
+                model_num_layers=79,
+                registered_groups=groups,
+                runtime=(79, 79),
+            )
+
+    @pytest.mark.parametrize("runtime", [None, (79,), (79, 0), (79, 22, 1)])
+    def test_missing_or_invalid_runtime_fails_closed(self, runtime):
+        with pytest.raises(ValueError, match="runtime"):
+            resolve_kv_group_num_layers(
+                kv_group=1,
+                dsa_two_groups=True,
+                model_num_layers=79,
+                registered_groups=[],
+                runtime=runtime,
+            )
+
+    def test_missing_runtime_rejects_registered_groups(self):
+        with pytest.raises(ValueError, match="runtime"):
+            resolve_kv_group_num_layers(
+                kv_group=1,
+                dsa_two_groups=True,
+                model_num_layers=79,
+                registered_groups=_two_group_manager(79, 22).kv_layer_groups,
+            )
 
     def test_out_of_range_fail_closed(self):
         with pytest.raises(ValueError, match="out of range"):
@@ -148,33 +152,14 @@ class TestResolveKvGroupNumLayers:
                 dsa_two_groups=True,
                 model_num_layers=79,
                 registered_groups=[],
-                declared=(79, 22),
+                runtime=(79, 22),
             )
-
-
-class TestParseDeclaredKvGroupLayers:
-    def test_none_untouched(self):
-        assert parse_declared_kv_group_layers(None) is None
-
-    def test_valid_list(self):
-        assert parse_declared_kv_group_layers([79, 22]) == (79, 22)
-
-    def test_rejects_empty(self):
-        with pytest.raises(ValueError):
-            parse_declared_kv_group_layers([])
-
-    def test_rejects_non_positive(self):
-        with pytest.raises(ValueError):
-            parse_declared_kv_group_layers([79, 0])
-
-    def test_rejects_non_int(self):
-        with pytest.raises(ValueError):
-            parse_declared_kv_group_layers([79, "22"])
 
 
 def _make_metadata(
     manager: Optional[KVLayerGroupsManager],
     num_layers: int = 79,
+    runtime: Optional[tuple[int, ...]] = None,
 ) -> LMCacheMetadata:
     return LMCacheMetadata(
         model_name="glm-5.2-test",
@@ -187,34 +172,88 @@ def _make_metadata(
         use_mla=True,
         chunk_size=256,
         kv_layer_groups_manager=manager or KVLayerGroupsManager(),
+        runtime_kv_group_layer_counts=runtime,
     )
 
 
 def _engine_for_cardinality(
     manager: Optional[KVLayerGroupsManager],
-    declared: Optional[tuple[int, ...]],
+    runtime: Optional[tuple[int, ...]],
 ) -> LMCacheEngine:
     engine = LMCacheEngine.__new__(LMCacheEngine)
     engine.num_layers = 79
     engine.dsa_two_groups = True
-    engine.metadata = _make_metadata(manager)
-    engine._kv_group_layers_declared = declared
+    engine.metadata = _make_metadata(manager, runtime=runtime)
     return engine
 
 
 class TestEngineNumLayersForGroup:
+    @pytest.mark.parametrize("runtime", [None, (79,)])
+    def test_init_rejects_invalid_runtime_before_resource_setup(
+        self,
+        monkeypatch,
+        runtime,
+    ):
+        side_effects = []
+
+        def record_side_effect(*_args, **_kwargs):
+            side_effects.append(True)
+
+        monkeypatch.setattr(
+            LMCacheEngine,
+            "_validate_shared_cpu_cache_contract",
+            record_side_effect,
+        )
+        monkeypatch.setattr(
+            LMCacheEngine,
+            "_prepare_shared_cpu_cache_name",
+            record_side_effect,
+        )
+        monkeypatch.setattr(
+            cache_engine_module.multiprocessing,
+            "set_start_method",
+            record_side_effect,
+        )
+        monkeypatch.setattr(
+            cache_engine_module.socket,
+            "gethostname",
+            record_side_effect,
+        )
+        monkeypatch.setattr(
+            cache_engine_module.threading,
+            "Condition",
+            record_side_effect,
+        )
+
+        with pytest.raises(ValueError, match="runtime"):
+            LMCacheEngine(
+                SimpleNamespace(dsa_two_groups=True),
+                _make_metadata(None, runtime=runtime),
+                SimpleNamespace(),
+                None,
+                lambda *_args: None,
+                lambda *_args: None,
+            )
+
+        assert side_effects == []
+
     def test_registered_two_groups(self):
-        engine = _engine_for_cardinality(_two_group_manager(79, 22), None)
+        engine = _engine_for_cardinality(_two_group_manager(79, 22), (79, 22))
         assert engine.num_layers_for_group(0) == 79
         assert engine.num_layers_for_group(1) == 22
 
-    def test_declared_scheduler_source(self):
+    def test_runtime_metadata_scheduler_source(self):
         engine = _engine_for_cardinality(None, (79, 22))
         assert engine.num_layers_for_group(0) == 79
         assert engine.num_layers_for_group(1) == 22
 
+    def test_missing_runtime_metadata_fails_closed(self):
+        engine = _engine_for_cardinality(None, None)
+        with pytest.raises(ValueError, match="runtime"):
+            engine.num_layers_for_group(1)
+
     def test_num_transfer_layers_validates_kvcaches(self):
-        engine = _engine_for_cardinality(_two_group_manager(79, 22), None)
+        engine = _engine_for_cardinality(_two_group_manager(79, 22), (79, 22))
         assert (
             engine._num_transfer_layers_for_call(
                 1, {"kvcaches": [object()] * 22}
@@ -273,8 +312,9 @@ def _store_layer_engine(kv_group: int, group_layers: int):
     engine = LMCacheEngine.__new__(LMCacheEngine)
     engine.num_layers = 79
     engine.dsa_two_groups = True
-    engine.metadata = _make_metadata(_two_group_manager(79, 22))
-    engine._kv_group_layers_declared = None
+    engine.metadata = _make_metadata(
+        _two_group_manager(79, 22), runtime=(79, 22)
+    )
     engine.kv_events_enabled = False
     engine.is_healthy = lambda: True
     engine._is_passive = lambda: False

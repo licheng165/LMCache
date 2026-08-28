@@ -13,34 +13,36 @@ from lmcache.logging import init_logger
 logger = init_logger(__name__)
 
 
-def parse_declared_kv_group_layers(
-    raw: object,
-) -> Optional[tuple[int, ...]]:
-    """Parse and validate a kv_group_layers declaration.
+def validate_two_group_layer_counts(
+    counts: Optional[Sequence[int]],
+) -> tuple[int, int]:
+    """Validate serving-engine runtime cardinalities for DSA groups.
 
     Args:
-        raw: The raw declaration value (e.g. from the kv_group_layers
-            extra config). None means nothing is declared.
+        counts: Runtime layer counts in latent/indexer order.
 
     Returns:
-        A tuple of positive per-group layer counts, or None.
+        The validated latent and indexer layer counts.
 
     Raises:
-        ValueError: If the declaration is not a non-empty list of
-            positive ints.
+        ValueError: If runtime metadata is missing or does not describe
+            exactly two non-empty groups.
     """
-    if raw is None:
-        return None
-    if isinstance(raw, (list, tuple)) and raw and all(
+    if counts is None:
+        raise ValueError(
+            "DSA two-group mode requires runtime KV group layer counts from "
+            "the serving engine"
+        )
+    if len(counts) == 2 and all(
         isinstance(value, int)
         and not isinstance(value, bool)
         and value > 0
-        for value in raw
+        for value in counts
     ):
-        return tuple(int(value) for value in raw)
+        return int(counts[0]), int(counts[1])
     raise ValueError(
-        "kv_group_layers must be a non-empty list of positive ints, got: "
-        f"{raw!r}"
+        "DSA two-group mode requires exactly two positive runtime layer "
+        f"counts, got: {counts!r}"
     )
 
 
@@ -50,60 +52,58 @@ def resolve_kv_group_num_layers(
     dsa_two_groups: bool,
     model_num_layers: int,
     registered_groups: Sequence["KVLayerGroupInfo"],
-    declared: Optional[Sequence[int]],
+    runtime: Optional[Sequence[int]] = None,
 ) -> int:
     """Resolve the authoritative transfer cardinality of a KV group.
 
     Shared by the cache engine and standalone lookup clients. Resolution
     order (fail-closed on disagreement):
 
-    1. Registered layer groups (built from the live KV caches) - the
-       authoritative runtime truth on workers.
-    2. The explicit kv_group_layers declaration - required on
-       schedulers/lookup servers, which register no KV caches.
-    3. Fallback: the global model layer count (legacy equal-group
-       contract).
+    DSA mode requires serving-engine runtime counts. Registered worker groups
+    are then validated against that expected topology before being used.
 
     Args:
         kv_group: The KV group index (0 = latent, 1 = indexer).
         dsa_two_groups: Whether DSA two-group mode is enabled.
         model_num_layers: The model forward layer count.
         registered_groups: Registered per-group layer info, if any.
-        declared: Declared per-group layer counts, if any.
+        runtime: Serving-engine-resolved per-group layer counts, if any.
 
     Returns:
         The number of layers in the group.
 
     Raises:
-        ValueError: If kv_group is out of range, or the registered and
-            declared cardinalities disagree.
+        ValueError: If runtime metadata is missing or invalid, kv_group is out
+            of range, or registered cardinalities disagree.
     """
     if not dsa_two_groups:
         return model_num_layers
-    if len(registered_groups) > 1:
+    runtime_counts = validate_two_group_layer_counts(runtime)
+    if registered_groups:
+        if len(registered_groups) != 2:
+            raise ValueError(
+                "DSA two-group mode requires exactly two registered KV layer "
+                f"groups, got {len(registered_groups)}"
+            )
         if kv_group < 0 or kv_group >= len(registered_groups):
             raise ValueError(
                 "KV group is out of range for registered layer groups: "
                 f"kv_group={kv_group}, num_groups={len(registered_groups)}"
             )
-        registered = [group.num_layers for group in registered_groups]
-        if declared is not None and tuple(registered) != tuple(declared):
+        registered = tuple(group.num_layers for group in registered_groups)
+        if registered != runtime_counts:
             raise ValueError(
-                "Declared kv_group_layers disagrees with the registered KV "
-                f"layer groups: declared={list(declared)}, "
-                f"registered={registered}. Fix the kv_group_layers "
-                "declaration or remove it so the registered groups are the "
-                "only cardinality source."
+                "Runtime KV group metadata disagrees with the registered KV "
+                f"layer groups: runtime={list(runtime_counts)}, "
+                f"registered={list(registered)}."
             )
         return registered[kv_group]
-    if declared is not None:
-        if kv_group < 0 or kv_group >= len(declared):
-            raise ValueError(
-                "KV group is out of range for declared kv_group_layers: "
-                f"kv_group={kv_group}, declared={list(declared)}"
-            )
-        return int(declared[kv_group])
-    return model_num_layers
+    if kv_group < 0 or kv_group >= len(runtime_counts):
+        raise ValueError(
+            "KV group is out of range for runtime metadata: "
+            f"kv_group={kv_group}, group_counts={list(runtime_counts)}"
+        )
+    return runtime_counts[kv_group]
 
 
 @dataclass

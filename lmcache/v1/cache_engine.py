@@ -74,8 +74,8 @@ from lmcache.v1.mooncake_layout import (
 )
 from lmcache.v1.pin_monitor import PinMonitor
 from lmcache.v1.kv_layer_groups import (
-    parse_declared_kv_group_layers,
     resolve_kv_group_num_layers,
+    validate_two_group_layer_counts,
 )
 from lmcache.v1.sampled_lookup import (
     find_last_sampled_hit,
@@ -189,6 +189,11 @@ class LMCacheEngine:
         logger.info(f"Creating LMCacheEngine with config: {config}")
         self.config = config
         self.metadata = metadata
+        self.dsa_two_groups = getattr(self.config, "dsa_two_groups", False)
+        if self.dsa_two_groups:
+            validate_two_group_layer_counts(
+                getattr(metadata, "runtime_kv_group_layer_counts", None)
+            )
         self.token_database = token_database
         self.gpu_connector = gpu_connector
         self.broadcast_fn = broadcast_fn
@@ -198,7 +203,6 @@ class LMCacheEngine:
             self.config.get_extra_config_value("save_only_first_rank", metadata.use_mla)
             and metadata.use_mla
         )
-        self.dsa_two_groups = getattr(self.config, "dsa_two_groups", False)
         self.enable_shared_cpu_cache = bool(
             self._get_shared_config_value("enable_shared_cpu_cache", False)
         )
@@ -302,9 +306,6 @@ class LMCacheEngine:
         self.retrieve_locations = config.retrieve_locations
 
         self.num_layers = metadata.kv_shape[0]
-        self._kv_group_layers_declared: Optional[tuple[int, ...]] = (
-            self._parse_declared_kv_group_layers()
-        )
         self.fmt = None
         if self.use_layerwise:
             if metadata.use_mla:
@@ -352,26 +353,6 @@ class LMCacheEngine:
             return value
         return getattr(self.config, key, default)
 
-    def _parse_declared_kv_group_layers(self) -> Optional[tuple[int, ...]]:
-        """Parse the explicit kv_group_layers extra-config declaration.
-
-        Returns:
-            A tuple of positive per-group layer counts (e.g. (79, 22)),
-            or None when nothing is declared.
-
-        Raises:
-            ValueError: If the declaration is not a non-empty list of
-                positive ints.
-        """
-        return parse_declared_kv_group_layers(
-            self._get_shared_config_value("kv_group_layers", None)
-        )
-
-    @property
-    def declared_kv_group_layers(self) -> Optional[tuple[int, ...]]:
-        """Return the declared kv_group_layers extra-config tuple or None."""
-        return self._kv_group_layers_declared
-
     def num_layers_for_group(self, kv_group: int = 0) -> int:
         """Return the authoritative transfer cardinality of a KV group.
 
@@ -386,10 +367,11 @@ class LMCacheEngine:
         1. Registered layer groups (metadata.kv_layer_groups_manager, built
            by the serving-engine adapter from the live KV caches) - the
            authoritative runtime truth on workers.
-        2. The explicit kv_group_layers extra-config declaration - required
-           on schedulers/lookup servers, where no KV cache is registered.
-        3. Fallback: the global model layer count (legacy equal-group
-           contract, e.g. GLM-5.1).
+        2. Per-group counts resolved by the serving engine and carried in
+           LMCacheMetadata.
+
+        Non-DSA callers retain the global model-layer contract. DSA callers
+        must provide runtime group counts, including equal-group models.
 
         Args:
             kv_group: The KV group index (0 = latent, 1 = indexer).
@@ -399,7 +381,7 @@ class LMCacheEngine:
 
         Raises:
             ValueError: If kv_group is out of range, or the registered and
-                declared cardinalities disagree.
+                startup cardinalities disagree.
         """
         # getattr keeps lightweight/mock engine instances (built via
         # __new__ in tests and connectors) working with the legacy global
@@ -418,7 +400,11 @@ class LMCacheEngine:
             dsa_two_groups=getattr(self, "dsa_two_groups", False),
             model_num_layers=self.num_layers,
             registered_groups=groups,
-            declared=getattr(self, "_kv_group_layers_declared", None),
+            runtime=getattr(
+                getattr(self, "metadata", None),
+                "runtime_kv_group_layer_counts",
+                None,
+            ),
         )
 
     def _num_transfer_layers_for_call(
@@ -454,8 +440,8 @@ class LMCacheEngine:
                     f"{kv_group} resolved_layers={num_layers} "
                     f"kvcaches_layers={kvcaches_len}. The registered KV "
                     "caches for this group disagree with the resolved "
-                    "group cardinality (check kv_group_layers and the "
-                    "serving-engine group registration)."
+                    "group cardinality (check runtime metadata and "
+                    "serving-engine registration)."
                 )
         return num_layers
 

@@ -66,6 +66,7 @@ from lmcache.v1.gpu_connector.sparse import (
     PreparedSparseSource,
     build_prepared_sparse_source,
 )
+from lmcache.v1.kv_layer_groups import validate_two_group_layer_counts
 from lmcache.v1.manager import LMCacheManager
 
 if TYPE_CHECKING:
@@ -74,6 +75,7 @@ if TYPE_CHECKING:
     from vllm.forward_context import ForwardContext
     from vllm.multimodal.inputs import PlaceholderRange
     from vllm.v1.core.sched.output import NewRequestData
+    from vllm.v1.kv_cache_interface import KVCacheConfig
     from vllm.v1.request import Request
 
     # First Party
@@ -1481,6 +1483,7 @@ class LMCacheConnectorV1Impl:
         vllm_config: "VllmConfig",
         role: KVConnectorRole,
         parent: KVConnectorBase_V1,
+        kv_cache_config: Optional["KVCacheConfig"] = None,
     ):
         self._parent = parent
         self._vllm_config = vllm_config
@@ -1494,9 +1497,25 @@ class LMCacheConnectorV1Impl:
             "LMCache v1 configuration is should be passed for vLLM v1."
         )
         self._apply_extra_config(config, vllm_config)
+        pipeline_parallel_size = vllm_config.parallel_config.pipeline_parallel_size
+        if config.dsa_two_groups and pipeline_parallel_size > 1:
+            raise ValueError(
+                "LMCache dsa_two_groups does not support pipeline parallelism; "
+                "pipeline_parallel_size must be 1, got "
+                f"{pipeline_parallel_size}."
+            )
+        runtime_group_layer_counts = self._derive_runtime_kv_group_layer_counts(
+            bool(config.dsa_two_groups),
+            kv_cache_config,
+        )
         self.config = config
 
-        service_factory = VllmServiceFactory(config, vllm_config, role.name.lower())
+        service_factory = VllmServiceFactory(
+            config,
+            vllm_config,
+            role.name.lower(),
+            runtime_kv_group_layer_counts=runtime_group_layer_counts,
+        )
         self._manager = LMCacheManager(config, service_factory, connector=self)
 
         # Start services managed by LMCacheManager
@@ -1557,6 +1576,52 @@ class LMCacheConnectorV1Impl:
                     max_num_batched_tokens
                 )
 
+    @staticmethod
+    def _derive_runtime_kv_group_layer_counts(
+        dsa_two_groups: bool,
+        kv_cache_config: Optional["KVCacheConfig"],
+    ) -> Optional[tuple[int, ...]]:
+        """Derive DSA group cardinalities from vLLM's resolved KV groups."""
+        if not dsa_two_groups:
+            return None
+        runtime_groups = (
+            kv_cache_config.kv_cache_groups
+            if kv_cache_config is not None
+            else None
+        )
+        runtime_layers = (
+            tuple(len(group.layer_names) for group in runtime_groups)
+            if runtime_groups is not None
+            else None
+        )
+        runtime_layers = validate_two_group_layer_counts(runtime_layers)
+
+        assert runtime_groups is not None
+        runtime_roles = []
+        for group in runtime_groups:
+            indexer_layers = [
+                "indexer" in layer_name.lower()
+                for layer_name in group.layer_names
+            ]
+            if all(indexer_layers):
+                runtime_roles.append("indexer")
+            elif not any(indexer_layers):
+                runtime_roles.append("latent")
+            else:
+                runtime_roles.append("mixed")
+        if runtime_roles != ["latent", "indexer"]:
+            raise ValueError(
+                "DSA two-group mode requires vLLM KV cache groups in latent "
+                "then indexer order, got group roles "
+                f"{runtime_roles}."
+            )
+
+        logger.info(
+            "Derived runtime KV group layer counts=%s from vLLM KVCacheConfig",
+            list(runtime_layers),
+        )
+        return runtime_layers
+
     def _init_connector_state(
         self,
         role: KVConnectorRole,
@@ -1585,7 +1650,6 @@ class LMCacheConnectorV1Impl:
         self._layerwise_waited_groups: set[int] = set()
         self._layerwise_sparse_indexer_sent_layers: set[tuple[str, int]] = set()
         self._layerwise_sparse_shared_ordered: list[bool] = []
-        self._layerwise_required_wait_groups_cache: Optional[set[int]] = None
         self._layerwise_save_storers: dict[
             LayerwiseSaveKey, Generator[Optional[LayerwiseStoreResult], None, None]
         ] = {}
@@ -1991,16 +2055,20 @@ class LMCacheConnectorV1Impl:
                     engine, "num_layers_for_group", None
                 )
                 if callable(num_layers_for_group):
+                    runtime_group_counts = getattr(
+                        engine.metadata,
+                        "runtime_kv_group_layer_counts",
+                        None,
+                    )
                     logger.info(
                         "LMCache KV group cardinality: latent=%d indexer=%d "
-                        "model_forward=%d declared=%s (mismatch between "
-                        "declared kv_group_layers and registered groups "
-                        "fails closed)",
+                        "model_forward=%d runtime=%s "
+                        "(mismatch with registered groups fails closed)",
                         num_layers_for_group(0),
                         num_layers_for_group(1),
                         self.num_layers,
-                        list(engine.declared_kv_group_layers)
-                        if engine.declared_kv_group_layers is not None
+                        list(runtime_group_counts)
+                        if runtime_group_counts is not None
                         else None,
                     )
 
@@ -2221,12 +2289,10 @@ class LMCacheConnectorV1Impl:
         )
 
     def _layerwise_required_wait_groups(self) -> set[int]:
-        cached = getattr(self, "_layerwise_required_wait_groups_cache", None)
-        if cached is not None:
-            return cached
-
         required = {0}
-        if self._is_dsa_two_groups():
+        if self._is_dsa_two_groups() and self._layerwise_has_indexer_model_layer(
+            self.current_layer
+        ):
             for idx, (_, indexer_retriever) in enumerate(
                 getattr(self, "layerwise_retrievers", [])
             ):
@@ -2237,7 +2303,6 @@ class LMCacheConnectorV1Impl:
                 if indexer_retriever is not None and not is_sparse:
                     required.add(1)
                     break
-        self._layerwise_required_wait_groups_cache = required
         return required
 
     def _layerwise_wait_should_advance(self, wait_group: int) -> bool:
@@ -2526,6 +2591,11 @@ class LMCacheConnectorV1Impl:
             )
         expected_latent_layers = self._num_layers_for_group(0)
         if expected_latent_layers <= 0:
+            if self._is_dsa_two_groups():
+                raise RuntimeError(
+                    "Shared CPU sparse decode cannot validate DSA latent state "
+                    "before the group topology is registered"
+                )
             expected_latent_layers = int(getattr(self, "num_layers", 0) or 0)
         required_latent_chunks = self._shared_required_chunk_count(
             state.cached_starts,
@@ -2997,7 +3067,6 @@ class LMCacheConnectorV1Impl:
                 self._layerwise_waited_groups.clear()
             if hasattr(self, "_layerwise_sparse_indexer_sent_layers"):
                 self._layerwise_sparse_indexer_sent_layers.clear()
-            self._layerwise_required_wait_groups_cache = None
 
     @staticmethod
     def _close_layerwise_retriever(
@@ -3292,6 +3361,8 @@ class LMCacheConnectorV1Impl:
             return False
         expected_layers = self._num_layers_for_group(kv_group)
         if expected_layers <= 0:
+            if self._is_dsa_two_groups():
+                return False
             expected_layers = int(getattr(self, "num_layers", 0) or 0)
         if expected_layers <= 0:
             expected_layers = len(memory_objs or [])
@@ -4106,9 +4177,10 @@ class LMCacheConnectorV1Impl:
         ):
             expected_index_layers = self._num_layers_for_group(1)
             if expected_index_layers <= 0:
-                expected_index_layers = int(getattr(self, "num_layers", 0) or 0)
-            if expected_index_layers <= 0:
-                expected_index_layers = len(state.cached_memory_objs_indexer or [])
+                raise RuntimeError(
+                    "Decode-window save cannot validate DSA index state before "
+                    "the group topology is registered"
+                )
             required_index_chunks = max(
                 required_latent_chunks,
                 self._shared_required_chunk_count(
@@ -4252,6 +4324,11 @@ class LMCacheConnectorV1Impl:
         generation = int(getattr(engine, "shared_cpu_cache_generation", 0) or 0)
         expected_latent_layers = self._num_layers_for_group(0)
         if expected_latent_layers <= 0:
+            if self._is_dsa_two_groups():
+                raise RuntimeError(
+                    "Shared CPU sparse decode cannot publish DSA state before "
+                    "the latent group topology is registered"
+                )
             expected_latent_layers = int(getattr(self, "num_layers", 0) or 0)
         cold_compact = bool(
             request.load_spec is not None
@@ -4291,9 +4368,12 @@ class LMCacheConnectorV1Impl:
         )
         expected_index_layers = self._num_layers_for_group(1)
         if expected_index_layers <= 0:
+            if self._is_dsa_two_groups():
+                raise RuntimeError(
+                    "Shared CPU sparse decode cannot publish DSA state before "
+                    "the index group topology is registered"
+                )
             expected_index_layers = int(getattr(self, "num_layers", 0) or 0)
-        if expected_index_layers <= 0:
-            expected_index_layers = len(state.cached_memory_objs_indexer or [])
         missing_index_layers = self._missing_shared_layer_cache_coverage(
             state.cached_memory_objs_indexer,
             expected_index_layers,
@@ -4865,6 +4945,11 @@ class LMCacheConnectorV1Impl:
         num_layers = self._num_layers_for_group(0)
         tensors = state.cached_tensors
         if num_layers <= 0:
+            if self._is_dsa_two_groups():
+                raise RuntimeError(
+                    "Cannot promote DSA retrieve state before the latent group "
+                    "topology is registered"
+                )
             if tensors and any(tensors):
                 return True
             mem = state.cached_memory_objs
@@ -5245,6 +5330,11 @@ class LMCacheConnectorV1Impl:
             return False
         num_layers = self._num_layers_for_group(result.kv_group)
         if num_layers <= 0:
+            if self._is_dsa_two_groups():
+                raise RuntimeError(
+                    "Cannot promote DSA store result before the group topology "
+                    f"is registered: kv_group={result.kv_group}"
+                )
             return bool(result.memory_objs and any(result.memory_objs))
         return (
             len(result.memory_objs) == num_layers

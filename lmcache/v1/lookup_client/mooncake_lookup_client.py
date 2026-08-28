@@ -9,8 +9,8 @@ import torch
 from lmcache.utils import CacheEngineKey
 from lmcache.v1.config import LMCacheEngineConfig
 from lmcache.v1.kv_layer_groups import (
-    parse_declared_kv_group_layers,
     resolve_kv_group_num_layers,
+    validate_two_group_layer_counts,
 )
 from lmcache.v1.lookup_client.abstract_client import LookupClientInterface
 from lmcache.v1.metadata import LMCacheMetadata
@@ -31,15 +31,16 @@ class MooncakeLookupClient(LookupClientInterface):
         metadata: LMCacheMetadata,
         master_addr: str,
     ):
+        self.config = config
+        self.metadata = metadata
+        if bool(getattr(config, "dsa_two_groups", False)):
+            validate_two_group_layer_counts(
+                getattr(metadata, "runtime_kv_group_layer_counts", None)
+            )
+
         # Third Party
         from mooncake.store import MooncakeDistributedStore
 
-        self.config = config
-        self.metadata = metadata
-        extra_config = getattr(config, "extra_config", None) or {}
-        self.declared_kv_group_layers = parse_declared_kv_group_layers(
-            extra_config.get("kv_group_layers", None)
-        )
         self.store = MooncakeDistributedStore()
         status = self.store.setup(
             "localhost",
@@ -107,7 +108,11 @@ class MooncakeLookupClient(LookupClientInterface):
                 dsa_two_groups=dsa_two_groups,
                 model_num_layers=num_layers,
                 registered_groups=registered_groups,
-                declared=getattr(self, "declared_kv_group_layers", None),
+                runtime=getattr(
+                    getattr(self, "metadata", None),
+                    "runtime_kv_group_layer_counts",
+                    None,
+                ),
             )
 
         sampled_lookup = bool(

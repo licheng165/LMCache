@@ -18,6 +18,7 @@ from lmcache.v1.cold_start_perf import (
     cold_start_perf_now,
 )
 from lmcache.v1.config import LMCacheEngineConfig
+from lmcache.v1.kv_layer_groups import resolve_kv_group_num_layers
 from lmcache.v1.memory_management import LayerPageMemoryObj, MemoryFormat, MemoryObj
 from lmcache.v1.mooncake_key_trace import trace_mooncake_keys
 from lmcache.v1.mooncake_layout import (
@@ -261,9 +262,6 @@ class MooncakestoreConnector(RemoteConnector):
             lmcache_config is not None
             and mooncake_layer_pages_enabled(lmcache_config)
             and getattr(local_cpu_backend, "layer_page_objects", False)
-        )
-        self._page_num_layers = int(
-            getattr(local_cpu_backend.metadata, "kv_shape", (1,))[0]
         )
         if getattr(self, "_page_first_multi_buffer", False):
             if self.save_chunk_meta:
@@ -586,6 +584,23 @@ class MooncakestoreConnector(RemoteConnector):
                 )
             self._external_buffers[ptr] = size
 
+    def _page_num_layers_for(self, key: CacheEngineKey) -> int:
+        """Resolve page cardinality from the key's live KV layer group."""
+        config = self.local_cpu_backend.config
+        metadata = self.local_cpu_backend.metadata
+        registered_groups = getattr(
+            getattr(metadata, "kv_layer_groups_manager", None),
+            "kv_layer_groups",
+            None,
+        ) or []
+        return resolve_kv_group_num_layers(
+            kv_group=int(getattr(key, "kv_group", 0) or 0),
+            dsa_two_groups=bool(getattr(config, "dsa_two_groups", False)),
+            model_num_layers=int(getattr(metadata, "kv_shape", (1,))[0]),
+            registered_groups=registered_groups,
+            runtime=getattr(metadata, "runtime_kv_group_layer_counts", None),
+        )
+
     def _page_keys_for(self, keys: List[CacheEngineKey]) -> list[Optional[str]]:
         """Resolve one serialized page key per unique layer-key identity."""
         if not getattr(self, "_page_first_multi_buffer", False):
@@ -608,7 +623,7 @@ class MooncakestoreConnector(RemoteConnector):
             )
             page_key = page_keys_by_identity.get(identity)
             if page_key is None:
-                page_key = mooncake_page_key(key, self._page_num_layers)
+                page_key = mooncake_page_key(key, self._page_num_layers_for(key))
                 page_keys_by_identity[identity] = page_key
             page_keys.append(page_key)
         return page_keys
@@ -671,12 +686,12 @@ class MooncakestoreConnector(RemoteConnector):
             grouped.setdefault(page_key, []).append(index)
 
         complete: list[tuple[str, list[int]]] = []
-        expected_layers = list(range(self._page_num_layers))
         for page_key, indices in grouped.items():
             ordered = sorted(
                 indices,
                 key=lambda index: keys[index].layer_id,  # type: ignore[attr-defined]
             )
+            expected_layers = list(range(self._page_num_layers_for(keys[ordered[0]])))
             layer_ids = [
                 keys[index].layer_id  # type: ignore[attr-defined]
                 for index in ordered
@@ -1066,6 +1081,7 @@ class MooncakestoreConnector(RemoteConnector):
             raise ValueError("Layer-page retrieval requires unique chunk keys")
 
         first_key = layer_keys[0]
+        page_num_layers = self._page_num_layers_for(first_key)
         first = self._metadata_for_raw_key(first_key)
         shapes, dtypes, fmt, _ = first
         if len(shapes) != 1 or len(dtypes) != 1 or any(
@@ -1078,7 +1094,7 @@ class MooncakestoreConnector(RemoteConnector):
         )
         allocation_started = cold_start_perf_now() if perf_enabled else 0.0
         pages = self.local_cpu_backend.batched_allocate_layer_pages(
-            shapes, dtypes, len(page_keys), self._page_num_layers, fmt
+            shapes, dtypes, len(page_keys), page_num_layers, fmt
         )
         allocation_ms = (
             (cold_start_perf_now() - allocation_started) * 1000
@@ -1094,7 +1110,7 @@ class MooncakestoreConnector(RemoteConnector):
                     layout="layer_merged",
                     kv_group=int(first_key.kv_group),
                     kv_groups=[int(first_key.kv_group)],
-                    layers=self._page_num_layers,
+                    layers=page_num_layers,
                     pages=len(page_keys),
                     submitted_pages=0,
                     completed_pages=0,
@@ -1110,9 +1126,9 @@ class MooncakestoreConnector(RemoteConnector):
             return []
 
         setup_started = cold_start_perf_now() if perf_enabled else 0.0
-        sizes = [[page.layer_size] * self._page_num_layers for page in pages]
+        sizes = [[page.layer_size] * page_num_layers for page in pages]
         ptrs = [
-            [page.layer_data_ptr(layer) for layer in range(self._page_num_layers)]
+            [page.layer_data_ptr(layer) for layer in range(page_num_layers)]
             for page in pages
         ]
         expected = [sum(page_sizes) for page_sizes in sizes]
@@ -1181,11 +1197,11 @@ class MooncakestoreConnector(RemoteConnector):
                     layout="layer_merged",
                     kv_group=int(first_key.kv_group),
                     kv_groups=[int(first_key.kv_group)],
-                    layers=self._page_num_layers,
+                    layers=page_num_layers,
                     pages=len(page_keys),
                     submitted_pages=len(page_keys),
                     completed_pages=len(page_keys) if status == "ok" else 0,
-                    buffers=len(page_keys) * self._page_num_layers,
+                    buffers=len(page_keys) * page_num_layers,
                     bytes=sum(expected),
                     metadata_ms=round(metadata_ms, 3),
                     allocation_ms=round(allocation_ms, 3),
@@ -1624,7 +1640,7 @@ class MooncakestoreConnector(RemoteConnector):
         page_keys = [
             key.to_string()
             if isinstance(key, LayerCacheEngineKey)
-            else mooncake_page_key(key, self._page_num_layers)
+            else mooncake_page_key(key, self._page_num_layers_for(key))
             for key in keys
         ]
         started = cold_start_perf_now() if cold_start_perf_enabled() else None
@@ -1718,7 +1734,9 @@ class MooncakestoreConnector(RemoteConnector):
         self, keys: List[CacheEngineKey]
     ) -> List[bool]:
         """Check arbitrary existing-format page keys in one Mooncake call."""
-        page_keys = [mooncake_page_key(key, self._page_num_layers) for key in keys]
+        page_keys = [
+            mooncake_page_key(key, self._page_num_layers_for(key)) for key in keys
+        ]
         results = self.store.batch_is_exist(page_keys)
         trace_mooncake_keys(
             "lookup",

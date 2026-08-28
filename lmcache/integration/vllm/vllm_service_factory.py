@@ -51,10 +51,13 @@ class VllmServiceFactory(BaseServiceFactory):
         lmcache_config: LMCacheEngineConfig,
         vllm_config: "VllmConfig",
         role: str,
-    ):
+        *,
+        runtime_kv_group_layer_counts: Optional[tuple[int, ...]] = None,
+    ) -> None:
         self.lmcache_config = lmcache_config
         self.vllm_config = vllm_config
         self.role = role
+        self.runtime_kv_group_layer_counts = runtime_kv_group_layer_counts
         self.metadata: Optional[LMCacheMetadata] = None
         self.lmcache_engine: Optional[LMCacheEngine] = None
 
@@ -157,6 +160,7 @@ class VllmServiceFactory(BaseServiceFactory):
             engine_id=engine_id,
             kv_connector_extra_config=kv_connector_extra_config,
             max_model_len=getattr(model_config, "max_model_len", None),
+            runtime_kv_group_layer_counts=self.runtime_kv_group_layer_counts,
         )
         return self.metadata
 
