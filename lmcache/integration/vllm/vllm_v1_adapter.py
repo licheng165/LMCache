@@ -1,14 +1,14 @@
 # SPDX-License-Identifier: Apache-2.0
 # Standard
 from collections import deque
-from collections.abc import Iterable
+from collections.abc import Iterable, Mapping
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass, field
 import json
 import os
 import time
-from types import SimpleNamespace
+from types import MappingProxyType, SimpleNamespace
 from typing import TYPE_CHECKING, Any, Generator, Optional, Union
 
 # Third Party
@@ -97,6 +97,15 @@ RETRIEVE_STATS_INTERVAL_SECONDS_ENV = (
     "VLLM_ASCEND_LMCACHE_RETRIEVE_STATS_INTERVAL_SECONDS"
 )
 LayerwiseSaveKey = tuple[str, str, int, int, int]
+
+
+@dataclass(frozen=True)
+class _DSAKVTopologyCache:
+    descriptor: Any
+    layer_name_to_row: Mapping[str, Any]
+    execution_to_entry: Mapping[int, Any]
+    group_layer_names: tuple[tuple[str, ...], ...]
+    group_cardinalities: tuple[int, ...]
 
 
 def _mtp_dw_diag_enabled() -> bool:
@@ -1504,10 +1513,30 @@ class LMCacheConnectorV1Impl:
                 "pipeline_parallel_size must be 1, got "
                 f"{pipeline_parallel_size}."
             )
-        runtime_group_layer_counts = self._derive_runtime_kv_group_layer_counts(
-            bool(config.dsa_two_groups),
-            kv_cache_config,
+        self._dsa_kv_topology_cache = self._build_dsa_kv_topology_cache(
+            bool(config.dsa_two_groups), kv_cache_config
         )
+        if self._dsa_kv_topology_cache is not None:
+            runtime_group_layer_counts = self._dsa_kv_topology_cache.group_cardinalities
+            producer_executions = [
+                execution_ordinal
+                for execution_ordinal, entry in (
+                    self._dsa_kv_topology_cache.execution_to_entry.items()
+                )
+                if entry.indexer is not None
+            ]
+            logger.info(
+                "Received vLLM DSA KV topology signature=%s, "
+                "group_cardinalities=%s, producer_executions=%s",
+                self._dsa_kv_topology_cache.descriptor.signature,
+                list(runtime_group_layer_counts),
+                producer_executions,
+            )
+        else:
+            runtime_group_layer_counts = self._derive_runtime_kv_group_layer_counts(
+                bool(config.dsa_two_groups),
+                kv_cache_config,
+            )
         self.config = config
 
         service_factory = VllmServiceFactory(
@@ -1515,6 +1544,11 @@ class LMCacheConnectorV1Impl:
             vllm_config,
             role.name.lower(),
             runtime_kv_group_layer_counts=runtime_group_layer_counts,
+            dsa_kv_topology=(
+                self._dsa_kv_topology_cache.descriptor
+                if self._dsa_kv_topology_cache is not None
+                else None
+            ),
         )
         self._manager = LMCacheManager(config, service_factory, connector=self)
 
@@ -1621,6 +1655,229 @@ class LMCacheConnectorV1Impl:
             list(runtime_layers),
         )
         return runtime_layers
+
+    @staticmethod
+    def _build_dsa_kv_topology_cache(
+        dsa_two_groups: bool,
+        kv_cache_config: Optional["KVCacheConfig"],
+    ) -> Optional[_DSAKVTopologyCache]:
+        """Validate and snapshot vLLM's authoritative DSA topology."""
+        if not dsa_two_groups or kv_cache_config is None:
+            return None
+        if not hasattr(kv_cache_config, "dsa_kv_topology"):
+            # Older vLLM releases do not expose the topology ABI. Keep their
+            # existing group-cardinality path until that ABI is available.
+            return None
+
+        topology = kv_cache_config.dsa_kv_topology
+        if topology is None:
+            raise ValueError(
+                "DSA two-group mode requires dsa_kv_topology from the vLLM "
+                "KVCacheConfig topology ABI."
+            )
+
+        try:
+            signature = topology.signature
+            raw_rows_by_group = topology.rows_by_group
+            raw_executions = topology.executions
+        except AttributeError as exc:
+            raise ValueError(
+                "vLLM dsa_kv_topology is partial; expected rows_by_group, "
+                "executions, and signature."
+            ) from exc
+        if not isinstance(signature, str) or not signature:
+            raise ValueError(
+                "vLLM dsa_kv_topology has an invalid signature; expected a "
+                "non-empty string."
+            )
+
+        try:
+            rows_by_group = tuple(tuple(rows) for rows in raw_rows_by_group)
+            executions = tuple(raw_executions)
+        except TypeError as exc:
+            raise ValueError(
+                "vLLM dsa_kv_topology is partial; rows_by_group and "
+                "executions must be iterable."
+            ) from exc
+        group_cardinalities = validate_two_group_layer_counts(
+            tuple(len(rows) for rows in rows_by_group)
+        )
+
+        def row_key(row: Any) -> tuple[str, int, int, int, int]:
+            try:
+                key = (
+                    row.layer_name,
+                    row.execution_ordinal,
+                    row.kv_group,
+                    row.row_ordinal,
+                    row.bank,
+                )
+            except AttributeError as exc:
+                raise ValueError(
+                    "vLLM dsa_kv_topology contains a partial row."
+                ) from exc
+            if (
+                not isinstance(key[0], str)
+                or not key[0]
+                or any(
+                    not isinstance(value, int) or isinstance(value, bool)
+                    for value in key[1:]
+                )
+            ):
+                raise ValueError(
+                    "vLLM dsa_kv_topology rows require a non-empty layer name "
+                    "and integer ordinals, group, and bank."
+                )
+            return key
+
+        layer_name_to_row: dict[str, Any] = {}
+        rows_by_execution: list[dict[int, Any]] = [{}, {}]
+        group_layer_names: list[tuple[str, ...]] = []
+        for kv_group, rows in enumerate(rows_by_group):
+            layer_names: list[str] = []
+            previous_execution_ordinal = -1
+            for expected_row_ordinal, row in enumerate(rows):
+                key = row_key(row)
+                layer_name, execution_ordinal, row_group, row_ordinal, bank = key
+                if (
+                    execution_ordinal < 0
+                    or row_group != kv_group
+                    or row_ordinal != expected_row_ordinal
+                    or bank != row_ordinal % 2
+                    or execution_ordinal <= previous_execution_ordinal
+                ):
+                    raise ValueError(
+                        "vLLM dsa_kv_topology row placement is inconsistent: "
+                        f"group={kv_group}, position={expected_row_ordinal}, "
+                        f"row={key!r}."
+                    )
+                previous_execution_ordinal = execution_ordinal
+                if layer_name in layer_name_to_row:
+                    raise ValueError(
+                        "vLLM dsa_kv_topology contains duplicate layer name "
+                        f"{layer_name!r}."
+                    )
+                layer_name_to_row[layer_name] = row
+                rows_by_execution[kv_group][execution_ordinal] = row
+                layer_names.append(layer_name)
+            group_layer_names.append(tuple(layer_names))
+
+        latent_execution_ordinals = tuple(rows_by_execution[0])
+        if latent_execution_ordinals != tuple(range(group_cardinalities[0])):
+            raise ValueError(
+                "vLLM dsa_kv_topology latent executions must be dense from "
+                f"zero, got {list(latent_execution_ordinals)}."
+            )
+
+        execution_to_entry: dict[int, Any] = {}
+        for entry in executions:
+            try:
+                execution_ordinal = entry.execution_ordinal
+                latent = entry.latent
+                indexer = entry.indexer
+            except AttributeError as exc:
+                raise ValueError(
+                    "vLLM dsa_kv_topology contains a partial execution entry; "
+                    "expected execution_ordinal, latent, and indexer."
+                ) from exc
+            if (
+                not isinstance(execution_ordinal, int)
+                or isinstance(execution_ordinal, bool)
+                or execution_ordinal < 0
+            ):
+                raise ValueError(
+                    "vLLM dsa_kv_topology execution_ordinal must be a "
+                    f"non-negative integer, got {execution_ordinal!r}."
+                )
+            if execution_ordinal in execution_to_entry:
+                raise ValueError(
+                    "vLLM dsa_kv_topology contains duplicate execution "
+                    f"ordinal {execution_ordinal}."
+                )
+
+            expected_latent = rows_by_execution[0].get(execution_ordinal)
+            if (
+                expected_latent is None
+                or row_key(latent) != row_key(expected_latent)
+                or latent.execution_ordinal != execution_ordinal
+                or latent.kv_group != 0
+            ):
+                raise ValueError(
+                    "vLLM dsa_kv_topology execution latent row disagrees with "
+                    f"rows_by_group for execution {execution_ordinal}."
+                )
+
+            expected_indexer = rows_by_execution[1].get(execution_ordinal)
+            if indexer is None:
+                if expected_indexer is not None:
+                    raise ValueError(
+                        "vLLM dsa_kv_topology execution is missing its indexer "
+                        f"row for execution {execution_ordinal}."
+                    )
+            else:
+                if (
+                    expected_indexer is None
+                    or row_key(indexer) != row_key(expected_indexer)
+                    or indexer.execution_ordinal != execution_ordinal
+                    or indexer.kv_group != 1
+                ):
+                    raise ValueError(
+                        "vLLM dsa_kv_topology execution indexer row disagrees "
+                        "with rows_by_group for execution "
+                        f"{execution_ordinal}."
+                    )
+            execution_to_entry[execution_ordinal] = entry
+
+        if tuple(execution_to_entry) != latent_execution_ordinals:
+            raise ValueError(
+                "vLLM dsa_kv_topology executions are partial or out of order; "
+                f"expected {list(latent_execution_ordinals)}, got "
+                f"{list(execution_to_entry)}."
+            )
+
+        try:
+            config_groups = tuple(kv_cache_config.kv_cache_groups)
+            config_group_layer_names = tuple(
+                tuple(group.layer_names) for group in config_groups
+            )
+        except (AttributeError, TypeError) as exc:
+            raise ValueError(
+                "DSA two-group mode requires iterable kv_cache_groups with "
+                "layer_names in vLLM KVCacheConfig."
+            ) from exc
+        config_cardinalities = validate_two_group_layer_counts(
+            tuple(len(names) for names in config_group_layer_names)
+        )
+        if config_cardinalities != group_cardinalities:
+            raise ValueError(
+                "vLLM dsa_kv_topology group cardinalities disagree with "
+                "KVCacheConfig groups: topology="
+                f"{list(group_cardinalities)}, config="
+                f"{list(config_cardinalities)}."
+            )
+        for kv_group, (topology_names, config_names) in enumerate(
+            zip(group_layer_names, config_group_layer_names, strict=True)
+        ):
+            if len(set(config_names)) != len(config_names):
+                raise ValueError(
+                    "vLLM KVCacheConfig contains duplicate layer names in DSA "
+                    f"group {kv_group}."
+                )
+            if set(config_names) != set(topology_names):
+                raise ValueError(
+                    "vLLM dsa_kv_topology group layer names disagree with "
+                    f"KVCacheConfig group {kv_group}: missing="
+                    f"{sorted(set(topology_names) - set(config_names))}, "
+                    f"unexpected={sorted(set(config_names) - set(topology_names))}."
+                )
+
+        return _DSAKVTopologyCache(
+            descriptor=topology,
+            layer_name_to_row=MappingProxyType(layer_name_to_row),
+            execution_to_entry=MappingProxyType(execution_to_entry),
+            group_layer_names=tuple(group_layer_names),
+            group_cardinalities=group_cardinalities,
+        )
 
     def _init_connector_state(
         self,

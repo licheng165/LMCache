@@ -2,6 +2,7 @@
 """Tests for deriving LMCache KV group cardinality from vLLM."""
 
 # Standard
+import operator
 from types import SimpleNamespace
 
 # Third Party
@@ -34,13 +35,18 @@ def _kv_cache_config(
     first_layer: int = 0,
     reverse_groups: bool = False,
 ) -> KVCacheConfig:
+    producer_executions = (
+        [0, 1, 2, *range(6, 75, 4), 78]
+        if latent_layers == 79 and indexer_layers == 22 and first_layer == 0
+        else list(range(indexer_layers))
+    )
     latent_names = [
         f"model.layers.{layer}.self_attn.attn"
         for layer in range(first_layer, first_layer + latent_layers)
     ]
     indexer_names = [
-        f"model.layers.{layer}.self_attn.indexer.k_cache"
-        for layer in range(first_layer, first_layer + indexer_layers)
+        f"model.layers.{first_layer + execution}.self_attn.indexer.k_cache"
+        for execution in producer_executions
     ]
     latent_spec = MLAAttentionSpec(
         block_size=16,
@@ -60,11 +66,42 @@ def _kv_cache_config(
     ]
     if reverse_groups:
         groups.reverse()
-    return KVCacheConfig(
+    config = KVCacheConfig(
         num_blocks=1,
         kv_cache_tensors=[],
         kv_cache_groups=groups,
     )
+    rows_by_group = []
+    for kv_group, layer_names in enumerate((latent_names, indexer_names)):
+        executions = range(latent_layers) if kv_group == 0 else producer_executions
+        rows_by_group.append(
+            tuple(
+                SimpleNamespace(
+                    layer_name=layer_name,
+                    execution_ordinal=execution_ordinal,
+                    kv_group=kv_group,
+                    row_ordinal=row_ordinal,
+                    bank=row_ordinal % 2,
+                )
+                for row_ordinal, (layer_name, execution_ordinal) in enumerate(
+                    zip(layer_names, executions, strict=True)
+                )
+            )
+        )
+    indexer_by_execution = {row.execution_ordinal: row for row in rows_by_group[1]}
+    config.dsa_kv_topology = SimpleNamespace(  # type: ignore[assignment]
+        rows_by_group=tuple(rows_by_group),
+        executions=tuple(
+            SimpleNamespace(
+                execution_ordinal=execution_ordinal,
+                latent=latent,
+                indexer=indexer_by_execution.get(execution_ordinal),
+            )
+            for execution_ordinal, latent in enumerate(rows_by_group[0])
+        ),
+        signature=f"test-{latent_layers}-{indexer_layers}-{first_layer}",
+    )
+    return config
 
 
 def _patch_connector_startup(
@@ -178,6 +215,158 @@ def test_connector_carries_real_vllm_group_counts_into_runtime_metadata(
     )
     assert (
         connector.lmcache_engine_metadata.runtime_kv_group_layer_counts == group_layers
+    )
+    assert observed == ["manager", "services", "layerwise", "metrics"]
+
+
+def test_connector_caches_authoritative_dsa_topology(monkeypatch) -> None:
+    _, vllm_config, observed = _patch_connector_startup(
+        monkeypatch,
+        dsa_two_groups=True,
+        model_num_layers=79,
+    )
+    kv_cache_config = _kv_cache_config(79, 22)
+    topology = kv_cache_config.dsa_kv_topology
+    assert topology is not None
+    topology_logs = []
+
+    def capture_info(message, *args, **_kwargs):
+        if message.startswith("Received vLLM DSA KV topology"):
+            topology_logs.append((message, args))
+
+    monkeypatch.setattr(adapter_module.logger, "info", capture_info)
+
+    connector = LMCacheConnectorV1Impl(
+        vllm_config,
+        KVConnectorRole.SCHEDULER,
+        object(),
+        kv_cache_config=kv_cache_config,
+    )
+
+    cache = connector._dsa_kv_topology_cache
+    assert cache is not None
+    assert cache.descriptor is topology
+    assert cache.group_cardinalities == (79, 22)
+    assert tuple(map(len, cache.group_layer_names)) == (79, 22)
+    assert len(cache.layer_name_to_row) == 101
+    assert len(cache.execution_to_entry) == 79
+
+    execution_6 = cache.execution_to_entry[6]
+    assert execution_6.latent.row_ordinal == 6
+    assert execution_6.indexer.row_ordinal == 3
+    assert execution_6.indexer.bank == 1
+    assert (
+        cache.layer_name_to_row[execution_6.indexer.layer_name] is execution_6.indexer
+    )
+
+    execution_78 = cache.execution_to_entry[78]
+    assert execution_78.latent.row_ordinal == 78
+    assert execution_78.indexer.row_ordinal == 21
+    assert execution_78.indexer.bank == 1
+    assert (
+        cache.layer_name_to_row[execution_78.indexer.layer_name] is execution_78.indexer
+    )
+
+    with pytest.raises(TypeError):
+        operator.setitem(cache.layer_name_to_row, "replacement", execution_6.latent)
+    with pytest.raises(TypeError):
+        operator.setitem(cache.execution_to_entry, 6, execution_78)
+
+    assert len(topology_logs) == 1
+    assert topology_logs[0][1][0] == topology.signature
+    assert topology_logs[0][1][1] == [79, 22]
+    assert topology_logs[0][1][2][3] == 6
+    assert topology_logs[0][1][2][-1] == 78
+    assert observed == ["manager", "services", "layerwise", "metrics"]
+
+
+@pytest.mark.parametrize(
+    ("mismatch", "error"),
+    [
+        ("cardinality", "group cardinalities disagree"),
+        ("membership", "group layer names disagree"),
+    ],
+)
+def test_dsa_topology_rejects_config_group_mismatch_before_startup(
+    monkeypatch,
+    mismatch,
+    error,
+) -> None:
+    _, vllm_config, observed = _patch_connector_startup(
+        monkeypatch,
+        dsa_two_groups=True,
+        model_num_layers=79,
+    )
+    kv_cache_config = _kv_cache_config(79, 22)
+    if mismatch == "cardinality":
+        kv_cache_config.kv_cache_groups[1].layer_names.pop()
+    else:
+        kv_cache_config.kv_cache_groups[1].layer_names[-1] = "unexpected.indexer"
+
+    with pytest.raises(ValueError, match=error):
+        LMCacheConnectorV1Impl(
+            vllm_config,
+            KVConnectorRole.SCHEDULER,
+            object(),
+            kv_cache_config=kv_cache_config,
+        )
+
+    assert observed == []
+
+
+@pytest.mark.parametrize(
+    ("topology", "error"),
+    [
+        (None, "requires dsa_kv_topology"),
+        (SimpleNamespace(rows_by_group=((), ())), "topology is partial"),
+    ],
+)
+def test_dsa_topology_abi_fails_closed_before_startup(
+    monkeypatch,
+    topology,
+    error,
+) -> None:
+    _, vllm_config, observed = _patch_connector_startup(
+        monkeypatch,
+        dsa_two_groups=True,
+        model_num_layers=79,
+    )
+    kv_cache_config = _kv_cache_config(79, 22)
+    kv_cache_config.dsa_kv_topology = topology
+
+    with pytest.raises(ValueError, match=error):
+        LMCacheConnectorV1Impl(
+            vllm_config,
+            KVConnectorRole.SCHEDULER,
+            object(),
+            kv_cache_config=kv_cache_config,
+        )
+
+    assert observed == []
+
+
+def test_dsa_legacy_kv_cache_config_without_topology_remains_supported(
+    monkeypatch,
+) -> None:
+    _, vllm_config, observed = _patch_connector_startup(
+        monkeypatch,
+        dsa_two_groups=True,
+        model_num_layers=79,
+    )
+    current_config = _kv_cache_config(79, 22)
+    legacy_config = SimpleNamespace(kv_cache_groups=current_config.kv_cache_groups)
+
+    connector = LMCacheConnectorV1Impl(
+        vllm_config,
+        KVConnectorRole.SCHEDULER,
+        object(),
+        kv_cache_config=legacy_config,
+    )
+
+    assert connector._dsa_kv_topology_cache is None
+    assert connector.lmcache_engine_metadata.runtime_kv_group_layer_counts == (
+        79,
+        22,
     )
     assert observed == ["manager", "services", "layerwise", "metrics"]
 
@@ -323,13 +512,16 @@ def test_runtime_kv_group_layer_counts_do_not_mutate_config(
             _role,
             *,
             runtime_kv_group_layer_counts,
+            dsa_kv_topology,
         ):
             self.runtime_kv_group_layer_counts = runtime_kv_group_layer_counts
+            self.dsa_kv_topology = dsa_kv_topology
             observed.append(
                 (
                     "factory",
                     dict(config.extra_config),
                     runtime_kv_group_layer_counts,
+                    dsa_kv_topology,
                 )
             )
 
@@ -340,6 +532,7 @@ def test_runtime_kv_group_layer_counts_do_not_mutate_config(
                     "manager",
                     dict(config.extra_config),
                     factory.runtime_kv_group_layer_counts,
+                    factory.dsa_kv_topology,
                 )
             )
             self.config = config
@@ -352,6 +545,7 @@ def test_runtime_kv_group_layer_counts_do_not_mutate_config(
                     "start",
                     dict(self.config.extra_config),
                     self.factory.runtime_kv_group_layer_counts,
+                    self.factory.dsa_kv_topology,
                 )
             )
 
@@ -385,17 +579,33 @@ def test_runtime_kv_group_layer_counts_do_not_mutate_config(
         parallel_config=ParallelConfig(),
     )
 
+    kv_cache_config = _kv_cache_config(79, 22)
     LMCacheConnectorV1Impl(
         vllm_config,
         SimpleNamespace(name="SCHEDULER"),
         object(),
-        kv_cache_config=_kv_cache_config(79, 22),
+        kv_cache_config=kv_cache_config,
     )
 
     assert observed == [
-        ("factory", initial_extra_config, (79, 22)),
-        ("manager", initial_extra_config, (79, 22)),
-        ("start", initial_extra_config, (79, 22)),
+        (
+            "factory",
+            initial_extra_config,
+            (79, 22),
+            kv_cache_config.dsa_kv_topology,
+        ),
+        (
+            "manager",
+            initial_extra_config,
+            (79, 22),
+            kv_cache_config.dsa_kv_topology,
+        ),
+        (
+            "start",
+            initial_extra_config,
+            (79, 22),
+            kv_cache_config.dsa_kv_topology,
+        ),
     ]
     assert config.extra_config == initial_extra_config
 
@@ -418,17 +628,20 @@ def test_service_factory_carries_runtime_counts_into_metadata(monkeypatch) -> No
         parallel_config=SimpleNamespace(rank=0, world_size=1),
         cache_config=SimpleNamespace(cache_dtype="auto"),
     )
+    topology = object()
     factory = VllmServiceFactory(
         SimpleNamespace(chunk_size=256),
         vllm_config,
         "scheduler",
         runtime_kv_group_layer_counts=(79, 22),
+        dsa_kv_topology=topology,
     )
 
     metadata = factory.get_or_create_metadata()
 
     assert metadata is not None
     assert metadata.runtime_kv_group_layer_counts == (79, 22)
+    assert metadata.dsa_kv_topology is topology
 
 
 def test_dynamic_connector_forwards_kv_cache_config(monkeypatch) -> None:

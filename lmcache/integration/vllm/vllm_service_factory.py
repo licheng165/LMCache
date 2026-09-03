@@ -8,7 +8,7 @@ keeping the LMCacheManager agnostic to the serving engine.
 
 # Standard
 from types import SimpleNamespace
-from typing import TYPE_CHECKING, Optional, Union
+from typing import TYPE_CHECKING, Any, Optional, Union
 
 if TYPE_CHECKING:
     # Third Party
@@ -53,11 +53,13 @@ class VllmServiceFactory(BaseServiceFactory):
         role: str,
         *,
         runtime_kv_group_layer_counts: Optional[tuple[int, ...]] = None,
+        dsa_kv_topology: Optional[Any] = None,
     ) -> None:
         self.lmcache_config = lmcache_config
         self.vllm_config = vllm_config
         self.role = role
         self.runtime_kv_group_layer_counts = runtime_kv_group_layer_counts
+        self.dsa_kv_topology = dsa_kv_topology
         self.metadata: Optional[LMCacheMetadata] = None
         self.lmcache_engine: Optional[LMCacheEngine] = None
 
@@ -161,6 +163,7 @@ class VllmServiceFactory(BaseServiceFactory):
             kv_connector_extra_config=kv_connector_extra_config,
             max_model_len=getattr(model_config, "max_model_len", None),
             runtime_kv_group_layer_counts=self.runtime_kv_group_layer_counts,
+            dsa_kv_topology=self.dsa_kv_topology,
         )
         return self.metadata
 

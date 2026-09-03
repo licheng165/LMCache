@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # Standard
 from dataclasses import dataclass, field
-from typing import Optional
+from typing import Any, Optional
 
 # Third Party
 import torch
@@ -68,6 +68,8 @@ class LMCacheMetadata:
     max_model_len: Optional[int] = None
     """Immutable per-group layer counts resolved by the serving engine."""
     runtime_kv_group_layer_counts: Optional[tuple[int, ...]] = None
+    """Canonical vLLM DSA KV topology descriptor, when DSA is enabled."""
+    dsa_kv_topology: Optional[Any] = None
 
     def is_first_rank(self) -> bool:
         """Check if the current worker is the first rank"""
