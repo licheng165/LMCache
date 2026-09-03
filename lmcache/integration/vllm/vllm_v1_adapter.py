@@ -5,8 +5,10 @@ from collections.abc import Iterable, Mapping
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass, field
+from enum import Enum
 import json
 import os
+import threading
 import time
 from types import MappingProxyType, SimpleNamespace
 from typing import TYPE_CHECKING, Any, Generator, Optional, Union
@@ -106,6 +108,639 @@ class _DSAKVTopologyCache:
     execution_to_entry: Mapping[int, Any]
     group_layer_names: tuple[tuple[str, ...], ...]
     group_cardinalities: tuple[int, ...]
+
+
+LAYERWISE_PREFILL_MAX_PENDING_JOBS_ENV = (
+    "LMCACHE_LAYERWISE_PREFILL_MAX_PENDING_JOBS"
+)
+LAYERWISE_PREFILL_MAX_PENDING_BYTES_ENV = (
+    "LMCACHE_LAYERWISE_PREFILL_MAX_PENDING_BYTES"
+)
+LAYERWISE_PREFILL_DEFAULT_MAX_PENDING_JOBS = 8
+LAYERWISE_PREFILL_DEFAULT_MAX_PENDING_BYTES = 64 << 20
+
+
+class LayerwisePrefillSavePhase(Enum):
+    """Lifecycle of one canonical layerwise-prefill row save."""
+
+    SAVE_SUBMITTED = "save_submitted"
+    SOURCE_DONE = "source_done"
+    PERSIST_DONE = "persist_done"
+
+
+def _layerwise_prefill_window_limit(
+    env_name: str,
+    default: int,
+) -> int:
+    raw = os.environ.get(env_name)
+    if raw is None:
+        return default
+    try:
+        value = int(raw)
+    except ValueError as exc:
+        raise ValueError(
+            f"{env_name} must be an integer, got {raw!r}."
+        ) from exc
+    if value <= 0:
+        raise ValueError(f"{env_name} must be positive, got {value}.")
+    return value
+
+
+def _dsa_row_key(row: Any) -> tuple[str, int, int, int, int]:
+    """Canonical identity of one DSA KV topology row."""
+
+    try:
+        key = (
+            row.layer_name,
+            row.execution_ordinal,
+            row.kv_group,
+            row.row_ordinal,
+            row.bank,
+        )
+    except AttributeError as exc:
+        raise ValueError(
+            "DSA KV topology contains a partial row."
+        ) from exc
+    if (
+        not isinstance(key[0], str)
+        or not key[0]
+        or any(
+            not isinstance(value, int) or isinstance(value, bool)
+            for value in key[1:]
+        )
+    ):
+        raise ValueError(
+            "DSA KV topology rows require a non-empty layer name and "
+            "integer ordinals, group, and bank."
+        )
+    return key
+
+
+@dataclass
+class _LayerwisePrefillWindowJob:
+    phase: LayerwisePrefillSavePhase = (
+        LayerwisePrefillSavePhase.SAVE_SUBMITTED
+    )
+    persist_future: Optional[Any] = None
+    # Host bytes credited to this job; only the primary job of a row
+    # callback carries them so multi-request batches do not over-count.
+    bytes: int = 0
+    primary: bool = False
+
+
+@dataclass
+class _LayerwisePrefillRequestArena:
+    request_id: str
+    allocation_generation: int
+    stale: bool = False
+    jobs: dict[tuple[int, int], _LayerwisePrefillWindowJob] = field(
+        default_factory=dict
+    )
+    save_cursors: dict[int, int] = field(default_factory=dict)
+    load_submitted_through: dict[int, int] = field(default_factory=dict)
+    pending_load_rows: dict[int, set[int]] = field(default_factory=dict)
+    pending_bytes: int = 0
+
+
+class LayerwisePrefillWindowCoordinator:
+    """Protocol state machine for the Stage 4 layerwise-prefill saves.
+
+    The coordinator owns the hardware-agnostic invariants of the two-phase
+    save protocol: canonical row validation against the frozen DSA topology,
+    per-group save cursors with the exact group cardinalities,
+    allocation-generation identity (so request-ID reuse and preemption
+    cannot alias arenas), the SAVE_SUBMITTED -> SOURCE_DONE -> PERSIST_DONE
+    lifecycle, bounded pending-save accounting, and the request-level
+    persistence barrier (all LATENT rows AND all INDEXER rows must reach
+    PERSIST_DONE).
+
+    Device-side submission and real completion events are delegated to a
+    backend supplied by the engine (the NPU implementation lives in
+    LMCache-Ascend). Without a backend every capability is False and all
+    callbacks fail closed before any state is mutated.
+    """
+
+    def __init__(
+        self,
+        topology_cache: _DSAKVTopologyCache,
+        backend: Optional[Any] = None,
+        *,
+        max_pending_jobs: Optional[int] = None,
+        max_pending_bytes: Optional[int] = None,
+    ):
+        self._topology = topology_cache
+        self._backend = backend
+        self._lock = threading.RLock()
+        self._arenas: dict[str, _LayerwisePrefillRequestArena] = {}
+        self._stale_arenas: dict[
+            tuple[str, int], _LayerwisePrefillRequestArena
+        ] = {}
+        self._max_pending_jobs = (
+            max_pending_jobs
+            if max_pending_jobs is not None
+            else _layerwise_prefill_window_limit(
+                LAYERWISE_PREFILL_MAX_PENDING_JOBS_ENV,
+                LAYERWISE_PREFILL_DEFAULT_MAX_PENDING_JOBS,
+            )
+        )
+        self._max_pending_bytes = (
+            max_pending_bytes
+            if max_pending_bytes is not None
+            else _layerwise_prefill_window_limit(
+                LAYERWISE_PREFILL_MAX_PENDING_BYTES_ENV,
+                LAYERWISE_PREFILL_DEFAULT_MAX_PENDING_BYTES,
+            )
+        )
+
+    @property
+    def topology_signature(self) -> str:
+        """Signature of the frozen DSA topology driving this coordinator."""
+
+        return self._topology.descriptor.signature
+
+    @property
+    def max_pending_jobs(self) -> int:
+        return self._max_pending_jobs
+
+    @property
+    def max_pending_bytes(self) -> int:
+        return self._max_pending_bytes
+
+    @property
+    def supports_sync_callbacks(self) -> bool:
+        return self._backend is not None and (
+            getattr(self._backend, "supports_sync_callbacks", False) is True
+        )
+
+    @property
+    def persists_indexer_group(self) -> bool:
+        return self._backend is not None and (
+            getattr(self._backend, "persists_indexer_group", False) is True
+        )
+
+    @property
+    def supports_transfer_window(self) -> bool:
+        return self._backend is not None and (
+            getattr(self._backend, "supports_transfer_window", False) is True
+        )
+
+    def pending_jobs(self) -> int:
+        with self._lock:
+            return sum(
+                1
+                for arena in self._arenas.values()
+                for job in arena.jobs.values()
+                if job.primary
+                and job.phase is not LayerwisePrefillSavePhase.PERSIST_DONE
+            )
+
+    def pending_bytes(self) -> int:
+        with self._lock:
+            return sum(arena.pending_bytes for arena in self._arenas.values())
+
+    def _expected_groups(self, execution: Any) -> tuple[int, ...]:
+        return (0,) if execution.indexer is None else (0, 1)
+
+    def _validate_metadata(self, metadata: Any) -> None:
+        row = metadata.row
+        execution = metadata.execution
+        canonical_row = self._topology.layer_name_to_row.get(row.layer_name)
+        if canonical_row is None or _dsa_row_key(canonical_row) != _dsa_row_key(row):
+            raise ValueError(
+                "Layerwise-prefill callback row is absent from the frozen "
+                f"DSA topology: {_dsa_row_key(row)!r}."
+            )
+        entry = self._topology.execution_to_entry.get(
+            execution.execution_ordinal
+        )
+        if entry is None:
+            raise ValueError(
+                "Layerwise-prefill callback execution is absent from the "
+                f"frozen DSA topology: {execution.execution_ordinal}."
+            )
+        if _dsa_row_key(entry.latent) != _dsa_row_key(execution.latent) or (
+            _dsa_row_key(entry.indexer) if entry.indexer is not None else None
+        ) != (
+            _dsa_row_key(execution.indexer)
+            if execution.indexer is not None
+            else None
+        ):
+            raise ValueError(
+                "Layerwise-prefill callback execution disagrees with the "
+                "frozen DSA topology: "
+                f"{execution.execution_ordinal}."
+            )
+        if row not in (execution.latent, execution.indexer):
+            raise ValueError(
+                "Layerwise-prefill callback row does not belong to its "
+                "execution."
+            )
+
+    def _metadata_request_generations(
+        self,
+        metadata: Any,
+    ) -> tuple[tuple[str, int], ...]:
+        generations = metadata.request_generations
+        if not generations:
+            raise ValueError(
+                "Layerwise-prefill window callbacks require at least one "
+                "request generation."
+            )
+        validated = []
+        for request_id, generation in generations:
+            if (
+                not isinstance(request_id, str)
+                or not request_id
+                or not isinstance(generation, int)
+                or isinstance(generation, bool)
+            ):
+                raise ValueError(
+                    "Layerwise-prefill callback generations must contain "
+                    "non-empty request IDs and integer generations."
+                )
+            validated.append((request_id, generation))
+        return tuple(validated)
+
+    def _arena_for(
+        self,
+        request_id: str,
+        generation: int,
+    ) -> _LayerwisePrefillRequestArena:
+        arena = self._arenas.get(request_id)
+        if arena is not None and arena.allocation_generation == generation:
+            return arena
+        if arena is not None:
+            # A new generation for a reused request ID supersedes the old
+            # arena; late old-generation completions may only clean their
+            # own resources and must never touch the new arena.
+            arena.stale = True
+            self._stale_arenas[(request_id, arena.allocation_generation)] = arena
+            del self._arenas[request_id]
+        arena = _LayerwisePrefillRequestArena(
+            request_id=request_id,
+            allocation_generation=generation,
+        )
+        self._arenas[request_id] = arena
+        return arena
+
+    def _resolve_arena(
+        self,
+        request_id: str,
+        generation: int,
+    ) -> Optional[_LayerwisePrefillRequestArena]:
+        arena = self._arenas.get(request_id)
+        if arena is not None and arena.allocation_generation == generation:
+            return arena
+        return self._stale_arenas.get((request_id, generation))
+
+    def _kv_layer_bytes(self, kv_layer: Any) -> int:
+        total = 0
+        tensors = kv_layer if isinstance(kv_layer, (list, tuple)) else (kv_layer,)
+        for tensor in tensors:
+            if torch.is_tensor(tensor):
+                total += tensor.numel() * tensor.element_size()
+        return total
+
+    def _enforce_pending_bounds(self, extra_bytes: int) -> None:
+        self._drain_completed_futures()
+        if (
+            self.pending_jobs() >= self._max_pending_jobs
+            or self.pending_bytes() + extra_bytes > self._max_pending_bytes
+        ):
+            raise RuntimeError(
+                "Layerwise-prefill window backlog exceeded its bounded "
+                "queue limits; refusing to submit another save instead of "
+                "dropping one."
+            )
+
+    def _settle_job(
+        self,
+        arena: _LayerwisePrefillRequestArena,
+        job: _LayerwisePrefillWindowJob,
+    ) -> None:
+        """Move one finished job to PERSIST_DONE and release its bytes."""
+
+        job.phase = LayerwisePrefillSavePhase.PERSIST_DONE
+        job.persist_future = None
+        arena.pending_bytes -= job.bytes
+
+    def _drain_completed_futures(self) -> None:
+        for arena in (*self._arenas.values(), *self._stale_arenas.values()):
+            for job in arena.jobs.values():
+                future = job.persist_future
+                if (
+                    job.phase is LayerwisePrefillSavePhase.SOURCE_DONE
+                    and future is not None
+                    and future.done()
+                ):
+                    future.result()
+                    self._settle_job(arena, job)
+
+    def wait_for_load(self, metadata: Any) -> None:
+        """Wait until the metadata's rows are ready for eager execution."""
+
+        self._validate_metadata(metadata)
+        generations = self._metadata_request_generations(metadata)
+        row = metadata.row
+        with self._lock:
+            arenas = []
+            must_wait = False
+            for request_id, generation in generations:
+                arena = self._resolve_arena(request_id, generation)
+                if arena is None:
+                    # The wait is the first callback of a request; it creates
+                    # the arena that all later saves of this generation use.
+                    arena = self._arena_for(request_id, generation)
+                arenas.append(arena)
+                must_wait = must_wait or (
+                    not arena.stale
+                    and row.row_ordinal
+                    in arena.pending_load_rows.get(row.kv_group, set())
+                )
+        if must_wait:
+            if self._backend is None:
+                raise RuntimeError(
+                    "Layerwise-prefill load wait requires a transfer backend."
+                )
+            self._backend.wait_for_load(metadata)
+        with self._lock:
+            for request_id, generation in generations:
+                arena = self._resolve_arena(request_id, generation)
+                if arena is not None and not arena.stale:
+                    arena.pending_load_rows.setdefault(
+                        row.kv_group, set()
+                    ).discard(row.row_ordinal)
+
+    def submit_save(
+        self,
+        metadata: Any,
+        kv_layer: Any,
+        attn_metadata: Any = None,
+    ) -> None:
+        """Pre-HCOM phase: enqueue one canonical row D2H save."""
+
+        self._validate_metadata(metadata)
+        generations = self._metadata_request_generations(metadata)
+        row = metadata.row
+        extra_bytes = self._kv_layer_bytes(kv_layer)
+        with self._lock:
+            arenas = []
+            for request_id, generation in generations:
+                arena = self._resolve_arena(request_id, generation)
+                if arena is not None and arena.stale:
+                    raise RuntimeError(
+                        "Refusing a layerwise-prefill save for the superseded "
+                        f"generation {request_id!r}/{generation}."
+                    )
+                if arena is None:
+                    arena = self._arena_for(request_id, generation)
+                expected = arena.save_cursors.get(row.kv_group, 0)
+                if row.row_ordinal != expected:
+                    raise RuntimeError(
+                        "Layerwise-prefill saves must arrive in per-group row "
+                        f"order: group={row.kv_group}, expected row "
+                        f"{expected}, got {row.row_ordinal}."
+                    )
+                arenas.append(arena)
+            self._enforce_pending_bounds(extra_bytes)
+            if self._backend is None:
+                raise RuntimeError(
+                    "Layerwise-prefill save submitted without a transfer "
+                    "backend."
+                )
+            self._backend.submit_save(metadata, kv_layer, attn_metadata)
+            for index, arena in enumerate(arenas):
+                arena.jobs[(row.kv_group, row.row_ordinal)] = (
+                    _LayerwisePrefillWindowJob(
+                        bytes=extra_bytes if index == 0 else 0,
+                        primary=index == 0,
+                    )
+                )
+                arena.save_cursors[row.kv_group] = row.row_ordinal + 1
+                if index == 0:
+                    arena.pending_bytes += extra_bytes
+
+    def finish_save(self, metadata: Any) -> None:
+        """Post-HCOM phase: publish one submitted row save."""
+
+        self._validate_metadata(metadata)
+        generations = self._metadata_request_generations(metadata)
+        row = metadata.row
+        with self._lock:
+            arenas = []
+            jobs = []
+            for request_id, generation in generations:
+                arena = self._resolve_arena(request_id, generation)
+                if arena is None:
+                    raise RuntimeError(
+                        "Layerwise-prefill finish for an unknown request "
+                        f"generation: {request_id!r}/{generation}."
+                    )
+                job = arena.jobs.get((row.kv_group, row.row_ordinal))
+                if job is None:
+                    raise RuntimeError(
+                        "Layerwise-prefill finish arrived before its submit: "
+                        f"group={row.kv_group}, row={row.row_ordinal}."
+                    )
+                arenas.append(arena)
+                jobs.append(job)
+            submitted = [
+                job
+                for job in jobs
+                if job.phase is LayerwisePrefillSavePhase.SAVE_SUBMITTED
+            ]
+            if not submitted:
+                # Duplicate completion for an already-published row is
+                # idempotent; the backend still cleans its own resources.
+                if self._backend is not None:
+                    self._backend.finish_save(metadata)
+                return
+            if self._backend is None:
+                raise RuntimeError(
+                    "Layerwise-prefill finish submitted without a transfer "
+                    "backend."
+                )
+            future = self._backend.finish_save(metadata)
+            for arena, job in zip(arenas, jobs, strict=True):
+                if job.phase is not LayerwisePrefillSavePhase.SAVE_SUBMITTED:
+                    continue
+                job.phase = LayerwisePrefillSavePhase.SOURCE_DONE
+                job.persist_future = future
+                if future is None:
+                    # No completion-required backend futures: the synchronous
+                    # store already committed the bytes.
+                    self._settle_job(arena, job)
+
+    def save(
+        self,
+        metadata: Any,
+        kv_layer: Any,
+        attn_metadata: Any = None,
+    ) -> None:
+        """Synchronous Stage 3 contract: save one row in one call."""
+
+        self._validate_metadata(metadata)
+        generations = self._metadata_request_generations(metadata)
+        row = metadata.row
+        with self._lock:
+            arenas = []
+            for request_id, generation in generations:
+                arena = self._resolve_arena(request_id, generation)
+                if arena is not None and arena.stale:
+                    raise RuntimeError(
+                        "Refusing a layerwise-prefill save for the superseded "
+                        f"generation {request_id!r}/{generation}."
+                    )
+                if arena is None:
+                    arena = self._arena_for(request_id, generation)
+                expected = arena.save_cursors.get(row.kv_group, 0)
+                if row.row_ordinal != expected:
+                    raise RuntimeError(
+                        "Layerwise-prefill saves must arrive in per-group row "
+                        f"order: group={row.kv_group}, expected row "
+                        f"{expected}, got {row.row_ordinal}."
+                    )
+                arenas.append(arena)
+            if self._backend is None:
+                raise RuntimeError(
+                    "Layerwise-prefill save submitted without a transfer "
+                    "backend."
+                )
+            self._backend.save(metadata, kv_layer, attn_metadata)
+            for index, arena in enumerate(arenas):
+                arena.jobs[(row.kv_group, row.row_ordinal)] = (
+                    _LayerwisePrefillWindowJob(
+                        phase=LayerwisePrefillSavePhase.PERSIST_DONE,
+                        primary=index == 0,
+                    )
+                )
+                arena.save_cursors[row.kv_group] = row.row_ordinal + 1
+
+    def submit_load(self, metadata: Any) -> None:
+        """Pre-HCOM phase: enqueue the next row loads for present groups."""
+
+        self._validate_metadata(metadata)
+        generations = self._metadata_request_generations(metadata)
+        execution = metadata.execution
+        with self._lock:
+            submissions: list[tuple[int, int]] = []
+            for request_id, generation in generations:
+                arena = self._resolve_arena(request_id, generation)
+                if arena is None or arena.stale:
+                    raise RuntimeError(
+                        "Layerwise-prefill load submit for an inactive request "
+                        f"generation: {request_id!r}/{generation}."
+                    )
+                for kv_group in self._expected_groups(execution):
+                    row = (
+                        execution.latent
+                        if kv_group == 0
+                        else execution.indexer
+                    )
+                    assert row is not None
+                    next_row = row.row_ordinal + 1
+                    cardinality = self._topology.group_cardinalities[kv_group]
+                    if next_row >= cardinality:
+                        continue
+                    if next_row < arena.load_submitted_through.get(kv_group, 0):
+                        continue
+                    arena.load_submitted_through[kv_group] = next_row + 1
+                    arena.pending_load_rows.setdefault(kv_group, set()).add(
+                        next_row
+                    )
+                    submissions.append((kv_group, next_row))
+        if submissions and self._backend is not None:
+            self._backend.submit_load(metadata)
+
+    def poll_completed_persists(self) -> None:
+        """Settle persistence futures that already completed (non-blocking)."""
+
+        with self._lock:
+            self._drain_completed_futures()
+
+    def has_request(self, request_id: str) -> bool:
+        """Whether the coordinator still owns an active arena for a request."""
+
+        with self._lock:
+            return request_id in self._arenas
+
+    def release_request(self, request_id: str) -> None:
+        """Drop every arena (current and stale) owned by one request."""
+
+        with self._lock:
+            self._arenas.pop(request_id, None)
+            for key in [
+                key for key in self._stale_arenas if key[0] == request_id
+            ]:
+                del self._stale_arenas[key]
+        if self._backend is not None:
+            abort = getattr(self._backend, "abort_request", None)
+            if callable(abort):
+                abort(request_id)
+
+    def request_persist_done(self, request_id: str) -> bool:
+        """Whether every required row of a request reached PERSIST_DONE."""
+
+        with self._lock:
+            arena = self._arenas.get(request_id)
+            if arena is None:
+                return False
+            return self._request_persist_done_unlocked(arena)
+
+    def wait_for_request_persist_done(self, request_id: str) -> None:
+        """Block until every required row of a request is persisted."""
+
+        while True:
+            self._drain_completed_futures()
+            with self._lock:
+                arena = self._arenas.get(request_id)
+                if arena is None:
+                    raise RuntimeError(
+                        "Layerwise-prefill persistence barrier for an "
+                        f"unknown request: {request_id!r}."
+                    )
+                if self._request_persist_done_unlocked(arena):
+                    return
+                outstanding = [
+                    (arena, job)
+                    for job in arena.jobs.values()
+                    if job.phase is LayerwisePrefillSavePhase.SOURCE_DONE
+                    and job.persist_future is not None
+                ]
+                if not outstanding:
+                    missing = sum(
+                        1
+                        for kv_group, cardinality in enumerate(
+                            self._topology.group_cardinalities
+                        )
+                        for row_ordinal in range(cardinality)
+                        if (kv_group, row_ordinal) not in arena.jobs
+                    )
+                    raise RuntimeError(
+                        "Layerwise-prefill persistence barrier is missing "
+                        f"{missing} row saves for {request_id!r}."
+                    )
+            for job_arena, job in outstanding:
+                future = job.persist_future
+                if future is not None:
+                    future.result()
+                    self._settle_job(job_arena, job)
+
+    def _request_persist_done_unlocked(
+        self,
+        arena: _LayerwisePrefillRequestArena,
+    ) -> bool:
+        for kv_group, cardinality in enumerate(
+            self._topology.group_cardinalities
+        ):
+            for row_ordinal in range(cardinality):
+                job = arena.jobs.get((kv_group, row_ordinal))
+                if (
+                    job is None
+                    or job.phase is not LayerwisePrefillSavePhase.PERSIST_DONE
+                ):
+                    return False
+        return True
 
 
 def _mtp_dw_diag_enabled() -> bool:
@@ -1555,6 +2190,11 @@ class LMCacheConnectorV1Impl:
         # Start services managed by LMCacheManager
         self._manager.start_services()
 
+        # Stage 4 layerwise-prefill transfer-window protocol. Worker roles
+        # with a frozen DSA topology always get the protocol coordinator;
+        # device-side submission requires an engine-provided backend.
+        self._layerwise_prefill_window = self._build_layerwise_prefill_window()
+
         # Initialize connector-specific state
         self._init_connector_state(role, vllm_config, config)
 
@@ -1704,31 +2344,7 @@ class LMCacheConnectorV1Impl:
         )
 
         def row_key(row: Any) -> tuple[str, int, int, int, int]:
-            try:
-                key = (
-                    row.layer_name,
-                    row.execution_ordinal,
-                    row.kv_group,
-                    row.row_ordinal,
-                    row.bank,
-                )
-            except AttributeError as exc:
-                raise ValueError(
-                    "vLLM dsa_kv_topology contains a partial row."
-                ) from exc
-            if (
-                not isinstance(key[0], str)
-                or not key[0]
-                or any(
-                    not isinstance(value, int) or isinstance(value, bool)
-                    for value in key[1:]
-                )
-            ):
-                raise ValueError(
-                    "vLLM dsa_kv_topology rows require a non-empty layer name "
-                    "and integer ordinals, group, and bank."
-                )
-            return key
+            return _dsa_row_key(row)
 
         layer_name_to_row: dict[str, Any] = {}
         rows_by_execution: list[dict[int, Any]] = [{}, {}]
@@ -4213,6 +4829,7 @@ class LMCacheConnectorV1Impl:
             self._cold_perf_dense_load_completed.pop(req_id, None)
             self._drop_layerwise_save_storers(req_id)
             self._drop_worker_retrieve_state(req_id)
+            self._release_layerwise_prefill_window(req_id)
 
     def _request_may_store_in_wait_for_save(self, request: ReqMeta) -> bool:
         if self.kv_role == "kv_consumer":
@@ -8286,7 +8903,117 @@ class LMCacheConnectorV1Impl:
         else:
             for request in save_context.get("decode_window_saves", ()):
                 self._mark_decode_window_save_completed(request)
+            self._poll_layerwise_prefill_window()
             self._complete_worker_save_step()
+
+    @property
+    def supports_layerwise_prefill_eager_callbacks(self) -> bool:
+        """Whether synchronous canonical-row callbacks are available."""
+
+        window = getattr(self, "_layerwise_prefill_window", None)
+        return window is not None and window.supports_sync_callbacks
+
+    @property
+    def supports_dsa_index_lmcache(self) -> bool:
+        """Whether the separate DSA INDEXER KV group is persisted."""
+
+        window = getattr(self, "_layerwise_prefill_window", None)
+        return window is not None and window.persists_indexer_group
+
+    @property
+    def supports_layerwise_prefill_transfer_window(self) -> bool:
+        """Whether the Stage 4 pre/post-HCOM transfer window is available."""
+
+        window = getattr(self, "_layerwise_prefill_window", None)
+        return window is not None and window.supports_transfer_window
+
+    def _layerwise_prefill_window_or_raise(
+        self,
+        requirement: str,
+    ) -> LayerwisePrefillWindowCoordinator:
+        window = getattr(self, "_layerwise_prefill_window", None)
+        if window is None:
+            raise RuntimeError(
+                "Layerwise-prefill callbacks require a frozen DSA topology."
+            )
+        return window
+
+    def wait_for_layerwise_prefill_load(self, metadata: Any) -> None:
+        """Wait for the canonical rows of one execution (eager entry)."""
+
+        self._layerwise_prefill_window_or_raise("load").wait_for_load(metadata)
+
+    def save_layerwise_prefill_kv_layer(
+        self,
+        metadata: Any,
+        kv_layer: Any,
+        attn_metadata: Any = None,
+    ) -> None:
+        """Synchronously save one canonical DSA row (Stage 3 contract)."""
+
+        window = self._layerwise_prefill_window_or_raise("sync save")
+        if not window.supports_sync_callbacks:
+            raise RuntimeError(
+                "The active transfer backend does not support synchronous "
+                "layerwise-prefill saves."
+            )
+        window.save(metadata, kv_layer, attn_metadata)
+
+    def submit_layerwise_prefill_save(
+        self,
+        metadata: Any,
+        kv_layer: Any,
+        attn_metadata: Any = None,
+    ) -> None:
+        """Enqueue one canonical row D2H save (pre-HCOM phase)."""
+
+        window = self._layerwise_prefill_window_or_raise("submit save")
+        if not window.supports_transfer_window:
+            raise RuntimeError(
+                "The active transfer backend does not support the "
+                "layerwise-prefill transfer window."
+            )
+        window.submit_save(metadata, kv_layer, attn_metadata)
+
+    def submit_layerwise_prefill_load(self, metadata: Any) -> None:
+        """Enqueue the next row loads for the execution's groups."""
+
+        window = self._layerwise_prefill_window_or_raise("submit load")
+        if not window.supports_transfer_window:
+            raise RuntimeError(
+                "The active transfer backend does not support the "
+                "layerwise-prefill transfer window."
+            )
+        window.submit_load(metadata)
+
+    def finish_layerwise_prefill_save(self, metadata: Any) -> None:
+        """Publish one submitted row save (post-HCOM phase)."""
+
+        window = self._layerwise_prefill_window_or_raise("finish")
+        if not window.supports_transfer_window:
+            raise RuntimeError(
+                "The active transfer backend does not support the "
+                "layerwise-prefill transfer window."
+            )
+        window.finish_save(metadata)
+
+    def layerwise_prefill_request_persist_done(self, request_id: str) -> bool:
+        """Whether every required row of a request reached PERSIST_DONE."""
+
+        window = getattr(self, "_layerwise_prefill_window", None)
+        if window is None:
+            return False
+        return window.request_persist_done(request_id)
+
+    def wait_for_layerwise_prefill_request_persist_done(
+        self,
+        request_id: str,
+    ) -> None:
+        """Block until every required row of a request is persisted."""
+
+        self._layerwise_prefill_window_or_raise(
+            "persistence barrier"
+        ).wait_for_request_persist_done(request_id)
 
     def _wait_for_save_impl(self, save_context: dict[str, Any]) -> None:
         connector_metadata = self._parent._get_connector_metadata()
@@ -9901,3 +10628,60 @@ class LMCacheConnectorV1Impl:
         if self.lmcache_engine is not None:
             return self.lmcache_engine.get_kv_events()
         return []
+
+    def _build_layerwise_prefill_window(
+        self,
+    ) -> Optional[LayerwisePrefillWindowCoordinator]:
+        """Create the Stage 4 transfer-window protocol coordinator.
+
+        Worker roles with a frozen DSA topology always receive the protocol
+        coordinator. Device-side submission requires a backend exposed by
+        the engine as ``layerwise_prefill_window_backend``; without one every
+        layerwise-prefill capability stays False and the callbacks fail
+        closed before mutating protocol state.
+        """
+
+        topology_cache = getattr(self, "_dsa_kv_topology_cache", None)
+        if topology_cache is None or self._role == KVConnectorRole.SCHEDULER:
+            return None
+        engine = getattr(self, "lmcache_engine", None)
+        backend = getattr(engine, "layerwise_prefill_window_backend", None)
+        window = LayerwisePrefillWindowCoordinator(topology_cache, backend)
+        logger.info(
+            "Layerwise-prefill transfer-window coordinator ready: "
+            "topology_signature=%s group_cardinalities=%s "
+            "max_pending_jobs=%d max_pending_bytes=%d "
+            "transfer_window=%s sync_callbacks=%s "
+            "indexer_persistence=%s",
+            window.topology_signature,
+            list(topology_cache.group_cardinalities),
+            window.max_pending_jobs,
+            window.max_pending_bytes,
+            window.supports_transfer_window,
+            window.supports_sync_callbacks,
+            window.persists_indexer_group,
+        )
+        return window
+
+    def _poll_layerwise_prefill_window(self) -> None:
+        """Settle already-completed persistence futures (non-blocking)."""
+
+        window = getattr(self, "_layerwise_prefill_window", None)
+        if window is not None:
+            window.poll_completed_persists()
+
+    def _release_layerwise_prefill_window(self, req_id: str) -> None:
+        """Enforce the persistence barrier, then drop window arenas.
+
+        A request that never created an arena is released directly; one that
+        used the transfer window must have every required row persisted
+        before its protocol state is dropped, so a late completion can never
+        publish completion for a released request.
+        """
+
+        window = getattr(self, "_layerwise_prefill_window", None)
+        if window is None:
+            return
+        if window.has_request(req_id):
+            window.wait_for_request_persist_done(req_id)
+        window.release_request(req_id)

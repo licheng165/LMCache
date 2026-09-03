@@ -1,0 +1,515 @@
+# SPDX-License-Identifier: Apache-2.0
+"""Stage 4 layerwise-prefill transfer-window protocol tests."""
+
+# Standard
+from concurrent.futures import Future
+from types import SimpleNamespace
+from typing import Any, Optional
+
+# Third Party
+import pytest
+import torch
+from vllm.distributed.kv_transfer.kv_connector.v1.base import (
+    KVConnectorRole,
+    LayerwisePrefillCallbackMetadata,
+)
+from vllm.v1.kv_cache_interface import DSAExecutionRow, DSAKVRow
+
+# First Party
+from lmcache.integration.vllm.vllm_v1_adapter import (
+    LayerwisePrefillSavePhase,
+    LayerwisePrefillWindowCoordinator,
+    LMCacheConnectorV1Impl,
+    _DSAKVTopologyCache,
+)
+
+# Local
+from tests.v1.test_vllm_kv_cache_config_cardinality import (
+    _kv_cache_config,
+    _patch_connector_startup,
+)
+
+PRODUCER_EXECUTIONS = (0, 1, 2, *(6 + 4 * index for index in range(18)), 78)
+
+
+def _topology_cache(cardinalities: tuple[int, int] = (79, 22)) -> _DSAKVTopologyCache:
+    config = _kv_cache_config(*cardinalities)
+    topology = config.dsa_kv_topology
+    rows = tuple(tuple(rows) for rows in topology.rows_by_group)
+    executions = tuple(topology.executions)
+    layer_name_to_row = {row.layer_name: row for rows_ in rows for row in rows_}
+    execution_to_entry = {entry.execution_ordinal: entry for entry in executions}
+    group_layer_names = tuple(
+        tuple(row.layer_name for row in rows_) for rows_ in rows
+    )
+    return _DSAKVTopologyCache(
+        descriptor=topology,
+        layer_name_to_row=layer_name_to_row,
+        execution_to_entry=execution_to_entry,
+        group_layer_names=group_layer_names,
+        group_cardinalities=cardinalities,
+    )
+
+
+class RecordingBackend:
+    """Transfer backend double with protocol-observable events."""
+
+    def __init__(
+        self,
+        *,
+        supports_sync: bool = True,
+        supports_window: bool = True,
+        persists_indexer: bool = True,
+        persist_futures: Optional[dict[Any, Future]] = None,
+    ):
+        self.supports_sync_callbacks = supports_sync
+        self.supports_transfer_window = supports_window
+        self.persists_indexer_group = persists_indexer
+        self.events: list[str] = []
+        self.persist_futures = persist_futures or {}
+        self.aborted: list[str] = []
+
+    def wait_for_load(self, metadata: Any) -> None:
+        self.events.append(f"wait-{metadata.row.kv_group}")
+
+    def submit_save(self, metadata: Any, kv_layer: Any, attn_metadata: Any) -> None:
+        self.events.append(f"submit-save-{metadata.row.kv_group}")
+
+    def submit_load(self, metadata: Any) -> None:
+        self.events.append("submit-load")
+
+    def finish_save(self, metadata: Any) -> Optional[Future]:
+        self.events.append(f"finish-{metadata.row.kv_group}")
+        return self.persist_futures.get(metadata.row)
+
+    def save(self, metadata: Any, kv_layer: Any, attn_metadata: Any) -> None:
+        self.events.append(f"sync-save-{metadata.row.kv_group}")
+
+    def abort_request(self, request_id: str) -> None:
+        self.aborted.append(request_id)
+
+
+def _callback(
+    cache: _DSAKVTopologyCache,
+    execution_ordinal: int,
+    generation: int = 7,
+) -> Any:
+    entry = cache.execution_to_entry[execution_ordinal]
+    latent_row = entry.latent
+    latent = DSAKVRow(
+        latent_row.layer_name,
+        latent_row.execution_ordinal,
+        latent_row.kv_group,
+        latent_row.row_ordinal,
+        latent_row.bank,
+    )
+    indexer = None
+    if entry.indexer is not None:
+        indexer_row = entry.indexer
+        indexer = DSAKVRow(
+            indexer_row.layer_name,
+            indexer_row.execution_ordinal,
+            indexer_row.kv_group,
+            indexer_row.row_ordinal,
+            indexer_row.bank,
+        )
+    execution = DSAExecutionRow(entry.execution_ordinal, latent, indexer)
+    return LayerwisePrefillCallbackMetadata.for_execution(
+        execution,
+        (("req-1", generation),),
+    )
+
+
+def _kv_layer() -> list[torch.Tensor]:
+    return [torch.empty(4)]
+
+
+def _drive_full_request(
+    coordinator: LayerwisePrefillWindowCoordinator,
+    cache: _DSAKVTopologyCache,
+) -> None:
+    """Wait, submit, and finish every LATENT row and producer INDEXER row."""
+
+    for execution_ordinal, entry in cache.execution_to_entry.items():
+        callbacks = _callback(cache, execution_ordinal)
+        for metadata in callbacks:
+            coordinator.wait_for_load(metadata)
+        for metadata in callbacks:
+            coordinator.submit_save(metadata, _kv_layer())
+        coordinator.submit_load(callbacks[0])
+        for metadata in callbacks:
+            coordinator.finish_save(metadata)
+
+
+def test_generator_counts_are_exact_79_and_22() -> None:
+    cache = _topology_cache()
+    backend = RecordingBackend()
+    coordinator = LayerwisePrefillWindowCoordinator(cache, backend)
+
+    _drive_full_request(coordinator, cache)
+
+    assert backend.events.count("submit-save-0") == 79
+    assert backend.events.count("submit-save-1") == 22
+    assert backend.events.count("finish-0") == 79
+    assert backend.events.count("finish-1") == 22
+    # One load submit per execution with a next row; execution 78 is the
+    # final row of both groups and has nothing left to prefetch. The 57
+    # shared consumers never generate a group-1 submission.
+    assert backend.events.count("submit-load") == 78
+    assert coordinator.request_persist_done("req-1") is True
+
+
+def test_execution_six_indexer_is_row_three_bank_one() -> None:
+    cache = _topology_cache()
+    backend = RecordingBackend()
+    coordinator = LayerwisePrefillWindowCoordinator(cache, backend)
+
+    for execution_ordinal in range(7):
+        for metadata in _callback(cache, execution_ordinal):
+            coordinator.submit_save(metadata, _kv_layer())
+            coordinator.finish_save(metadata)
+
+    execution = cache.execution_to_entry[6]
+    assert execution.indexer is not None
+    assert execution.indexer.row_ordinal == 3
+    assert execution.indexer.bank == 1
+    # Execution 6's tail events: LATENT row 6, then INDEXER row 3, each
+    # submitted and finished before the next row starts.
+    assert backend.events[-4:] == [
+        "submit-save-0",
+        "finish-0",
+        "submit-save-1",
+        "finish-1",
+    ]
+    # Row identity in the job map is group-local, not the model layer id.
+    arena = coordinator._arenas["req-1"]
+    assert (1, 3) in arena.jobs
+    assert (1, 6) not in arena.jobs
+
+
+def test_shared_consumers_never_touch_group_one() -> None:
+    cache = _topology_cache()
+    backend = RecordingBackend()
+    coordinator = LayerwisePrefillWindowCoordinator(cache, backend)
+
+    for execution_ordinal in (3, 4, 5):
+        entry = cache.execution_to_entry[execution_ordinal]
+        assert entry.indexer is None
+        metadata = _callback(cache, execution_ordinal)[0]
+        coordinator.wait_for_load(metadata)
+        coordinator.submit_load(metadata)
+
+    assert all("-1" not in event for event in backend.events)
+
+
+def test_finish_before_submit_and_out_of_order_rows_fail_closed() -> None:
+    cache = _topology_cache()
+    coordinator = LayerwisePrefillWindowCoordinator(cache, RecordingBackend())
+
+    # The wait is the request's first callback and creates its arena.
+    coordinator.wait_for_load(_callback(cache, 0)[0])
+    with pytest.raises(RuntimeError, match="before its submit"):
+        coordinator.finish_save(_callback(cache, 0)[0])
+
+    with pytest.raises(RuntimeError, match="per-group row order"):
+        coordinator.submit_save(_callback(cache, 1)[0], _kv_layer())
+
+
+def test_duplicate_finish_is_idempotent() -> None:
+    cache = _topology_cache()
+    backend = RecordingBackend()
+    coordinator = LayerwisePrefillWindowCoordinator(cache, backend)
+    metadata = _callback(cache, 0)[0]
+
+    coordinator.submit_save(metadata, _kv_layer())
+    coordinator.finish_save(metadata)
+    coordinator.finish_save(metadata)
+
+    assert backend.events.count("finish-0") == 2
+    arena = coordinator._arenas["req-1"]
+    assert arena.jobs[(0, 0)].phase is LayerwisePrefillSavePhase.PERSIST_DONE
+
+
+def test_delayed_persistence_future_blocks_request_completion() -> None:
+    cache = _topology_cache()
+    metadata = _callback(cache, 0)[0]
+    future: Future = Future()
+    backend = RecordingBackend(persist_futures={metadata.row: future})
+    coordinator = LayerwisePrefillWindowCoordinator(cache, backend)
+
+    coordinator.submit_save(metadata, _kv_layer())
+    coordinator.finish_save(metadata)
+
+    arena = coordinator._arenas["req-1"]
+    assert arena.jobs[(0, 0)].phase is LayerwisePrefillSavePhase.SOURCE_DONE
+    assert coordinator.request_persist_done("req-1") is False
+
+    future.set_result(None)
+    coordinator.poll_completed_persists()
+    assert arena.jobs[(0, 0)].phase is LayerwisePrefillSavePhase.PERSIST_DONE
+
+
+def test_stale_generation_cannot_touch_current_arena() -> None:
+    cache = _topology_cache()
+    backend = RecordingBackend()
+    coordinator = LayerwisePrefillWindowCoordinator(cache, backend)
+
+    old = _callback(cache, 0, generation=7)[0]
+    coordinator.submit_save(old, _kv_layer())
+    coordinator.finish_save(old)
+
+    new = _callback(cache, 0, generation=8)[0]
+    coordinator.submit_save(new, _kv_layer())
+
+    # A late old-generation finish may only clean its own resources.
+    coordinator.finish_save(old)
+    arena = coordinator._arenas["req-1"]
+    assert arena.allocation_generation == 8
+    assert (0, 0) in arena.jobs
+    with pytest.raises(RuntimeError, match="superseded"):
+        coordinator.submit_save(old, _kv_layer())
+    assert coordinator.request_persist_done("req-1") is False
+
+
+def test_request_id_reuse_uses_generation_arena_isolation() -> None:
+    cache = _topology_cache()
+    backend = RecordingBackend()
+    coordinator = LayerwisePrefillWindowCoordinator(cache, backend)
+
+    _drive_full_request(coordinator, cache)
+    assert coordinator.request_persist_done("req-1") is True
+
+    reused = _callback(cache, 0, generation=9)[0]
+    coordinator.submit_save(reused, _kv_layer())
+
+    arena = coordinator._arenas["req-1"]
+    assert arena.allocation_generation == 9
+    assert len(arena.jobs) == 1
+    assert coordinator.request_persist_done("req-1") is False
+
+
+def test_bounded_pending_jobs_fail_closed_instead_of_dropping() -> None:
+    cache = _topology_cache()
+    backend = RecordingBackend()
+    coordinator = LayerwisePrefillWindowCoordinator(
+        cache,
+        backend,
+        max_pending_jobs=2,
+    )
+
+    # Execution 0 is a producer: two rows fit exactly inside the bound.
+    for metadata in _callback(cache, 0):
+        coordinator.submit_save(metadata, _kv_layer())
+
+    with pytest.raises(RuntimeError, match="bounded queue"):
+        coordinator.submit_save(_callback(cache, 1)[0], _kv_layer())
+
+    # Nothing was dropped: both accepted submissions are intact.
+    arena = coordinator._arenas["req-1"]
+    assert len(arena.jobs) == 2
+
+
+def test_completion_barrier_requires_both_groups() -> None:
+    cache = _topology_cache()
+    backend = RecordingBackend()
+    coordinator = LayerwisePrefillWindowCoordinator(cache, backend)
+
+    for execution_ordinal, entry in cache.execution_to_entry.items():
+        metadata = _callback(cache, execution_ordinal)[0]
+        coordinator.submit_save(metadata, _kv_layer())
+        coordinator.finish_save(metadata)
+
+    assert coordinator.request_persist_done("req-1") is False
+
+    for execution_ordinal in PRODUCER_EXECUTIONS:
+        metadata = _callback(cache, execution_ordinal)[1]
+        coordinator.submit_save(metadata, _kv_layer())
+        coordinator.finish_save(metadata)
+
+    assert coordinator.request_persist_done("req-1") is True
+
+
+def test_release_drops_arenas_and_aborts_backend() -> None:
+    cache = _topology_cache()
+    backend = RecordingBackend()
+    coordinator = LayerwisePrefillWindowCoordinator(cache, backend)
+
+    _drive_full_request(coordinator, cache)
+    coordinator.release_request("req-1")
+
+    assert coordinator.has_request("req-1") is False
+    assert backend.aborted == ["req-1"]
+    with pytest.raises(RuntimeError, match="unknown request"):
+        coordinator.finish_save(_callback(cache, 0)[0])
+
+
+def test_blocking_barrier_waits_for_outstanding_futures() -> None:
+    cache = _topology_cache()
+    backend = RecordingBackend()
+    futures: dict[Any, Future] = {}
+
+    def finish_with_future(metadata: Any) -> Future:
+        future: Future = Future()
+        futures[metadata.row] = future
+        return future
+
+    backend.finish_save = finish_with_future
+    coordinator = LayerwisePrefillWindowCoordinator(
+        cache,
+        backend,
+        max_pending_jobs=102,
+        max_pending_bytes=1 << 30,
+    )
+
+    _drive_full_request(coordinator, cache)
+    assert coordinator.request_persist_done("req-1") is False
+
+    for future in futures.values():
+        future.set_result(None)
+    coordinator.wait_for_request_persist_done("req-1")
+    assert coordinator.request_persist_done("req-1") is True
+
+
+def test_blocking_barrier_fails_closed_when_rows_are_missing() -> None:
+    cache = _topology_cache()
+    backend = RecordingBackend()
+    coordinator = LayerwisePrefillWindowCoordinator(cache, backend)
+
+    for metadata in _callback(cache, 0):
+        coordinator.submit_save(metadata, _kv_layer())
+        coordinator.finish_save(metadata)
+
+    with pytest.raises(RuntimeError, match="missing"):
+        coordinator.wait_for_request_persist_done("req-1")
+
+
+def test_multi_request_callback_counts_host_resources_once() -> None:
+    cache = _topology_cache()
+    backend = RecordingBackend()
+    coordinator = LayerwisePrefillWindowCoordinator(cache, backend)
+    entry = cache.execution_to_entry[0]
+    latent_row = entry.latent
+    latent = DSAKVRow(
+        latent_row.layer_name,
+        latent_row.execution_ordinal,
+        latent_row.kv_group,
+        latent_row.row_ordinal,
+        latent_row.bank,
+    )
+    indexer_row = entry.indexer
+    assert indexer_row is not None
+    indexer = DSAKVRow(
+        indexer_row.layer_name,
+        indexer_row.execution_ordinal,
+        indexer_row.kv_group,
+        indexer_row.row_ordinal,
+        indexer_row.bank,
+    )
+    metadata = LayerwisePrefillCallbackMetadata(
+        DSAExecutionRow(entry.execution_ordinal, latent, indexer),
+        latent,
+        (("req-a", 1), ("req-b", 2)),
+    )
+
+    coordinator.submit_save(metadata, _kv_layer())
+    # One host allocation, counted once even though two requests share it.
+    assert coordinator.pending_bytes() == 16
+    assert coordinator.pending_jobs() == 1
+    coordinator.finish_save(metadata)
+
+    assert coordinator.pending_bytes() == 0
+    assert coordinator.pending_jobs() == 0
+    for req_id in ("req-a", "req-b"):
+        arena = coordinator._arenas[req_id]
+        job = arena.jobs[(0, 0)]
+        assert job.phase is LayerwisePrefillSavePhase.PERSIST_DONE
+        assert coordinator.request_persist_done(req_id) is False
+    assert backend.events == ["submit-save-0", "finish-0"]
+
+
+def test_no_backend_fails_closed_on_capabilities_and_callbacks() -> None:
+    cache = _topology_cache()
+    coordinator = LayerwisePrefillWindowCoordinator(cache, None)
+
+    assert coordinator.supports_sync_callbacks is False
+    assert coordinator.persists_indexer_group is False
+    assert coordinator.supports_transfer_window is False
+
+    with pytest.raises(RuntimeError, match="without a transfer backend"):
+        coordinator.submit_save(_callback(cache, 0)[0], _kv_layer())
+
+
+def test_sync_contract_saves_one_row_to_persist_done() -> None:
+    cache = _topology_cache()
+    backend = RecordingBackend(supports_window=False)
+    coordinator = LayerwisePrefillWindowCoordinator(cache, backend)
+
+    assert coordinator.supports_sync_callbacks is True
+    assert coordinator.supports_transfer_window is False
+
+    metadata = _callback(cache, 0)[0]
+    coordinator.save(metadata, _kv_layer())
+
+    arena = coordinator._arenas["req-1"]
+    assert arena.jobs[(0, 0)].phase is LayerwisePrefillSavePhase.PERSIST_DONE
+    assert backend.events == ["sync-save-0"]
+
+
+def _window_connector(
+    monkeypatch,
+    backend: Optional[Any],
+) -> LMCacheConnectorV1Impl:
+    _config, vllm_config, _observed = _patch_connector_startup(
+        monkeypatch,
+        dsa_two_groups=True,
+        model_num_layers=101,
+    )
+    impl = LMCacheConnectorV1Impl(
+        vllm_config,
+        KVConnectorRole.SCHEDULER,
+        SimpleNamespace(),
+        kv_cache_config=_kv_cache_config(79, 22),
+    )
+    cache = impl._dsa_kv_topology_cache
+    assert cache is not None
+    impl._layerwise_prefill_window = LayerwisePrefillWindowCoordinator(
+        cache,
+        backend,
+    )
+    return impl
+
+
+def test_connector_capabilities_and_delegation(monkeypatch) -> None:
+    backend = RecordingBackend()
+    impl = _window_connector(monkeypatch, backend)
+
+    assert impl.supports_layerwise_prefill_eager_callbacks is True
+    assert impl.supports_dsa_index_lmcache is True
+    assert impl.supports_layerwise_prefill_transfer_window is True
+
+    cache = impl._dsa_kv_topology_cache
+    indexer_metadata = _callback(cache, 0)[1]
+    impl.submit_layerwise_prefill_save(indexer_metadata, _kv_layer())
+    impl.submit_layerwise_prefill_load(_callback(cache, 0)[0])
+    impl.finish_layerwise_prefill_save(indexer_metadata)
+
+    assert backend.events == [
+        "submit-save-1",
+        "submit-load",
+        "finish-1",
+    ]
+    assert impl.layerwise_prefill_request_persist_done("req-1") is False
+
+
+def test_connector_without_backend_fails_closed(monkeypatch) -> None:
+    impl = _window_connector(monkeypatch, None)
+
+    assert impl.supports_layerwise_prefill_eager_callbacks is False
+    assert impl.supports_dsa_index_lmcache is False
+    assert impl.supports_layerwise_prefill_transfer_window is False
+
+    cache = impl._dsa_kv_topology_cache
+    with pytest.raises(RuntimeError, match="synchronous"):
+        impl.save_layerwise_prefill_kv_layer(_callback(cache, 0)[0], _kv_layer())
+    with pytest.raises(RuntimeError, match="transfer window"):
+        impl.submit_layerwise_prefill_save(_callback(cache, 0)[0], _kv_layer())
