@@ -10532,6 +10532,11 @@ class LMCacheConnectorV1Impl:
                         f"req_id={req_id} frontier={lmcache_cached_for_sparse} "
                         f"tokens={len(request.all_token_ids)}"
                     )
+                self._dsa_long_request_admission_check(
+                    request,
+                    request_tracker,
+                    lmcache_cached_for_sparse,
+                )
                 if (
                     len(request_tracker.sparse_token_ids)
                     < lmcache_cached_for_sparse
@@ -10701,3 +10706,37 @@ class LMCacheConnectorV1Impl:
         if window.has_request(req_id):
             window.wait_for_request_persist_done(req_id)
         window.release_request(req_id)
+
+    def _dsa_long_request_admission_check(
+        self,
+        request: Any,
+        request_tracker: Any,
+        lmcache_cached_for_sparse: int,
+    ) -> None:
+        """Stage 6 long-request admission gate for sparse decode.
+
+        Requests longer than the policy threshold may only enter sparse
+        decode when the exact remote lookup proves the complete prompt
+        prefix exists (the P node's final PERSIST_DONE frontier covers the
+        prompt) and the local DSA topology carries the canonical group
+        cardinalities. Anything else fails closed: the request is rejected
+        or rerouted to P, never dense-prefilled on the D node.
+        """
+        threshold = getattr(self, "_dsa_kv_policy_threshold", 0) or 0
+        if threshold <= 0 or int(len(request_tracker.token_ids)) <= threshold:
+            return
+        if int(lmcache_cached_for_sparse) < int(request_tracker.prompt_len):
+            raise RuntimeError(
+                "DSA long request has no exact full remote hit and cannot "
+                "dense prefill on the D node: "
+                f"req_id={request.req_id} prompt_len="
+                f"{request_tracker.prompt_len} cached="
+                f"{lmcache_cached_for_sparse}."
+            )
+        topology_cache = getattr(self, "_dsa_kv_topology_cache", None)
+        if topology_cache is not None:
+            if tuple(topology_cache.group_cardinalities) != (79, 22):
+                raise RuntimeError(
+                    "DSA long request admission requires the canonical 79/22 "
+                    f"topology, got {list(topology_cache.group_cardinalities)}."
+                )

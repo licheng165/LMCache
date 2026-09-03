@@ -516,6 +516,36 @@ def test_connector_without_backend_fails_closed(monkeypatch) -> None:
         impl.submit_layerwise_prefill_save(_callback(cache, 0)[0], _kv_layer())
 
 
+def test_dsa_long_request_admission_gates_sparse_decode() -> None:
+    impl = LMCacheConnectorV1Impl.__new__(LMCacheConnectorV1Impl)
+    impl._dsa_kv_policy_threshold = 256
+    impl._dsa_kv_topology_cache = _topology_cache()
+    request = SimpleNamespace(req_id="req-long")
+    tracker = SimpleNamespace(
+        token_ids=list(range(1000)),
+        prompt_len=1000,
+    )
+
+    # A long request without a full remote hit must not dense prefill.
+    with pytest.raises(RuntimeError, match="no exact full remote hit"):
+        impl._dsa_long_request_admission_check(request, tracker, 768)
+
+    # An exact full hit is admitted.
+    impl._dsa_long_request_admission_check(request, tracker, 1000)
+
+    # Short requests skip the gate even without any cached frontier.
+    short_tracker = SimpleNamespace(
+        token_ids=list(range(200)),
+        prompt_len=200,
+    )
+    impl._dsa_long_request_admission_check(request, short_tracker, 0)
+
+    # Non-canonical group cardinalities fail closed.
+    impl._dsa_kv_topology_cache = _topology_cache((79, 79))
+    with pytest.raises(RuntimeError, match="canonical 79/22"):
+        impl._dsa_long_request_admission_check(request, tracker, 1000)
+
+
 def test_connector_logs_p_node_observability(monkeypatch) -> None:
     _config, vllm_config, _observed = _patch_connector_startup(
         monkeypatch,
