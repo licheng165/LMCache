@@ -10647,16 +10647,32 @@ class LMCacheConnectorV1Impl:
         engine = getattr(self, "lmcache_engine", None)
         backend = getattr(engine, "layerwise_prefill_window_backend", None)
         window = LayerwisePrefillWindowCoordinator(topology_cache, backend)
+        config = getattr(self, "config", None)
+        cpu_cache_bytes = int(
+            float(getattr(config, "max_local_cpu_size", 0.0) or 0.0)
+            * (1 << 30)
+        )
+        extra_config = getattr(config, "extra_config", None)
+        if isinstance(extra_config, dict):
+            segment_value = extra_config.get("global_segment_size")
+        elif extra_config is not None:
+            segment_value = getattr(extra_config, "global_segment_size", None)
+        else:
+            segment_value = None
+        segment_bytes = int(segment_value or 0)
         logger.info(
-            "Layerwise-prefill transfer-window coordinator ready: "
+            "Layerwise-prefill P node: residency_mode=PREFILL_LAYERWISE "
             "topology_signature=%s group_cardinalities=%s "
             "max_pending_jobs=%d max_pending_bytes=%d "
-            "transfer_window=%s sync_callbacks=%s "
-            "indexer_persistence=%s",
+            "cpu_cache_bytes=%d mooncake_segment_bytes=%d "
+            "connector_transfer_window=%s connector_sync_callbacks=%s "
+            "connector_indexer_persistence=%s",
             window.topology_signature,
             list(topology_cache.group_cardinalities),
             window.max_pending_jobs,
             window.max_pending_bytes,
+            cpu_cache_bytes,
+            segment_bytes,
             window.supports_transfer_window,
             window.supports_sync_callbacks,
             window.persists_indexer_group,

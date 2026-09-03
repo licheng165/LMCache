@@ -16,6 +16,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.base import (
 from vllm.v1.kv_cache_interface import DSAExecutionRow, DSAKVRow
 
 # First Party
+from lmcache.integration.vllm import vllm_v1_adapter as adapter_module
 from lmcache.integration.vllm.vllm_v1_adapter import (
     LayerwisePrefillSavePhase,
     LayerwisePrefillWindowCoordinator,
@@ -513,3 +514,41 @@ def test_connector_without_backend_fails_closed(monkeypatch) -> None:
         impl.save_layerwise_prefill_kv_layer(_callback(cache, 0)[0], _kv_layer())
     with pytest.raises(RuntimeError, match="transfer window"):
         impl.submit_layerwise_prefill_save(_callback(cache, 0)[0], _kv_layer())
+
+
+def test_connector_logs_p_node_observability(monkeypatch) -> None:
+    _config, vllm_config, _observed = _patch_connector_startup(
+        monkeypatch,
+        dsa_two_groups=True,
+        model_num_layers=101,
+    )
+    impl = LMCacheConnectorV1Impl(
+        vllm_config,
+        KVConnectorRole.SCHEDULER,
+        SimpleNamespace(),
+        kv_cache_config=_kv_cache_config(79, 22),
+    )
+    impl._role = KVConnectorRole.WORKER
+    impl._dsa_kv_topology_cache = _topology_cache()
+    impl.config = SimpleNamespace(
+        max_local_cpu_size=120.0,
+        extra_config={"global_segment_size": 137_438_953_472},
+    )
+    logged = []
+    monkeypatch.setattr(
+        adapter_module.logger,
+        "info",
+        lambda message, *args, **_kwargs: logged.append(
+            message % args if args else message
+        ),
+    )
+
+    window = impl._build_layerwise_prefill_window()
+
+    assert window is not None
+    message = next(
+        message for message in logged if "Layerwise-prefill P node" in message
+    )
+    assert "cpu_cache_bytes=128849018880" in message
+    assert "mooncake_segment_bytes=137438953472" in message
+    assert "connector_transfer_window=False" in message
