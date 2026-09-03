@@ -83,7 +83,7 @@ class RecordingBackend:
         self.events.append(f"finish-{metadata.row.kv_group}")
         return self.persist_futures.get(metadata.row)
 
-    def save(self, metadata: Any, kv_layer: Any, attn_metadata: Any) -> None:
+    def sync_save(self, metadata: Any, kv_layer: Any, attn_metadata: Any) -> None:
         self.events.append(f"sync-save-{metadata.row.kv_group}")
 
     def abort_request(self, request_id: str) -> None:
@@ -432,12 +432,16 @@ def test_no_backend_fails_closed_on_capabilities_and_callbacks() -> None:
     cache = _topology_cache()
     coordinator = LayerwisePrefillWindowCoordinator(cache, None)
 
-    assert coordinator.supports_sync_callbacks is False
-    assert coordinator.persists_indexer_group is False
+    # The synchronous Stage 3 contract works eagerly without a backend;
+    # only the asynchronous transfer window stays fail closed.
+    assert coordinator.supports_sync_callbacks is True
+    assert coordinator.persists_indexer_group is True
     assert coordinator.supports_transfer_window is False
 
     with pytest.raises(RuntimeError, match="without a transfer backend"):
         coordinator.submit_save(_callback(cache, 0)[0], _kv_layer())
+    with pytest.raises(RuntimeError, match="no data plane"):
+        coordinator.save(_callback(cache, 0)[0], _kv_layer())
 
 
 def test_sync_contract_saves_one_row_to_persist_done() -> None:
@@ -454,6 +458,27 @@ def test_sync_contract_saves_one_row_to_persist_done() -> None:
     arena = coordinator._arenas["req-1"]
     assert arena.jobs[(0, 0)].phase is LayerwisePrefillSavePhase.PERSIST_DONE
     assert backend.events == ["sync-save-0"]
+
+
+def test_sync_contract_eager_store_replaces_missing_backend() -> None:
+    cache = _topology_cache()
+    coordinator = LayerwisePrefillWindowCoordinator(cache, None)
+    stored: list[tuple[str, tuple[Any, ...]]] = []
+
+    def eager_store(layer_name, kv_layer, attn_metadata):
+        stored.append((layer_name, tuple(kv_layer)))
+
+    metadata = _callback(cache, 0)[0]
+    kv_layer = _kv_layer()
+    coordinator.save(metadata, kv_layer, None, eager_store=eager_store)
+
+    arena = coordinator._arenas["req-1"]
+    assert arena.jobs[(0, 0)].phase is LayerwisePrefillSavePhase.PERSIST_DONE
+    assert stored == [(metadata.row.layer_name, tuple(kv_layer))]
+
+    # Out-of-order rows still fail closed on the eager path.
+    with pytest.raises(RuntimeError, match="per-group row order"):
+        coordinator.save(metadata, kv_layer, None, eager_store=eager_store)
 
 
 def _window_connector(
@@ -505,13 +530,26 @@ def test_connector_capabilities_and_delegation(monkeypatch) -> None:
 def test_connector_without_backend_fails_closed(monkeypatch) -> None:
     impl = _window_connector(monkeypatch, None)
 
-    assert impl.supports_layerwise_prefill_eager_callbacks is False
-    assert impl.supports_dsa_index_lmcache is False
+    # The eager Stage 3 protocol is available through the adapter's own
+    # per-layer store; only the asynchronous window needs a backend.
+    assert impl.supports_layerwise_prefill_eager_callbacks is True
+    assert impl.supports_dsa_index_lmcache is True
     assert impl.supports_layerwise_prefill_transfer_window is False
 
     cache = impl._dsa_kv_topology_cache
-    with pytest.raises(RuntimeError, match="synchronous"):
-        impl.save_layerwise_prefill_kv_layer(_callback(cache, 0)[0], _kv_layer())
+    stored: list[str] = []
+    monkeypatch.setattr(
+        impl,
+        "save_kv_layer",
+        lambda layer_name, kv_layer, attn_metadata, **_kwargs: stored.append(
+            layer_name
+        ),
+    )
+    metadata = _callback(cache, 0)[0]
+    impl.save_layerwise_prefill_kv_layer(metadata, _kv_layer())
+    assert stored == [metadata.row.layer_name]
+    assert impl.layerwise_prefill_request_persist_done("req-1") is False
+
     with pytest.raises(RuntimeError, match="transfer window"):
         impl.submit_layerwise_prefill_save(_callback(cache, 0)[0], _kv_layer())
 

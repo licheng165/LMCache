@@ -268,15 +268,14 @@ class LayerwisePrefillWindowCoordinator:
 
     @property
     def supports_sync_callbacks(self) -> bool:
-        return self._backend is not None and (
+        return self._backend is None or (
             getattr(self._backend, "supports_sync_callbacks", False) is True
         )
 
     @property
     def persists_indexer_group(self) -> bool:
-        return self._backend is not None and (
-            getattr(self._backend, "persists_indexer_group", False) is True
-        )
+        cardinalities = self._topology.group_cardinalities
+        return len(cardinalities) > 1 and cardinalities[1] > 0
 
     @property
     def supports_transfer_window(self) -> bool:
@@ -576,10 +575,17 @@ class LayerwisePrefillWindowCoordinator:
         metadata: Any,
         kv_layer: Any,
         attn_metadata: Any = None,
+        *,
+        eager_store: Any = None,
     ) -> None:
         """Synchronous Stage 3 contract: save one row in one call."""
 
         self._validate_metadata(metadata)
+        if self._backend is None and not callable(eager_store):
+            raise RuntimeError(
+                "Layerwise-prefill sync save has no data plane: no transfer "
+                "backend and no eager store."
+            )
         generations = self._metadata_request_generations(metadata)
         row = metadata.row
         with self._lock:
@@ -601,12 +607,10 @@ class LayerwisePrefillWindowCoordinator:
                         f"{expected}, got {row.row_ordinal}."
                     )
                 arenas.append(arena)
-            if self._backend is None:
-                raise RuntimeError(
-                    "Layerwise-prefill save submitted without a transfer "
-                    "backend."
-                )
-            self._backend.save(metadata, kv_layer, attn_metadata)
+            if self._backend is not None:
+                self._backend.sync_save(metadata, kv_layer, attn_metadata)
+            else:
+                eager_store(row.layer_name, kv_layer, attn_metadata)
             for index, arena in enumerate(arenas):
                 arena.jobs[(row.kv_group, row.row_ordinal)] = (
                     _LayerwisePrefillWindowJob(
@@ -8957,7 +8961,12 @@ class LMCacheConnectorV1Impl:
                 "The active transfer backend does not support synchronous "
                 "layerwise-prefill saves."
             )
-        window.save(metadata, kv_layer, attn_metadata)
+        window.save(
+            metadata,
+            kv_layer,
+            attn_metadata,
+            eager_store=self.save_kv_layer,
+        )
 
     def submit_layerwise_prefill_save(
         self,
@@ -10640,10 +10649,12 @@ class LMCacheConnectorV1Impl:
         """Create the Stage 4 transfer-window protocol coordinator.
 
         Worker roles with a frozen DSA topology always receive the protocol
-        coordinator. Device-side submission requires a backend exposed by
-        the engine as ``layerwise_prefill_window_backend``; without one every
-        layerwise-prefill capability stays False and the callbacks fail
-        closed before mutating protocol state.
+        coordinator. The synchronous Stage 3 contract (eager callbacks)
+        works without a backend by delegating the row store to the
+        adapter's per-layer eager save path; device-side asynchronous
+        submission additionally requires a backend exposed by the engine
+        as ``layerwise_prefill_window_backend`` and stays fail closed
+        without one.
         """
 
         topology_cache = getattr(self, "_dsa_kv_topology_cache", None)
