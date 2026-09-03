@@ -988,3 +988,83 @@ def load_engine_config_with_overrides(
         config_file_path=config_file_path,
         overrides=overrides,
     )
+
+
+UNIFIED_FOUR_NODE_GLOBAL_SEGMENT_SIZE = 137_438_953_472
+
+
+def validate_unified_four_node_yaml(config: Any) -> None:
+    """Validate one node config against the unified 2P2D YAML contract.
+
+    Every deployed replica (two P nodes and two D nodes) must satisfy the
+    design's unified YAML so the four-replica protocol cannot diverge on
+    chunking, shared CPU, sparse sampling, Mooncake paging, or the
+    first-rank publication policy. Fail closed on any drift.
+    """
+    failures: list[str] = []
+
+    def require(condition: bool, description: str) -> None:
+        if not condition:
+            failures.append(description)
+
+    require(
+        int(getattr(config, "chunk_size", 0)) == 256,
+        "chunk_size: 256",
+    )
+    require(getattr(config, "local_cpu", False) is True, "local_cpu: true")
+    require(
+        float(getattr(config, "max_local_cpu_size", 0.0)) >= 120.0,
+        "max_local_cpu_size: 120",
+    )
+    require(
+        getattr(config, "use_layerwise", False) is True,
+        "use_layerwise: true",
+    )
+    require(
+        getattr(config, "enable_sparse_attention", False) is True,
+        "enable_sparse_attention: true",
+    )
+    require(
+        getattr(config, "dsa_two_groups", False) is True,
+        "dsa_two_groups: true",
+    )
+    require(
+        getattr(config, "enable_shared_cpu_cache", False) is True,
+        "enable_shared_cpu_cache: true",
+    )
+    require(
+        getattr(config, "shared_cpu_cache_strict", False) is True,
+        "shared_cpu_cache_strict: true",
+    )
+    require(
+        getattr(config, "shared_cpu_cache_numa_policy", None)
+        == "interleave",
+        'shared_cpu_cache_numa_policy: "interleave"',
+    )
+    require(getattr(config, "store_async", True) is False, "store_async: false")
+    require(
+        getattr(config, "experimental_sampled_layerwise_lookup", False)
+        is True,
+        "experimental_sampled_layerwise_lookup: true",
+    )
+    extra = getattr(config, "extra_config", None) or {}
+    require(
+        int(extra.get("global_segment_size", 0))
+        == UNIFIED_FOUR_NODE_GLOBAL_SEGMENT_SIZE,
+        "extra_config.global_segment_size: 137438953472",
+    )
+    require(extra.get("protocol") == "ascend", 'extra_config.protocol: "ascend"')
+    require(
+        extra.get("mooncake_page_first_multi_buffer") is True,
+        "extra_config.mooncake_page_first_multi_buffer: true",
+    )
+    save_only_first_rank = extra.get("save_only_first_rank")
+    require(
+        isinstance(save_only_first_rank, bool),
+        "extra_config.save_only_first_rank must be a boolean on every replica",
+    )
+
+    if failures:
+        raise ValueError(
+            "Unified four-node YAML validation failed: " + "; ".join(failures)
+        )

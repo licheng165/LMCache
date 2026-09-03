@@ -1,16 +1,74 @@
 # SPDX-License-Identifier: Apache-2.0
 # Standard
 from pathlib import Path
+from types import SimpleNamespace
 import os
 
 # Third Party
 import pytest
 
 # First Party
-from lmcache.v1.config import LMCacheEngineConfig
+from lmcache.v1.config import (
+    LMCacheEngineConfig,
+    validate_unified_four_node_yaml,
+)
 from lmcache.v1.config_base import apply_remote_configs, validate_and_set_config_value
 
 BASE_DIR = Path(__file__).parent
+
+
+def _unified_node_config(**overrides) -> SimpleNamespace:
+    config = SimpleNamespace(
+        chunk_size=256,
+        local_cpu=True,
+        max_local_cpu_size=120.0,
+        use_layerwise=True,
+        enable_sparse_attention=True,
+        dsa_two_groups=True,
+        enable_shared_cpu_cache=True,
+        shared_cpu_cache_strict=True,
+        shared_cpu_cache_numa_policy="interleave",
+        store_async=False,
+        experimental_sampled_layerwise_lookup=True,
+        extra_config={
+            "global_segment_size": 137_438_953_472,
+            "protocol": "ascend",
+            "mooncake_page_first_multi_buffer": True,
+            "save_only_first_rank": True,
+        },
+    )
+    for key, value in overrides.items():
+        setattr(config, key, value)
+    return config
+
+
+def test_unified_four_node_yaml_accepts_the_contract() -> None:
+    validate_unified_four_node_yaml(_unified_node_config())
+
+
+@pytest.mark.parametrize(
+    ("overrides", "expected"),
+    [
+        ({"chunk_size": 512}, "chunk_size: 256"),
+        ({"max_local_cpu_size": 100.0}, "max_local_cpu_size: 120"),
+        ({"use_layerwise": False}, "use_layerwise: true"),
+        ({"enable_sparse_attention": False}, "enable_sparse_attention: true"),
+        ({"dsa_two_groups": False}, "dsa_two_groups: true"),
+        ({"shared_cpu_cache_numa_policy": "local"}, 'numa_policy: "interleave"'),
+        ({"store_async": True}, "store_async: false"),
+        (
+            {"extra_config": {"global_segment_size": 100_000_000_000}},
+            "global_segment_size",
+        ),
+        (
+            {"extra_config": {"save_only_first_rank": "yes"}},
+            "save_only_first_rank",
+        ),
+    ],
+)
+def test_unified_four_node_yaml_fails_closed_on_drift(overrides, expected) -> None:
+    with pytest.raises(ValueError, match=expected):
+        validate_unified_four_node_yaml(_unified_node_config(**overrides))
 
 
 def test_get_extra_config_from_file():
