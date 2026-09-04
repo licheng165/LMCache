@@ -669,3 +669,57 @@ def test_dynamic_connector_forwards_kv_cache_config(monkeypatch) -> None:
     assert captured["base"]["kv_cache_config"] is kv_cache_config
     assert captured["impl"][0] == (vllm_config, role, connector)
     assert captured["impl"][1]["kv_cache_config"] is kv_cache_config
+
+
+def test_dynamic_connector_forwards_layerwise_prefill_contract(monkeypatch) -> None:
+    calls = []
+    engine = SimpleNamespace(
+        supports_layerwise_prefill_eager_callbacks=True,
+        supports_dsa_index_lmcache=True,
+        supports_layerwise_prefill_transfer_window=True,
+        wait_for_layerwise_prefill_load=lambda metadata: calls.append(
+            ("wait", metadata)
+        ),
+        save_layerwise_prefill_kv_layer=lambda metadata, kv_layer, attn_metadata: (
+            calls.append(("save", metadata, kv_layer, attn_metadata))
+        ),
+        submit_layerwise_prefill_save=lambda metadata, kv_layer, attn_metadata: (
+            calls.append(("submit-save", metadata, kv_layer, attn_metadata))
+        ),
+        submit_layerwise_prefill_load=lambda metadata: calls.append(
+            ("submit-load", metadata)
+        ),
+        finish_layerwise_prefill_save=lambda metadata: calls.append(
+            ("finish", metadata)
+        ),
+    )
+    monkeypatch.setattr(KVConnectorBase_V1, "__init__", lambda self, **kwargs: None)
+    monkeypatch.setattr(
+        connector_module,
+        "LMCacheConnectorV1Impl",
+        lambda *args, **kwargs: engine,
+    )
+
+    connector = connector_module.LMCacheConnectorV1Dynamic(object(), object(), object())
+    metadata = object()
+    kv_layer = torch.empty(1)
+    attn_metadata = object()
+
+    assert connector.supports_layerwise_prefill_eager_callbacks is True
+    assert connector.supports_dsa_index_lmcache is True
+    assert connector.supports_layerwise_prefill_p_node is True
+    assert connector.supports_layerwise_prefill_transfer_window is True
+
+    connector.wait_for_layerwise_prefill_load(metadata)
+    connector.save_layerwise_prefill_kv_layer(metadata, kv_layer, attn_metadata)
+    connector.submit_layerwise_prefill_save(metadata, kv_layer, attn_metadata)
+    connector.submit_layerwise_prefill_load(metadata)
+    connector.finish_layerwise_prefill_save(metadata)
+
+    assert [call[0] for call in calls] == [
+        "wait",
+        "save",
+        "submit-save",
+        "submit-load",
+        "finish",
+    ]

@@ -50,6 +50,40 @@ class LMCacheConnectorV1Dynamic(KVConnectorBase_V1):
         )
 
     @property
+    def supports_layerwise_prefill_eager_callbacks(self) -> bool:
+        return (
+            getattr(
+                self._lmcache_engine,
+                "supports_layerwise_prefill_eager_callbacks",
+                False,
+            )
+            is True
+        )
+
+    @property
+    def supports_dsa_index_lmcache(self) -> bool:
+        return (
+            getattr(
+                self._lmcache_engine,
+                "supports_dsa_index_lmcache",
+                False,
+            )
+            is True
+        )
+
+    @property
+    def supports_layerwise_prefill_transfer_window(self) -> bool:
+        return bool(
+            self.supports_layerwise_prefill_p_node
+            and getattr(
+                self._lmcache_engine,
+                "supports_layerwise_prefill_transfer_window",
+                False,
+            )
+            is True
+        )
+
+    @property
     def supports_dsa_compact_external_load(self) -> bool:
         return self._lmcache_engine.supports_dsa_cold_compact_load()
 
@@ -125,6 +159,9 @@ class LMCacheConnectorV1Dynamic(KVConnectorBase_V1):
             selected_token_counts=selected_token_counts,
         )
 
+    def wait_for_layerwise_prefill_load(self, metadata: Any) -> None:
+        self._lmcache_engine.wait_for_layerwise_prefill_load(metadata)
+
     def save_kv_layer(
         self,
         layer_name: str,
@@ -147,6 +184,34 @@ class LMCacheConnectorV1Dynamic(KVConnectorBase_V1):
         self._lmcache_engine.save_kv_layer(
             layer_name, kv_layer, attn_metadata, **kwargs
         )
+
+    def save_layerwise_prefill_kv_layer(
+        self,
+        metadata: Any,
+        kv_layer: torch.Tensor,
+        attn_metadata: "AttentionMetadata",
+        **kwargs: Any,
+    ) -> None:
+        self._lmcache_engine.save_layerwise_prefill_kv_layer(
+            metadata, kv_layer, attn_metadata, **kwargs
+        )
+
+    def submit_layerwise_prefill_save(
+        self,
+        metadata: Any,
+        kv_layer: torch.Tensor,
+        attn_metadata: "AttentionMetadata",
+        **kwargs: Any,
+    ) -> None:
+        self._lmcache_engine.submit_layerwise_prefill_save(
+            metadata, kv_layer, attn_metadata, **kwargs
+        )
+
+    def submit_layerwise_prefill_load(self, metadata: Any) -> None:
+        self._lmcache_engine.submit_layerwise_prefill_load(metadata)
+
+    def finish_layerwise_prefill_save(self, metadata: Any) -> None:
+        self._lmcache_engine.finish_layerwise_prefill_save(metadata)
 
     def wait_for_save(self):
         """
