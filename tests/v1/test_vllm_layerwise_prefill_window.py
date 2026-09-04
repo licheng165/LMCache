@@ -481,6 +481,46 @@ def test_sync_contract_eager_store_replaces_missing_backend() -> None:
         coordinator.save(metadata, kv_layer, None, eager_store=eager_store)
 
 
+def test_sync_contract_repeats_rows_for_chunked_prefill() -> None:
+    cache = _topology_cache()
+    coordinator = LayerwisePrefillWindowCoordinator(cache, None)
+    stored = []
+
+    def eager_store(layer_name, kv_layer, attn_metadata):
+        stored.append(layer_name)
+
+    for _ in range(2):
+        for execution_ordinal in cache.execution_to_entry:
+            for metadata in _callback(cache, execution_ordinal):
+                coordinator.wait_for_load(metadata)
+                coordinator.save(
+                    metadata,
+                    _kv_layer(),
+                    None,
+                    eager_store=eager_store,
+                )
+        assert coordinator.request_persist_done("req-1") is True
+
+    arena = coordinator._arenas["req-1"]
+    assert arena.save_cursors == {0: 79, 1: 22}
+    assert len(arena.jobs) == 101
+    assert len(stored) == 2 * (79 + 22)
+
+
+def test_transfer_window_repeats_rows_after_previous_chunk_persists() -> None:
+    cache = _topology_cache()
+    backend = RecordingBackend()
+    coordinator = LayerwisePrefillWindowCoordinator(cache, backend)
+
+    _drive_full_request(coordinator, cache)
+    assert coordinator.request_persist_done("req-1") is True
+    _drive_full_request(coordinator, cache)
+
+    assert coordinator.request_persist_done("req-1") is True
+    assert backend.events.count("submit-save-0") == 2 * 79
+    assert backend.events.count("submit-save-1") == 2 * 22
+
+
 def _window_connector(
     monkeypatch,
     backend: Optional[Any],

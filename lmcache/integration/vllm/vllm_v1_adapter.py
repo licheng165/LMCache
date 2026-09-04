@@ -216,8 +216,9 @@ class LayerwisePrefillWindowCoordinator:
 
     Device-side submission and real completion events are delegated to a
     backend supplied by the engine (the NPU implementation lives in
-    LMCache-Ascend). Without a backend every capability is False and all
-    callbacks fail closed before any state is mutated.
+    LMCache-Ascend). Without a backend the synchronous eager path delegates
+    to the adapter's per-layer store while the asynchronous window remains
+    disabled.
     """
 
     def __init__(
@@ -412,6 +413,55 @@ class LayerwisePrefillWindowCoordinator:
                 "dropping one."
             )
 
+    def _prepare_save_cursor(
+        self,
+        arena: _LayerwisePrefillRequestArena,
+        row: Any,
+    ) -> int:
+        """Reset one completed group cursor for the next prefill chunk."""
+
+        kv_group = row.kv_group
+        expected = arena.save_cursors.get(kv_group, 0)
+        cardinality = self._topology.group_cardinalities[kv_group]
+        if expected != cardinality or row.row_ordinal != 0:
+            return expected
+
+        previous_jobs = [
+            arena.jobs.get((kv_group, row_ordinal))
+            for row_ordinal in range(cardinality)
+        ]
+        for job in previous_jobs:
+            if (
+                job is not None
+                and job.phase is LayerwisePrefillSavePhase.SOURCE_DONE
+                and job.persist_future is not None
+            ):
+                job.persist_future.result()
+                self._settle_job(arena, job)
+        if any(
+            job is None
+            or job.phase is not LayerwisePrefillSavePhase.PERSIST_DONE
+            for job in previous_jobs
+        ):
+            raise RuntimeError(
+                "Layerwise-prefill cannot start the next prefill chunk before "
+                "the previous group round reaches PERSIST_DONE: "
+                f"request_id={arena.request_id!r}, "
+                f"generation={arena.allocation_generation}, group={kv_group}."
+            )
+        if arena.pending_load_rows.get(kv_group):
+            raise RuntimeError(
+                "Layerwise-prefill cannot start the next prefill chunk with "
+                f"pending group-{kv_group} loads."
+            )
+
+        for row_ordinal in range(cardinality):
+            del arena.jobs[(kv_group, row_ordinal)]
+        arena.save_cursors[kv_group] = 0
+        arena.load_submitted_through[kv_group] = 0
+        arena.pending_load_rows.pop(kv_group, None)
+        return 0
+
     def _settle_job(
         self,
         arena: _LayerwisePrefillRequestArena,
@@ -493,7 +543,7 @@ class LayerwisePrefillWindowCoordinator:
                     )
                 if arena is None:
                     arena = self._arena_for(request_id, generation)
-                expected = arena.save_cursors.get(row.kv_group, 0)
+                expected = self._prepare_save_cursor(arena, row)
                 if row.row_ordinal != expected:
                     raise RuntimeError(
                         "Layerwise-prefill saves must arrive in per-group row "
@@ -599,7 +649,7 @@ class LayerwisePrefillWindowCoordinator:
                     )
                 if arena is None:
                     arena = self._arena_for(request_id, generation)
-                expected = arena.save_cursors.get(row.kv_group, 0)
+                expected = self._prepare_save_cursor(arena, row)
                 if row.row_ordinal != expected:
                     raise RuntimeError(
                         "Layerwise-prefill saves must arrive in per-group row "
