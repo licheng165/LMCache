@@ -1282,6 +1282,7 @@ class TestBuildConnectorMetaSparseSyntheticLoadSpec:
             token_ids=list(range(prompt_len)),
             allocated_block_ids=list(range(256)),
             num_saved_tokens=prompt_len,
+            num_lmcache_cached_tokens=prompt_len,
         )
         scheduler_output = StubSchedulerOutput(
             finished_req_ids=set(),

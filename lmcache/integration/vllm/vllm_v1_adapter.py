@@ -10591,11 +10591,7 @@ class LMCacheConnectorV1Impl:
                         f"req_id={req_id} frontier={lmcache_cached_for_sparse} "
                         f"tokens={len(request.all_token_ids)}"
                     )
-                self._dsa_long_request_admission_check(
-                    request,
-                    request_tracker,
-                    lmcache_cached_for_sparse,
-                )
+                self._dsa_long_request_admission_check(request_tracker)
                 if (
                     len(request_tracker.sparse_token_ids)
                     < lmcache_cached_for_sparse
@@ -10770,9 +10766,7 @@ class LMCacheConnectorV1Impl:
 
     def _dsa_long_request_admission_check(
         self,
-        request: Any,
         request_tracker: Any,
-        lmcache_cached_for_sparse: int,
     ) -> None:
         """Stage 6 long-request admission gate for sparse decode.
 
@@ -10784,15 +10778,16 @@ class LMCacheConnectorV1Impl:
         or rerouted to P, never dense-prefilled on the D node.
         """
         threshold = getattr(self, "_dsa_kv_policy_threshold", 0) or 0
-        if threshold <= 0 or int(len(request_tracker.token_ids)) <= threshold:
+        prompt_len = int(request_tracker.prompt_len)
+        if threshold <= 0 or prompt_len <= threshold:
             return
-        if int(lmcache_cached_for_sparse) < int(request_tracker.prompt_len):
+        remote_cached_tokens = int(request_tracker.num_lmcache_cached_tokens)
+        if remote_cached_tokens < prompt_len:
             raise RuntimeError(
                 "DSA long request has no exact full remote hit and cannot "
                 "dense prefill on the D node: "
-                f"req_id={request.req_id} prompt_len="
-                f"{request_tracker.prompt_len} cached="
-                f"{lmcache_cached_for_sparse}."
+                f"req_id={request_tracker.req_id} prompt_len={prompt_len} "
+                f"cached={remote_cached_tokens}."
             )
         topology_cache = getattr(self, "_dsa_kv_topology_cache", None)
         if topology_cache is not None:

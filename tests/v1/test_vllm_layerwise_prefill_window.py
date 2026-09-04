@@ -598,30 +598,36 @@ def test_dsa_long_request_admission_gates_sparse_decode() -> None:
     impl = LMCacheConnectorV1Impl.__new__(LMCacheConnectorV1Impl)
     impl._dsa_kv_policy_threshold = 256
     impl._dsa_kv_topology_cache = _topology_cache()
-    request = SimpleNamespace(req_id="req-long")
     tracker = SimpleNamespace(
+        req_id="req-long",
         token_ids=list(range(1000)),
         prompt_len=1000,
+        num_lmcache_cached_tokens=768,
     )
 
     # A long request without a full remote hit must not dense prefill.
     with pytest.raises(RuntimeError, match="no exact full remote hit"):
-        impl._dsa_long_request_admission_check(request, tracker, 768)
+        impl._dsa_long_request_admission_check(tracker)
 
-    # An exact full hit is admitted.
-    impl._dsa_long_request_admission_check(request, tracker, 1000)
+    # The exact lookup count, not the chunk-aligned sparse working frontier,
+    # proves that the remote cache covers the complete prompt.
+    tracker.num_lmcache_cached_tokens = 1000
+    impl._dsa_long_request_admission_check(tracker)
 
-    # Short requests skip the gate even without any cached frontier.
+    # A short prompt may grow past the policy threshold during decode. That is
+    # a policy transition, not a new long-prompt admission decision.
     short_tracker = SimpleNamespace(
-        token_ids=list(range(200)),
+        req_id="req-short",
+        token_ids=list(range(300)),
         prompt_len=200,
+        num_lmcache_cached_tokens=0,
     )
-    impl._dsa_long_request_admission_check(request, short_tracker, 0)
+    impl._dsa_long_request_admission_check(short_tracker)
 
     # Non-canonical group cardinalities fail closed.
     impl._dsa_kv_topology_cache = _topology_cache((79, 79))
     with pytest.raises(RuntimeError, match="canonical 79/22"):
-        impl._dsa_long_request_admission_check(request, tracker, 1000)
+        impl._dsa_long_request_admission_check(tracker)
 
 
 def test_connector_logs_p_node_observability(monkeypatch) -> None:
